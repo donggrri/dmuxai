@@ -691,3 +691,53 @@ fn tc_2567_storage_hardening_regressions() {
         "new run must survive"
     );
 }
+
+/// TC-2800 / FR-2800, FR-2810: `save_relaxed` persists a loadable manifest with
+/// identical validation and permissions (0700 dirs / 0600 files on unix) while
+/// skipping the durability syncs.
+#[test]
+fn tc_2800_save_relaxed_roundtrip_and_permissions() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store_root = tmp.path().join("runs");
+    let store = JournalStore::new(store_root.clone());
+
+    let run_id = "0123456789abcdef";
+    let manifest = sample_manifest(run_id, "running", 1_000_000, None);
+
+    store
+        .save_relaxed(&manifest)
+        .expect("save_relaxed initial manifest");
+
+    let run_dir = store_root.join(run_id);
+    let manifest_path = run_dir.join("manifest.json");
+    assert!(run_dir.is_dir());
+    assert!(manifest_path.is_file());
+
+    #[cfg(unix)]
+    {
+        let dir_mode = fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&manifest_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "run directory mode must be 0700");
+        assert_eq!(file_mode, 0o600, "manifest file mode must be 0600");
+    }
+
+    // Load back - running status is normalized to authoritative active, same as save
+    let loaded = store
+        .load(run_id)
+        .expect("load manifest after save_relaxed");
+    assert_eq!(loaded.run_id, run_id);
+    assert_eq!(loaded.status, "active");
+
+    // Overwrite with a terminal state via save_relaxed and verify roundtrip
+    let mut updated = manifest.clone();
+    updated.status = "completed".to_string();
+    updated.completed_at_ms = Some(2_000_000);
+    updated.duration_ms = Some(1_000_000);
+    updated.child_exit_code = Some(0);
+    store
+        .save_relaxed(&updated)
+        .expect("save_relaxed terminal manifest");
+
+    let reloaded = store.load(run_id).expect("reload terminal manifest");
+    assert_eq!(reloaded, updated, "terminal manifest must roundtrip equal");
+}

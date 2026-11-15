@@ -552,7 +552,17 @@ impl JournalStore {
     /// Saves a run manifest atomically, masking secrets and enforcing directory permissions.
     /// This is the raw low-level unpruned save API.
     pub fn save(&self, manifest: &RunManifest) -> Result<(), JournalError> {
-        self.save_internal(manifest)?;
+        self.save_internal(manifest, true)?;
+        Ok(())
+    }
+
+    /// Saves a run manifest with the same validation, permissions, nofollow and
+    /// atomic temp-file + rename contract as [`JournalStore::save`], but skips
+    /// the durability syncs (`sync_all` on the temp file and the parent
+    /// directory fsync). Used by headless run paths where per-run latency
+    /// matters more than crash-exact durability (FR-2810).
+    pub fn save_relaxed(&self, manifest: &RunManifest) -> Result<(), JournalError> {
+        self.save_internal(manifest, false)?;
         Ok(())
     }
 
@@ -564,7 +574,7 @@ impl JournalStore {
         retention_config: Option<&JournalConfig>,
         now_ms: u64,
     ) -> Result<Option<PruneReport>, JournalError> {
-        self.save_internal(manifest)?;
+        self.save_internal(manifest, true)?;
 
         if let Some(cfg) = retention_config {
             let report = self.prune(cfg, now_ms)?;
@@ -574,7 +584,7 @@ impl JournalStore {
         }
     }
 
-    fn save_internal(&self, manifest: &RunManifest) -> Result<(), JournalError> {
+    fn save_internal(&self, manifest: &RunManifest, durable: bool) -> Result<(), JournalError> {
         let run_id = &manifest.run_id;
         if !valid_run_id(run_id) {
             return Err(JournalError::InvalidId(run_id.clone()));
@@ -670,7 +680,9 @@ impl JournalStore {
         let write_res = (|| -> io::Result<()> {
             let mut tmp_file = open_file_write_nofollow(&tmp_path, true)?;
             tmp_file.write_all(&payload)?;
-            tmp_file.sync_all()?;
+            if durable {
+                tmp_file.sync_all()?;
+            }
             Ok(())
         })();
 
@@ -686,7 +698,9 @@ impl JournalStore {
         }
 
         // Sync parent directory after successful rename for durable atomic contract
-        sync_dir(&run_dir)?;
+        if durable {
+            sync_dir(&run_dir)?;
+        }
 
         Ok(())
     }

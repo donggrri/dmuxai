@@ -2427,7 +2427,7 @@ fn start_headless_journal(
         diagnostics: dmuxai::run_journal::RunDiagnosticsRef::default(),
         end_summary: None,
     };
-    if let Err(e) = store.save(&manifest) {
+    if let Err(e) = store.save_relaxed(&manifest) {
         eprintln!("warning: run journal unavailable: {e}");
         return None;
     }
@@ -2536,7 +2536,7 @@ async fn run_headless(
                 manifest.completed_at_ms = Some(now_ms);
                 manifest.duration_ms = Some(now_ms.saturating_sub(manifest.created_at_ms));
                 manifest.dmuxai_exit_code = Some(130);
-                if let Err(err) = store.save(&manifest) {
+                if let Err(err) = store.save_relaxed(&manifest) {
                     eprintln!("warning: run journal unavailable: {err}");
                 }
             }
@@ -2597,7 +2597,7 @@ async fn run_headless(
         if let Some(plan_hash) = &outcome.plan_hash {
             manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
         }
-        if let Err(err) = store.save(&manifest) {
+        if let Err(err) = store.save_relaxed(&manifest) {
             eprintln!("warning: run journal unavailable: {err}");
         }
     }
