@@ -3,7 +3,7 @@
 Status: proposed
 Owner: DmuxAI Team
 Created: 2026-11-15
-Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR-2800–2810 / TC-2800–2809 (PR A); PR B adds FR/TC-2811–2814
+Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810 (PR A); PR B adds FR/TC-2811–2814
 Related: SPEC-run-journal, SPEC-agent-api, SPEC-web-dashboard, SPEC-graph-view, issues #147, #148, #301
 
 ## 1. Decision summary
@@ -63,7 +63,7 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | FR-2807 | Must | `GET /api/runs/{id}`, | returns the manifest, `graph` (graph view from `.dmuxai/graphs/<graph_id>.json` when present), `approval` `{plan_hash, hint}` when `awaiting_approval`, and the last 200 progress lines. The hint is `dmuxai run --graph --approve-plan-id <plan_hash> -` (graph) or `dmuxai run --agent <runner> --approve-plan -` (direct), never `--allow-sensitive`. | Invalid id → 400; unknown → 404. | TC-2807 |
 | FR-2808 | Must | `GET /api/runs/{id}/stream` (SSE), | sends `run` (manifest on change), `progress` (new progress lines) and `state-change` (events whose `run_id` matches), using incremental offsets; sends `end` once the run is terminal and drained. | Unknown id → 404. | TC-2808 |
 | FR-2809 | Must | For every runs endpoint, | only GET is routed; the existing dashboard token check applies; payload strings are masked and never contain the dashboard token. | Missing/wrong token → 401 as other `/api` routes. | TC-2809 |
-| FR-2810 | Should | When a trivial headless run is benchmarked against main, | wall time stays within 10 % (#301 rule); numbers are recorded in the PR. | — | PR bench (manual, no TC) |
+| FR-2810 | Should | When a trivial headless run is benchmarked against main, | wall time stays within 10 % (#301 rule); numbers are recorded in the PR; masking skips its regexes for lines with no secret-like literal and headless manifest saves stay atomic without fsync. | — | TC-2810 + PR bench |
 
 ## 5. Acceptance scenarios and test design
 
@@ -79,6 +79,7 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | TC-2807 | FR-2807 | integration | awaiting_approval graph run fixture with graph file and progress lines | `GET /api/runs/{id}` | graph view, approval hint with `--approve-plan-id`, progress tail; 400/404 | `tests/serve_runs_api.rs`: `tc_2807_run_detail_graph_and_approval` |
 | TC-2808 | FR-2808 | integration | active run fixture | open SSE, append progress line and event with matching / other run_id, then mark terminal | receives `progress`, matching `state-change` only, `run`, then `end` | `tests/serve_runs_api.rs`: `tc_2808_run_stream_sse` |
 | TC-2809 | FR-2809 | integration | server with token; fixture containing a fake secret | requests without token, POST, with token | 401 without token, 405 on POST, masked payload without token string | `tests/serve_runs_api.rs`: `tc_2809_runs_api_read_only_and_masked` |
+| TC-2810 | FR-2810, FR-2802 | unit | masking inputs with and without secret-like literals; relaxed manifest save | mask and save | secrets still masked, plain progress lines unchanged; relaxed save roundtrips with 0700/0600 | `src/run_journal.rs`: `tc_2810_mask_prefilter_keeps_masking`; bench numbers in the PR description |
 
 ## 6. Data, integration, and safety contracts
 
@@ -88,7 +89,7 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | Events | optional `run_id` on records | omitted when none; old lines parse | TC-2804 |
 | API | new GET routes only; token required | no change to existing routes | TC-2806–TC-2809 |
 | Security | `mask_sensitive_tokens` on progress copy and error summary; no raw stderr served | — | TC-2802, TC-2809 |
-| Performance | incremental tail; journal writes are two small files per run | #301 10 % rule | TC-2805, PR bench |
+| Performance | incremental tail; relaxed (non-fsync) atomic manifest saves; masking prefilter | #301 10 % rule | TC-2805, TC-2810, PR bench |
 
 ## 7. Implementation plan
 
