@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use filetime::{FileTime, set_file_mtime};
 use serde_json::{Value, json};
 
 struct ChildGuard(Option<Child>);
@@ -510,9 +511,29 @@ fn tc_2812_runs_list_rows() {
     m_fail["dmuxai_exit_code"] = json!(1);
     write_manifest(&runs.join(failed), &m_fail);
 
+    let stalled_id = "ffffffffffffffff";
     let mut m_active = base_manifest(active, 4_000, "active");
     m_active["pid"] = json!(999_999);
     write_manifest(&runs.join(active), &m_active);
+
+    let mut m_stalled = base_manifest(stalled_id, 6_000, "active");
+    m_stalled["pid"] = json!(std::process::id());
+    write_manifest(&runs.join(stalled_id), &m_stalled);
+    let stalled_progress = runs.join(stalled_id).join("progress.jsonl");
+    fs::write(
+        &stalled_progress,
+        "{\"type\":\"progress\",\"ts_ms\":6000,\"kind\":\"started\",\"summary\":\"old\"}\n",
+    )
+    .expect("stalled progress");
+    let old = FileTime::from_unix_time(
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_secs() as i64)
+            - 120,
+        0,
+    );
+    set_file_mtime(&stalled_progress, old).expect("stale progress mtime");
 
     let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
     wait_for_runs_open(&mut session);
@@ -523,7 +544,7 @@ fn tc_2812_runs_list_rows() {
         if let Ok(n) = session
             .cdp
             .eval("document.querySelectorAll('.runs-row').length")
-            && n.as_u64() == Some(3)
+            && n.as_u64() == Some(4)
         {
             break;
         }
@@ -534,7 +555,7 @@ fn tc_2812_runs_list_rows() {
         .expect("row count")
         .as_u64()
         .unwrap_or(0);
-    assert_eq!(row_count, 3, "expected 3 run rows");
+    assert_eq!(row_count, 4, "expected 4 run rows");
 
     let stale = session
         .cdp
@@ -567,6 +588,82 @@ fn tc_2812_runs_list_rows() {
         runner_text.contains("codex"),
         "expected runner text: {runner_text}"
     );
+
+    let origins = session
+        .cdp
+        .eval(
+            "Array.from(document.querySelectorAll('.runs-col-origin')).map(el => el.innerText).join('|')",
+        )
+        .expect("origins")
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        origins.split('|').all(|o| o == "cli"),
+        "expected cli origin labels: {origins}"
+    );
+
+    let stalled = session
+        .cdp
+        .eval(&format!(
+            "!!document.querySelector('[data-run-id=\"{stalled_id}\"] .runs-flag-stalled')"
+        ))
+        .expect("stalled badge");
+    assert_eq!(stalled.as_bool(), Some(true), "stalled badge on quiet run");
+
+    let elapsed_before = session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-run-id=\"{active}\"] .runs-col-elapsed') && document.querySelector('[data-run-id=\"{active}\"] .runs-col-elapsed').innerText"
+        ))
+        .expect("elapsed before")
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        elapsed_before.contains(':'),
+        "elapsed column must show M:SS: {elapsed_before}"
+    );
+
+    let tick_deadline = Instant::now() + Duration::from_secs(3);
+    let mut elapsed_after = elapsed_before.clone();
+    while Instant::now() < tick_deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(text) = session.cdp.eval(&format!(
+            "document.querySelector('[data-run-id=\"{active}\"] .runs-col-elapsed').innerText"
+        )) {
+            let t = text.as_str().unwrap_or("").to_owned();
+            if t != elapsed_before {
+                elapsed_after = t;
+                break;
+            }
+        }
+    }
+    assert_ne!(
+        elapsed_before, elapsed_after,
+        "active run elapsed should tick"
+    );
+
+    let late_id = "1111111111111111";
+    let mut m_late = base_manifest(late_id, 7_000, "completed");
+    m_late["completed_at_ms"] = json!(7_100);
+    m_late["duration_ms"] = json!(100);
+    write_manifest(&runs.join(late_id), &m_late);
+
+    let poll_deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_fifth = false;
+    while Instant::now() < poll_deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(n) = session
+            .cdp
+            .eval("document.querySelectorAll('.runs-row').length")
+            && n.as_u64() == Some(5)
+        {
+            saw_fifth = true;
+            break;
+        }
+    }
+    assert!(saw_fifth, "poll should pick up a new run within ~2s");
 }
 
 // TC-2813 / FR-2813: live stream, approval banner, graph nodes, exit code.
@@ -615,12 +712,26 @@ fn tc_2813_run_detail_live_and_approval() {
         ))
         .expect("select row");
 
+    let boot_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < boot_deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(text) = session.cdp.eval(
+            "document.querySelector('#runs-stream') && document.querySelector('#runs-stream').innerText",
+        ) && text.as_str().unwrap_or("").contains("boot")
+        {
+            break;
+        }
+    }
+
     fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&progress_path)
         .expect("open progress")
-        .write_all(br#"{"type":"progress","ts_ms":6000,"kind":"tool","summary":"live line"}"#)
+        .write_all(
+            br#"{"type":"progress","ts_ms":6000,"kind":"tool","summary":"live line"}
+"#,
+        )
         .expect("append progress");
 
     let mut saw_live = false;
@@ -737,9 +848,19 @@ fn tc_2814_run_text_is_not_html() {
         ))
         .expect("select row");
 
-    for _ in 0..40 {
+    let text_deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_payload = false;
+    while Instant::now() < text_deadline {
         std::thread::sleep(Duration::from_millis(100));
+        if let Ok(text) = session.cdp.eval(
+            "document.querySelector('#runs-stream') && document.querySelector('#runs-stream').innerText",
+        ) && text.as_str().unwrap_or("").contains(xss)
+        {
+            saw_payload = true;
+            break;
+        }
     }
+    assert!(saw_payload, "stream must show literal payload text");
 
     let img = session
         .cdp

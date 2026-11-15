@@ -17,6 +17,12 @@ All notable changes to dmuxai are listed here. Versions follow
   `--approve-plan-id` marks the earlier `awaiting_approval` run as `approved` with
   `approved_by_run_id` (FR-2816, #325).
 
+- **Runs view in the `dmuxai serve` dashboard (PR B of SPEC-headless-runs-dashboard,
+  FR-2811..2814).** A view-only Runs panel (open by default under serve) lists headless runs
+  with status, origin, runner/model, elapsed and stale flag; selecting one shows the live
+  progress stream, graph node detail, the approval banner with the `--approve-plan-id` CLI
+  hint, and the final exit code. All run text is rendered as text, never HTML.
+
 - **Persistent terminal sessions: `dmuxai term` (PR1a of SPEC-terminal-sessions,
   FR-2600..2609, FR-2620, FR-2621, FR-2632).** Named Linux PTY sessions (`shell` or `cmd`)
   owned by a per-workspace session host on a private Unix socket: `open`, `send`

@@ -1898,7 +1898,7 @@ function syncCenterViewsWithSnapshot(snap) {
     var key = String(graph.id || '') + ':' + String(graph.approval.rev);
     if (!approvalAutoOpened[key]) {
       approvalAutoOpened[key] = true;
-      if (centerView !== 'graph') { setCenterView('graph', { focus: false }); }
+      if (centerView !== 'graph') { setCenterView('graph', { focus: false, persist: false }); }
     }
   }
 }
@@ -4285,14 +4285,14 @@ function applySnapshot(snap) {
   snapshot = snap;
   lastRendered = Date.now();
   applySnapshotUi(snap);
+  render(lastRendered);
+  syncCenterViewsWithSnapshot(snap);
   if (!serveRunsDefaultDone) {
     serveRunsDefaultDone = true;
-    if (String(snap.source || '') === 'files' && !readCenterView()) {
+    if (String(snap.source || '') === 'files' && !readCenterView() && !centerView) {
       setCenterView('runs', { persist: false, focus: false });
     }
   }
-  render(lastRendered);
-  syncCenterViewsWithSnapshot(snap);
   applyPendingRunFocus(snap);
   renderTodos(snap);
   if (isSomethingRunning(snap)) {
@@ -4337,6 +4337,9 @@ function startSse() {
   }
 
   sse.addEventListener('snapshot', onSnapshotEvent);
+  sse.addEventListener('state-change', function () {
+    document.dispatchEvent(new CustomEvent('dmuxai:state-change'));
+  });
   sse.addEventListener('error', function() {
     sseFailures += 1;
     if (sse && sse.readyState === EventSource.CLOSED) {
@@ -4440,6 +4443,9 @@ window.addEventListener('pagehide', function() {
   stopSse();
   stopPolling();
   stopTickTimer();
+  if (typeof window.dmuxaiRunsOnViewClose === 'function') {
+    window.dmuxaiRunsOnViewClose();
+  }
 });
 
 function init() {

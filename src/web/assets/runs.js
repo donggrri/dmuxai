@@ -127,11 +127,11 @@ function runsCopyText(text) {
 var runsUiOpen = false;
 var runsPollTimer = null;
 var runsTickTimer = null;
-var runsEventsSse = null;
 var runsStreamSse = null;
 var runsListData = [];
 var runsSelectedId = null;
 var runsDetailRun = null;
+var runsDetailGen = 0;
 var runsStreamLines = 0;
 var runsStreamStickBottom = true;
 var runsStreamBackoffIx = 0;
@@ -156,14 +156,7 @@ function runsStopTick() {
   }
 }
 
-function runsStopEventsSse() {
-  if (runsEventsSse) {
-    runsEventsSse.close();
-    runsEventsSse = null;
-  }
-}
-
-function runsStopStream() {
+function runsCloseStreamSse() {
   if (runsStreamReconnectTimer !== null) {
     clearTimeout(runsStreamReconnectTimer);
     runsStreamReconnectTimer = null;
@@ -172,7 +165,15 @@ function runsStopStream() {
     runsStreamSse.close();
     runsStreamSse = null;
   }
+}
+
+function runsResetStreamBackoff() {
   runsStreamBackoffIx = 0;
+}
+
+function runsStopStream() {
+  runsCloseStreamSse();
+  runsResetStreamBackoff();
 }
 
 function runsStartPoll() {
@@ -186,24 +187,11 @@ function runsStartTick() {
   runsTickTimer = window.setInterval(runsTickElapsed, RUNS_TICK_MS);
 }
 
-function runsStartEventsSse() {
-  runsStopEventsSse();
-  if (typeof EventSource === 'undefined') { return; }
-  var tok = runsToken();
-  if (!tok) { return; }
-  try {
-    runsEventsSse = new EventSource(
-      runsApiUrl('/api/events?token=' + encodeURIComponent(tok))
-    );
-  } catch (err) {
-    return;
+function runsOnDashboardStateChange() {
+  runsRefreshList();
+  if (runsSelectedId) {
+    runsLoadDetail(runsSelectedId, false);
   }
-  runsEventsSse.addEventListener('state-change', function () {
-    runsRefreshList();
-    if (runsSelectedId) {
-      runsLoadDetail(runsSelectedId, false);
-    }
-  });
 }
 
 function runsOnViewOpen() {
@@ -211,7 +199,6 @@ function runsOnViewOpen() {
   runsUiOpen = true;
   runsStartPoll();
   runsStartTick();
-  runsStartEventsSse();
 }
 
 function runsOnViewClose() {
@@ -219,9 +206,10 @@ function runsOnViewClose() {
   runsUiOpen = false;
   runsStopPoll();
   runsStopTick();
-  runsStopEventsSse();
   runsStopStream();
 }
+
+window.dmuxaiRunsOnViewClose = runsOnViewClose;
 
 function runsRefreshList() {
   runsFetchJson('/api/runs').then(function (data) {
@@ -326,15 +314,17 @@ function runsClearDetail() {
 }
 
 function runsLoadDetail(id, reopenStream) {
+  runsDetailGen += 1;
+  var gen = runsDetailGen;
   runsFetchJson('/api/runs/' + encodeURIComponent(id)).then(function (data) {
+    if (gen !== runsDetailGen || id !== runsSelectedId) { return; }
     runsDetailRun = data.run || null;
     var detail = document.getElementById('runs-detail');
     if (detail) { detail.hidden = false; }
     runsRenderDetailHeader(data);
     runsRenderApproval(data.approval);
     runsRenderGraphNodes(data.graph);
-    if (reopenStream) {
-      runsRenderInitialProgress(data.progress);
+    if (reopenStream && id === runsSelectedId) {
       runsConnectStream(id);
     }
   }).catch(function () { /* keep prior detail */ });
@@ -480,17 +470,13 @@ function runsRenderProgressItem(item) {
   runsAppendStreamLine('runs-stream-progress', [ts, kind, summary]);
 }
 
-function runsRenderInitialProgress(progress) {
+function runsConnectStream(id) {
+  if (id !== runsSelectedId) { return; }
+  runsCloseStreamSse();
   var ol = runsStreamOl();
   if (ol) { ol.textContent = ''; }
   runsStreamLines = 0;
   runsStreamStickBottom = true;
-  if (!progress || !progress.length) { return; }
-  progress.forEach(runsRenderProgressItem);
-}
-
-function runsConnectStream(id) {
-  runsStopStream();
   if (typeof EventSource === 'undefined') { return; }
   var tok = runsToken();
   if (!tok) { return; }
@@ -500,6 +486,11 @@ function runsConnectStream(id) {
   } catch (err) {
     return;
   }
+
+  runsStreamSse.addEventListener('open', function (e) {
+    if (e.target !== runsStreamSse) { return; }
+    runsResetStreamBackoff();
+  });
 
   runsStreamSse.addEventListener('run', function (e) {
     try {
@@ -533,7 +524,8 @@ function runsConnectStream(id) {
     runsStopStream();
   });
 
-  runsStreamSse.addEventListener('error', function () {
+  runsStreamSse.addEventListener('error', function (e) {
+    if (e.target !== runsStreamSse) { return; }
     if (!runsDetailRun || !runsIsActive(runsDetailRun.status)) {
       runsStopStream();
       return;
@@ -574,6 +566,9 @@ function runsInit() {
   runsBindStreamScroll();
   document.addEventListener('dmuxai:center-view', function () {
     runsSyncViewState();
+  });
+  document.addEventListener('dmuxai:state-change', function () {
+    if (runsUiOpen) { runsOnDashboardStateChange(); }
   });
   window.setTimeout(runsSyncViewState, 0);
 }
