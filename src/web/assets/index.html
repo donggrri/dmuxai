@@ -11,6 +11,7 @@
 <link rel="stylesheet" href="/assets/session.css">
 <link rel="stylesheet" href="/assets/docs.css">
 <script src="/assets/app.js" defer></script>
+<script src="/assets/runs.js" defer></script>
 <script src="/assets/docs.js" defer></script>
 </head>
 <body>
@@ -33,6 +34,7 @@
   <button id="chat-toggle" type="button" class="btn sidebar-toggle chat-toggle active" aria-pressed="true" aria-controls="session" title="Back to the chat (closes Diff, Graph, Memory and Skills)">Chat</button>
   <button id="diff-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="diff" aria-controls="docs" aria-expanded="false" aria-pressed="false" title="Show files changed by agents (Esc closes)" aria-label="Diff">Diff <span id="diff-count" class="todos-count" aria-hidden="true" hidden>0</span></button>
   <button id="graph-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="graph" aria-controls="graph" aria-expanded="false" aria-pressed="false" title="Show the graph run and plan (Esc closes)" aria-label="Graph">Graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
+  <button id="runs-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="runs" aria-controls="runs" aria-expanded="false" aria-pressed="false" title="Show headless runs (Esc closes)" aria-label="Runs">Runs <span id="runs-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
   <button id="memory-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="memory-popover" title="Memory vault status">Memory <span id="memory-badge" class="memory-badge" aria-hidden="true">Off</span></button>
   <button id="skills-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="skills-popover" title="Stage skills">Skills</button>
   <button id="agent-prompts-toggle" type="button" class="btn sidebar-toggle memory-top-btn" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="agent-prompts-popover" title="System prompts">System prompts</button>
@@ -122,6 +124,43 @@
       <ol id="nodes" class="nodes"></ol>
     </div>
     <p id="gate-hint" class="gate" hidden></p>
+  </section>
+
+  <section id="runs" class="panel center-view" aria-label="Runs" hidden>
+    <div class="center-view-head">
+      <h2 class="panel-title center-view-title">Runs</h2>
+      <button type="button" class="btn sidebar-close center-view-close" data-view="runs" aria-label="Close Runs">&times;</button>
+    </div>
+    <div id="runs-body" class="runs-body">
+      <div class="runs-layout">
+        <div class="runs-list-pane">
+          <p id="runs-empty" class="empty" hidden></p>
+          <table id="runs-table" class="runs-table" hidden>
+            <thead>
+              <tr>
+                <th scope="col">Status</th>
+                <th scope="col">Origin</th>
+                <th scope="col">Runner</th>
+                <th scope="col">Elapsed</th>
+                <th scope="col">Flags</th>
+              </tr>
+            </thead>
+            <tbody id="runs-table-body"></tbody>
+          </table>
+        </div>
+        <aside id="runs-detail" class="runs-detail-pane" hidden aria-label="Run detail">
+          <div id="runs-detail-header" class="runs-detail-header"></div>
+          <div id="runs-approval-banner" class="runs-approval-banner" hidden></div>
+          <section id="runs-graph-section" class="runs-graph-section" hidden aria-label="Graph nodes">
+            <h3 class="runs-graph-heading">Graph nodes</h3>
+            <ul id="runs-graph-nodes" class="runs-graph-nodes"></ul>
+          </section>
+          <div id="runs-stream-wrap" class="runs-stream-wrap">
+            <ol id="runs-stream" class="runs-stream"></ol>
+          </div>
+        </aside>
+      </div>
+    </div>
   </section>
 
   <div id="memory-popover" class="memory-popover" role="dialog" aria-label="Memory" hidden></div>

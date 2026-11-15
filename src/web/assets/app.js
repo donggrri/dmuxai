@@ -1757,8 +1757,13 @@ function onGraphKeydown(e) {
 // ---------------------------------------------------------------------------
 
 var CENTER_VIEW_KEY = 'dmuxai.centerView';
-var CENTER_VIEWS = { diff: { panel: 'docs', toggle: 'diff-toggle' }, graph: { panel: 'graph', toggle: 'graph-toggle' } };
+var CENTER_VIEWS = {
+  diff: { panel: 'docs', toggle: 'diff-toggle' },
+  graph: { panel: 'graph', toggle: 'graph-toggle' },
+  runs: { panel: 'runs', toggle: 'runs-toggle' }
+};
 var centerView = null;
+var serveRunsDefaultDone = false;
 var centerViewReturnFocus = null;
 // Approval keys (graph id + plan rev) that already auto-opened the Graph view,
 // so closing it while the plan waits does not re-open it on every snapshot.
@@ -1795,6 +1800,7 @@ function setCenterView(next, opts) {
     }
   });
   document.body.classList.toggle('center-view-open', !!next);
+  document.dispatchEvent(new CustomEvent('dmuxai:center-view', { detail: { view: next } }));
   if (opts.persist !== false) { writeCenterView(next); }
   if (next === 'diff') {
     // The Diff view is the change list; show it expanded.
@@ -4279,6 +4285,12 @@ function applySnapshot(snap) {
   snapshot = snap;
   lastRendered = Date.now();
   applySnapshotUi(snap);
+  if (!serveRunsDefaultDone) {
+    serveRunsDefaultDone = true;
+    if (String(snap.source || '') === 'files' && !readCenterView()) {
+      setCenterView('runs', { persist: false, focus: false });
+    }
+  }
   render(lastRendered);
   syncCenterViewsWithSnapshot(snap);
   applyPendingRunFocus(snap);

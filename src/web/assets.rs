@@ -6,6 +6,7 @@ pub const JIRA_TODOS_JS: &str = include_str!("assets/jira-todos.js");
 pub const AGENT_PROMPTS_JS: &str = include_str!("assets/agent-prompts.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
+pub const RUNS_JS: &str = include_str!("assets/runs.js");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
@@ -1743,6 +1744,7 @@ mod tests {
         for (id, panel, view) in [
             ("diff-toggle", "docs", "diff"),
             ("graph-toggle", "graph", "graph"),
+            ("runs-toggle", "runs", "runs"),
         ] {
             let start = INDEX_HTML
                 .find(&format!("<button id=\"{id}\""))
@@ -1790,6 +1792,13 @@ mod tests {
         assert!(DOCS_CSS.contains(".todos-count[hidden]"));
         assert!(DOCS_JS.contains("window.dmuxaiSetCenterView('diff')"));
         assert!(DOCS_JS.contains("$('diff-count')"));
+        assert!(INDEX_HTML.contains("/assets/runs.js"));
+        assert!(INDEX_HTML.contains("id=\"runs-toggle\""));
+        assert!(RUNS_JS.contains("textContent"));
+        assert!(!RUNS_JS.contains("innerHTML"));
+        assert!(APP_JS.contains("runs: { panel: 'runs', toggle: 'runs-toggle' }"));
+        assert!(APP_JS.contains("setCenterView('runs'"));
+        assert!(APP_JS.contains("dmuxai:center-view"));
     }
 
     // Top bar Chat button: a view tab that returns to the chat from the
