@@ -5,7 +5,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -2309,6 +2309,7 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
         "conversation_id": outcome.conversation_id,
         "agent": outcome.agent,
         "graph_id": outcome.graph_id,
+        "run_id": outcome.run_id,
         "text": outcome.text,
         "messages": outcome.messages,
         "error": outcome.error,
@@ -2377,6 +2378,62 @@ fn conversation_open_error(error: &ConversationError) -> ApiError {
     }
 }
 
+fn start_headless_journal(
+    workspace_root: &Path,
+    options: &RunOptions,
+    run_id: &str,
+) -> Option<(
+    dmuxai::run_journal::JournalStore,
+    dmuxai::run_journal::RunManifest,
+)> {
+    let runs_dir = match dmuxai::run_journal::repo_runs_dir(workspace_root) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("warning: run journal unavailable: {e}");
+            return None;
+        }
+    };
+    let store = dmuxai::run_journal::JournalStore::new(runs_dir);
+    let origin = if std::env::var("DMUXAI_RUN_ORIGIN").as_deref() == Ok("mcp") {
+        "mcp".to_string()
+    } else {
+        "cli_headless".to_string()
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let manifest = dmuxai::run_journal::RunManifest {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        origin,
+        status: "active".to_string(),
+        created_at_ms: now_ms,
+        completed_at_ms: None,
+        duration_ms: None,
+        requested_runner: options.agent.clone(),
+        resolved_runner: None,
+        requested_model: options.model.clone(),
+        resolved_model: None,
+        dmuxai_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        build_commit: None,
+        pid: Some(std::process::id()),
+        dmuxai_exit_code: None,
+        child_exit_code: None,
+        child_signal: None,
+        error_kind: None,
+        error_summary: None,
+        links: dmuxai::run_journal::RunLinks::default(),
+        diagnostics: dmuxai::run_journal::RunDiagnosticsRef::default(),
+        end_summary: None,
+    };
+    if let Err(e) = store.save(&manifest) {
+        eprintln!("warning: run journal unavailable: {e}");
+        return None;
+    }
+    Some((store, manifest))
+}
+
 async fn run_headless(
     workspace_root: &Path,
     options: &RunOptions,
@@ -2404,6 +2461,7 @@ async fn run_headless(
         eprintln!("warning: {warning}");
     }
     let sink = build_event_sink(workspace_root, &settings);
+    let run_id = dmuxai::run_journal::generate_run_id();
     let first_seq = sink.log().last_seq() + 1;
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
@@ -2412,20 +2470,35 @@ async fn run_headless(
     let mut app = App::new(engine, workspace_root.to_path_buf(), settings)
         .map_err(|error| conversation_open_error(&error))?;
     app.attach_dashboard(hub);
-    if options.progress {
-        app.set_progress_sink(Box::new(|line: &str| {
-            eprintln!("{line}");
-        }));
-    }
     if todo_id.is_some() {
         let store = agent_api::open_todo_store(workspace_root)?;
         app.attach_todo_store(Arc::new(store));
     }
 
+    let journal_pair = start_headless_journal(workspace_root, options, &run_id);
+    let journal_handle = Arc::new(std::sync::Mutex::new(journal_pair));
+
+    let progress_journal = Arc::clone(&journal_handle);
+    let progress_opt = options.progress;
+    let progress_warned = Arc::new(AtomicBool::new(false));
+    app.set_progress_sink(Box::new(move |line: &str| {
+        if progress_opt {
+            eprintln!("{line}");
+        }
+        if let Ok(guard) = progress_journal.lock()
+            && let Some((store, manifest)) = guard.as_ref()
+            && let Err(err) = store.append_progress(&manifest.run_id, line)
+            && !progress_warned.swap(true, Ordering::SeqCst)
+        {
+            eprintln!("warning: run journal unavailable: {err}");
+        }
+    }));
+
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_signal = cancel.clone();
     let finished = Arc::new(AtomicBool::new(false));
     let finished_signal = finished.clone();
+    let signal_journal = Arc::clone(&journal_handle);
     let signal_task = tokio::spawn(async move {
         wait_for_stop_signal().await;
         cancel_signal.store(true, Ordering::SeqCst);
@@ -2438,6 +2511,19 @@ async fn run_headless(
                 dmuxai::process::supervisor::GroupOwner::DEFAULT,
                 Duration::from_secs(2),
             );
+            if let Ok(mut guard) = signal_journal.lock()
+                && let Some((store, manifest)) = guard.as_mut()
+            {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(manifest.created_at_ms);
+                manifest.status = "cancelled".to_string();
+                manifest.completed_at_ms = Some(now_ms);
+                manifest.duration_ms = Some(now_ms.saturating_sub(manifest.created_at_ms));
+                manifest.dmuxai_exit_code = Some(130);
+                let _ = store.save(manifest);
+            }
             eprintln!("error: stopped after signal");
             std::process::exit(130);
         }
@@ -2458,10 +2544,50 @@ async fn run_headless(
         todo_id,
         model: options.model.clone(),
     };
-    let outcome = app.run_headless(request, cancel).await;
+    let mut outcome = app.run_headless(request, cancel).await;
     app.shutdown().await;
     finished.store(true, Ordering::SeqCst);
     signal_task.abort();
+
+    outcome.run_id = Some(run_id.clone());
+
+    if let Ok(mut guard) = journal_handle.lock()
+        && let Some((store, manifest)) = guard.as_mut()
+    {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(manifest.created_at_ms);
+        manifest.status = match outcome.exit_code {
+            0 => "completed".to_string(),
+            7 => "awaiting_approval".to_string(),
+            130 => "cancelled".to_string(),
+            _ => "failed".to_string(),
+        };
+        manifest.completed_at_ms = Some(now_ms);
+        manifest.duration_ms = Some(now_ms.saturating_sub(manifest.created_at_ms));
+        manifest.dmuxai_exit_code = Some(outcome.exit_code);
+        manifest.error_kind = outcome.error_kind.clone();
+        manifest.error_summary = outcome.error.as_deref().map(|err| {
+            let masked = dmuxai::run_journal::mask_sensitive_tokens(err);
+            dmuxai::run_journal::truncate_tail_utf8(&masked, 2048).to_string()
+        });
+        manifest.resolved_runner = outcome.agent.clone();
+        manifest.resolved_model = outcome
+            .triage
+            .as_ref()
+            .map(|t| t.model.clone())
+            .or_else(|| options.model.clone());
+        manifest.links.graph_id = outcome.graph_id.clone();
+        manifest.links.conversation_id = Some(outcome.conversation_id.clone());
+        if let Some(plan_hash) = &outcome.plan_hash {
+            manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
+        }
+        if let Err(err) = store.save(manifest) {
+            eprintln!("warning: run journal unavailable: {err}");
+        }
+    }
+
     let last_seq = sink.log().last_seq();
     Ok((outcome, first_seq, last_seq))
 }
@@ -2522,6 +2648,7 @@ impl CliMcpBackend {
         let mut child = std::process::Command::new(exe)
             .args(&args)
             .current_dir(&self.workspace_root)
+            .env("DMUXAI_RUN_ORIGIN", "mcp")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2970,11 +3097,13 @@ mod tests {
             plan: None,
             plan_hash: None,
             system_prompt: None,
+            run_id: Some("0123456789abcdef".to_owned()),
             fallbacks: Vec::new(),
         };
         let json = outcome_json(&outcome, 1, 2);
         assert_eq!(json["error"], "boom");
         assert_eq!(json["error_kind"], "provider");
+        assert_eq!(json["run_id"], "0123456789abcdef");
 
         let outcome = HeadlessOutcome {
             ok: true,
@@ -2991,11 +3120,13 @@ mod tests {
             plan: None,
             plan_hash: None,
             system_prompt: None,
+            run_id: None,
             fallbacks: Vec::new(),
         };
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());
         assert!(json["error_kind"].is_null());
+        assert!(json["run_id"].is_null());
     }
 
     // TC-1750 / FR-1730: headless --model parses for run and todo run

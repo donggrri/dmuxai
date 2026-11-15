@@ -33,6 +33,12 @@ pub const MAX_MANIFEST_READ_BYTES: u64 = 128 * 1024;
 /// Maximum diagnostics tail buffer size on write (64 KiB).
 pub const MAX_DIAGNOSTICS_WRITE_BYTES: usize = 64 * 1024;
 
+/// Maximum progress copy file size on write (4 MiB).
+pub const MAX_PROGRESS_COPY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Maximum bounded progress read buffer size (1 MiB).
+pub const MAX_PROGRESS_READ_BYTES: u64 = 1024 * 1024;
+
 /// Execution origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +46,7 @@ pub enum RunOrigin {
     CliHeadless,
     WebDashboard,
     Tui,
+    Mcp,
 }
 
 /// Run terminal or active status.
@@ -52,6 +59,7 @@ pub enum RunStatus {
     Completed,
     Failed,
     Cancelled,
+    AwaitingApproval,
 }
 
 impl RunStatus {
@@ -74,6 +82,7 @@ impl std::str::FromStr for RunStatus {
             "completed" => Ok(RunStatus::Completed),
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
+            "awaiting_approval" => Ok(RunStatus::AwaitingApproval),
             _ => Err("unknown run status"),
         }
     }
@@ -112,6 +121,8 @@ pub struct RunManifest {
     pub resolved_model: Option<String>,
     pub dmuxai_version: Option<String>,
     pub build_commit: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
     #[serde(default)]
     pub dmuxai_exit_code: Option<i32>,
     pub child_exit_code: Option<i32>,
@@ -839,6 +850,148 @@ impl JournalStore {
         }
 
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Appends a masked progress line to `<root>/<id>/progress.jsonl`.
+    /// Validates the id, refuses symlinks, creates the file with 0600 on unix,
+    /// and silently skips (Ok) once the file would exceed MAX_PROGRESS_COPY_BYTES.
+    pub fn append_progress(&self, id: &str, line: &str) -> Result<(), JournalError> {
+        if !valid_run_id(id) {
+            return Err(JournalError::InvalidId(id.to_string()));
+        }
+
+        verify_no_symlinks(&self.root)?;
+
+        let run_dir = self.root.join(id);
+        if is_symlink(&run_dir)? {
+            return Err(JournalError::SymlinkDetected(run_dir));
+        }
+
+        #[cfg(unix)]
+        {
+            if !run_dir.exists() {
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&run_dir)?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !run_dir.exists() {
+                fs::create_dir_all(&run_dir)?;
+            }
+        }
+
+        let progress_path = run_dir.join("progress.jsonl");
+        if is_symlink(&progress_path)? {
+            return Err(JournalError::SymlinkDetected(progress_path));
+        }
+
+        let masked = mask_sensitive_tokens(line);
+        let mut entry = masked;
+        entry.push('\n');
+        let entry_bytes = entry.as_bytes();
+
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+
+        let mut file = opts.open(&progress_path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "progress path {} is not a regular file",
+                    progress_path.display()
+                ),
+            )));
+        }
+
+        let current_len = meta.len();
+        if current_len.saturating_add(entry_bytes.len() as u64) > MAX_PROGRESS_COPY_BYTES {
+            // Silently skip once file would exceed MAX_PROGRESS_COPY_BYTES
+            return Ok(());
+        }
+
+        file.write_all(entry_bytes)?;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    /// Loads the last `max_lines` from `<root>/<id>/progress.jsonl`,
+    /// bounded to reading at most the last 1 MiB.
+    pub fn load_progress_tail(
+        &self,
+        id: &str,
+        max_lines: usize,
+    ) -> Result<Vec<String>, JournalError> {
+        if !valid_run_id(id) {
+            return Err(JournalError::InvalidId(id.to_string()));
+        }
+
+        verify_no_symlinks(&self.root)?;
+
+        let run_dir = self.root.join(id);
+        if is_symlink(&run_dir)? {
+            return Err(JournalError::SymlinkDetected(run_dir));
+        }
+
+        let progress_path = run_dir.join("progress.jsonl");
+        if !progress_path.exists() {
+            return Ok(Vec::new());
+        }
+        if is_symlink(&progress_path)? {
+            return Err(JournalError::SymlinkDetected(progress_path));
+        }
+
+        let mut file = open_file_read_nofollow(&progress_path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "progress path {} is not a regular file",
+                    progress_path.display()
+                ),
+            )));
+        }
+
+        let len = meta.len();
+        let bytes_to_read = std::cmp::min(len, MAX_PROGRESS_READ_BYTES);
+        let seek_pos = len.saturating_sub(bytes_to_read);
+        if seek_pos > 0 {
+            file.seek(SeekFrom::Start(seek_pos))?;
+        }
+
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(bytes_to_read)
+            .read_to_end(&mut bytes)?;
+
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines: Vec<String> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect();
+
+        // If we sought into the middle of the file (seek_pos > 0), the first line might be partial; drop it
+        if seek_pos > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+
+        if lines.len() > max_lines {
+            let start = lines.len() - max_lines;
+            lines = lines[start..].to_vec();
+        }
+
+        Ok(lines)
     }
 
     /// Prunes terminal runs based on age and size limits.

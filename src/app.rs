@@ -1103,6 +1103,8 @@ pub struct HeadlessOutcome {
     pub plan_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<HeadlessSystemPrompt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<dmuxai::runner_fallback::FallbackRecord>,
 }
@@ -1129,6 +1131,7 @@ impl HeadlessOutcome {
             plan: None,
             plan_hash: None,
             system_prompt: None,
+            run_id: None,
             fallbacks: Vec::new(),
         }
     }
@@ -15053,6 +15056,7 @@ impl App {
             plan,
             plan_hash: None,
             system_prompt: self.system_prompt_applied.clone(),
+            run_id: None,
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
         }
     }
