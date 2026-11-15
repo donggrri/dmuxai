@@ -2462,6 +2462,7 @@ async fn run_headless(
     }
     let sink = build_event_sink(workspace_root, &settings);
     let run_id = dmuxai::run_journal::generate_run_id();
+    sink.log().set_run_id(Some(run_id.clone()));
     let first_seq = sink.log().last_seq() + 1;
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());

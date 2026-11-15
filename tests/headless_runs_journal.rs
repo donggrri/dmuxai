@@ -291,6 +291,41 @@ timeout_secs = 30
     );
 }
 
+// TC-2804 / FR-2804: headless run events carry run_id for the emitted seq range
+#[cfg(unix)]
+#[test]
+fn tc_2804_headless_events_carry_run_id() {
+    let sandbox = Sandbox::new(&fake_agent_config("jsonl"));
+    let output = sandbox.run(&["run", "hi", "--agent", "fake", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let json = stdout_json(&output);
+    let run_id = json["run_id"].as_str().expect("run_id in outcome");
+    let first = json["events"]["first_seq"].as_u64();
+    let last = json["events"]["last_seq"].as_u64();
+    let (Some(first), Some(last)) = (first, last) else {
+        panic!("expected event seq range in outcome: {json}");
+    };
+    assert!(last >= first);
+
+    let events_path = sandbox.workspace.join(".dmuxai").join("events.jsonl");
+    let content = fs::read_to_string(events_path).expect("read events log");
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record: Value = serde_json::from_str(line).expect("parse event line");
+        let seq = record["seq"].as_u64().expect("seq");
+        if (first..=last).contains(&seq) {
+            assert_eq!(
+                record["run_id"].as_str(),
+                Some(run_id),
+                "event seq {seq} must carry run_id"
+            );
+        }
+    }
+}
+
 // TC-2803 / FR-2803: journal failure does not change outcome
 #[cfg(unix)]
 #[test]
