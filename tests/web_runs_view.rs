@@ -572,6 +572,43 @@ fn tc_2811_runs_default_yields_to_conversation() {
     panic!("Runs view still open after conversation snapshot");
 }
 
+// TC-2811 / FR-2811: Runs view opens by default even when headless runs wrote a transcript and graph.
+#[test]
+#[ignore]
+fn tc_2811_runs_default_with_headless_transcript() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2811_runs_default_with_headless_transcript: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    // Simulate a headless run having created a graph fixture and run manifest.
+    write_graph_fixture(&fixture.workspace, "headless-graph");
+    let run_id = "run-headless-test";
+    let run_dir = fixture.runs_dir().join(run_id);
+    let mut manifest = base_manifest(run_id, 1_700_000_000_000, "active");
+    manifest["links"]["graph_id"] = json!("headless-graph");
+    write_manifest(&run_dir, &manifest);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+
+    // Runs panel should open by default.
+    wait_for_runs_open(&mut session);
+
+    let visible = session
+        .cdp
+        .eval(
+            "(() => { const p = document.querySelector('#runs'); return p && !p.hidden && p.classList.contains('open'); })()",
+        )
+        .expect("eval runs panel");
+    assert_eq!(
+        visible.as_bool(),
+        Some(true),
+        "Runs panel must be visible by default even when headless graph/transcript exists"
+    );
+}
+
 // TC-2812 / FR-2812: list rows with status, origin, runner/model, stale flag.
 #[test]
 #[ignore]

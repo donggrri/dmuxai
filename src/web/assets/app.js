@@ -1837,12 +1837,7 @@ function toggleCenterView(name) {
 
 function runsWouldObstructConversation(snap) {
   if (!snap) { return false; }
-  var transcript = snap.session && Array.isArray(snap.session.transcript)
-    ? snap.session.transcript
-    : [];
-  if (transcript.length > 0) { return true; }
-  if (String(snap.source || '') !== 'files') { return true; }
-  return !!(snap.graph && snap.graph.id);
+  return String(snap.source || '') !== 'files';
 }
 
 function maybeYieldRunsToConversation(snap) {
