@@ -434,18 +434,41 @@ fn open_dashboard_in_chrome(url: &str) -> Option<ChromeSession> {
     })
 }
 
+fn runs_panel_open(session: &mut ChromeSession) -> bool {
+    session
+        .cdp
+        .eval(
+            "(() => { const p = document.querySelector('#runs'); return !!(p && !p.hidden && p.classList.contains('open')); })()",
+        )
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn wait_for_runs_open(session: &mut ChromeSession) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
-        if let Ok(val) = session.cdp.eval(
-            "(() => { const p = document.querySelector('#runs'); return p && !p.hidden && p.classList.contains('open'); })()",
-        ) && val.as_bool() == Some(true)
-        {
+        if runs_panel_open(session) {
             return;
         }
     }
     panic!("timed out waiting for Runs view to open");
+}
+
+/// Opens Runs when a workspace graph blocks the serve default (FR-2811).
+fn open_runs_view(session: &mut ChromeSession) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if runs_panel_open(session) {
+            return;
+        }
+        let _ = session.cdp.eval(
+            "(() => { const b = document.querySelector('#runs-toggle'); if (b) { b.click(); } })()",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("timed out opening Runs view");
 }
 
 // TC-2811 / FR-2811: under serve, Runs toggle exists and view is open by default.
@@ -480,6 +503,73 @@ fn tc_2811_runs_view_default_under_serve() {
         Some(true),
         "Runs panel must be visible without clicking"
     );
+}
+
+// TC-2811 / FR-2811: soft default Runs view yields when a conversation snapshot arrives.
+#[test]
+#[ignore]
+fn tc_2811_runs_default_yields_to_conversation() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2811_runs_default_yields_to_conversation: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let snap = json!({
+        "source": "tui",
+        "workspace": fixture.workspace.display().to_string(),
+        "agents": [],
+        "session": {
+            "conversation_id": "c1",
+            "conversation_title": "t",
+            "selected_agent": "demo",
+            "details_expanded": false,
+            "agents": [{
+                "id": "demo",
+                "label": "demo",
+                "allowed": true,
+                "busy": false,
+                "modes": ["ask"],
+                "mode": "ask",
+                "models": [],
+                "model": null,
+                "effort": null,
+                "models_loading": false
+            }],
+            "conversations": [],
+            "transcript_omitted": 0,
+            "transcript": [{
+                "id": "c1:0",
+                "role": "user",
+                "agent": null,
+                "content": "hello",
+                "streaming": false
+            }]
+        }
+    });
+    let snap_js = serde_json::to_string(&snap).expect("snap json");
+    session
+        .cdp
+        .eval(&format!(
+            "document.dispatchEvent(new CustomEvent('dmuxai:snapshot', {{detail: {snap_js}}}))"
+        ))
+        .expect("dispatch conversation snapshot");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(
+            "(() => { const p = document.querySelector('#runs'); return !(p && !p.hidden && p.classList.contains('open')); })()",
+        ) && val.as_bool() == Some(true)
+        {
+            return;
+        }
+    }
+    panic!("Runs view still open after conversation snapshot");
 }
 
 // TC-2812 / FR-2812: list rows with status, origin, runner/model, stale flag.
@@ -691,7 +781,7 @@ fn tc_2813_run_detail_live_and_approval() {
     .expect("progress");
 
     let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
-    wait_for_runs_open(&mut session);
+    open_runs_view(&mut session);
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {

@@ -1764,6 +1764,7 @@ var CENTER_VIEWS = {
 };
 var centerView = null;
 var serveRunsDefaultDone = false;
+var runsAutoOpened = false;
 var centerViewReturnFocus = null;
 // Approval keys (graph id + plan rev) that already auto-opened the Graph view,
 // so closing it while the plan waits does not re-open it on every snapshot.
@@ -1824,10 +1825,32 @@ function setCenterView(next, opts) {
 
 // docs.js opens the Diff view from chat document cards and closes it for
 // "Show in chat".
-window.dmuxaiSetCenterView = function (name) { setCenterView(name || null); };
+window.dmuxaiSetCenterView = function (name) {
+  runsAutoOpened = false;
+  setCenterView(name || null);
+};
 
 function toggleCenterView(name) {
+  runsAutoOpened = false;
   setCenterView(centerView === name ? null : name);
+}
+
+function runsWouldObstructConversation(snap) {
+  if (!snap) { return false; }
+  var transcript = snap.session && Array.isArray(snap.session.transcript)
+    ? snap.session.transcript
+    : [];
+  if (transcript.length > 0) { return true; }
+  if (String(snap.source || '') !== 'files') { return true; }
+  return !!(snap.graph && snap.graph.id);
+}
+
+function maybeYieldRunsToConversation(snap) {
+  if (!runsAutoOpened || centerView !== 'runs') { return; }
+  if (runsWouldObstructConversation(snap)) {
+    setCenterView(null, { persist: false, focus: false });
+    runsAutoOpened = false;
+  }
 }
 
 function syncChatTab() {
@@ -1841,6 +1864,7 @@ function syncChatTab() {
 
 function showChat(opts) {
   opts = opts || {};
+  runsAutoOpened = false;
   if (window.dmuxaiCloseMemory) { window.dmuxaiCloseMemory(); }
   if (window.dmuxaiCloseSkills) { window.dmuxaiCloseSkills(); }
   setCenterView(null, { focus: false });
@@ -1992,7 +2016,10 @@ function bindCenterViews() {
   if (chatToggle) { chatToggle.addEventListener('click', function () { showChat(); }); }
   var closes = document.querySelectorAll('.center-view-close');
   for (var i = 0; i < closes.length; i++) {
-    closes[i].addEventListener('click', function () { setCenterView(null); });
+    closes[i].addEventListener('click', function () {
+      runsAutoOpened = false;
+      setCenterView(null);
+    });
   }
   // Capture phase: runs before the inner layers' own Esc handlers, so it
   // sees their state before they close.
@@ -2007,8 +2034,12 @@ function bindCenterViews() {
     var t = e.target;
     if (t && t.classList && t.classList.contains('graph-approval-feedback')) { return; }
     if (t && t.closest && t.closest('.sidebar, .sessions-sidebar, .workspace-dialog-backdrop')) { return; }
+    runsAutoOpened = false;
     setCenterView(null);
   }, true);
+  document.addEventListener('dmuxai:snapshot', function (e) {
+    if (e && e.detail) { maybeYieldRunsToConversation(e.detail); }
+  });
   document.addEventListener('dmuxai:memory-popover', syncChatTab);
   document.addEventListener('dmuxai:skills-popover', syncChatTab);
   setCenterView(readCenterView(), { persist: false, focus: false });
@@ -4289,10 +4320,13 @@ function applySnapshot(snap) {
   syncCenterViewsWithSnapshot(snap);
   if (!serveRunsDefaultDone) {
     serveRunsDefaultDone = true;
-    if (String(snap.source || '') === 'files' && !readCenterView() && !centerView) {
+    if (String(snap.source || '') === 'files' && !readCenterView() && !centerView &&
+        !runsWouldObstructConversation(snap)) {
       setCenterView('runs', { persist: false, focus: false });
+      runsAutoOpened = true;
     }
   }
+  maybeYieldRunsToConversation(snap);
   applyPendingRunFocus(snap);
   renderTodos(snap);
   if (isSomethingRunning(snap)) {
