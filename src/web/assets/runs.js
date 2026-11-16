@@ -171,6 +171,7 @@ var runsStreamSse = null;
 var runsListData = [];
 var runsSelectedId = null;
 var runsDetailRun = null;
+var runsDetailGraph = null;
 var runsDetailGen = 0;
 var runsStreamLines = 0;
 var runsStreamStickBottom = true;
@@ -397,8 +398,10 @@ function runsSelectRun(id) {
 function runsClearDetail() {
   runsSelectedId = null;
   runsDetailRun = null;
+  runsDetailGraph = null;
   runsStopDetailRefetchPoll();
   runsStopStream();
+  runsRenderGraphNodes(null);
   var detail = document.getElementById('runs-detail');
   if (detail) { detail.hidden = true; }
 }
@@ -554,14 +557,27 @@ function runsRenderApproval(approval, run) {
 
 function runsRenderGraphNodes(graph) {
   var section = document.getElementById('runs-graph-section');
+  var canvas = document.getElementById('runs-graph-canvas');
+  var fullBtn = document.getElementById('runs-full-graph');
   var list = document.getElementById('runs-graph-nodes');
   if (!section || !list) { return; }
   list.textContent = '';
   if (!graph || !graph.nodes || !graph.nodes.length) {
+    runsDetailGraph = null;
     section.hidden = true;
+    if (fullBtn) { fullBtn.hidden = true; }
+    if (canvas) {
+      canvas.replaceChildren();
+      canvas.style.height = '';
+    }
     return;
   }
+  runsDetailGraph = graph;
   section.hidden = false;
+  if (fullBtn) { fullBtn.hidden = false; }
+  if (canvas && typeof window.dmuxaiRenderGraphDiagram === 'function') {
+    window.dmuxaiRenderGraphDiagram(canvas, graph, Date.now());
+  }
   graph.nodes.forEach(function (node) {
     var li = document.createElement('li');
     li.className = 'runs-graph-node';
@@ -718,8 +734,50 @@ function runsSyncViewState() {
   }
 }
 
+function runsFindByGraphId(list, graphId) {
+  if (!graphId || !Array.isArray(list)) { return null; }
+  var target = String(graphId);
+  for (var i = 0; i < list.length; i++) {
+    if (runsRunGraphId(list[i]) === target) { return list[i]; }
+  }
+  return null;
+}
+
+// FR-2824: if `graphId` belongs to a headless run in Runs, open Runs and
+// select that run instead of opening the standalone Graph view.
+window.dmuxaiOpenRunForGraph = function (graphId, opts) {
+  if (!graphId) { return Promise.resolve(false); }
+  function openMatch(run) {
+    if (!run) { return false; }
+    if (typeof window.dmuxaiSetCenterView === 'function') {
+      window.dmuxaiSetCenterView('runs', opts);
+    }
+    runsSelectRun(run.run_id);
+    return true;
+  }
+  var cached = runsFindByGraphId(runsListData, graphId);
+  if (cached) {
+    return Promise.resolve(openMatch(cached));
+  }
+  return runsFetchJson('/api/runs').then(function (data) {
+    runsListData = data && data.runs ? data.runs : [];
+    runsIndicatorLastFetchAt = Date.now();
+    return openMatch(runsFindByGraphId(runsListData, graphId));
+  }).catch(function () {
+    return false;
+  });
+};
+
 function runsInit() {
   runsBindStreamScroll();
+  var fullBtn = document.getElementById('runs-full-graph');
+  if (fullBtn) {
+    fullBtn.addEventListener('click', function () {
+      if (runsDetailGraph && typeof window.dmuxaiOpenFullGraph === 'function') {
+        window.dmuxaiOpenFullGraph(runsDetailGraph);
+      }
+    });
+  }
   document.addEventListener('dmuxai:center-view', function () {
     runsSyncViewState();
   });

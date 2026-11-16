@@ -155,8 +155,12 @@
         <aside id="runs-detail" class="runs-detail-pane" hidden aria-label="Run detail">
           <div id="runs-detail-header" class="runs-detail-header"></div>
           <div id="runs-approval-banner" class="runs-approval-banner" hidden></div>
-          <section id="runs-graph-section" class="runs-graph-section" hidden aria-label="Graph nodes">
-            <h3 class="runs-graph-heading">Graph nodes</h3>
+          <section id="runs-graph-section" class="runs-graph-section" hidden aria-label="Graph">
+            <div class="runs-graph-header">
+              <h3 class="runs-graph-heading">Graph</h3>
+              <button id="runs-full-graph" type="button" class="btn btn-small runs-full-graph-btn" hidden>Full graph</button>
+            </div>
+            <div id="runs-graph-canvas" class="graph-canvas runs-graph-canvas"></div>
             <ul id="runs-graph-nodes" class="runs-graph-nodes"></ul>
           </section>
           <div id="runs-stream-wrap" class="runs-stream-wrap">

@@ -53,6 +53,8 @@ fn find_chrome_binary() -> Option<PathBuf> {
 
 struct ServeFixture {
     _workspace: tempfile::TempDir,
+    workspace: PathBuf,
+    data_home: PathBuf,
     dashboard_url: String,
     _guard: ChildGuard,
 }
@@ -112,9 +114,20 @@ impl ServeFixture {
 
         Self {
             _workspace: workspace,
+            workspace: ws_path,
+            data_home,
             dashboard_url: url.to_string(),
             _guard: ChildGuard(Some(child)),
         }
+    }
+
+    fn runs_dir(&self) -> PathBuf {
+        let key = dmuxai::state_path::repo_key(&self.workspace).expect("repo_key");
+        self.data_home
+            .join("dmuxai")
+            .join("repos")
+            .join(key)
+            .join("runs")
     }
 }
 
@@ -808,5 +821,295 @@ fn tc_2822_workspace_button() {
         label.as_str(),
         Some("Workspace, 2 open to-dos"),
         "badge in accessible name"
+    );
+}
+
+// TC-2824 / FR-2824 / OQ-2820: Chat "Open in Graph" and plan-awaiting-approval
+// auto-open target Runs (selecting the matching run) when the graph belongs to
+// a headless run in Runs, and open the large Graph view otherwise (and always
+// under --web for plan approvals).
+#[test]
+#[ignore]
+fn tc_2824_open_in_graph_retarget() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2824_open_in_graph_retarget: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new_with_config("");
+    let runs = fixture.runs_dir();
+    let run_id = "cccccccccccccccc";
+    let headless_graph_id = "headless-g-2824";
+    let plain_graph_id = "chat-g-2824";
+
+    // Write a headless run manifest linked to `headless_graph_id` and its graph file.
+    fs::create_dir_all(runs.join(run_id)).expect("run dir");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "run_id": run_id,
+        "origin": "cli_headless",
+        "status": "completed",
+        "created_at_ms": 1_700_000_000_000u64,
+        "completed_at_ms": 1_700_000_001_000u64,
+        "duration_ms": 1_000u64,
+        "requested_runner": "codex",
+        "resolved_runner": "codex",
+        "requested_model": "composer-2.5",
+        "resolved_model": null,
+        "dmuxai_version": "0.0.0",
+        "build_commit": null,
+        "pid": null,
+        "dmuxai_exit_code": 0,
+        "child_exit_code": null,
+        "child_signal": null,
+        "error_kind": null,
+        "error_summary": null,
+        "links": {
+            "conversation_id": null,
+            "turn_id": null,
+            "graph_id": headless_graph_id,
+            "node_id": null,
+            "attempt_index": null
+        },
+        "diagnostics": { "stderr_bytes": 0, "tail_sample": null },
+        "end_summary": null
+    });
+    fs::write(
+        runs.join(run_id).join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).expect("manifest"),
+    )
+    .expect("write manifest");
+
+    let graphs = fixture.workspace.join(".dmuxai").join("graphs");
+    fs::create_dir_all(&graphs).expect("graphs dir");
+    let graph_file = serde_json::json!({
+        "plan": {
+            "schema": "dmuxai.graph/v1",
+            "id": headless_graph_id,
+            "orchestrator_model": "gpt-4o",
+            "user_prompt": "headless 2824",
+            "limits": { "max_parallel": 2, "max_retries": 2 },
+            "nodes": [{
+                "id": "step1", "role": "plan", "job": "plan task",
+                "runner": "codex", "model_id": "m", "skill": null,
+                "requires_gate": false, "status": "completed", "attempt": 1
+            }],
+            "edges": []
+        },
+        "conversation_id": "conv-2824",
+        "phase": "completed",
+        "waiting_gate_node": null
+    });
+    fs::write(
+        graphs.join(format!("{headless_graph_id}.json")),
+        serde_json::to_vec_pretty(&graph_file).expect("graph file"),
+    )
+    .expect("write graph file");
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_truthy(
+        &mut session,
+        "typeof applySnapshot === 'function' && snapshot !== null && document.getElementById('runs').classList.contains('open')",
+        "dashboard ready with initial runs default",
+        15,
+    );
+
+    let make_snap =
+        |source: &str, graph_id: &str, phase: &str, rev: u64, approval_rev: Option<u64>| {
+            let approval = approval_rev.map(|r| {
+                serde_json::json!({
+                    "rev": r,
+                    "prompt": "approve?",
+                    "plan_hash": "cafebabe"
+                })
+            });
+            serde_json::json!({
+                "schema": "dmuxai.dashboard/v1",
+                "revision": rev,
+                "generated_at_ms": 1_700_000_002_000u64,
+                "source": source,
+                "workspace": fixture.workspace.display().to_string(),
+                "agents": [],
+                "graph": {
+                    "id": graph_id,
+                    "phase": phase,
+                    "orchestrator_model": "gpt-4o",
+                    "user_prompt": "test prompt",
+                    "approval": approval,
+                    "nodes": [{
+                        "id": "step1", "role": "plan", "job": "plan task",
+                        "runner": "codex", "model_id": "m", "status": "completed", "attempt": 1
+                    }],
+                    "edges": []
+                },
+                "session": {
+                    "conversation_id": "c-2824",
+                    "conversation_title": "t",
+                    "selected_agent": "demo",
+                    "details_expanded": false,
+                    "agents": [{
+                        "id": "demo",
+                        "label": "demo",
+                        "allowed": true,
+                        "busy": false,
+                        "modes": ["ask"],
+                        "mode": "ask",
+                        "models": [],
+                        "model": null,
+                        "effort": null,
+                        "models_loading": false
+                    }],
+                    "conversations": [],
+                    "transcript_omitted": 0,
+                    "transcript": [{
+                        "id": "c-2824:0",
+                        "role": "user",
+                        "agent": null,
+                        "content": "hello",
+                        "streaming": false
+                    }]
+                }
+            })
+        };
+
+    // 1. Non-headless graph "Open in Graph" opens the large Graph view.
+    session
+        .cdp
+        .eval("document.getElementById('chat-toggle').click()")
+        .expect("switch to chat");
+    let snap1 = serde_json::to_string(&make_snap("files", plain_graph_id, "completed", 10, None))
+        .expect("snap1");
+    session
+        .cdp
+        .eval(&format!("applySnapshot({snap1})"))
+        .expect("apply snap1");
+    wait_for_truthy(
+        &mut session,
+        &format!(
+            "!!document.querySelector('.chat-aux-open-run[data-run-id=\"{plain_graph_id}\"]')"
+        ),
+        "Open in Graph button for non-headless graph",
+        10,
+    );
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('.chat-aux-open-run[data-run-id=\"{plain_graph_id}\"]').click()"
+        ))
+        .expect("click Open in Graph for non-headless");
+    wait_for_truthy(
+        &mut session,
+        "(() => { const g = document.getElementById('graph'); return !!(g && !g.hidden && g.classList.contains('open')); })()",
+        "large Graph view opens for non-headless graph",
+        10,
+    );
+
+    // 2. Headless-run graph "Open in Graph" opens Runs and selects that run.
+    session
+        .cdp
+        .eval("document.getElementById('chat-toggle').click()")
+        .expect("back to chat");
+    let snap2 = serde_json::to_string(&make_snap(
+        "files",
+        headless_graph_id,
+        "completed",
+        11,
+        None,
+    ))
+    .expect("snap2");
+    session
+        .cdp
+        .eval(&format!("applySnapshot({snap2})"))
+        .expect("apply snap2");
+    wait_for_truthy(
+        &mut session,
+        &format!(
+            "!!document.querySelector('.chat-aux-open-run[data-run-id=\"{headless_graph_id}\"]')"
+        ),
+        "Open in Graph button for headless graph",
+        10,
+    );
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('.chat-aux-open-run[data-run-id=\"{headless_graph_id}\"]').click()"
+        ))
+        .expect("click Open in Graph for headless");
+    wait_for_truthy(
+        &mut session,
+        &format!(
+            "(() => {{ \
+                const r = document.getElementById('runs'); \
+                const sel = document.querySelector('.runs-row-selected'); \
+                const btn = document.getElementById('runs-full-graph'); \
+                return !!(r && !r.hidden && r.classList.contains('open') \
+                    && sel && sel.getAttribute('data-run-id') === '{run_id}' \
+                    && btn && !btn.hidden); \
+            }})()"
+        ),
+        "Runs opens and selects headless run with Full graph button",
+        10,
+    );
+
+    // 3. OQ-2820: Under --web (source !== 'files'), pending plan auto-open still
+    // opens the large Graph view with approval controls even if graph_id matches a run.
+    session
+        .cdp
+        .eval("document.getElementById('chat-toggle').click()")
+        .expect("back to chat for web approval");
+    let snap3 = serde_json::to_string(&make_snap(
+        "tui",
+        headless_graph_id,
+        "awaiting_approval",
+        12,
+        Some(1),
+    ))
+    .expect("snap3");
+    session
+        .cdp
+        .eval(&format!("applySnapshot({snap3})"))
+        .expect("apply snap3");
+    wait_for_truthy(
+        &mut session,
+        "(() => { \
+            const g = document.getElementById('graph'); \
+            const ap = document.getElementById('graph-approval'); \
+            return !!(g && !g.hidden && g.classList.contains('open') && ap && !ap.hidden); \
+        })()",
+        "large Graph view with approval controls opens under --web",
+        10,
+    );
+
+    // 4. Under serve (source === 'files'), pending plan auto-open for a headless
+    // run's graph selects that run in Runs instead.
+    session
+        .cdp
+        .eval("document.getElementById('chat-toggle').click()")
+        .expect("back to chat for serve approval");
+    let snap4 = serde_json::to_string(&make_snap(
+        "files",
+        headless_graph_id,
+        "awaiting_approval",
+        13,
+        Some(2),
+    ))
+    .expect("snap4");
+    session
+        .cdp
+        .eval(&format!("applySnapshot({snap4})"))
+        .expect("apply snap4");
+    wait_for_truthy(
+        &mut session,
+        &format!(
+            "(() => {{ \
+                const r = document.getElementById('runs'); \
+                const sel = document.querySelector('.runs-row-selected'); \
+                return !!(r && !r.hidden && r.classList.contains('open') \
+                    && sel && sel.getAttribute('data-run-id') === '{run_id}'); \
+            }})()"
+        ),
+        "Runs opens and selects headless run on serve approval auto-open",
+        10,
     );
 }

@@ -2843,12 +2843,32 @@ main {
 
 .runs-graph-section {
   flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.runs-graph-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .runs-graph-heading {
-  margin: 0 0 4px;
+  margin: 0;
   font-size: 0.85em;
   color: var(--muted);
+}
+
+.runs-graph-canvas {
+  cursor: default;
+  overflow: auto;
+  max-height: 280px;
+}
+
+.runs-graph-canvas:active {
+  cursor: default;
 }
 
 .runs-graph-nodes {

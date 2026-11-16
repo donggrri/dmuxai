@@ -1350,3 +1350,203 @@ fn tc_2826_runs_indicator() {
     }
     assert!(saw_hidden, "indicator must hide when no runs are active");
 }
+
+// TC-2823 / FR-2823: Runs detail renders the read-only swimlane diagram and a
+// "Full graph" button when a run has a graph, and hides both when it does not.
+#[test]
+#[ignore]
+fn tc_2823_runs_detail_graph_and_full_graph() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2823_runs_detail_graph_and_full_graph: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    fs::create_dir_all(&runs).expect("runs root");
+
+    let graph_run_id = "3333333333333333";
+    let plain_run_id = "4444444444444444";
+    let graph_id = "g-2823";
+
+    // Write graph fixture with plan.id matching graph_id.
+    let graphs = fixture.workspace.join(".dmuxai").join("graphs");
+    fs::create_dir_all(&graphs).expect("graphs dir");
+    let graph_json = json!({
+        "plan": {
+            "schema": "dmuxai.graph/v1",
+            "id": graph_id,
+            "orchestrator_model": "gpt-4o",
+            "user_prompt": "run 2823 graph",
+            "limits": { "max_parallel": 2, "max_retries": 2 },
+            "nodes": [
+                {
+                    "id": "plan", "role": "plan", "job": "draft plan",
+                    "runner": "codex", "model_id": "m", "skill": null,
+                    "requires_gate": false, "status": "completed", "attempt": 1
+                },
+                {
+                    "id": "impl", "role": "implement", "job": "implement",
+                    "runner": "codex", "model_id": "m", "skill": null,
+                    "requires_gate": false, "status": "completed", "attempt": 1
+                }
+            ],
+            "edges": [{ "from": "plan", "to": "impl" }]
+        },
+        "conversation_id": "conv-2823",
+        "phase": "completed",
+        "waiting_gate_node": null
+    });
+    fs::write(
+        graphs.join(format!("{graph_id}.json")),
+        serde_json::to_vec_pretty(&graph_json).expect("graph json"),
+    )
+    .expect("write graph");
+
+    let mut with_graph = base_manifest(graph_run_id, 20_000, "completed");
+    with_graph["completed_at_ms"] = json!(21_000);
+    with_graph["duration_ms"] = json!(1_000);
+    with_graph["links"]["graph_id"] = json!(graph_id);
+    write_manifest(&runs.join(graph_run_id), &with_graph);
+
+    let mut without_graph = base_manifest(plain_run_id, 10_000, "completed");
+    without_graph["completed_at_ms"] = json!(11_000);
+    without_graph["duration_ms"] = json!(1_000);
+    write_manifest(&runs.join(plain_run_id), &without_graph);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    // Run with graph: diagram SVG (read-only) and "Full graph" button appear.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_diagram = false;
+    let mut last_diag = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(val) = session.cdp.eval(
+            "(() => { \
+                const sec = document.getElementById('runs-graph-section'); \
+                const svg = document.querySelector('#runs-graph-canvas svg.graph-svg'); \
+                const nodes = document.querySelectorAll('#runs-graph-canvas svg.graph-svg g.node[data-id]'); \
+                const liCount = document.querySelectorAll('#runs-graph-nodes li').length; \
+                const btn = document.getElementById('runs-full-graph'); \
+                const interactive = Array.from(nodes).some(n => n.hasAttribute('tabindex') || n.getAttribute('role') === 'button'); \
+                return { \
+                    secHidden: sec ? sec.hidden : null, \
+                    hasSvg: !!svg, \
+                    nodeCount: nodes.length, \
+                    liCount, \
+                    btnHidden: btn ? btn.hidden : null, \
+                    btnText: btn ? btn.textContent.trim() : null, \
+                    interactive \
+                }; \
+            })()",
+        ) && val.is_object()
+        {
+            let ok = val.get("secHidden").and_then(|v| v.as_bool()) == Some(false)
+                && val.get("hasSvg").and_then(|v| v.as_bool()) == Some(true)
+                && val.get("nodeCount").and_then(|v| v.as_u64()) == Some(2)
+                && val.get("btnHidden").and_then(|v| v.as_bool()) == Some(false);
+            last_diag = val.clone();
+            if ok {
+                assert_eq!(
+                    val.get("interactive").and_then(|v| v.as_bool()),
+                    Some(false),
+                    "Runs detail diagram must be read-only"
+                );
+                assert_eq!(
+                    val.get("btnText").and_then(|v| v.as_str()),
+                    Some("Full graph")
+                );
+                saw_diagram = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_diagram,
+        "Runs detail must render swimlane diagram and Full graph button: {last_diag}"
+    );
+
+    // Select run without graph: section, diagram, and button are hidden.
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-run-id=\"{plain_run_id}\"]').click()"
+        ))
+        .expect("select plain run");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_hidden = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(ok) = session.cdp.eval(
+            "(() => { \
+                const hdr = document.getElementById('runs-detail-header'); \
+                const sec = document.getElementById('runs-graph-section'); \
+                const btn = document.getElementById('runs-full-graph'); \
+                const svg = document.querySelector('#runs-graph-canvas svg'); \
+                return !!(hdr && hdr.getAttribute('data-run-id') === '4444444444444444' \
+                    && sec && sec.hidden && btn && btn.hidden && !svg); \
+            })()",
+        ) && ok.as_bool() == Some(true)
+        {
+            saw_hidden = true;
+            break;
+        }
+    }
+    assert!(
+        saw_hidden,
+        "run without graph must hide diagram and Full graph button"
+    );
+
+    // Re-select run with graph and click "Full graph".
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-run-id=\"{graph_run_id}\"]').click()"
+        ))
+        .expect("reselect graph run");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(ok) = session.cdp.eval(
+            "(() => { const b = document.getElementById('runs-full-graph'); return !!(b && !b.hidden); })()",
+        ) && ok.as_bool() == Some(true)
+        {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "Full graph button visible after reselecting run");
+
+    session
+        .cdp
+        .eval("document.getElementById('runs-full-graph').click()")
+        .expect("click Full graph");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut opened_full = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(ok) = session.cdp.eval(&format!(
+            "(() => {{ \
+                const g = document.getElementById('graph'); \
+                const body = document.getElementById('graph-body'); \
+                const id = document.getElementById('graph-id'); \
+                const svg = document.querySelector('#graph-canvas svg.graph-svg'); \
+                return !!(g && !g.hidden && g.classList.contains('open') \
+                    && body && !body.hidden && id && id.textContent === '{graph_id}' && svg); \
+            }})()"
+        )) && ok.as_bool() == Some(true)
+        {
+            opened_full = true;
+            break;
+        }
+    }
+    assert!(
+        opened_full,
+        "Full graph button must open large Graph view focused on {graph_id}"
+    );
+}

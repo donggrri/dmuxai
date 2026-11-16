@@ -931,8 +931,8 @@ function fmtTick(ms) {
   return s === 0 ? '0m' : s + 's';
 }
 
-function graphTimelineWidth() {
-  var canvas = $('graph-canvas');
+function graphTimelineWidth(canvasOpt) {
+  var canvas = canvasOpt || $('graph-canvas');
   var cw = canvas && canvas.clientWidth ? canvas.clientWidth : 1000;
   return Math.max(TIMELINE_MIN_W, cw - LANE_LABEL_W - TIMELINE_PAD_R - 2);
 }
@@ -1172,11 +1172,12 @@ function graphFitText(text, maxPx, charPx) {
   return max <= 1 ? '\u2026' : str.slice(0, max - 1) + '\u2026';
 }
 
-function graphCardTime(entry, nowMs) {
+function graphCardTime(entry, nowMs, snapOpt) {
   var node = entry.node;
   var status = graphNodeStatus(node);
   if (graphIsWaiting(status)) { return '~' + fmtElapsed(entry.est.estDurMs); }
-  var ms = nodeElapsed(node, snapshot, nowMs);
+  var snapArg = snapOpt === undefined ? snapshot : snapOpt;
+  var ms = nodeElapsed(node, snapArg, nowMs);
   if (ms === null && !entry.est.untimed) { ms = Math.max(0, entry.est.end - entry.est.start); }
   return ms === null ? stationStateWord(status) : fmtElapsed(ms);
 }
@@ -1194,22 +1195,26 @@ function graphCardSub(entry, geometry) {
 }
 
 // FR-881: one card. Running cards get a pulsing dot and a striped tail.
-function graphCard(entry, geometry, nowMs) {
+function graphCard(entry, geometry, nowMs, opts) {
+  opts = opts || {};
+  var readOnly = !!opts.readOnly;
   var node = entry.node;
   var status = graphNodeStatus(node);
   var group = svgEl('g');
   var classes = 'node card state-' + status;
   if (entry.est.blocked) { classes += ' card-blocked'; }
-  if (graphSelectedId === entry.id) { classes += ' node-selected'; }
-  if (taskChecklistHighlight[entry.id]) { classes += ' node-task-highlight'; }
+  if (!readOnly && graphSelectedId === entry.id) { classes += ' node-selected'; }
+  if (!readOnly && taskChecklistHighlight[entry.id]) { classes += ' node-task-highlight'; }
   group.setAttribute('class', classes);
   group.setAttribute('data-id', entry.id);
   group.setAttribute('data-lane', String(entry.lane));
   group.setAttribute('data-subrow', String(entry.subrow));
   group.setAttribute('data-runner', String(node.runner || ''));
   group.setAttribute('transform', 'translate(' + entry.x + ',' + entry.y + ')');
-  group.setAttribute('tabindex', '0');
-  group.setAttribute('role', 'button');
+  if (!readOnly) {
+    group.setAttribute('tabindex', '0');
+    group.setAttribute('role', 'button');
+  }
   group.setAttribute('aria-label', nodeAriaLabel(node));
 
   var title = svgEl('title');
@@ -1251,18 +1256,20 @@ function graphCard(entry, geometry, nowMs) {
   var idPad = 26 + (revBadgeW > 0 ? revBadgeW + 6 : 0);
   var idText = svgText(idPad, 22, graphFitText(entry.id, chipX - idPad - 6, CARD_ID_CHAR), 'card-id');
   group.appendChild(idText);
-  var timeText = graphCardTime(entry, nowMs);
+  var timeText = graphCardTime(entry, nowMs, readOnly ? null : snapshot);
   var timeW = timeText.length * CARD_TIME_CHAR;
   group.appendChild(svgText(w - 10, 45, timeText, 'card-time', 'end'));
   group.appendChild(svgText(12, 45, graphFitText(graphCardSub(entry, geometry), w - timeW - 30, CARD_SUB_CHAR), 'card-sub'));
 
-  group.addEventListener('click', function () { selectGraphNode(entry.id); });
-  group.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
-      e.preventDefault();
-      selectGraphNode(entry.id);
-    }
-  });
+  if (!readOnly) {
+    group.addEventListener('click', function () { selectGraphNode(entry.id); });
+    group.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+        e.preventDefault();
+        selectGraphNode(entry.id);
+      }
+    });
+  }
   return group;
 }
 
@@ -1316,32 +1323,40 @@ function graphCanvasHeight(geometry) {
   return Math.max(GRAPH_MIN_H, Math.min(geometry.height + 2, maxH));
 }
 
+function computeGraphFitScale(geometry, canvas) {
+  if (!canvas) { return null; }
+  var cw = canvas.clientWidth;
+  var ch = canvas.clientHeight;
+  if (!cw || !ch) { return null; }
+  var floor = GRAPH_TEXT_FLOOR / GRAPH_MIN_FONT;
+  var scale = Math.min(cw / geometry.width, ch / geometry.height, 1);
+  return Math.max(floor, Math.max(GRAPH_MIN_SCALE, Math.min(GRAPH_MAX_SCALE, scale)));
+}
+
 // UX-703 / UX-881: Fit frames the timeline but never scales text below
 // GRAPH_TEXT_FLOOR px; wider timelines pan horizontally instead. Returns false
 // when the canvas has no measured size (e.g. while the List view hides it).
 function autoFitGraph(geometry) {
-  var canvas = $('graph-canvas');
-  if (!canvas) { return false; }
-  var cw = canvas.clientWidth;
-  var ch = canvas.clientHeight;
-  if (!cw || !ch) { return false; }
-  var floor = GRAPH_TEXT_FLOOR / GRAPH_MIN_FONT;
-  var scale = Math.min(cw / geometry.width, ch / geometry.height, 1);
-  scale = Math.max(floor, Math.max(GRAPH_MIN_SCALE, Math.min(GRAPH_MAX_SCALE, scale)));
+  var scale = computeGraphFitScale(geometry, $('graph-canvas'));
+  if (scale === null) { return false; }
   graphTransform.scale = scale;
   graphTransform.x = 0;
   graphTransform.y = 0;
   return true;
 }
 
-function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
-  var canvas = $('graph-canvas');
+function renderSwimlaneTo(canvas, graph, nowMs, opts) {
+  opts = opts || {};
   if (!canvas) { return; }
-  var active = document.activeElement;
-  var focusId = active && active.closest && active.closest('.graph-svg g.node[data-id]')
-    ? active.closest('.graph-svg g.node[data-id]').getAttribute('data-id')
-    : null;
-  graphZoomGroup = null;
+  var readOnly = !!opts.readOnly;
+  var focusId = null;
+  if (!readOnly) {
+    var active = document.activeElement;
+    focusId = active && active.closest && active.closest('.graph-svg g.node[data-id]')
+      ? active.closest('.graph-svg g.node[data-id]').getAttribute('data-id')
+      : null;
+    graphZoomGroup = null;
+  }
   canvas.replaceChildren();
   var nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
   if (nodes.length === 0) {
@@ -1349,19 +1364,32 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
     return;
   }
 
-  var geometry = geometryOpt ||
-    buildSwimlaneGeometry(graph, graphServerNow(snapshot, nowMs), graphTimelineWidth());
-  graphGeometry = geometry;
-  graphLastBuildAt = Date.now();
+  var serverNow = readOnly
+    ? (typeof nowMs === 'number' ? nowMs : Date.now())
+    : graphServerNow(snapshot, nowMs);
+  var geometry = opts.geometry ||
+    buildSwimlaneGeometry(graph, serverNow, graphTimelineWidth(canvas));
+  if (!readOnly) {
+    graphGeometry = geometry;
+    graphLastBuildAt = Date.now();
+  }
   var width = geometry.width;
   var height = geometry.height;
   canvas.style.height = graphCanvasHeight(geometry) + 'px';
   var svg = svgEl('svg');
   svg.setAttribute('class', 'graph-svg swimlane');
+  var fitScale = readOnly ? (computeGraphFitScale(geometry, canvas) || 1) : 1;
+  if (readOnly && fitScale < 1) {
+    canvas.style.height = Math.max(GRAPH_MIN_H, Math.min(graphCanvasHeight(geometry), Math.ceil(height * fitScale) + 4)) + 'px';
+  }
   // The svg fills the canvas; the zoom group carries the pan/zoom transform,
   // so panning never clips the timeline at the svg edge.
-  var svgW = Math.max(width, canvas.clientWidth || 0);
-  var svgH = Math.max(height, graphCanvasHeight(geometry));
+  var svgW = readOnly
+    ? Math.max(Math.ceil(width * fitScale), canvas.clientWidth || 0)
+    : Math.max(width, canvas.clientWidth || 0);
+  var svgH = readOnly
+    ? Math.max(Math.ceil(height * fitScale), canvas.clientHeight || 0)
+    : Math.max(height, graphCanvasHeight(geometry));
   svg.setAttribute('width', svgW);
   svg.setAttribute('height', svgH);
   svg.setAttribute('viewBox', '0 0 ' + svgW + ' ' + svgH);
@@ -1372,7 +1400,9 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
 
   var zoom = svgEl('g');
   zoom.setAttribute('class', 'graph-zoom');
-  graphZoomGroup = zoom;
+  if (!readOnly) {
+    graphZoomGroup = zoom;
+  }
   var i;
 
   // Axis: ticks, labels and vertical grid lines (FR-880).
@@ -1435,7 +1465,7 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
   }
 
   for (i = 0; i < geometry.entries.length; i++) {
-    zoom.appendChild(graphCard(geometry.entries[i], geometry, nowMs));
+    zoom.appendChild(graphCard(geometry.entries[i], geometry, nowMs, { readOnly: readOnly }));
   }
 
   // FR-883: the now (or ended) line on top, with its label in the axis band.
@@ -1448,20 +1478,38 @@ function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
   nowG.appendChild(svgText(labelX + 6, 17, geometry.nowLabel, 'now-text'));
   zoom.appendChild(nowG);
 
-  var key = geometryKeyOpt || graphGeometryKey(geometry);
-  if (!graphUserInteracted) {
-    autoFitGraph(geometry);
+  if (readOnly) {
+    zoom.setAttribute('transform', 'translate(0,0) scale(' + fitScale + ')');
+  } else {
+    var key = opts.geometryKey || graphGeometryKey(geometry);
+    if (!graphUserInteracted) {
+      autoFitGraph(geometry);
+    }
+    lastGraphGeometryKey = key;
   }
-  lastGraphGeometryKey = key;
 
   svg.appendChild(zoom);
   canvas.appendChild(svg);
-  applyGraphTransform();
-  if (focusId) {
-    var again = graphNodeElementById(focusId);
-    if (again) { again.focus(); }
+  if (!readOnly) {
+    applyGraphTransform();
+    if (focusId) {
+      var again = graphNodeElementById(focusId);
+      if (again) { again.focus(); }
+    }
   }
 }
+
+function renderGraphCanvas(graph, nowMs, geometryOpt, geometryKeyOpt) {
+  renderSwimlaneTo($('graph-canvas'), graph, nowMs, {
+    readOnly: false,
+    geometry: geometryOpt,
+    geometryKey: geometryKeyOpt
+  });
+}
+
+window.dmuxaiRenderGraphDiagram = function (target, graph, nowMs, opts) {
+  renderSwimlaneTo(target, graph, nowMs, Object.assign({ readOnly: true }, opts || {}));
+};
 
 function updateGraphNodeSelection() {
   var groups = document.querySelectorAll('.graph-svg g.node[data-id]');
@@ -1528,7 +1576,7 @@ window.dmuxaiGraph = {
 
 function selectGraphNode(id) {
   graphSelectedId = id;
-  var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+  var graph = activeGraph();
   var now = lastRendered || Date.now();
   updateGraphNodeSelection();
   renderGraphDetail(graph, now);
@@ -1768,7 +1816,7 @@ function setGraphViewChoice(mode) {
   }
   applyGraphViewMode();
   if (graphViewPref === 'graph') {
-    var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+    var graph = activeGraph();
     var now = lastRendered || Date.now();
     var rev = snapshot && typeof snapshot.revision === 'number' ? snapshot.revision : null;
     if (graph && rev !== null) {
@@ -1823,7 +1871,7 @@ function onGraphResize() {
   if (graphResizeTimer !== null) { clearTimeout(graphResizeTimer); }
   graphResizeTimer = setTimeout(function () {
     graphResizeTimer = null;
-    var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+    var graph = activeGraph();
     if (graph && graphViewMode === 'graph') {
       renderGraphCanvas(graph, lastRendered || Date.now());
       updateGraphNodeSelection();
@@ -1849,6 +1897,7 @@ var CENTER_VIEWS = {
   runs: { panel: 'runs', toggle: 'runs-toggle' }
 };
 var centerView = null;
+var graphViewOverride = null;
 var serveRunsDefaultDone = false;
 var serveRunsDefaultPending = false;
 var serveRunsDefaultAborted = false;
@@ -1857,6 +1906,11 @@ var centerViewReturnFocus = null;
 // Approval keys (graph id + plan rev) that already auto-opened the Graph view,
 // so closing it while the plan waits does not re-open it on every snapshot.
 var approvalAutoOpened = {};
+
+function activeGraph() {
+  if (centerView === 'graph' && graphViewOverride) { return graphViewOverride; }
+  return snapshot && snapshot.graph ? snapshot.graph : null;
+}
 
 function readCenterView() {
   var v = null;
@@ -1873,6 +1927,11 @@ function setCenterView(next, opts) {
   if (next && !CENTER_VIEWS[next]) { next = null; }
   var prev = centerView;
   centerView = next;
+  if (next !== 'graph' && graphViewOverride) {
+    graphViewOverride = null;
+    renderGraphSection(snapshot && snapshot.graph ? snapshot.graph : null,
+      lastRendered || Date.now(), snapshot ? snapshot.revision : 0);
+  }
   Object.keys(CENTER_VIEWS).forEach(function (name) {
     var cfg = CENTER_VIEWS[name];
     var panel = $(cfg.panel);
@@ -1912,10 +1971,10 @@ function setCenterView(next, opts) {
 }
 
 // docs.js opens the Diff view from chat document cards and closes it for
-// "Show in chat".
-window.dmuxaiSetCenterView = function (name) {
+// "Show in chat"; runs.js opens Runs when retargeting a headless run graph.
+window.dmuxaiSetCenterView = function (name, opts) {
   runsAutoOpened = false;
-  setCenterView(name || null);
+  setCenterView(name || null, opts);
 };
 
 function toggleCenterView(name) {
@@ -1995,9 +2054,9 @@ function updateGraphIndicator(snap) {
   toggle.setAttribute('aria-label', label);
 }
 
-// FR-1214, FR-1221: approval is never hidden. A new pending plan opens the
-// Graph view once; the chat always shows an inline approval card (session.js)
-// with Approve / Edit / Reject while the plan waits.
+// FR-1214, FR-1221, FR-2824: approval is never hidden. Under --web, a new
+// pending plan opens the Graph view once (OQ-2820); under serve, if the graph
+// belongs to a headless run listed in Runs, select that run in Runs instead.
 function syncCenterViewsWithSnapshot(snap) {
   var graph = snap ? snap.graph : null;
   updateGraphIndicator(snap);
@@ -2005,7 +2064,15 @@ function syncCenterViewsWithSnapshot(snap) {
     var key = String(graph.id || '') + ':' + String(graph.approval.rev);
     if (!approvalAutoOpened[key]) {
       approvalAutoOpened[key] = true;
-      if (centerView !== 'graph') { setCenterView('graph', { focus: false, persist: false }); }
+      if (snap && String(snap.source || '') === 'files' && graph.id && typeof window.dmuxaiOpenRunForGraph === 'function') {
+        window.dmuxaiOpenRunForGraph(graph.id, { persist: false, focus: false }).then(function (opened) {
+          if (!opened && centerView !== 'graph') {
+            setCenterView('graph', { focus: false, persist: false });
+          }
+        });
+      } else if (centerView !== 'graph') {
+        setCenterView('graph', { focus: false, persist: false });
+      }
     }
   }
 }
@@ -2034,6 +2101,16 @@ window.dmuxaiFocusGraphNode = function (id) {
 var pendingRunFocus = null;
 
 window.dmuxaiShowGraphRun = function (runId, nodeId) {
+  if (!nodeId && runId && typeof window.dmuxaiOpenRunForGraph === 'function') {
+    return window.dmuxaiOpenRunForGraph(runId).then(function (opened) {
+      if (opened) { return { ok: true }; }
+      return openGraphViewForRun(runId, nodeId);
+    });
+  }
+  return openGraphViewForRun(runId, nodeId);
+};
+
+function openGraphViewForRun(runId, nodeId) {
   var graph = snapshot && snapshot.graph;
   if (graph && graph.id === runId) {
     if (nodeId) { window.dmuxaiFocusGraphNode(nodeId); } else { setCenterView('graph'); }
@@ -2050,6 +2127,26 @@ window.dmuxaiShowGraphRun = function (runId, nodeId) {
     pendingRunFocus = null;
     return { ok: false, error: err && err.message ? err.message : 'Could not open that run.' };
   });
+}
+
+// FR-2823: open the large Graph center view focused on a graph from Runs detail.
+window.dmuxaiOpenFullGraph = function (graph) {
+  if (!graph) {
+    setCenterView('graph');
+    return;
+  }
+  var cur = snapshot && snapshot.graph;
+  if (cur && cur.id === graph.id) {
+    graphViewOverride = null;
+    setCenterView('graph');
+    return;
+  }
+  graphViewOverride = graph;
+  setCenterView('graph');
+  renderGraphSection(graph, Date.now(), snapshot && typeof snapshot.revision === 'number' ? snapshot.revision : 0);
+  if (!isDashboardViewOnly() && graph.id) {
+    openGraphViewForRun(graph.id, null);
+  }
 };
 
 function applyPendingRunFocus(snap) {
@@ -4296,7 +4393,14 @@ function render(nowMs) {
   updateRunStatus(snap, nowMs);
   updateTabTitle(snap);
 
-  var graph = snap.graph;
+  if (graphViewOverride && snap.graph && snap.graph.id === graphViewOverride.id) {
+    graphViewOverride = null;
+  }
+  var graph = activeGraph();
+  renderGraphSection(graph, nowMs, snap.revision);
+}
+
+function renderGraphSection(graph, nowMs, revision) {
   if (!graph) {
     $('graph-empty').hidden = false;
     $('graph-body').hidden = true;
@@ -4333,7 +4437,7 @@ function render(nowMs) {
     renderNodes(graph, nowMs);
     applyGraphViewMode();
     if (graphViewMode === 'graph') {
-      syncGraphCanvas(graph, nowMs, snap.revision);
+      syncGraphCanvas(graph, nowMs, revision);
       renderGraphDetail(graph, nowMs);
     } else {
       renderGraphDetail(graph, nowMs);
