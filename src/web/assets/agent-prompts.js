@@ -65,7 +65,9 @@
       var editor = el('div', 'agent-prompt-editor');
       var ta = el('textarea', 'agent-prompt-textarea');
       ta.value = '';
-      // keep full not available; user types new text
+      if (row.set && row.preview) {
+        ta.placeholder = 'Current: ' + row.preview;
+      }
       ta.setAttribute('aria-label', 'System prompt for ' + row.runner);
       var sel = el('select', 'agent-prompt-inject');
       ['session', 'always'].forEach(function (v) {
