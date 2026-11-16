@@ -430,13 +430,13 @@ mod tests {
     // TC-840: todo_sidebar_assets (SPEC-todo-sidebar FR-840..FR-842, UX-840)
     #[test]
     fn tc_840_todo_sidebar_assets() {
-        // Header button with badge, wired to the shared sidebar.
-        assert!(INDEX_HTML.contains(r#"id="todos-toggle""#));
+        // Header Workspace button with badge, wired to the shared sidebar.
+        assert!(INDEX_HTML.contains(r#"id="workspace-toggle""#));
         assert!(INDEX_HTML.contains(r#"id="todos-count""#));
         // UX-840: the count is part of the button's accessible name.
-        assert!(INDEX_HTML.contains(r#"aria-label="To-dos, 0 open""#));
-        assert!(APP_JS.contains("'To-dos, ' + open + ' open'"));
-        let toggle_start = INDEX_HTML.find(r#"id="todos-toggle""#).unwrap();
+        assert!(INDEX_HTML.contains(r#"aria-label="Workspace, 0 open to-dos""#));
+        assert!(APP_JS.contains("'Workspace, ' + open + ' open to-dos'"));
+        let toggle_start = INDEX_HTML.find(r#"id="workspace-toggle""#).unwrap();
         let toggle_tag = &INDEX_HTML[INDEX_HTML[..toggle_start].rfind('<').unwrap()..];
         let toggle_tag = &toggle_tag[..toggle_tag.find('>').unwrap()];
         assert!(toggle_tag.contains(r#"aria-controls="sidebar""#));
@@ -1116,17 +1116,10 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"sessions-filter\""));
         assert!(INDEX_HTML.contains("id=\"sessions-list\""));
 
-        // Toggle button appears before the Files button in the header.
-        let sessions_pos = INDEX_HTML
-            .find("id=\"sessions-toggle\"")
-            .expect("sessions-toggle button");
-        let files_pos = INDEX_HTML
-            .find("id=\"sidebar-toggle-files\"")
-            .expect("sidebar-toggle-files button");
-        assert!(
-            sessions_pos < files_pos,
-            "#sessions-toggle must appear before #sidebar-toggle-files"
-        );
+        // Sessions toggle lives in the More menu (FR-2821).
+        assert!(INDEX_HTML.contains("id=\"more-menu\""));
+        assert!(INDEX_HTML.contains("id=\"sessions-toggle\""));
+        assert!(INDEX_HTML.contains("id=\"workspace-toggle\""));
 
         // Old in-panel aside.session-conversations is removed.
         assert!(!SESSION_JS.contains("session-conversations"));
@@ -1743,7 +1736,6 @@ mod tests {
     fn tc_1209_diff_and_graph_center_view_assets() {
         for (id, panel, view) in [
             ("diff-toggle", "docs", "diff"),
-            ("graph-toggle", "graph", "graph"),
             ("runs-toggle", "runs", "runs"),
         ] {
             let start = INDEX_HTML
@@ -1763,12 +1755,24 @@ mod tests {
             assert!(open_tag.contains("center-view"), "{open_tag}");
             assert!(open_tag.ends_with(" hidden"), "{open_tag}");
         }
-        // The buttons sit right after To-dos in the header.
-        let todos = INDEX_HTML.find("id=\"todos-toggle\"").unwrap();
+        let graph_start = INDEX_HTML
+            .find("<button id=\"graph-toggle\"")
+            .expect("graph toggle in More menu");
+        let graph_tag =
+            &INDEX_HTML[graph_start..INDEX_HTML[graph_start..].find('>').unwrap() + graph_start];
+        assert!(graph_tag.contains("data-view=\"graph\""), "{graph_tag}");
+        assert!(graph_tag.contains("aria-controls=\"graph\""), "{graph_tag}");
+        assert!(graph_tag.contains("Full graph"), "{graph_tag}");
+        // FR-2820: top bar order Runs | Diff | Chat | Workspace | More.
+        let runs = INDEX_HTML.find("id=\"runs-toggle\"").unwrap();
         let diff = INDEX_HTML.find("id=\"diff-toggle\"").unwrap();
-        let graph = INDEX_HTML.find("id=\"graph-toggle\"").unwrap();
+        let chat = INDEX_HTML.find("id=\"chat-toggle\"").unwrap();
+        let workspace = INDEX_HTML.find("id=\"workspace-toggle\"").unwrap();
+        let more = INDEX_HTML.find("id=\"more-toggle\"").unwrap();
         let status = INDEX_HTML.find("<nav id=\"status\"").unwrap();
-        assert!(todos < diff && diff < graph && graph < status);
+        assert!(
+            runs < diff && diff < chat && chat < workspace && workspace < more && more < status
+        );
         assert!(INDEX_HTML.contains("id=\"graph-indicator\""));
         // FR-1215: the chat reminder is the inline approval card (FR-1221),
         // not a separate callout.
@@ -1784,6 +1788,7 @@ mod tests {
         assert!(views_js.contains("approvalAutoOpened[key]"));
         assert!(!views_js.contains("innerHTML"));
         assert!(APP_JS.contains("bindCenterViews();"));
+        assert!(APP_JS.contains("bindMoreMenu();"));
         assert!(APP_JS.contains("syncCenterViewsWithSnapshot(snap);"));
         assert!(DOCS_CSS.contains(".center-view[hidden]"));
         assert!(DOCS_CSS.contains("left: calc(var(--left-dock, 0px) + 14px);"));
@@ -1811,10 +1816,11 @@ mod tests {
         let tag = &INDEX_HTML[start..INDEX_HTML[start..].find('>').unwrap() + start];
         assert!(tag.contains("aria-pressed=\"true\""), "{tag}");
         assert!(tag.contains("aria-controls=\"session\""), "{tag}");
-        // Placed after To-dos and before Diff/Graph/Memory.
-        let todos = INDEX_HTML.find("id=\"todos-toggle\"").unwrap();
+        // Placed after Runs/Diff and before Workspace/More.
+        let runs = INDEX_HTML.find("id=\"runs-toggle\"").unwrap();
         let diff = INDEX_HTML.find("id=\"diff-toggle\"").unwrap();
-        assert!(todos < start && start < diff);
+        let workspace = INDEX_HTML.find("id=\"workspace-toggle\"").unwrap();
+        assert!(runs < diff && diff < start && start < workspace);
         for id in [
             "diff-toggle",
             "graph-toggle",

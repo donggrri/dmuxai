@@ -182,8 +182,8 @@ with sync_playwright() as p:
     pg = b.new_page()
     pg.goto(sys.argv[2])
     # Toggle sidebar open if not already open
-    pg.wait_for_selector("#sidebar-toggle-files", timeout=15000)
-    toggle = pg.query_selector("#sidebar-toggle-files")
+    pg.wait_for_selector("#workspace-toggle", timeout=15000)
+    toggle = pg.query_selector("#workspace-toggle")
     if toggle.get_attribute("aria-expanded") != "true":
         toggle.click()
     pg.wait_for_selector("#sidebar.open", timeout=15000)

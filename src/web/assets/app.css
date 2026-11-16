@@ -266,6 +266,11 @@ body {
   z-index: 2;
 }
 
+/* FR-2821: only while the More dropdown is open (avoids blocking header-adjacent UI). */
+.top.more-open {
+  z-index: 30;
+}
+
 h1.brand {
   margin: 0;
   font-size: 1em;
@@ -310,6 +315,55 @@ h1.brand {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 16em;
+}
+
+/* Top bar views (SPEC-dashboard-tab-trim FR-2820) and More menu (FR-2821). */
+
+.top-views {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.more-menu-wrap {
+  position: relative;
+}
+
+.more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 12em;
+  padding: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.more-menu[hidden] {
+  display: none;
+}
+
+.more-menu-item {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+}
+
+.more-menu-label {
+  margin-top: 4px;
+}
+
+.more-menu .theme-select,
+.more-menu .accent-picker {
+  width: 100%;
+  max-width: none;
 }
 
 /* Header theme controls (SPEC-theme-colors UX-600). */
@@ -2794,12 +2848,32 @@ main {
 
 .runs-graph-section {
   flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.runs-graph-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .runs-graph-heading {
-  margin: 0 0 4px;
+  margin: 0;
   font-size: 0.85em;
   color: var(--muted);
+}
+
+.runs-graph-canvas {
+  cursor: default;
+  overflow: auto;
+  max-height: 280px;
+}
+
+.runs-graph-canvas:active {
+  cursor: default;
 }
 
 .runs-graph-nodes {

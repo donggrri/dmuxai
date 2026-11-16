@@ -166,7 +166,8 @@ with sync_playwright() as p:
     # bypass_csp only lets Playwright run its own wait predicates; the page CSP is unchanged.
     pg = b.new_page(viewport={"width": 1400, "height": 900}, bypass_csp=True)
     pg.goto(sys.argv[2])
-    pg.click("#todos-toggle")
+    pg.click("#workspace-toggle")
+    pg.click("#tab-todos")
     pg.wait_for_selector("#sidebar.open #tab-panel-todos:not([hidden])", timeout=15000)
     pg.wait_for_function("document.querySelectorAll('#jira-list .jira-item').length === 2", timeout=15000)
     out["items"] = pg.eval_on_selector_all(

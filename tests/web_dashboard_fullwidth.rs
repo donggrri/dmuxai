@@ -311,6 +311,15 @@ fn tc_1207_center_views_toggle_in_headless_chrome() {
 import sys, json
 from playwright.sync_api import sync_playwright
 
+def open_more(pg):
+    if pg.evaluate("() => document.getElementById('more-menu').hidden"):
+        pg.eval_on_selector("#more-toggle", "e => e.click()")
+        pg.wait_for_selector("#more-menu:not([hidden])", timeout=5000)
+
+def click_graph(pg):
+    open_more(pg)
+    pg.eval_on_selector("#graph-toggle", "e => e.click()")
+
 STATE = """() => {
   const r = q => { const e = document.querySelector(q); const b = e.getBoundingClientRect(); return {left: b.left, width: b.width}; };
   const cs = getComputedStyle(document.body);
@@ -334,22 +343,22 @@ with sync_playwright() as p:
     pg = b.new_page(viewport={"width": 1440, "height": 900}, bypass_csp=True)
     pg.on("pageerror", lambda e: print("PAGEERROR", e, file=sys.stderr))
     pg.goto(sys.argv[2])
-    pg.wait_for_selector("#graph-toggle", timeout=15000)
+    pg.wait_for_selector("#more-toggle", timeout=15000)
     pg.wait_for_function("() => document.querySelector('#graph-id').textContent.length > 0", timeout=15000)
     out["initial"] = pg.evaluate(STATE)
-    pg.click("#graph-toggle")
+    click_graph(pg)
     pg.wait_for_function("() => document.querySelectorAll('.graph-svg g.node').length === 2", timeout=15000)
     pg.wait_for_timeout(400)
     out["graph_open"] = pg.evaluate(STATE)
-    pg.click("#graph-toggle")
+    click_graph(pg)
     out["graph_closed_click"] = pg.evaluate(STATE)
     pg.focus("#diff-toggle")
     pg.keyboard.press("Enter")
     out["diff_open"] = pg.evaluate(STATE)
-    pg.click("#graph-toggle")
+    click_graph(pg)
     out["switch_to_graph"] = pg.evaluate(STATE)
     pg.reload()
-    pg.wait_for_selector("#graph-toggle", timeout=15000)
+    pg.wait_for_selector("#more-toggle", timeout=15000)
     pg.wait_for_timeout(500)
     out["after_reload"] = pg.evaluate(STATE)
     pg.keyboard.press("Escape")
@@ -690,6 +699,15 @@ fn tc_1218_per_turn_run_rows_and_session_graphs_in_headless_chrome() {
 import sys, json, copy
 from playwright.sync_api import sync_playwright
 
+def open_more(pg):
+    if pg.evaluate("() => document.getElementById('more-menu').hidden"):
+        pg.eval_on_selector("#more-toggle", "e => e.click()")
+        pg.wait_for_selector("#more-menu:not([hidden])", timeout=5000)
+
+def click_graph(pg):
+    open_more(pg)
+    pg.eval_on_selector("#graph-toggle", "e => e.click()")
+
 ROWS = """() => {
   const t = document.querySelector('.session-transcript');
   const kids = [...t.children].map(li => li.getAttribute('data-msg-id') || (li.classList.contains('chat-aux') ? 'row:' + (li.getAttribute('data-run-id') || li.getAttribute('data-aux-key')) : li.className));
@@ -783,7 +801,7 @@ with sync_playwright() as p:
     # Conversation B: no graph and no rows from A.
     state["snap"] = b_snap
     pg.wait_for_function("() => !document.querySelector('li.chat-aux-run') && document.querySelector('li.msg[data-msg-id=\"c2:0\"]')", timeout=15000)
-    pg.click("#graph-toggle")
+    click_graph(pg)
     pg.wait_for_timeout(300)
     out["b"] = pg.evaluate(ROWS)
     pg.keyboard.press("Escape")
@@ -968,7 +986,7 @@ with sync_playwright() as p:
     pg.goto(sys.argv[2])
     pg.wait_for_selector("#sessions-list li.sessions-group", timeout=15000)
     if not pg.evaluate("() => document.querySelector('#sessions-sidebar').classList.contains('open')"):
-        pg.click("#sessions-toggle")
+        pg.evaluate("() => { const m = document.getElementById('more-menu'); if (m.hidden) document.getElementById('more-toggle').click(); document.getElementById('sessions-toggle').click(); }")
     pg.wait_for_function("() => [...document.querySelectorAll('#sessions-list .sessions-row')].some(r => r.getAttribute('aria-disabled') !== 'true' && r.getAttribute('data-id') === 'api-0' && !r.title.includes('not available'))", timeout=15000)
     out["initial"] = pg.evaluate(GROUPS)
     pg.click("li.sessions-group[data-workspace='/home/u/src/api'] .sessions-more-btn")
@@ -1267,7 +1285,7 @@ with sync_playwright() as p:
     pg.goto(sys.argv[2])
     pg.wait_for_selector(".sessions-row[data-id='stored']", timeout=15000)
     if not pg.evaluate("() => document.querySelector('#sessions-sidebar').classList.contains('open')"):
-        pg.click("#sessions-toggle")
+        pg.evaluate("() => { const m = document.getElementById('more-menu'); if (m.hidden) document.getElementById('more-toggle').click(); document.getElementById('sessions-toggle').click(); }")
     pg.wait_for_selector(".sessions-row[data-id='stored'] .sessions-row-badge", timeout=15000)
     if pg.query_selector(".sessions-more-btn"):
         pg.click(".sessions-more-btn")
@@ -1307,6 +1325,15 @@ fn chat_button_returns_from_views_in_headless_chrome() {
     let script = r##"
 import sys, json
 from playwright.sync_api import sync_playwright
+
+def open_more(pg):
+    if pg.evaluate("() => document.getElementById('more-menu').hidden"):
+        pg.eval_on_selector("#more-toggle", "e => e.click()")
+        pg.wait_for_selector("#more-menu:not([hidden])", timeout=5000)
+
+def click_in_more(pg, sel):
+    open_more(pg)
+    pg.eval_on_selector(sel, "e => e.click()")
 
 STATE = """() => {
   const q = s => document.querySelector(s);
@@ -1373,15 +1400,15 @@ with sync_playwright() as p:
     pg.click("#chat-toggle")
     pg.wait_for_timeout(200)
     out["back"] = pg.evaluate(STATE)
-    pg.click("#graph-toggle")
+    click_in_more(pg, "#graph-toggle")
     out["graph_again"] = pg.evaluate(STATE)
-    pg.click("#graph-toggle")
+    click_in_more(pg, "#graph-toggle")
     out["graph_toggled_off"] = pg.evaluate(STATE)
-    pg.click("#memory-toggle")
+    click_in_more(pg, "#memory-toggle")
     out["memory_open"] = pg.evaluate(STATE)
     pg.click("#chat-toggle")
     out["memory_back"] = pg.evaluate(STATE)
-    pg.click("#skills-toggle")
+    click_in_more(pg, "#skills-toggle")
     out["skills_open"] = pg.evaluate(STATE)
     pg.click("#chat-toggle")
     out["skills_back"] = pg.evaluate(STATE)
@@ -1389,6 +1416,7 @@ with sync_playwright() as p:
     pg.focus("#chat-toggle")
     pg.keyboard.press("Enter")
     out["diff_back_keyboard"] = pg.evaluate(STATE)
+    open_more(pg)
     pg.focus("#graph-toggle")
     pg.keyboard.press("Enter")
     pg.keyboard.press("Escape")

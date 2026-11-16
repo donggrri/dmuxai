@@ -233,7 +233,7 @@
   var pendingOpen = null;
   // Active sidebar tab: 'files' or 'todos' (SPEC-todo-sidebar FR-842).
   var SIDEBAR_TABS = ['files', 'todos'];
-  var SIDEBAR_TOGGLES = { files: 'sidebar-toggle-files', todos: 'todos-toggle' };
+  var WORKSPACE_TOGGLE = 'workspace-toggle';
   var activeTab = 'files';
   var pendingTab = null;
   var pendingExpanded = null;
@@ -363,13 +363,10 @@
         document.body.classList.remove('sidebar-open');
       }
     }
-    // Each toggle is "expanded" only while the sidebar shows its tab.
-    for (var t = 0; t < SIDEBAR_TABS.length; t++) {
-      var btn = $(SIDEBAR_TOGGLES[SIDEBAR_TABS[t]]);
-      if (!btn) { continue; }
-      var shown = open && activeTab === SIDEBAR_TABS[t];
-      btn.setAttribute('aria-expanded', shown ? 'true' : 'false');
-      btn.classList.toggle('active', shown);
+    var wsBtn = $(WORKSPACE_TOGGLE);
+    if (wsBtn) {
+      wsBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      wsBtn.classList.toggle('active', open);
     }
     if (backdrop) {
       if (open) {
@@ -395,14 +392,23 @@
   function closeSidebar() {
     saveSidebarOpen(false);
     updateSidebarUI(false);
-    var toggleBtn = $(SIDEBAR_TOGGLES[activeTab]);
+    var toggleBtn = $(WORKSPACE_TOGGLE);
     if (toggleBtn && typeof toggleBtn.focus === 'function') {
       toggleBtn.focus();
     }
   }
 
-  // A header toggle closes the sidebar when it already shows that tab and
-  // otherwise opens it on that tab (FR-842).
+  function toggleWorkspace() {
+    var aside = $('sidebar');
+    var isOpen = aside ? aside.classList.contains('open') : false;
+    if (isOpen) {
+      closeSidebar();
+    } else {
+      openSidebar();
+    }
+  }
+
+  // Tab controls inside the sidebar open/close on that tab (FR-842).
   function toggleSidebarTab(tab) {
     var aside = $('sidebar');
     var isOpen = aside ? aside.classList.contains('open') : false;
@@ -909,11 +915,12 @@
     setActiveTab(state.tab, true);
     updateSidebarUI(state.open);
 
+    var wsToggle = $(WORKSPACE_TOGGLE);
+    if (wsToggle) {
+      wsToggle.addEventListener('click', toggleWorkspace);
+    }
+
     SIDEBAR_TABS.forEach(function (tab) {
-      var toggleBtn = $(SIDEBAR_TOGGLES[tab]);
-      if (toggleBtn) {
-        toggleBtn.addEventListener('click', function () { toggleSidebarTab(tab); });
-      }
       var tabBtn = $('tab-' + tab);
       if (tabBtn) {
         tabBtn.addEventListener('click', function () { setActiveTab(tab); });

@@ -192,6 +192,42 @@
     paint();
   }
 
+  // FR-2825: restore the default open/closed state through the modules that own
+  // it, so their in-memory flags stay in sync. Sessions open by default on wide
+  // screens; the Files/To-dos sidebar is closed by default.
+  function resetOpenState() {
+    var leftDefaultOpen = window.innerWidth > 1200;
+    if (isLeftOpen() !== leftDefaultOpen) {
+      if (isLeftOpen()) {
+        var leftClose = document.getElementById('sessions-close');
+        var leftToggle = document.getElementById('sessions-toggle');
+        if (leftClose) { leftClose.click(); }
+        else if (leftToggle) { leftToggle.click(); }
+      } else {
+        var leftOpen = document.getElementById('sessions-toggle');
+        if (leftOpen) { leftOpen.click(); }
+      }
+    }
+    if (isRightOpen()) {
+      var rightClose = document.getElementById('sidebar-close');
+      if (rightClose) { rightClose.click(); }
+      else {
+        var rightToggle = document.getElementById('workspace-toggle');
+        if (rightToggle) { rightToggle.click(); }
+      }
+    }
+  }
+
+  window.dmuxaiResetSidebarLayout = function () {
+    lastClick = null;
+    beginInstant();
+    resetOpenState();
+    reset('left');
+    reset('right');
+    beginInstant();
+    relayout();
+  };
+
   // Left sidebar is docked at x = 0, so its width is clientX.
   // Right width is the sidebar's right edge minus clientX (not innerWidth,
   // so a classic scrollbar does not shift the handle).

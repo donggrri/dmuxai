@@ -122,10 +122,11 @@ with sync_playwright() as p:
     pg.goto(sys.argv[2])
     pg.wait_for_function("document.querySelector('#todos-count') && document.querySelector('#todos-count').textContent === '3'", timeout=15000)
     out["sidebar_open_before"] = pg.eval_on_selector("#sidebar", "e => e.classList.contains('open')")
-    pg.click("#todos-toggle")
+    pg.click("#workspace-toggle")
+    pg.click("#tab-todos")
     pg.wait_for_selector("#sidebar.open #tab-panel-todos:not([hidden])", timeout=15000)
-    out["todos_expanded"] = pg.get_attribute("#todos-toggle", "aria-expanded")
-    out["toggle_label"] = pg.get_attribute("#todos-toggle", "aria-label")
+    out["todos_expanded"] = pg.get_attribute("#workspace-toggle", "aria-expanded")
+    out["toggle_label"] = pg.get_attribute("#workspace-toggle", "aria-label")
     out["tab_todos_selected"] = pg.get_attribute("#tab-todos", "aria-selected")
     pg.wait_for_function("document.querySelectorAll('#todo-list .todo').length === 3", timeout=15000)
     out["open_count"] = len(visible_titles(pg))
@@ -141,11 +142,11 @@ with sync_playwright() as p:
     pg.fill("#todo-search", "export")
     out["search_export"] = visible_titles(pg)
     pg.screenshot(path=sys.argv[3])
-    pg.click("#sidebar-toggle-files")
+    pg.click("#tab-files")
     out["files_selected"] = pg.get_attribute("#tab-files", "aria-selected")
     out["files_panel_hidden"] = pg.eval_on_selector("#tab-panel-files", "e => e.hidden")
     out["todos_panel_hidden"] = pg.eval_on_selector("#tab-panel-todos", "e => e.hidden")
-    out["todos_expanded_after"] = pg.get_attribute("#todos-toggle", "aria-expanded")
+    out["todos_expanded_after"] = pg.get_attribute("#workspace-toggle", "aria-expanded")
     # Esc closes the sidebar when focus is not in a text field.
     pg.focus("#tab-files")
     pg.keyboard.press("Escape")
@@ -192,7 +193,7 @@ with sync_playwright() as p:
 
     assert_eq!(v["sidebar_open_before"], false, "{v}");
     assert_eq!(v["todos_expanded"], "true", "{v}");
-    assert_eq!(v["toggle_label"], "To-dos, 3 open", "{v}");
+    assert_eq!(v["toggle_label"], "Workspace, 3 open to-dos", "{v}");
     assert_eq!(v["tab_todos_selected"], "true", "{v}");
     assert_eq!(v["open_count"], 3, "{v}");
     let open_after: Vec<String> = serde_json::from_value(v["open_after_done"].clone()).unwrap();
@@ -207,7 +208,7 @@ with sync_playwright() as p:
     assert_eq!(v["files_selected"], "true", "{v}");
     assert_eq!(v["files_panel_hidden"], false, "{v}");
     assert_eq!(v["todos_panel_hidden"], true, "{v}");
-    assert_eq!(v["todos_expanded_after"], "false", "{v}");
+    assert_eq!(v["todos_expanded_after"], "true", "{v}");
     assert_eq!(v["open_after_esc"], false, "{v}");
     assert!(screenshot_file.exists(), "screenshot was not captured");
 }

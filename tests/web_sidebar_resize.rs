@@ -386,11 +386,17 @@ def wait_aria(pg, side, value):
         timeout=8000,
     )
 
+def open_more(pg):
+    if pg.evaluate("() => document.getElementById('more-menu').hidden"):
+        pg.eval_on_selector("#more-toggle", "e => e.click()")
+        pg.wait_for_selector("#more-menu:not([hidden])", timeout=5000)
+
 def ensure_left(pg, open_):
     is_open = pg.eval_on_selector("#sessions-sidebar", "e => e.classList.contains('open')")
     if bool(is_open) == bool(open_):
         return
     if open_:
+        open_more(pg)
         pg.click("#sessions-toggle")
         pg.wait_for_selector("#sessions-sidebar.open", timeout=8000)
     else:
@@ -402,7 +408,7 @@ def ensure_right(pg, open_):
     is_open = pg.eval_on_selector("#sidebar", "e => e.classList.contains('open')")
     if bool(is_open) == bool(open_):
         return
-    pg.click("#sidebar-toggle-files")
+    pg.eval_on_selector("#workspace-toggle", "e => e.click()")
     if open_:
         pg.wait_for_selector("#sidebar.open", timeout=8000)
     else:
@@ -476,7 +482,7 @@ def boot(pg, width, height):
     pg.set_viewport_size({"width": width, "height": height})
     pg.goto(sys.argv[2])
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
-    pg.wait_for_selector("#sessions-toggle", timeout=15000)
+    pg.wait_for_selector("#more-toggle", timeout=15000)
     pg.wait_for_selector("#sessions-resize", timeout=15000)
     pg.wait_for_function(
         "(w) => document.documentElement.clientWidth === w",

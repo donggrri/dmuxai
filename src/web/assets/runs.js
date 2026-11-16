@@ -3,6 +3,7 @@
 /* FR-2811..FR-2814: headless runs dashboard view (read-only). */
 
 var RUNS_POLL_MS = 2000;
+var RUNS_INDICATOR_POLL_MS = 2000;
 var RUNS_TICK_MS = 1000;
 var RUNS_DETAIL_REFETCH_MS = 3000;
 var RUNS_STREAM_MAX_LINES = 2000;
@@ -170,6 +171,7 @@ var runsStreamSse = null;
 var runsListData = [];
 var runsSelectedId = null;
 var runsDetailRun = null;
+var runsDetailGraph = null;
 var runsDetailGen = 0;
 var runsStreamLines = 0;
 var runsStreamStickBottom = true;
@@ -177,6 +179,9 @@ var runsStreamBackoffIx = 0;
 var runsStreamReconnectTimer = null;
 var runsDetailRefetchTimer = null;
 var runsDetailLastRefetchAt = 0;
+var runsIndicatorTimer = null;
+var runsIndicatorLastFetchAt = 0;
+var runsIndicatorInFlight = false;
 
 function runsPanelOpen() {
   var panel = document.getElementById('runs');
@@ -256,11 +261,54 @@ window.dmuxaiRunsOnViewClose = runsOnViewClose;
 function runsRefreshList() {
   runsFetchJson('/api/runs').then(function (data) {
     runsListData = data && data.runs ? data.runs : [];
+    runsIndicatorLastFetchAt = Date.now();
     runsRenderList();
   }).catch(function () { /* keep last list */ });
 }
 
+// FR-2826: the Runs button shows how many headless runs are active.
+function runsActiveCount() {
+  var count = 0;
+  for (var i = 0; i < runsListData.length; i++) {
+    if (runsIsActive(runsListData[i].status)) { count += 1; }
+  }
+  return count;
+}
+
+function runsUpdateIndicator() {
+  var ind = document.getElementById('runs-indicator');
+  var toggle = document.getElementById('runs-toggle');
+  if (!ind || !toggle) { return; }
+  var count = runsActiveCount();
+  if (count > 0) {
+    ind.hidden = false;
+    ind.textContent = String(count);
+    toggle.setAttribute('aria-label', 'Runs, ' + count + ' active');
+  } else {
+    ind.hidden = true;
+    ind.textContent = '';
+    toggle.setAttribute('aria-label', 'Runs');
+  }
+}
+
+// While Runs is closed, reuse GET /api/runs at most once every 2 s so the
+// indicator still reflects active runs without a new endpoint.
+function runsRefreshIndicator() {
+  if (runsUiOpen || runsIndicatorInFlight) { return; }
+  var now = Date.now();
+  if (now - runsIndicatorLastFetchAt < RUNS_INDICATOR_POLL_MS) { return; }
+  runsIndicatorLastFetchAt = now;
+  runsIndicatorInFlight = true;
+  runsFetchJson('/api/runs').then(function (data) {
+    runsListData = data && data.runs ? data.runs : [];
+    runsUpdateIndicator();
+  }).catch(function () { /* keep last count */ }).then(function () {
+    runsIndicatorInFlight = false;
+  });
+}
+
 function runsRenderList() {
+  runsUpdateIndicator();
   var table = document.getElementById('runs-table');
   var tbody = document.getElementById('runs-table-body');
   var empty = document.getElementById('runs-empty');
@@ -350,8 +398,10 @@ function runsSelectRun(id) {
 function runsClearDetail() {
   runsSelectedId = null;
   runsDetailRun = null;
+  runsDetailGraph = null;
   runsStopDetailRefetchPoll();
   runsStopStream();
+  runsRenderGraphNodes(null);
   var detail = document.getElementById('runs-detail');
   if (detail) { detail.hidden = true; }
 }
@@ -507,14 +557,27 @@ function runsRenderApproval(approval, run) {
 
 function runsRenderGraphNodes(graph) {
   var section = document.getElementById('runs-graph-section');
+  var canvas = document.getElementById('runs-graph-canvas');
+  var fullBtn = document.getElementById('runs-full-graph');
   var list = document.getElementById('runs-graph-nodes');
   if (!section || !list) { return; }
   list.textContent = '';
   if (!graph || !graph.nodes || !graph.nodes.length) {
+    runsDetailGraph = null;
     section.hidden = true;
+    if (fullBtn) { fullBtn.hidden = true; }
+    if (canvas) {
+      canvas.replaceChildren();
+      canvas.style.height = '';
+    }
     return;
   }
+  runsDetailGraph = graph;
   section.hidden = false;
+  if (fullBtn) { fullBtn.hidden = false; }
+  if (canvas && typeof window.dmuxaiRenderGraphDiagram === 'function') {
+    window.dmuxaiRenderGraphDiagram(canvas, graph, Date.now());
+  }
   graph.nodes.forEach(function (node) {
     var li = document.createElement('li');
     li.className = 'runs-graph-node';
@@ -671,15 +734,60 @@ function runsSyncViewState() {
   }
 }
 
+function runsFindByGraphId(list, graphId) {
+  if (!graphId || !Array.isArray(list)) { return null; }
+  var target = String(graphId);
+  for (var i = 0; i < list.length; i++) {
+    if (runsRunGraphId(list[i]) === target) { return list[i]; }
+  }
+  return null;
+}
+
+// FR-2824: if `graphId` belongs to a headless run in Runs, open Runs and
+// select that run instead of opening the standalone Graph view.
+window.dmuxaiOpenRunForGraph = function (graphId, opts) {
+  if (!graphId) { return Promise.resolve(false); }
+  function openMatch(run) {
+    if (!run) { return false; }
+    if (typeof window.dmuxaiSetCenterView === 'function') {
+      window.dmuxaiSetCenterView('runs', opts);
+    }
+    runsSelectRun(run.run_id);
+    return true;
+  }
+  var cached = runsFindByGraphId(runsListData, graphId);
+  if (cached) {
+    return Promise.resolve(openMatch(cached));
+  }
+  return runsFetchJson('/api/runs').then(function (data) {
+    runsListData = data && data.runs ? data.runs : [];
+    runsIndicatorLastFetchAt = Date.now();
+    return openMatch(runsFindByGraphId(runsListData, graphId));
+  }).catch(function () {
+    return false;
+  });
+};
+
 function runsInit() {
   runsBindStreamScroll();
+  var fullBtn = document.getElementById('runs-full-graph');
+  if (fullBtn) {
+    fullBtn.addEventListener('click', function () {
+      if (runsDetailGraph && typeof window.dmuxaiOpenFullGraph === 'function') {
+        window.dmuxaiOpenFullGraph(runsDetailGraph);
+      }
+    });
+  }
   document.addEventListener('dmuxai:center-view', function () {
     runsSyncViewState();
   });
   document.addEventListener('dmuxai:state-change', function () {
     if (runsUiOpen) { runsOnDashboardStateChange(); }
+    else { runsRefreshIndicator(); }
   });
   window.setTimeout(runsSyncViewState, 0);
+  runsRefreshIndicator();
+  runsIndicatorTimer = window.setInterval(runsRefreshIndicator, RUNS_INDICATOR_POLL_MS);
 }
 
 if (document.readyState === 'loading') {
