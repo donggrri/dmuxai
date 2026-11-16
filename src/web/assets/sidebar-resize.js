@@ -212,7 +212,7 @@
       var rightClose = document.getElementById('sidebar-close');
       if (rightClose) { rightClose.click(); }
       else {
-        var rightToggle = document.getElementById('sidebar-toggle-files');
+        var rightToggle = document.getElementById('workspace-toggle');
         if (rightToggle) { rightToggle.click(); }
       }
     }

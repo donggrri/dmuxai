@@ -1,4 +1,4 @@
-//! Browser tests for SPEC-dashboard-tab-trim step 1 (FR-2825, FR-2827, FR-2828).
+//! Browser tests for SPEC-dashboard-tab-trim (FR-2820–FR-2822, FR-2825, FR-2828).
 //! Needs Chrome/Chromium, so the tests are `#[ignore]`d. Every wait is bounded.
 
 use std::fs;
@@ -423,7 +423,7 @@ fn tc_2825_reset_layout() {
         .expect("close sessions sidebar");
     session
         .cdp
-        .eval("document.getElementById('sidebar-toggle-files').click()")
+        .eval("document.getElementById('workspace-toggle').click()")
         .expect("open files sidebar");
     wait_for_truthy(
         &mut session,
@@ -490,13 +490,13 @@ fn tc_2828_system_prompt_preview_placeholder() {
 
     wait_for_truthy(
         &mut session,
-        "!!document.getElementById('agent-prompts-toggle')",
-        "system prompts toggle",
+        "!!document.getElementById('more-toggle')",
+        "more menu toggle",
         15,
     );
     session
         .cdp
-        .eval("document.getElementById('agent-prompts-toggle').click()")
+        .eval("(() => { const m = document.getElementById('more-menu'); if (m.hidden) document.getElementById('more-toggle').click(); document.getElementById('agent-prompts-toggle').click(); })()")
         .expect("open system prompts");
     wait_for_truthy(
         &mut session,
@@ -552,5 +552,261 @@ fn tc_2828_system_prompt_preview_placeholder() {
             .and_then(|v| v.as_bool())
             == Some(true),
         "preview text visible in row"
+    );
+}
+
+// TC-2820 / FR-2820: top bar shows exactly Runs, Diff, Chat, Workspace, More.
+#[test]
+#[ignore]
+fn tc_2820_top_bar_controls() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2820_top_bar_controls: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new_with_config("");
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+
+    wait_for_truthy(
+        &mut session,
+        "!!document.getElementById('runs-toggle')",
+        "runs toggle",
+        15,
+    );
+    let labels = session
+        .cdp
+        .eval(
+            "(() => [...document.querySelectorAll('nav.top-views > button, nav.top-views > .more-menu-wrap > button')]
+              .map(b => b.textContent.replace(/\\s+/g, ' ').trim().replace(/\\s\\d+$/, '')))()",
+        )
+        .expect("top bar labels");
+    let arr = labels.as_array().expect("array");
+    assert_eq!(arr.len(), 5, "expected five top-level controls");
+    assert_eq!(arr[0].as_str(), Some("Runs"));
+    assert_eq!(arr[1].as_str(), Some("Diff"));
+    assert_eq!(arr[2].as_str(), Some("Chat"));
+    assert_eq!(arr[3].as_str(), Some("Workspace"));
+    assert_eq!(arr[4].as_str(), Some("More"));
+
+    let stray = session
+        .cdp
+        .eval(
+            "(() => !document.querySelector('header.top > #sessions-toggle') \
+              && !document.querySelector('header.top > #memory-toggle') \
+              && !document.querySelector('header.top > #theme-select'))()",
+        )
+        .expect("no stray controls");
+    assert_eq!(
+        stray.as_bool(),
+        Some(true),
+        "secondary controls not in top bar"
+    );
+}
+
+// TC-2821 / FR-2821: More menu lists secondary items with correct aria and Esc.
+#[test]
+#[ignore]
+fn tc_2821_more_menu_items() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2821_more_menu_items: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new_with_config("");
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+
+    wait_for_truthy(
+        &mut session,
+        "!!document.getElementById('more-toggle')",
+        "more toggle",
+        15,
+    );
+    let popup = session
+        .cdp
+        .eval("document.getElementById('more-toggle').getAttribute('aria-haspopup')")
+        .expect("aria-haspopup");
+    assert_eq!(popup.as_str(), Some("menu"));
+
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("open more");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('more-toggle').getAttribute('aria-expanded') === 'true'",
+        "menu expanded",
+        5,
+    );
+    wait_for_truthy(
+        &mut session,
+        "!document.getElementById('more-menu').hidden",
+        "menu visible",
+        5,
+    );
+
+    let items = session
+        .cdp
+        .eval(
+            "(() => [...document.querySelectorAll('#more-menu [role=\"menuitem\"]')]
+              .map(el => (el.tagName === 'SELECT' ? 'Theme' : (el.id === 'accent-picker' ? 'Accent' : el.textContent.trim().replace(/\\s+(Off|On)$/, '').split('\\n')[0]))))()",
+        )
+        .expect("menu items");
+    let names: Vec<String> = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        names.windows(2).any(|w| w == ["Sessions", "Memory"]),
+        "Sessions then Memory: {names:?}"
+    );
+    assert!(names.iter().any(|n| n.contains("Skills")), "{names:?}");
+    assert!(
+        names.iter().any(|n| n.contains("System prompts")),
+        "{names:?}"
+    );
+    assert!(names.iter().any(|n| n == "Full graph"), "{names:?}");
+    assert!(names.iter().any(|n| n == "Theme"), "{names:?}");
+    assert!(names.iter().any(|n| n == "Accent"), "{names:?}");
+    assert!(
+        names.iter().any(|n| n.contains("Reset layout")),
+        "{names:?}"
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('memory-toggle').click()")
+        .expect("pick memory");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('more-menu').hidden",
+        "menu closed after pick",
+        5,
+    );
+    wait_for_truthy(
+        &mut session,
+        "!document.getElementById('memory-popover').hidden",
+        "memory popover open",
+        10,
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("reopen more");
+    session
+        .cdp
+        .eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))",
+        )
+        .expect("esc");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('more-menu').hidden",
+        "menu closed on esc",
+        5,
+    );
+}
+
+// TC-2822 / FR-2822: Workspace opens the sidebar with Files/To-dos tabs and badge.
+#[test]
+#[ignore]
+fn tc_2822_workspace_button() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2822_workspace_button: chrome binary not found");
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    let ws = workspace.path();
+    let data_home = ws.join("data");
+    let state_home = ws.join("state");
+    let cfg_home = ws.join("cfg");
+    let home = ws.join("home");
+    for dir in [&data_home, &state_home, &cfg_home, &home] {
+        fs::create_dir_all(dir).expect("dir");
+    }
+    fs::create_dir_all(ws.join(".dmuxai")).expect(".dmuxai");
+    fs::write(ws.join(".dmuxai/events.jsonl"), "").expect("events");
+    for title in ["Alpha todo", "Beta todo"] {
+        let status = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+            .args(["todo", "add", title])
+            .current_dir(ws)
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("XDG_CONFIG_HOME", &cfg_home)
+            .env_remove("DMUXAI_WORKSPACE")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("todo add");
+        assert!(status.success());
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+        .args(["serve", "--port", "0"])
+        .current_dir(ws)
+        .env_remove("DMUXAI_WORKSPACE")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CONFIG_HOME", &cfg_home)
+        .env("HOME", &home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn serve");
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let first_line = rx.recv_timeout(Duration::from_secs(20)).expect("url line");
+    let dashboard_url = first_line
+        .trim()
+        .strip_prefix("dmuxai dashboard: ")
+        .unwrap()
+        .to_string();
+    let _serve_guard = ChildGuard(Some(child));
+
+    let mut session = open_dashboard_in_chrome(&dashboard_url).expect("open chrome");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('todos-count').textContent === '2'",
+        "todo badge",
+        20,
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('workspace-toggle').click()")
+        .expect("workspace");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('sidebar').classList.contains('open')",
+        "sidebar open",
+        10,
+    );
+    wait_for_truthy(
+        &mut session,
+        "!!document.getElementById('tab-files') && !!document.getElementById('tab-todos')",
+        "sidebar tabs",
+        5,
+    );
+    let label = session
+        .cdp
+        .eval("document.getElementById('workspace-toggle').getAttribute('aria-label')")
+        .expect("label");
+    assert_eq!(
+        label.as_str(),
+        Some("Workspace, 2 open to-dos"),
+        "badge in accessible name"
     );
 }

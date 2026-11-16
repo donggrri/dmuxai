@@ -244,6 +244,88 @@ function bindThemeControls() {
   reset.addEventListener('click', resetAccent);
 }
 
+// FR-2821: the More menu holds secondary header controls; Esc and outside
+// clicks close it, and arrow keys move between items.
+function bindMoreMenu() {
+  var moreToggle = $('more-toggle');
+  var menu = $('more-menu');
+  if (!moreToggle || !menu) { return; }
+
+  function menuFocusables() {
+    var nodes = menu.querySelectorAll('[role="menuitem"]');
+    var list = [];
+    for (var i = 0; i < nodes.length; i++) { list.push(nodes[i]); }
+    return list;
+  }
+
+  function isOpen() {
+    return moreToggle.getAttribute('aria-expanded') === 'true';
+  }
+
+  function setOpen(open) {
+    moreToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    menu.hidden = !open;
+    if (open) {
+      var items = menuFocusables();
+      if (items.length && typeof items[0].focus === 'function') {
+        items[0].focus();
+      }
+    }
+  }
+
+  function closeMenu() { setOpen(false); }
+
+  moreToggle.addEventListener('click', function (e) {
+    e.stopPropagation();
+    if (isOpen()) { closeMenu(); }
+    else { setOpen(true); }
+  });
+
+  document.addEventListener('click', function (e) {
+    if (!isOpen()) { return; }
+    if (menu.contains(e.target) || moreToggle.contains(e.target)) { return; }
+    closeMenu();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && isOpen()) {
+      e.preventDefault();
+      closeMenu();
+      moreToggle.focus();
+      return;
+    }
+    if (!isOpen()) { return; }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') { return; }
+    e.preventDefault();
+    var items = menuFocusables();
+    var idx = items.indexOf(document.activeElement);
+    if (idx === -1) { idx = 0; }
+    var next = e.key === 'ArrowDown'
+      ? items[(idx + 1) % items.length]
+      : items[(idx - 1 + items.length) % items.length];
+    if (next && typeof next.focus === 'function') { next.focus(); }
+  });
+
+  var closers = menu.querySelectorAll('button[role="menuitem"]');
+  for (var c = 0; c < closers.length; c++) {
+    closers[c].addEventListener('click', function () {
+      if (isOpen()) { closeMenu(); }
+    });
+  }
+  var themeSelect = $('theme-select');
+  if (themeSelect) {
+    themeSelect.addEventListener('change', function () {
+      if (isOpen()) { closeMenu(); }
+    });
+  }
+  var accentPicker = $('accent-picker');
+  if (accentPicker) {
+    accentPicker.addEventListener('change', function () {
+      if (isOpen()) { closeMenu(); }
+    });
+  }
+}
+
 // FR-603: while the user has made no in-session choice, the page follows the
 // snapshot ui.theme / ui.accent (from [web] config); missing or invalid values
 // are ignored. Once the user picks theme or accent, or hits Reset, the flags
@@ -3809,8 +3891,8 @@ function updateTodoCount(allTodos) {
   }
   badge.textContent = String(open);
   // A span's aria-label is ignored, so the count is announced via the button name.
-  var toggle = $('todos-toggle');
-  if (toggle) { toggle.setAttribute('aria-label', 'To-dos, ' + open + ' open'); }
+  var toggle = $('workspace-toggle');
+  if (toggle) { toggle.setAttribute('aria-label', 'Workspace, ' + open + ' open to-dos'); }
 }
 
 function bindTodoFilter() {
@@ -4512,6 +4594,7 @@ window.addEventListener('pagehide', function() {
 function init() {
   // Theme controls work even without a token (the panel is header-visible).
   bindThemeControls();
+  bindMoreMenu();
   // A stored choice counts as already-made: snapshot values must not override it.
   var stored = storedTheme();
   userThemeChosen = validTheme(stored);

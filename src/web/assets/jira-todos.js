@@ -212,8 +212,17 @@
       }, 0);
     });
   }
-  var todosToggle = document.getElementById('todos-toggle');
-  if (todosToggle) { todosToggle.addEventListener('click', function () { load(false); }); }
+  var wsToggle = document.getElementById('workspace-toggle');
+  if (wsToggle) {
+    wsToggle.addEventListener('click', function () {
+      var aside = document.getElementById('sidebar');
+      var todosTab = document.getElementById('tab-todos');
+      if (aside && aside.classList.contains('open') &&
+          todosTab && todosTab.getAttribute('aria-selected') === 'true') {
+        load(false);
+      }
+    });
+  }
 
   document.addEventListener('dmuxai:snapshot', syncViewOnly);
   load(false);

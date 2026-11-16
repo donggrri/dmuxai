@@ -110,16 +110,21 @@ def rect_of(pg, sel):
         return {left: r.left, right: r.right, width: r.width, top: r.top, bottom: r.bottom, height: r.height};
     }""")
 
+def open_more(pg):
+    if pg.evaluate("() => document.getElementById('more-menu').hidden"):
+        pg.eval_on_selector("#more-toggle", "e => e.click()")
+
 def set_left_dock(pg, enabled):
     is_open = pg.eval_on_selector("#sessions-sidebar", "e => e.classList.contains('open')")
     if is_open != enabled:
+        open_more(pg)
         pg.eval_on_selector("#sessions-toggle", "e => e.click()")
 
 def close_right_sidebar(pg, width):
     is_open = pg.eval_on_selector("#sidebar", "e => e.classList.contains('open')")
     if is_open:
         if width > 900:
-            pg.click("#sidebar-toggle-files")
+            pg.eval_on_selector("#workspace-toggle", "e => e.click()")
         else:
             pg.click("#sidebar-close")
 
@@ -128,8 +133,8 @@ with sync_playwright() as p:
     pg = b.new_page(viewport={"width": 1280, "height": 900}, bypass_csp=True)
     pg.goto(sys.argv[2])
     pg.wait_for_selector("#session:not([hidden]) .session-prompt", timeout=15000)
-    pg.wait_for_selector("#sidebar-toggle-files", timeout=15000)
-    pg.wait_for_selector("#sessions-toggle", timeout=15000)
+    pg.wait_for_selector("#workspace-toggle", timeout=15000)
+    pg.wait_for_selector("#more-toggle", timeout=15000)
 
     # Enable input in view-only serve mode so we can type into .session-input and verify text preservation.
     pg.eval_on_selector(".session-input", "e => { e.disabled = false; }")
@@ -150,8 +155,8 @@ with sync_playwright() as p:
             "prompt": rect_of(pg, ".session-prompt"),
         }
 
-        # 2. right (click #sidebar-toggle-files)
-        pg.click("#sidebar-toggle-files")
+        # 2. right (click #workspace-toggle)
+        pg.eval_on_selector("#workspace-toggle", "e => e.click()")
         pg.wait_for_selector("#sidebar.open", timeout=15000)
         pg.wait_for_timeout(300)
         out["measurements"][w_key]["right"] = {
@@ -170,7 +175,7 @@ with sync_playwright() as p:
         }
 
         # 4. both (open right while left is open)
-        pg.eval_on_selector("#sidebar-toggle-files", "e => e.click()")
+        pg.eval_on_selector("#workspace-toggle", "e => e.click()")
         pg.wait_for_selector("#sidebar.open", timeout=15000)
         pg.wait_for_timeout(300)
         out["measurements"][w_key]["both"] = {
