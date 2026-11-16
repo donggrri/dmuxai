@@ -777,6 +777,22 @@ async fn get_workspace_js() -> impl IntoResponse {
     )
 }
 
+async fn get_runs_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::RUNS_JS,
+    )
+}
+
 async fn get_sidebar_resize_js() -> impl IntoResponse {
     (
         [
@@ -2229,6 +2245,7 @@ pub fn build_router_with_directory(
         .route("/assets/agent-prompts.js", get(get_agent_prompts_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
+        .route("/assets/runs.js", get(get_runs_js))
         .route("/assets/sidebar-resize.js", get(get_sidebar_resize_js))
         .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))

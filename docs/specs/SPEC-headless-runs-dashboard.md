@@ -3,7 +3,7 @@
 Status: proposed
 Owner: DmuxAI Team
 Created: 2026-11-15
-Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810, 2815–2816 (PR A); PR B adds FR/TC-2811–2814
+Baseline: main b2e8b6b; existing highest FR-2693; this spec adds FR/TC-2800–2810, 2815–2816 (PR A); PR B adds FR/TC-2811–2814, 2817 (included)
 Related: SPEC-run-journal, SPEC-agent-api, SPEC-web-dashboard, SPEC-graph-view, issues #147, #148, #301
 
 ## 1. Decision summary
@@ -64,8 +64,13 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | FR-2808 | Must | `GET /api/runs/{id}/stream` (SSE), | sends `run` (manifest on change), `progress` (new progress lines) and `state-change` (events whose `run_id` matches), using incremental offsets; sends `end` once the run is terminal and drained. | Unknown id → 404. | TC-2808 |
 | FR-2809 | Must | For every runs endpoint, | only GET is routed; the existing dashboard token check applies; payload strings are masked and never contain the dashboard token. | Missing/wrong token → 401 as other `/api` routes. | TC-2809 |
 | FR-2810 | Should | When a trivial headless run is benchmarked against main, | wall time stays within 10 % (#301 rule); numbers are recorded in the PR; masking skips its regexes for lines with no secret-like literal and headless manifest saves stay atomic without fsync. | — | TC-2810 + PR bench |
+| FR-2811 | Must | When the dashboard loads, | a "Runs" view toggle exists in the top bar; under `serve` (snapshot source `files`) the Runs view opens by default when no center view is saved and the workspace has at least one headless run (`GET /api/runs` non-empty), even if those runs left a transcript or graph; it gives way to the normal view as soon as a TUI-attached snapshot (source other than `files`) arrives, and never re-opens itself after the user picks another view. A workspace without headless runs keeps the normal (chat) default. | — | TC-2811 |
+| FR-2812 | Must | When the Runs view is open, | it lists runs with status badge, origin, runner/model, elapsed time, `stale`/`stalled` badges; it refreshes on SSE `state-change` and at most every 2 s by polling. | Empty list shows a hint on how to start `dmuxai serve` alongside headless runs. | TC-2812 |
+| FR-2813 | Must | When a run is selected, | the detail shows the live stream (`EventSource` on `/api/runs/{id}/stream`), graph nodes with status, the approval banner with a copy button for the hint, and the final exit code / error kind. | Stream errors reconnect with backoff; terminal runs show history without reconnect loops. | TC-2813 |
+| FR-2814 | Must | When run data is rendered, | text is inserted with `textContent` (never `innerHTML` of payload strings); no new JS/CSS dependencies. | — | TC-2814 |
 | FR-2815 | Must | While a headless run is active (#326), | the manifest gets the resolved runner, resolved model and `links.graph_id` as soon as each is known (relaxed save only when a value changes, at most a handful of saves per run), so `GET /api/runs/{id}` shows the graph view and runner/model before the run ends. | — | TC-2815 |
 | FR-2816 | Must | When a headless `run --graph --approve-plan-id <hash>` starts executing the approved plan (#325), | every earlier run manifest in the same repo with status `awaiting_approval` and `end_summary.plan_hash == <hash>` is changed to status `approved` with `end_summary.approved_by_run_id = <new run id>` (bounded scan of the most recent run dirs; only when `--approve-plan-id` is given). `approved` is a terminal status; the runs API no longer returns an approval hint for it. | — | TC-2816 |
+| FR-2817 | Must | When the Runs view shows a run that is active or `approved` (#325, #326), | runner/model and the graph node list update while the run is active (detail refetched when the run's manifest changes, e.g. on the stream `run` event); an `approved` run shows an `approved` status pill and, instead of the approval banner, "Approved — continued in run <id>" where the id selects that run. | — | TC-2817 |
 
 ## 5. Acceptance scenarios and test design
 
@@ -82,8 +87,13 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | TC-2808 | FR-2808 | integration | active run fixture | open SSE, append progress line and event with matching / other run_id, then mark terminal | receives `progress`, matching `state-change` only, `run`, then `end` | `tests/serve_runs_api.rs`: `tc_2808_run_stream_sse` |
 | TC-2809 | FR-2809 | integration | server with token; fixture containing a fake secret | requests without token, POST, with token | 401 without token, 405 on POST, masked payload without token string | `tests/serve_runs_api.rs`: `tc_2809_runs_api_read_only_and_masked` |
 | TC-2810 | FR-2810, FR-2802 | unit | masking inputs with and without secret-like literals; relaxed manifest save | mask and save | secrets still masked, plain progress lines unchanged; relaxed save roundtrips with 0700/0600 | `src/run_journal.rs`: `tc_2810_mask_prefilter_keeps_masking`; bench numbers in the PR description |
+| TC-2811 | FR-2811 | browser | `serve` on fixture workspace with / without headless run manifests | load dashboard | with runs: Runs view visible by default (also with a transcript/graph); without runs: chat stays; a TUI snapshot makes the auto-opened Runs view yield | `tests/web_runs_view.rs`: `tc_2811_runs_view_default_under_serve`, `tc_2811_runs_default_yields_to_conversation`, `tc_2811_runs_default_with_headless_transcript`, `tc_2811_no_runs_keeps_chat_default` |
+| TC-2812 | FR-2812 | browser | runs fixtures incl. stale | load Runs view | rows show status, origin, runner/model, elapsed, stale badge | `tests/web_runs_view.rs`: `tc_2812_runs_list_rows` |
+| TC-2813 | FR-2813 | browser | active run fixture, then progress appended, then awaiting_approval with graph | select run | stream lines appear live; graph nodes; approval banner with hint; final exit shown | `tests/web_runs_view.rs`: `tc_2813_run_detail_live_and_approval` |
+| TC-2814 | FR-2814 | browser | fixture with `<img onerror>` in summary | render | no element injected; text shown literally | `tests/web_runs_view.rs`: `tc_2814_run_text_is_not_html` |
 | TC-2815 | FR-2815 | integration | fake graph/agent run whose step blocks until the test reads the manifest | read manifest while the run is active | status `active`, `resolved_runner` and `links.graph_id` already set | `tests/headless_runs_journal.rs`: `tc_2815_active_manifest_has_graph_and_runner` |
 | TC-2816 | FR-2816 | integration | an `awaiting_approval` manifest with `plan_hash` H (and one with another hash) | headless run with `--approve-plan-id H` | the H manifest becomes `approved` with `approved_by_run_id` = new run id; the other stays `awaiting_approval`; API detail of the approved one has no approval hint | `tests/headless_runs_journal.rs`: `tc_2816_approval_supersedes_awaiting_run`; `tests/run_journal_store.rs`: `tc_2816_store_supersede_awaiting_bounded_scan`; `tests/serve_runs_api.rs`: `tc_2816_approved_run_has_no_hint` |
+| TC-2817 | FR-2817 | browser | active run fixture without graph, then manifest gains `graph_id` + runner/model; an `approved` fixture with `approved_by_run_id` | watch detail; select approved run, click the link | graph nodes and runner/model appear without reselecting; approved pill, no approval banner, link selects the continuing run | `tests/web_runs_view.rs`: `tc_2817_live_graph_and_approved_link` |
 
 ## 6. Data, integration, and safety contracts
 
@@ -104,6 +114,7 @@ Lifecycle: `active` (before dispatch) → `completed` (exit 0) | `failed` (exit 
 | 3 | Runs API | `src/web/runs_api.rs`, `src/web/server.rs`, `tests/serve_runs_api.rs` | FR-2806–FR-2809 | TC-2806–TC-2809 |
 | 4 | Active manifest metadata sink (graph id, runner, model) | `src/app.rs`, `src/cli.rs`, `tests/headless_runs_journal.rs` | FR-2815 | TC-2815 |
 | 5 | Approval supersede of stale awaiting runs | `src/run_journal.rs`, `src/cli.rs`, `src/web/runs_api.rs`, tests | FR-2816 | TC-2816 |
+| 6 | Runs view (PR B) | `src/web/assets/runs.js`, `index.html`, `app.css`, `src/web/assets.rs`, `tests/web_runs_view.rs` | FR-2811–FR-2814 | TC-2811–TC-2814 |
 
 ## 8. Review and test exit criteria
 

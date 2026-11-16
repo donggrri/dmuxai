@@ -1757,8 +1757,16 @@ function onGraphKeydown(e) {
 // ---------------------------------------------------------------------------
 
 var CENTER_VIEW_KEY = 'dmuxai.centerView';
-var CENTER_VIEWS = { diff: { panel: 'docs', toggle: 'diff-toggle' }, graph: { panel: 'graph', toggle: 'graph-toggle' } };
+var CENTER_VIEWS = {
+  diff: { panel: 'docs', toggle: 'diff-toggle' },
+  graph: { panel: 'graph', toggle: 'graph-toggle' },
+  runs: { panel: 'runs', toggle: 'runs-toggle' }
+};
 var centerView = null;
+var serveRunsDefaultDone = false;
+var serveRunsDefaultPending = false;
+var serveRunsDefaultAborted = false;
+var runsAutoOpened = false;
 var centerViewReturnFocus = null;
 // Approval keys (graph id + plan rev) that already auto-opened the Graph view,
 // so closing it while the plan waits does not re-open it on every snapshot.
@@ -1795,6 +1803,7 @@ function setCenterView(next, opts) {
     }
   });
   document.body.classList.toggle('center-view-open', !!next);
+  document.dispatchEvent(new CustomEvent('dmuxai:center-view', { detail: { view: next } }));
   if (opts.persist !== false) { writeCenterView(next); }
   if (next === 'diff') {
     // The Diff view is the change list; show it expanded.
@@ -1818,10 +1827,27 @@ function setCenterView(next, opts) {
 
 // docs.js opens the Diff view from chat document cards and closes it for
 // "Show in chat".
-window.dmuxaiSetCenterView = function (name) { setCenterView(name || null); };
+window.dmuxaiSetCenterView = function (name) {
+  runsAutoOpened = false;
+  setCenterView(name || null);
+};
 
 function toggleCenterView(name) {
+  runsAutoOpened = false;
   setCenterView(centerView === name ? null : name);
+}
+
+function runsWouldObstructConversation(snap) {
+  if (!snap) { return false; }
+  return String(snap.source || '') !== 'files';
+}
+
+function maybeYieldRunsToConversation(snap) {
+  if (!runsAutoOpened || centerView !== 'runs') { return; }
+  if (runsWouldObstructConversation(snap)) {
+    setCenterView(null, { persist: false, focus: false });
+    runsAutoOpened = false;
+  }
 }
 
 function syncChatTab() {
@@ -1835,6 +1861,7 @@ function syncChatTab() {
 
 function showChat(opts) {
   opts = opts || {};
+  runsAutoOpened = false;
   if (window.dmuxaiCloseMemory) { window.dmuxaiCloseMemory(); }
   if (window.dmuxaiCloseSkills) { window.dmuxaiCloseSkills(); }
   setCenterView(null, { focus: false });
@@ -1892,7 +1919,7 @@ function syncCenterViewsWithSnapshot(snap) {
     var key = String(graph.id || '') + ':' + String(graph.approval.rev);
     if (!approvalAutoOpened[key]) {
       approvalAutoOpened[key] = true;
-      if (centerView !== 'graph') { setCenterView('graph', { focus: false }); }
+      if (centerView !== 'graph') { setCenterView('graph', { focus: false, persist: false }); }
     }
   }
 }
@@ -1986,7 +2013,10 @@ function bindCenterViews() {
   if (chatToggle) { chatToggle.addEventListener('click', function () { showChat(); }); }
   var closes = document.querySelectorAll('.center-view-close');
   for (var i = 0; i < closes.length; i++) {
-    closes[i].addEventListener('click', function () { setCenterView(null); });
+    closes[i].addEventListener('click', function () {
+      runsAutoOpened = false;
+      setCenterView(null);
+    });
   }
   // Capture phase: runs before the inner layers' own Esc handlers, so it
   // sees their state before they close.
@@ -2001,8 +2031,12 @@ function bindCenterViews() {
     var t = e.target;
     if (t && t.classList && t.classList.contains('graph-approval-feedback')) { return; }
     if (t && t.closest && t.closest('.sidebar, .sessions-sidebar, .workspace-dialog-backdrop')) { return; }
+    runsAutoOpened = false;
     setCenterView(null);
   }, true);
+  document.addEventListener('dmuxai:snapshot', function (e) {
+    if (e && e.detail) { maybeYieldRunsToConversation(e.detail); }
+  });
   document.addEventListener('dmuxai:memory-popover', syncChatTab);
   document.addEventListener('dmuxai:skills-popover', syncChatTab);
   setCenterView(readCenterView(), { persist: false, focus: false });
@@ -4274,13 +4308,48 @@ function onSnapshotEvent(e) {
   applySnapshot(snap);
 }
 
+function maybeAbortServeRunsDefault(snap) {
+  if (serveRunsDefaultPending && runsWouldObstructConversation(snap)) {
+    serveRunsDefaultAborted = true;
+  }
+}
+
+function tryServeRunsDefault(snap) {
+  if (serveRunsDefaultDone) { return; }
+  if (String(snap.source || '') !== 'files' || readCenterView() || centerView) {
+    serveRunsDefaultDone = true;
+    return;
+  }
+  serveRunsDefaultDone = true;
+  serveRunsDefaultPending = true;
+  serveRunsDefaultAborted = false;
+  var fetchList = window.dmuxaiFetchRunsList;
+  if (typeof fetchList !== 'function') {
+    serveRunsDefaultPending = false;
+    return;
+  }
+  fetchList().then(function (runs) {
+    serveRunsDefaultPending = false;
+    if (serveRunsDefaultAborted || centerView || readCenterView()) { return; }
+    if (runs && runs.length > 0) {
+      setCenterView('runs', { persist: false, focus: false });
+      runsAutoOpened = true;
+    }
+  }).catch(function () {
+    serveRunsDefaultPending = false;
+  });
+}
+
 function applySnapshot(snap) {
   snap.receivedAt = Date.now();
   snapshot = snap;
   lastRendered = Date.now();
+  maybeAbortServeRunsDefault(snap);
   applySnapshotUi(snap);
   render(lastRendered);
   syncCenterViewsWithSnapshot(snap);
+  tryServeRunsDefault(snap);
+  maybeYieldRunsToConversation(snap);
   applyPendingRunFocus(snap);
   renderTodos(snap);
   if (isSomethingRunning(snap)) {
@@ -4325,6 +4394,9 @@ function startSse() {
   }
 
   sse.addEventListener('snapshot', onSnapshotEvent);
+  sse.addEventListener('state-change', function () {
+    document.dispatchEvent(new CustomEvent('dmuxai:state-change'));
+  });
   sse.addEventListener('error', function() {
     sseFailures += 1;
     if (sse && sse.readyState === EventSource.CLOSED) {
@@ -4428,6 +4500,9 @@ window.addEventListener('pagehide', function() {
   stopSse();
   stopPolling();
   stopTickTimer();
+  if (typeof window.dmuxaiRunsOnViewClose === 'function') {
+    window.dmuxaiRunsOnViewClose();
+  }
 });
 
 function init() {
