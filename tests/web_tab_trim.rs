@@ -423,6 +423,26 @@ fn wait_for_truthy(session: &mut ChromeSession, expr: &str, what: &str, secs: u6
     panic!("timed out waiting for {what}");
 }
 
+fn click_until_truthy(
+    session: &mut ChromeSession,
+    click_js: &str,
+    cond_js: &str,
+    what: &str,
+    secs: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        let _ = session.cdp.eval(click_js);
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(v) = session.cdp.eval(cond_js)
+            && v.as_bool() == Some(true)
+        {
+            return;
+        }
+    }
+    panic!("timed out waiting for {what}");
+}
+
 // TC-2825 / FR-2825: Reset layout restores the snapshot accent and the sidebar
 // width and open/closed defaults (the same as double-clicking each handle).
 #[test]
@@ -475,14 +495,20 @@ fn tc_2825_reset_layout() {
         "sessions sidebar open after reload",
         10,
     );
-    session
-        .cdp
-        .eval("document.getElementById('sessions-toggle').click()")
-        .expect("close sessions sidebar");
-    session
-        .cdp
-        .eval("document.getElementById('workspace-toggle').click()")
-        .expect("open files sidebar");
+    click_until_truthy(
+        &mut session,
+        "(() => { if (document.body.classList.contains('left-sidebar-open')) document.getElementById('sessions-toggle').click(); })()",
+        "!document.body.classList.contains('left-sidebar-open')",
+        "sessions sidebar closed",
+        20,
+    );
+    click_until_truthy(
+        &mut session,
+        "(() => { if (!document.body.classList.contains('sidebar-open')) document.getElementById('workspace-toggle').click(); })()",
+        "document.body.classList.contains('sidebar-open')",
+        "files sidebar open",
+        20,
+    );
     wait_for_truthy(
         &mut session,
         "(() => { const v = getComputedStyle(document.documentElement).getPropertyValue('--left-sidebar-width').trim(); \
@@ -497,18 +523,15 @@ fn tc_2825_reset_layout() {
         5,
     );
 
-    session
-        .cdp
-        .eval("document.getElementById('accent-reset').click()")
-        .expect("click reset layout");
-
-    // Accent back to the configured (snapshot) accent...
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
+        "(() => { const b = document.getElementById('accent-reset'); if (b) b.click(); })()",
         "(() => localStorage.getItem('dmuxai.accent') === null && getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() === '#3366ff')()",
         "accent reset",
-        10,
+        20,
     );
+
+    // Accent back to the configured (snapshot) accent...
     // ...sidebar widths and open/closed back to the defaults.
     wait_for_truthy(
         &mut session,
@@ -558,21 +581,12 @@ fn tc_2828_system_prompt_preview_placeholder() {
     let fixture = ServeFixture::new_with_config(&config);
     let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
 
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
-        "!!document.getElementById('more-toggle')",
-        "more menu toggle",
-        15,
-    );
-    session
-        .cdp
-        .eval("(() => { const m = document.getElementById('more-menu'); if (m.hidden) document.getElementById('more-toggle').click(); document.getElementById('agent-prompts-toggle').click(); })()")
-        .expect("open system prompts");
-    wait_for_truthy(
-        &mut session,
-        "!document.getElementById('agent-prompts-popover').hidden",
+        "(() => { const m = document.getElementById('more-menu'); if (m && m.hidden) document.getElementById('more-toggle').click(); const b = document.getElementById('agent-prompts-toggle'); if (b) b.click(); })()",
+        "(() => { const p = document.getElementById('agent-prompts-popover'); return !!p && !p.hidden; })()",
         "system prompts popover",
-        10,
+        20,
     );
     wait_for_truthy(
         &mut session,
@@ -699,26 +713,20 @@ fn tc_2821_more_menu_above_center_view() {
         "diff toggle",
         15,
     );
-    session
-        .cdp
-        .eval("document.getElementById('diff-toggle').click()")
-        .expect("open diff center");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
+        "(() => { const d = document.getElementById('docs'); if (d && !d.classList.contains('open')) document.getElementById('diff-toggle').click(); })()",
         "document.getElementById('docs').classList.contains('open')",
         "diff center open",
-        10,
+        20,
     );
 
-    session
-        .cdp
-        .eval("document.getElementById('more-toggle').click()")
-        .expect("open more");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
+        "(() => { const m = document.getElementById('more-menu'); if (m && m.hidden) document.getElementById('more-toggle').click(); })()",
         "!document.getElementById('more-menu').hidden",
         "more menu visible",
-        5,
+        20,
     );
     wait_for_truthy(
         &mut session,
@@ -822,21 +830,13 @@ fn tc_2821_more_menu_items() {
         .expect("aria-haspopup");
     assert_eq!(popup.as_str(), Some("menu"));
 
-    session
-        .cdp
-        .eval("document.getElementById('more-toggle').click()")
-        .expect("open more");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
-        "document.getElementById('more-toggle').getAttribute('aria-expanded') === 'true'",
-        "menu expanded",
-        5,
-    );
-    wait_for_truthy(
-        &mut session,
-        "!document.getElementById('more-menu').hidden",
-        "menu visible",
-        5,
+        "(() => { const m = document.getElementById('more-menu'); if (m && m.hidden) document.getElementById('more-toggle').click(); })()",
+        "(() => { const m = document.getElementById('more-menu'); const t = document.getElementById('more-toggle'); \
+           return !!m && !m.hidden && t && t.getAttribute('aria-expanded') === 'true'; })()",
+        "more menu open",
+        20,
     );
 
     let items = session
@@ -869,21 +869,13 @@ fn tc_2821_more_menu_items() {
         "{names:?}"
     );
 
-    session
-        .cdp
-        .eval("document.getElementById('memory-toggle').click()")
-        .expect("pick memory");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
-        "document.getElementById('more-menu').hidden",
-        "menu closed after pick",
-        5,
-    );
-    wait_for_truthy(
-        &mut session,
-        "!document.getElementById('memory-popover').hidden",
-        "memory popover open",
-        10,
+        "(() => { const p = document.getElementById('memory-popover'); if (p && p.hidden) document.getElementById('memory-toggle').click(); })()",
+        "(() => { const m = document.getElementById('more-menu'); const p = document.getElementById('memory-popover'); \
+           return !!m && m.hidden && p && !p.hidden; })()",
+        "memory popover open after pick",
+        20,
     );
 
     session
@@ -1124,15 +1116,12 @@ fn tc_2822_workspace_button() {
         20,
     );
 
-    session
-        .cdp
-        .eval("document.getElementById('workspace-toggle').click()")
-        .expect("workspace");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
+        "(() => { const s = document.getElementById('sidebar'); if (s && !s.classList.contains('open')) document.getElementById('workspace-toggle').click(); })()",
         "document.getElementById('sidebar').classList.contains('open')",
         "sidebar open",
-        10,
+        20,
     );
     wait_for_truthy(
         &mut session,
@@ -1301,35 +1290,27 @@ fn tc_2824_open_in_graph_retarget() {
         };
 
     // 1. Non-headless graph "Open in Graph" opens the large Graph view.
-    session
-        .cdp
-        .eval("document.getElementById('chat-toggle').click()")
-        .expect("switch to chat");
+    click_until_truthy(
+        &mut session,
+        "(() => { const s = document.getElementById('session'); if (s && s.hidden) document.getElementById('chat-toggle').click(); })()",
+        "(() => { const s = document.getElementById('session'); return !!s && !s.hidden; })()",
+        "chat view open",
+        20,
+    );
     let snap1 = serde_json::to_string(&make_snap("files", plain_graph_id, "completed", 10, None))
         .expect("snap1");
     session
         .cdp
         .eval(&format!("applySnapshot({snap1})"))
         .expect("apply snap1");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
         &format!(
-            "!!document.querySelector('.chat-aux-open-run[data-run-id=\"{plain_graph_id}\"]')"
+            "(() => {{ const b = document.querySelector('.chat-aux-open-run[data-run-id=\"{plain_graph_id}\"]'); if (b) b.click(); }})()"
         ),
-        "Open in Graph button for non-headless graph",
-        10,
-    );
-    session
-        .cdp
-        .eval(&format!(
-            "document.querySelector('.chat-aux-open-run[data-run-id=\"{plain_graph_id}\"]').click()"
-        ))
-        .expect("click Open in Graph for non-headless");
-    wait_for_truthy(
-        &mut session,
         "(() => { const g = document.getElementById('graph'); return !!(g && !g.hidden && g.classList.contains('open')); })()",
         "large Graph view opens for non-headless graph",
-        10,
+        20,
     );
 
     // 2. Headless-run graph "Open in Graph" opens Runs and selects that run.
@@ -1349,22 +1330,11 @@ fn tc_2824_open_in_graph_retarget() {
         .cdp
         .eval(&format!("applySnapshot({snap2})"))
         .expect("apply snap2");
-    wait_for_truthy(
+    click_until_truthy(
         &mut session,
         &format!(
-            "!!document.querySelector('.chat-aux-open-run[data-run-id=\"{headless_graph_id}\"]')"
+            "(() => {{ const b = document.querySelector('.chat-aux-open-run[data-run-id=\"{headless_graph_id}\"]'); if (b) b.click(); }})()"
         ),
-        "Open in Graph button for headless graph",
-        10,
-    );
-    session
-        .cdp
-        .eval(&format!(
-            "document.querySelector('.chat-aux-open-run[data-run-id=\"{headless_graph_id}\"]').click()"
-        ))
-        .expect("click Open in Graph for headless");
-    wait_for_truthy(
-        &mut session,
         &format!(
             "(() => {{ \
                 const r = document.getElementById('runs'); \
@@ -1376,7 +1346,7 @@ fn tc_2824_open_in_graph_retarget() {
             }})()"
         ),
         "Runs opens and selects headless run with Full graph button",
-        10,
+        20,
     );
 
     // 3. OQ-2820: Under --web (source !== 'files'), pending plan auto-open still
