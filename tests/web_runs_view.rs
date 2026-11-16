@@ -1259,3 +1259,94 @@ fn tc_2817_live_graph_and_approved_link() {
     }
     assert!(linked, "continuation link selects run {short}");
 }
+
+// TC-2826 / FR-2826: the Runs button indicator shows the active-run count
+// (accessible label) and is hidden when no runs are active. The Runs view is
+// closed here, so the count refreshes from the reuse of GET /api/runs at most
+// every 5 s.
+#[test]
+#[ignore]
+fn tc_2826_runs_indicator() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2826_runs_indicator: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    fs::create_dir_all(&runs).expect("runs root");
+    let run_id = "2222222222222222";
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_chat_default(&mut session);
+
+    // No runs: indicator hidden with the plain accessible label.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(hidden) = session
+            .cdp
+            .eval("document.getElementById('runs-indicator')?.hidden")
+            && hidden.as_bool() == Some(true)
+            && let Ok(label) = session
+                .cdp
+                .eval("document.getElementById('runs-toggle').getAttribute('aria-label')")
+        {
+            assert_eq!(label.as_str(), Some("Runs"));
+            break;
+        }
+    }
+
+    // An active run appears: indicator becomes visible with the count within
+    // the 5 s closed-view refresh window.
+    let mut manifest = base_manifest(run_id, 1_000, "active");
+    manifest["pid"] = json!(std::process::id());
+    write_manifest(&runs.join(run_id), &manifest);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_active = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(expr_val) = session.cdp.eval(
+            "(() => { const ind = document.getElementById('runs-indicator'); const t = document.getElementById('runs-toggle'); \
+               return ind && t ? {hidden: ind.hidden, text: ind.textContent, label: t.getAttribute('aria-label')} : null; })()",
+        ) {
+            let hidden = expr_val.get("hidden").and_then(|v| v.as_bool());
+            let text = expr_val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let label = expr_val.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            if hidden == Some(false) && text == "1" && label == "Runs, 1 active" {
+                saw_active = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_active,
+        "indicator must show the active count while the Runs view is closed"
+    );
+
+    // The run completes: the indicator hides again.
+    let mut manifest = base_manifest(run_id, 1_000, "completed");
+    manifest["completed_at_ms"] = json!(1_100);
+    manifest["duration_ms"] = json!(100);
+    write_manifest(&runs.join(run_id), &manifest);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut saw_hidden = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(expr_val) = session.cdp.eval(
+            "(() => { const ind = document.getElementById('runs-indicator'); const t = document.getElementById('runs-toggle'); \
+               return ind && t ? {hidden: ind.hidden, label: t.getAttribute('aria-label')} : null; })()",
+        ) {
+            let hidden = expr_val.get("hidden").and_then(|v| v.as_bool());
+            let label = expr_val.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            if hidden == Some(true) && label == "Runs" {
+                saw_hidden = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_hidden, "indicator must hide when no runs are active");
+}

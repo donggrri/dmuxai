@@ -209,13 +209,17 @@ function setAccentChoice(value) {
   syncAccentPicker();
 }
 
-// Reset: drop the stored accent once and fall back to the configured (snapshot)
-// accent immediately, so the palette default is never painted in between.
+// FR-2825: Reset layout drops the stored accent once, falls back to the
+// configured (snapshot) accent immediately, and restores the sidebar widths and
+// open/closed defaults through the resize module.
 function resetAccent() {
   userAccentChosen = true;
   try { window.localStorage.removeItem(ACCENT_KEY); } catch (err) { /* ignore */ }
   applyAccentOverride(snapshotAccent);
   syncAccentPicker();
+  if (typeof window.dmuxaiResetSidebarLayout === 'function') {
+    window.dmuxaiResetSidebarLayout();
+  }
 }
 
 function storedTheme() {

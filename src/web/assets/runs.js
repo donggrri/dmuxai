@@ -3,6 +3,7 @@
 /* FR-2811..FR-2814: headless runs dashboard view (read-only). */
 
 var RUNS_POLL_MS = 2000;
+var RUNS_INDICATOR_POLL_MS = 5000;
 var RUNS_TICK_MS = 1000;
 var RUNS_DETAIL_REFETCH_MS = 3000;
 var RUNS_STREAM_MAX_LINES = 2000;
@@ -177,6 +178,9 @@ var runsStreamBackoffIx = 0;
 var runsStreamReconnectTimer = null;
 var runsDetailRefetchTimer = null;
 var runsDetailLastRefetchAt = 0;
+var runsIndicatorTimer = null;
+var runsIndicatorLastFetchAt = 0;
+var runsIndicatorInFlight = false;
 
 function runsPanelOpen() {
   var panel = document.getElementById('runs');
@@ -256,11 +260,54 @@ window.dmuxaiRunsOnViewClose = runsOnViewClose;
 function runsRefreshList() {
   runsFetchJson('/api/runs').then(function (data) {
     runsListData = data && data.runs ? data.runs : [];
+    runsIndicatorLastFetchAt = Date.now();
     runsRenderList();
   }).catch(function () { /* keep last list */ });
 }
 
+// FR-2826: the Runs button shows how many headless runs are active.
+function runsActiveCount() {
+  var count = 0;
+  for (var i = 0; i < runsListData.length; i++) {
+    if (runsIsActive(runsListData[i].status)) { count += 1; }
+  }
+  return count;
+}
+
+function runsUpdateIndicator() {
+  var ind = document.getElementById('runs-indicator');
+  var toggle = document.getElementById('runs-toggle');
+  if (!ind || !toggle) { return; }
+  var count = runsActiveCount();
+  if (count > 0) {
+    ind.hidden = false;
+    ind.textContent = String(count);
+    toggle.setAttribute('aria-label', 'Runs, ' + count + ' active');
+  } else {
+    ind.hidden = true;
+    ind.textContent = '';
+    toggle.setAttribute('aria-label', 'Runs');
+  }
+}
+
+// While Runs is closed, reuse GET /api/runs at most once every 5 s so the
+// indicator still reflects active runs without a new endpoint.
+function runsRefreshIndicator() {
+  if (runsUiOpen || runsIndicatorInFlight) { return; }
+  var now = Date.now();
+  if (now - runsIndicatorLastFetchAt < RUNS_INDICATOR_POLL_MS) { return; }
+  runsIndicatorLastFetchAt = now;
+  runsIndicatorInFlight = true;
+  runsFetchJson('/api/runs').then(function (data) {
+    runsListData = data && data.runs ? data.runs : [];
+    runsUpdateIndicator();
+  }).catch(function () { /* keep last count */ }).then(function () {
+    runsIndicatorInFlight = false;
+  });
+}
+
 function runsRenderList() {
+  runsUpdateIndicator();
   var table = document.getElementById('runs-table');
   var tbody = document.getElementById('runs-table-body');
   var empty = document.getElementById('runs-empty');
@@ -678,8 +725,11 @@ function runsInit() {
   });
   document.addEventListener('dmuxai:state-change', function () {
     if (runsUiOpen) { runsOnDashboardStateChange(); }
+    else { runsRefreshIndicator(); }
   });
   window.setTimeout(runsSyncViewState, 0);
+  runsRefreshIndicator();
+  runsIndicatorTimer = window.setInterval(runsRefreshIndicator, RUNS_INDICATOR_POLL_MS);
 }
 
 if (document.readyState === 'loading') {
