@@ -1103,6 +1103,8 @@ pub struct HeadlessOutcome {
     pub plan_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<HeadlessSystemPrompt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<dmuxai::runner_fallback::FallbackRecord>,
 }
@@ -1129,6 +1131,7 @@ impl HeadlessOutcome {
             plan: None,
             plan_hash: None,
             system_prompt: None,
+            run_id: None,
             fallbacks: Vec::new(),
         }
     }
@@ -1555,6 +1558,8 @@ pub struct App {
     headless_plan_only_approval: bool,
     /// FR-2121: a plan-only agent reply was seen during this headless run.
     headless_plan_only_reply: bool,
+    /// Graph ID of the last graph session started or finished during a headless run.
+    headless_last_graph_id: Option<String>,
     /// Test-only escape hatch: legacy app tests assume a direct send, so they
     /// skip the judge and start a quiet 1-node run with override kind `agent`.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1658,11 +1663,22 @@ pub struct App {
     agent_availability: HashMap<Agent, Option<String>>,
     pub(crate) progress_tracker: crate::progress::ProgressTracker,
     pub(crate) progress_sink: Option<ProgressSink>,
+    headless_meta_sink: Option<HeadlessMetaSink>,
+    headless_last_meta: HeadlessRunMeta,
     last_tool_progress_state: HashMap<(Agent, String), String>,
     last_output_heartbeat_at: HashMap<Agent, Instant>,
 }
 
 pub type ProgressSink = Box<dyn FnMut(&str) + Send>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeadlessRunMeta {
+    pub graph_id: Option<String>,
+    pub runner: Option<String>,
+    pub model: Option<String>,
+}
+
+pub type HeadlessMetaSink = Box<dyn Fn(HeadlessRunMeta) + Send + Sync>;
 
 /// `Some` when `DMUXAI_*_BIN` names a missing file, or the default binary is not on `PATH`.
 fn runner_binary_unavailable(
@@ -1753,6 +1769,53 @@ fn program_is_executable_os(
 impl App {
     pub fn set_progress_sink(&mut self, sink: ProgressSink) {
         self.progress_sink = Some(sink);
+    }
+
+    pub fn set_headless_meta_sink(&mut self, sink: HeadlessMetaSink) {
+        self.headless_meta_sink = Some(sink);
+    }
+
+    fn emit_headless_meta(
+        &mut self,
+        graph_id: Option<String>,
+        runner: Option<String>,
+        model: Option<String>,
+    ) {
+        let mut changed = false;
+        if let Some(gid) = graph_id
+            && self.headless_last_meta.graph_id.as_deref() != Some(gid.as_str())
+        {
+            self.headless_last_meta.graph_id = Some(gid);
+            changed = true;
+        }
+        if let Some(r) = runner
+            && self.headless_last_meta.runner.as_deref() != Some(r.as_str())
+        {
+            self.headless_last_meta.runner = Some(r);
+            changed = true;
+        }
+        if let Some(m) = model
+            && self.headless_last_meta.model.as_deref() != Some(m.as_str())
+        {
+            self.headless_last_meta.model = Some(m);
+            changed = true;
+        }
+        if changed && let Some(sink) = &self.headless_meta_sink {
+            sink(self.headless_last_meta.clone());
+        }
+    }
+
+    fn set_headless_last_graph_id(&mut self, graph_id: String) {
+        self.headless_last_graph_id = Some(graph_id.clone());
+        self.emit_headless_meta(Some(graph_id), None, None);
+    }
+
+    fn emit_headless_meta_from_triage(&mut self, triage: &Triage) {
+        self.emit_headless_meta(
+            None,
+            Some(triage.runner.clone()),
+            Some(triage.model.clone()),
+        );
     }
     pub fn new(
         engine: ConversationEngine,
@@ -1953,6 +2016,7 @@ impl App {
             headless_require_edits: false,
             headless_plan_only_approval: false,
             headless_plan_only_reply: false,
+            headless_last_graph_id: None,
             skip_judge_for_tests: false,
             last_group_expanded: false,
             all_details_expanded: false,
@@ -1996,6 +2060,8 @@ impl App {
             agent_availability: HashMap::new(),
             progress_tracker: crate::progress::ProgressTracker::new(),
             progress_sink: None,
+            headless_meta_sink: None,
+            headless_last_meta: HeadlessRunMeta::default(),
             last_tool_progress_state: HashMap::new(),
             last_output_heartbeat_at: HashMap::new(),
         };
@@ -8999,6 +9065,13 @@ impl App {
             }
             self.remember_judge_reason_triage(planning_run.triage.as_ref());
             let plan_id = planning_run.plan.id.clone();
+            if let Some(triage) = planning_run.triage.as_ref() {
+                self.emit_headless_meta(
+                    Some(plan_id.clone()),
+                    Some(triage.runner.clone()),
+                    Some(triage.model.clone()),
+                );
+            }
             self.todos.commit_pending_graph(&plan_id, &mut planning_run);
             self.last_graph_run = Some(planning_run);
         }
@@ -9244,6 +9317,14 @@ impl App {
             self.push_system(format!("Could not save the plan: {error}"));
         }
         self.remember_judge_reason_triage(run.triage.as_ref());
+        let plan_id = run.plan.id.clone();
+        if let Some(triage) = run.triage.as_ref() {
+            self.emit_headless_meta(
+                Some(plan_id),
+                Some(triage.runner.clone()),
+                Some(triage.model.clone()),
+            );
+        }
         self.last_graph_run = Some(run);
         self.push_plan_waiting_approval_transcript_line();
     }
@@ -11010,6 +11091,7 @@ impl App {
             self.clear_graph_defer_state();
         }
         if self.conversation_id.as_str() == conversation_id {
+            self.set_headless_last_graph_id(run.plan.id.clone());
             self.last_graph_run = Some(run.clone());
         }
         let success = run.phase == GraphRunPhase::Completed;
@@ -12287,8 +12369,17 @@ impl App {
         }
         let actions = session.schedule();
         let _ = save_run(&self.workspace_root, session.run());
+        let graph_id = session.run().plan.id.clone();
+        let (runner, model) = session
+            .run()
+            .triage
+            .as_ref()
+            .map(|t| (Some(t.runner.clone()), Some(t.model.clone())))
+            .unwrap_or((None, None));
         self.last_graph_run = Some(session.run().clone());
+        self.headless_last_graph_id = Some(graph_id.clone());
         self.graph_session = Some(session);
+        self.emit_headless_meta(Some(graph_id), runner, model);
         self.dispatch_graph_actions(actions);
     }
 
@@ -12316,12 +12407,14 @@ impl App {
                     if let Some(session) = self.graph_session.as_mut() {
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
+                        let graph_id = run.plan.id.clone();
                         self.last_graph_run = Some(run);
                         self.graph_assignment_line = resolved_assignment_line(
                             &self.model_catalogs,
                             Some(&self.settings),
                             session,
                         );
+                        self.set_headless_last_graph_id(graph_id);
                     }
                     let agents: Vec<Agent> = self
                         .graph_agent_nodes
@@ -12364,12 +12457,14 @@ impl App {
                         session.run_mut().phase = GraphRunPhase::Cancelled;
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
+                        let graph_id = run.plan.id.clone();
                         self.last_graph_run = Some(run);
                         self.graph_assignment_line = resolved_assignment_line(
                             &self.model_catalogs,
                             Some(&self.settings),
                             session,
                         );
+                        self.set_headless_last_graph_id(graph_id);
                     }
                     self.clear_graph_defer_state();
                     for (agent, _node_id) in self.graph_agent_nodes.drain() {
@@ -12410,12 +12505,14 @@ impl App {
                         session.finalize_failure();
                         let run = session.run().clone();
                         let _ = save_run(&self.workspace_root, &run);
+                        let graph_id = run.plan.id.clone();
                         self.last_graph_run = Some(run);
                         self.graph_assignment_line = resolved_assignment_line(
                             &self.model_catalogs,
                             Some(&self.settings),
                             session,
                         );
+                        self.set_headless_last_graph_id(graph_id);
                     }
                     self.clear_graph_defer_state();
                     for (agent, _node_id) in self.graph_agent_nodes.drain() {
@@ -12684,7 +12781,9 @@ impl App {
                     session.run_mut().phase = GraphRunPhase::Failed;
                     let run = session.run().clone();
                     let _ = save_run(&self.workspace_root, &run);
+                    let graph_id = run.plan.id.clone();
                     self.last_graph_run = Some(run);
+                    self.set_headless_last_graph_id(graph_id);
                 }
                 self.graph_agent_nodes.remove(&agent);
                 self.graph_session = None;
@@ -14636,6 +14735,8 @@ impl App {
         };
         let headless_conversation_id = self.conversation_id.as_str().to_owned();
         self.last_graph_run = None;
+        self.headless_last_graph_id = None;
+        self.headless_last_meta = HeadlessRunMeta::default();
         self.graph_session = None;
         self.headless_triage = None;
 
@@ -14648,6 +14749,7 @@ impl App {
             let target_agent = self.adapters[self.selected].agent();
             match self.build_direct_triage(target_agent, &req.prompt) {
                 Ok(triage) => {
+                    self.emit_headless_meta_from_triage(&triage);
                     self.headless_triage = Some(triage);
                 }
                 Err(error) => {
@@ -14880,6 +14982,8 @@ impl App {
 
                 if let Some(session) = &self.graph_session {
                     last_graph_id = Some(session.run().plan.id.clone());
+                } else if last_graph_id.is_none() {
+                    last_graph_id = self.headless_last_graph_id.clone();
                 }
 
                 if !self.busy_agents.is_empty()
@@ -14959,6 +15063,10 @@ impl App {
         } else {
             None
         };
+
+        if last_graph_id.is_none() {
+            last_graph_id = self.headless_last_graph_id.clone();
+        }
 
         let graph_failed = last_graph_id.as_ref().is_some_and(|graph_id| {
             self.last_graph_run
@@ -15053,6 +15161,7 @@ impl App {
             plan,
             plan_hash: None,
             system_prompt: self.system_prompt_applied.clone(),
+            run_id: None,
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
         }
     }
@@ -26987,6 +27096,60 @@ out3
     // TC-1774 / FR-1774: with a progress sink installed, a headless run that streams
     // text then completes produces started, text, completed lines in order;
     // without a sink nothing is produced.
+    // TC-2815 / FR-2815: headless meta sink emits only when values change
+    #[test]
+    fn tc_2815_headless_meta_sink_emits_on_change_only() {
+        let (mut app, _sent) = test_app();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<HeadlessRunMeta>::new()));
+        let seen_clone = Arc::clone(&seen);
+        app.set_headless_meta_sink(Box::new(move |meta| {
+            seen_clone.lock().unwrap().push(meta);
+        }));
+
+        app.set_headless_last_graph_id("graph-1".to_owned());
+        app.set_headless_last_graph_id("graph-1".to_owned());
+        let triage = Triage {
+            route: Route::Simple,
+            reason: "test".to_owned(),
+            source: TriageSource::Override,
+            cause: None,
+            override_kind: Some(OverrideKind::Agent),
+            runner: "codex".to_owned(),
+            model: "gpt-5.4".to_owned(),
+            elapsed_ms: 0,
+        };
+        app.emit_headless_meta_from_triage(&triage);
+        app.emit_headless_meta_from_triage(&triage);
+        app.set_headless_last_graph_id("graph-2".to_owned());
+
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0],
+            HeadlessRunMeta {
+                graph_id: Some("graph-1".to_owned()),
+                runner: None,
+                model: None,
+            }
+        );
+        assert_eq!(
+            events[1],
+            HeadlessRunMeta {
+                graph_id: Some("graph-1".to_owned()),
+                runner: Some("codex".to_owned()),
+                model: Some("gpt-5.4".to_owned()),
+            }
+        );
+        assert_eq!(
+            events[2],
+            HeadlessRunMeta {
+                graph_id: Some("graph-2".to_owned()),
+                runner: Some("codex".to_owned()),
+                model: Some("gpt-5.4".to_owned()),
+            }
+        );
+    }
+
     #[tokio::test]
     async fn tc_1774_headless_progress_sink_receives_lines() {
         let (mut app, sent, event_tx) = test_app_with_event_sender();

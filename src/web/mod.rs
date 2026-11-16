@@ -15,6 +15,7 @@ mod file_source;
 mod hub;
 pub mod layout;
 pub mod parity;
+pub mod runs_api;
 mod server;
 mod snapshot;
 

@@ -4,6 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -33,6 +34,12 @@ pub const MAX_MANIFEST_READ_BYTES: u64 = 128 * 1024;
 /// Maximum diagnostics tail buffer size on write (64 KiB).
 pub const MAX_DIAGNOSTICS_WRITE_BYTES: usize = 64 * 1024;
 
+/// Maximum progress copy file size on write (4 MiB).
+pub const MAX_PROGRESS_COPY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Maximum bounded progress read buffer size (1 MiB).
+pub const MAX_PROGRESS_READ_BYTES: u64 = 1024 * 1024;
+
 /// Execution origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,6 +47,7 @@ pub enum RunOrigin {
     CliHeadless,
     WebDashboard,
     Tui,
+    Mcp,
 }
 
 /// Run terminal or active status.
@@ -52,6 +60,8 @@ pub enum RunStatus {
     Completed,
     Failed,
     Cancelled,
+    AwaitingApproval,
+    Approved,
 }
 
 impl RunStatus {
@@ -61,6 +71,19 @@ impl RunStatus {
 
     pub fn is_terminal(&self) -> bool {
         !self.is_active()
+    }
+
+    /// Canonical manifest status string (inverse of `FromStr`).
+    pub fn as_status_str(&self) -> &'static str {
+        match self {
+            RunStatus::Active => "active",
+            RunStatus::Running => "running",
+            RunStatus::Completed => "completed",
+            RunStatus::Failed => "failed",
+            RunStatus::Cancelled => "cancelled",
+            RunStatus::AwaitingApproval => "awaiting_approval",
+            RunStatus::Approved => "approved",
+        }
     }
 }
 
@@ -74,6 +97,8 @@ impl std::str::FromStr for RunStatus {
             "completed" => Ok(RunStatus::Completed),
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
+            "awaiting_approval" => Ok(RunStatus::AwaitingApproval),
+            "approved" => Ok(RunStatus::Approved),
             _ => Err("unknown run status"),
         }
     }
@@ -112,6 +137,8 @@ pub struct RunManifest {
     pub resolved_model: Option<String>,
     pub dmuxai_version: Option<String>,
     pub build_commit: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
     #[serde(default)]
     pub dmuxai_exit_code: Option<i32>,
     pub child_exit_code: Option<i32>,
@@ -232,9 +259,66 @@ static COMMON_TOKEN_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,})\b").unwrap()
 });
 
+/// Conservative literal substrings derived from every masking regex (case-insensitive).
+/// If none appear in the input, compiled regexes are not touched.
+const MASK_LITERAL_TRIGGERS: &[&str] = &[
+    "api_key",
+    "access_token",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "auth",
+    "bearer",
+    "authorization",
+    "key",
+    "sig",
+    "signature",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "github_pat",
+    "xox",
+    "credential",
+    "cookie",
+    "session",
+];
+
+fn has_disallowed_control(input: &str) -> bool {
+    input
+        .chars()
+        .any(|ch| ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t')
+}
+
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let n = needle.len();
+    if n == 0 || haystack.len() < n {
+        return false;
+    }
+    let nb = needle.as_bytes();
+    haystack
+        .as_bytes()
+        .windows(n)
+        .any(|w| w.eq_ignore_ascii_case(nb))
+}
+
+fn may_need_masking(s: &str) -> bool {
+    MASK_LITERAL_TRIGGERS
+        .iter()
+        .any(|needle| contains_ascii_ci(s, needle))
+}
+
 /// Strips ANSI escape sequences and non-standard control characters (retaining \n, \r, \t).
 pub fn strip_ansi_and_control(input: &str) -> String {
-    let stripped = ANSI_RE.replace_all(input, "");
+    let needs_ansi = input.as_bytes().contains(&0x1b);
+    if !needs_ansi && !has_disallowed_control(input) {
+        return input.to_string();
+    }
+    let stripped = if needs_ansi {
+        ANSI_RE.replace_all(input, "").into_owned()
+    } else {
+        input.to_owned()
+    };
     let mut out = String::with_capacity(stripped.len());
     for ch in stripped.chars() {
         if ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control() {
@@ -246,7 +330,16 @@ pub fn strip_ansi_and_control(input: &str) -> String {
 
 /// Masks sensitive credentials in text before writing to disk.
 pub fn mask_sensitive_tokens(input: &str) -> String {
+    if !input.as_bytes().contains(&0x1b)
+        && !has_disallowed_control(input)
+        && !may_need_masking(input)
+    {
+        return input.to_string();
+    }
     let clean = strip_ansi_and_control(input);
+    if !may_need_masking(&clean) {
+        return clean;
+    }
 
     // 1. JSON quoted secret fields: "api_key": "secret" -> "api_key": "[REDACTED]"
     let step1 = JSON_SECRET_RE.replace_all(&clean, |caps: &regex::Captures| {
@@ -494,6 +587,33 @@ fn open_file_read_nofollow(path: &Path) -> Result<File, io::Error> {
     File::open(path)
 }
 
+/// Single-handle append writer for `<root>/<id>/progress.jsonl`.
+/// Created once per run so each progress line is a single write without
+/// per-line ancestor symlink walks or `sync_data`.
+#[derive(Debug)]
+pub struct ProgressCopy {
+    file: File,
+    written_bytes: u64,
+}
+
+impl ProgressCopy {
+    /// Appends a masked progress line, silently skipping once the file would
+    /// exceed `MAX_PROGRESS_COPY_BYTES`.
+    pub fn append_line(&mut self, line: &str) -> Result<(), JournalError> {
+        let masked = mask_sensitive_tokens(line);
+        let mut entry = masked;
+        entry.push('\n');
+        let entry_bytes = entry.as_bytes();
+        let next_len = self.written_bytes.saturating_add(entry_bytes.len() as u64);
+        if next_len > MAX_PROGRESS_COPY_BYTES {
+            return Ok(());
+        }
+        self.file.write_all(entry_bytes)?;
+        self.written_bytes = next_len;
+        Ok(())
+    }
+}
+
 /// Journal storage engine managing runs for a repository.
 #[derive(Debug, Clone)]
 pub struct JournalStore {
@@ -514,7 +634,17 @@ impl JournalStore {
     /// Saves a run manifest atomically, masking secrets and enforcing directory permissions.
     /// This is the raw low-level unpruned save API.
     pub fn save(&self, manifest: &RunManifest) -> Result<(), JournalError> {
-        self.save_internal(manifest)?;
+        self.save_internal(manifest, true)?;
+        Ok(())
+    }
+
+    /// Saves a run manifest with the same validation, permissions, nofollow and
+    /// atomic temp-file + rename contract as [`JournalStore::save`], but skips
+    /// the durability syncs (`sync_all` on the temp file and the parent
+    /// directory fsync). Used by headless run paths where per-run latency
+    /// matters more than crash-exact durability (FR-2810).
+    pub fn save_relaxed(&self, manifest: &RunManifest) -> Result<(), JournalError> {
+        self.save_internal(manifest, false)?;
         Ok(())
     }
 
@@ -526,7 +656,7 @@ impl JournalStore {
         retention_config: Option<&JournalConfig>,
         now_ms: u64,
     ) -> Result<Option<PruneReport>, JournalError> {
-        self.save_internal(manifest)?;
+        self.save_internal(manifest, true)?;
 
         if let Some(cfg) = retention_config {
             let report = self.prune(cfg, now_ms)?;
@@ -536,7 +666,7 @@ impl JournalStore {
         }
     }
 
-    fn save_internal(&self, manifest: &RunManifest) -> Result<(), JournalError> {
+    fn save_internal(&self, manifest: &RunManifest, durable: bool) -> Result<(), JournalError> {
         let run_id = &manifest.run_id;
         if !valid_run_id(run_id) {
             return Err(JournalError::InvalidId(run_id.clone()));
@@ -632,7 +762,9 @@ impl JournalStore {
         let write_res = (|| -> io::Result<()> {
             let mut tmp_file = open_file_write_nofollow(&tmp_path, true)?;
             tmp_file.write_all(&payload)?;
-            tmp_file.sync_all()?;
+            if durable {
+                tmp_file.sync_all()?;
+            }
             Ok(())
         })();
 
@@ -648,7 +780,9 @@ impl JournalStore {
         }
 
         // Sync parent directory after successful rename for durable atomic contract
-        sync_dir(&run_dir)?;
+        if durable {
+            sync_dir(&run_dir)?;
+        }
 
         Ok(())
     }
@@ -725,6 +859,105 @@ impl JournalStore {
         }
 
         Ok(manifest)
+    }
+
+    /// FR-2816: supersedes earlier runs that were left `awaiting_approval` with
+    /// `end_summary.plan_hash == plan_hash` once an approved plan with that hash
+    /// actually starts executing under run `approved_by`. Each matching
+    /// manifest becomes `approved` (terminal) with
+    /// `end_summary.approved_by_run_id = approved_by` and keeps its
+    /// `plan_hash`. The scan is bounded to the `max_scan` most recent run
+    /// directories (valid run ids only, symlinks skipped) and never touches the
+    /// current run (`approved_by`). Returns the number of superseded manifests.
+    /// Load failures on individual runs are skipped; the first save error is
+    /// returned so the caller can warn without failing the run.
+    pub fn supersede_awaiting(
+        &self,
+        plan_hash: &str,
+        approved_by: &str,
+        max_scan: usize,
+    ) -> Result<usize, JournalError> {
+        if !valid_pending_plan_hash(plan_hash) {
+            return Err(JournalError::InvalidId(plan_hash.to_string()));
+        }
+        if !valid_run_id(approved_by) {
+            return Err(JournalError::InvalidId(approved_by.to_string()));
+        }
+        verify_no_symlinks(&self.root)?;
+        if !self.root.is_dir() {
+            return Ok(0);
+        }
+
+        let entries = fs::read_dir(&self.root)?;
+        let mut candidates: Vec<(String, SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_symlink(&path).unwrap_or(true) {
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !valid_run_id(name) {
+                continue;
+            }
+            let modified = fs::symlink_metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            candidates.push((name.to_owned(), modified));
+        }
+
+        // Newest first, deterministic tie-break on the id, bounded scan.
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        candidates.truncate(max_scan);
+
+        let mut superseded = 0;
+        for (name, _) in candidates.into_iter() {
+            if name.as_str() == approved_by {
+                continue;
+            }
+            let Ok(mut manifest) = self.load(&name) else {
+                // Corrupt / oversized / foreign manifest: preserve like prune.
+                continue;
+            };
+            if manifest.status != "awaiting_approval" {
+                continue;
+            }
+            let hash_matches = manifest
+                .end_summary
+                .as_ref()
+                .and_then(|summary| summary.get("plan_hash"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|hash| hash == plan_hash);
+            if !hash_matches {
+                continue;
+            }
+            manifest.status = RunStatus::Approved.as_status_str().to_owned();
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(manifest.created_at_ms);
+            if manifest.completed_at_ms.is_none() {
+                manifest.completed_at_ms = Some(now_ms);
+            }
+            if manifest.duration_ms.is_none() {
+                manifest.duration_ms = Some(now_ms.saturating_sub(manifest.created_at_ms));
+            }
+            if let Some(summary) = manifest.end_summary.as_mut()
+                && let Some(object) = summary.as_object_mut()
+            {
+                object.insert(
+                    "approved_by_run_id".to_owned(),
+                    serde_json::Value::String(approved_by.to_owned()),
+                );
+            }
+            self.save_relaxed(&manifest)?;
+            superseded += 1;
+        }
+        Ok(superseded)
     }
 
     /// Replaces whole diagnostic tail snapshot bounded to 64 KiB with pre-masking.
@@ -839,6 +1072,146 @@ impl JournalStore {
         }
 
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Opens `<root>/<id>/progress.jsonl` for appending masked progress lines
+    /// without per-line `sync_data`. Validates the id, refuses symlinks,
+    /// creates the file with 0600 on unix, and tracks the current size against
+    /// `MAX_PROGRESS_COPY_BYTES`.
+    pub fn open_progress_copy(&self, id: &str) -> Result<ProgressCopy, JournalError> {
+        if !valid_run_id(id) {
+            return Err(JournalError::InvalidId(id.to_string()));
+        }
+
+        verify_no_symlinks(&self.root)?;
+
+        let run_dir = self.root.join(id);
+        if is_symlink(&run_dir)? {
+            return Err(JournalError::SymlinkDetected(run_dir));
+        }
+
+        #[cfg(unix)]
+        {
+            if !run_dir.exists() {
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&run_dir)?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if !run_dir.exists() {
+                fs::create_dir_all(&run_dir)?;
+            }
+        }
+
+        let progress_path = run_dir.join("progress.jsonl");
+        if is_symlink(&progress_path)? {
+            return Err(JournalError::SymlinkDetected(progress_path));
+        }
+
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o600);
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+
+        let file = opts.open(&progress_path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "progress path {} is not a regular file",
+                    progress_path.display()
+                ),
+            )));
+        }
+
+        Ok(ProgressCopy {
+            file,
+            written_bytes: meta.len(),
+        })
+    }
+
+    /// Appends a masked progress line to `<root>/<id>/progress.jsonl`.
+    /// Validates the id, refuses symlinks, creates the file with 0600 on unix,
+    /// and silently skips (Ok) once the file would exceed MAX_PROGRESS_COPY_BYTES.
+    pub fn append_progress(&self, id: &str, line: &str) -> Result<(), JournalError> {
+        self.open_progress_copy(id)?.append_line(line)
+    }
+
+    /// Loads the last `max_lines` from `<root>/<id>/progress.jsonl`,
+    /// bounded to reading at most the last 1 MiB.
+    pub fn load_progress_tail(
+        &self,
+        id: &str,
+        max_lines: usize,
+    ) -> Result<Vec<String>, JournalError> {
+        if !valid_run_id(id) {
+            return Err(JournalError::InvalidId(id.to_string()));
+        }
+
+        verify_no_symlinks(&self.root)?;
+
+        let run_dir = self.root.join(id);
+        if is_symlink(&run_dir)? {
+            return Err(JournalError::SymlinkDetected(run_dir));
+        }
+
+        let progress_path = run_dir.join("progress.jsonl");
+        if !progress_path.exists() {
+            return Ok(Vec::new());
+        }
+        if is_symlink(&progress_path)? {
+            return Err(JournalError::SymlinkDetected(progress_path));
+        }
+
+        let mut file = open_file_read_nofollow(&progress_path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(JournalError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "progress path {} is not a regular file",
+                    progress_path.display()
+                ),
+            )));
+        }
+
+        let len = meta.len();
+        let bytes_to_read = std::cmp::min(len, MAX_PROGRESS_READ_BYTES);
+        let seek_pos = len.saturating_sub(bytes_to_read);
+        if seek_pos > 0 {
+            file.seek(SeekFrom::Start(seek_pos))?;
+        }
+
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut file)
+            .take(bytes_to_read)
+            .read_to_end(&mut bytes)?;
+
+        let text = String::from_utf8_lossy(&bytes);
+        let mut lines: Vec<String> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.to_string())
+            .collect();
+
+        // If we sought into the middle of the file (seek_pos > 0), the first line might be partial; drop it
+        if seek_pos > 0 && !lines.is_empty() {
+            lines.remove(0);
+        }
+
+        if lines.len() > max_lines {
+            let start = lines.len() - max_lines;
+            lines = lines[start..].to_vec();
+        }
+
+        Ok(lines)
     }
 
     /// Prunes terminal runs based on age and size limits.
@@ -1040,4 +1413,65 @@ fn safe_delete_run_dir(dir: &Path) -> io::Result<()> {
     }
 
     fs::remove_dir(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunStatus, mask_sensitive_tokens};
+
+    // TC-2816 / FR-2816: `approved` is a terminal status; FromStr, serde and
+    // the manifest string all agree.
+    #[test]
+    fn tc_2816_approved_status_roundtrip_and_terminal() {
+        assert_eq!(
+            "approved".parse::<RunStatus>().expect("parse approved"),
+            RunStatus::Approved
+        );
+        assert_eq!(
+            serde_json::to_value(RunStatus::Approved).expect("serialize approved"),
+            serde_json::Value::String("approved".to_owned())
+        );
+        assert_eq!(
+            serde_json::from_str::<RunStatus>("\"approved\"").expect("deserialize approved"),
+            RunStatus::Approved
+        );
+        assert_eq!(RunStatus::Approved.as_status_str(), "approved");
+        assert!(RunStatus::Approved.is_terminal());
+        assert!(!RunStatus::Approved.is_active());
+    }
+
+    // TC-2802 / FR-2802, FR-2810: prefilter must not skip real secrets; benign progress lines pass through.
+    #[test]
+    fn tc_2810_mask_prefilter_keeps_masking() {
+        let cases = [
+            (r#"API_KEY="my secret key""#, true),
+            (r#""api_key": "json_secret_pass""#, true),
+            ("Authorization: Bearer sk-1234567890abcdef", true),
+            ("https://example.com/api?token=secrettoken999&other=1", true),
+            ("found sk-1234567890abcdefghij", true),
+            ("leaked ghp_abcdefghijklmnopqrst", true),
+        ];
+        for (input, should_redact) in cases {
+            let masked = mask_sensitive_tokens(input);
+            assert!(
+                masked.contains("[REDACTED]") == should_redact,
+                "input {:?} -> {:?}",
+                input,
+                masked
+            );
+            if should_redact {
+                assert!(
+                    !masked.contains("json_secret_pass")
+                        && !masked.contains("secrettoken999")
+                        && !masked.contains("sk-1234567890abcdefghij")
+                        && !masked.contains("ghp_abcdefghijklmnopqrst"),
+                    "raw secret leaked in {:?}",
+                    masked
+                );
+            }
+        }
+
+        let plain = r#"{"type":"progress","kind":"tool","summary":"read src/main.rs"}"#;
+        assert_eq!(mask_sensitive_tokens(plain), plain);
+    }
 }

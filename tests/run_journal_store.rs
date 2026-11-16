@@ -42,7 +42,7 @@ use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 // Before dmuxai::run_journal is implemented, this import will COMPILE-FAIL as required.
-use dmuxai::run_journal::{JournalConfig, JournalStore, RunManifest};
+use dmuxai::run_journal::{JournalConfig, JournalError, JournalStore, RunManifest};
 
 fn sample_manifest(
     run_id: &str,
@@ -690,4 +690,225 @@ fn tc_2567_storage_hardening_regressions() {
         store_root.join(id_new_terminal).exists(),
         "new run must survive"
     );
+}
+
+/// TC-2800 / FR-2800, FR-2810: `save_relaxed` persists a loadable manifest with
+/// identical validation and permissions (0700 dirs / 0600 files on unix) while
+/// skipping the durability syncs.
+#[test]
+fn tc_2800_save_relaxed_roundtrip_and_permissions() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store_root = tmp.path().join("runs");
+    let store = JournalStore::new(store_root.clone());
+
+    let run_id = "0123456789abcdef";
+    let manifest = sample_manifest(run_id, "running", 1_000_000, None);
+
+    store
+        .save_relaxed(&manifest)
+        .expect("save_relaxed initial manifest");
+
+    let run_dir = store_root.join(run_id);
+    let manifest_path = run_dir.join("manifest.json");
+    assert!(run_dir.is_dir());
+    assert!(manifest_path.is_file());
+
+    #[cfg(unix)]
+    {
+        let dir_mode = fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&manifest_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "run directory mode must be 0700");
+        assert_eq!(file_mode, 0o600, "manifest file mode must be 0600");
+    }
+
+    // Load back - running status is normalized to authoritative active, same as save
+    let loaded = store
+        .load(run_id)
+        .expect("load manifest after save_relaxed");
+    assert_eq!(loaded.run_id, run_id);
+    assert_eq!(loaded.status, "active");
+
+    // Overwrite with a terminal state via save_relaxed and verify roundtrip
+    let mut updated = manifest.clone();
+    updated.status = "completed".to_string();
+    updated.completed_at_ms = Some(2_000_000);
+    updated.duration_ms = Some(1_000_000);
+    updated.child_exit_code = Some(0);
+    store
+        .save_relaxed(&updated)
+        .expect("save_relaxed terminal manifest");
+
+    let reloaded = store.load(run_id).expect("reload terminal manifest");
+    assert_eq!(reloaded, updated, "terminal manifest must roundtrip equal");
+}
+
+/// TC-2816 / FR-2816: `supersede_awaiting` flips only the `awaiting_approval`
+/// manifests whose `end_summary.plan_hash` matches to `approved` (terminal),
+/// keeping `plan_hash` and recording `approved_by_run_id`. The current run id
+/// and foreign hashes stay untouched, the scan is bounded by `max_scan`, and
+/// malformed ids are rejected.
+#[test]
+fn tc_2816_store_supersede_awaiting_bounded_scan() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = JournalStore::new(tmp.path().join("runs"));
+    let plan_hash = "deadbeefdeadbeef";
+    let approver = "ffffffffffffffff";
+
+    let mut awaiting_h = sample_manifest("aaaaaaaaaaaaaaaa", "awaiting_approval", 1_000, None);
+    awaiting_h.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    store.save(&awaiting_h).expect("save awaiting H");
+
+    let mut awaiting_other = sample_manifest("cccccccccccccccc", "awaiting_approval", 2_000, None);
+    awaiting_other.end_summary = Some(json!({ "plan_hash": "1234567890abcdef" }));
+    store
+        .save(&awaiting_other)
+        .expect("save awaiting other hash");
+
+    let mut awaiting_h_dup = sample_manifest("bbbbbbbbbbbbbbbb", "awaiting_approval", 3_000, None);
+    awaiting_h_dup.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    awaiting_h_dup.completed_at_ms = Some(5_000);
+    awaiting_h_dup.duration_ms = Some(2_000);
+    store
+        .save(&awaiting_h_dup)
+        .expect("save awaiting H duplicate");
+
+    let mut current = sample_manifest(approver, "awaiting_approval", 4_000, None);
+    current.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    store.save(&current).expect("save current run manifest");
+
+    let superseded = store
+        .supersede_awaiting(plan_hash, approver, 200)
+        .expect("supersede_awaiting");
+    assert_eq!(superseded, 2, "both hash matches superseded");
+
+    for id in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"] {
+        let manifest = store.load(id).expect("load superseded manifest");
+        assert_eq!(manifest.status, "approved", "run {id} must be approved");
+        let summary = manifest.end_summary.expect("end_summary kept");
+        assert_eq!(summary["plan_hash"], plan_hash, "plan_hash kept for {id}");
+        assert_eq!(summary["approved_by_run_id"], approver);
+        let completed_at = manifest
+            .completed_at_ms
+            .unwrap_or_else(|| panic!("run {id} must have completed_at_ms"));
+        assert!(
+            completed_at >= manifest.created_at_ms,
+            "run {id} completed_at_ms must not predate creation"
+        );
+        assert_eq!(
+            manifest.duration_ms,
+            Some(completed_at.saturating_sub(manifest.created_at_ms)),
+            "run {id} duration_ms must match completed_at_ms"
+        );
+    }
+
+    let preserved = store
+        .load("bbbbbbbbbbbbbbbb")
+        .expect("load preserved manifest");
+    assert_eq!(
+        preserved.completed_at_ms,
+        Some(5_000),
+        "an existing completed_at_ms must be kept"
+    );
+    assert_eq!(
+        preserved.duration_ms,
+        Some(2_000),
+        "an existing duration_ms must be kept"
+    );
+
+    let other = store.load("cccccccccccccccc").expect("load other-hash run");
+    assert_eq!(other.status, "awaiting_approval");
+    let other_summary = other.end_summary.expect("other end_summary");
+    assert_eq!(other_summary["plan_hash"], "1234567890abcdef");
+    assert!(
+        other_summary.get("approved_by_run_id").is_none(),
+        "foreign-hash run must not gain approved_by_run_id"
+    );
+
+    let still = store.load(approver).expect("load current run");
+    assert_eq!(
+        still.status, "awaiting_approval",
+        "the current run must never touch its own manifest"
+    );
+
+    // Bounded scan: with max_scan = 2 only the two newest matching runs are
+    // superseded; distinct mtimes make the recency order deterministic.
+    let tmp2 = TempDir::new().expect("tempdir");
+    let store2 = JournalStore::new(tmp2.path().join("runs"));
+    let base_secs = 1_700_000_000i64;
+    for index in 0..4u64 {
+        let id = format!("{:016x}", 0x1000 + index);
+        let mut manifest = sample_manifest(&id, "awaiting_approval", 1_000 + index, None);
+        manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
+        store2.save(&manifest).expect("save bounded fixture");
+        filetime::set_file_mtime(
+            store2.root().join(&id),
+            filetime::FileTime::from_unix_time(base_secs + index as i64, 0),
+        )
+        .expect("set bounded fixture mtime");
+    }
+
+    // A symlinked run directory with a matching hash must never be followed or
+    // modified, even when it is newer than every real run.
+    let symlink_target = TempDir::new().expect("symlink target tempdir");
+    let symlink_target_store = JournalStore::new(symlink_target.path().join("runs"));
+    let symlink_target_id = "00000000000000aa";
+    let mut symlink_target_manifest =
+        sample_manifest(symlink_target_id, "awaiting_approval", 9_000, None);
+    symlink_target_manifest.end_summary = Some(json!({ "plan_hash": plan_hash }));
+    symlink_target_store
+        .save(&symlink_target_manifest)
+        .expect("save symlink target manifest");
+    #[cfg(unix)]
+    {
+        let symlink_id = "00000000000000bb";
+        std::os::unix::fs::symlink(
+            symlink_target_store.root().join(symlink_target_id),
+            store2.root().join(symlink_id),
+        )
+        .expect("symlink run directory");
+        filetime::set_file_mtime(
+            store2.root().join(symlink_id),
+            filetime::FileTime::from_unix_time(base_secs + 100, 0),
+        )
+        .expect("set symlink mtime");
+    }
+
+    let bounded = store2
+        .supersede_awaiting(plan_hash, "ffffffffffffffff", 2)
+        .expect("bounded supersede_awaiting");
+    assert_eq!(bounded, 2, "max_scan bounds how many runs are superseded");
+    // Newest two (indexes 2 and 3) were within the bounded scan; the older
+    // two were not.
+    for index in 0..4u64 {
+        let manifest = store2
+            .load(&format!("{:016x}", 0x1000 + index))
+            .expect("load bounded fixture");
+        let expected = if index >= 2 {
+            "approved"
+        } else {
+            "awaiting_approval"
+        };
+        assert_eq!(
+            manifest.status, expected,
+            "bounded scan must pick the newest runs (index {index})"
+        );
+    }
+    assert_eq!(
+        symlink_target_store
+            .load(symlink_target_id)
+            .expect("load symlink target manifest")
+            .status,
+        "awaiting_approval",
+        "a symlinked run directory must stay untouched"
+    );
+
+    // Malformed plan hash / approver ids are rejected, not silently scanned.
+    assert!(matches!(
+        store.supersede_awaiting("NOT-A-PLAN-HASH", approver, 200),
+        Err(JournalError::InvalidId(_))
+    ));
+    assert!(matches!(
+        store.supersede_awaiting(plan_hash, "short", 200),
+        Err(JournalError::InvalidId(_))
+    ));
 }

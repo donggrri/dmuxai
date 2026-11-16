@@ -483,6 +483,7 @@ mod tests {
             to_state: to_state.to_owned(),
             message: None,
             error_kind: None,
+            run_id: None,
         }
     }
 

@@ -100,13 +100,19 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     token: Arc<String>,
     allowed_hosts: Option<Arc<Vec<String>>>,
     workspaces: Arc<WorkspaceDirectory>,
 }
 
-struct Ws(Arc<WorkspaceEntry>);
+impl AppState {
+    pub(crate) fn token(&self) -> &str {
+        self.token.as_str()
+    }
+}
+
+pub(crate) struct Ws(pub(crate) Arc<WorkspaceEntry>);
 
 impl FromRequestParts<AppState> for Ws {
     type Rejection = Response;
@@ -145,7 +151,7 @@ impl DashboardServer {
     }
 }
 
-fn error_json(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_json(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "error": message }).to_string();
     (
         status,
@@ -159,7 +165,7 @@ fn error_json(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-fn json_ok<T: Serialize>(status: StatusCode, value: &T) -> Response {
+pub(crate) fn json_ok<T: Serialize>(status: StatusCode, value: &T) -> Response {
     match serde_json::to_string(value) {
         Ok(body) => (
             status,
@@ -972,9 +978,12 @@ async fn get_events(Ws(ws): Ws, Query(params): Query<EventsQueryParams>) -> Resp
 
     if let Some((path, replay_since)) = tail {
         tokio::spawn(async move {
-            let mut cursor = replay_since;
-            for record in crate::events::read_since(&path, cursor, None) {
-                cursor = record.seq;
+            let mut offset = 0u64;
+            let mut seq_cursor = replay_since;
+            let (records, next) = crate::events::read_since_from(&path, offset, seq_cursor, None);
+            offset = next;
+            for record in records {
+                seq_cursor = seq_cursor.max(record.seq);
                 if tx.send(state_change_sse_event(&record)).is_err() {
                     return;
                 }
@@ -987,8 +996,11 @@ async fn get_events(Ws(ws): Ws, Query(params): Query<EventsQueryParams>) -> Resp
                 if tx.is_closed() {
                     return;
                 }
-                for record in crate::events::read_since(&path, cursor, None) {
-                    cursor = record.seq;
+                let (records, next) =
+                    crate::events::read_since_from(&path, offset, seq_cursor, None);
+                offset = next;
+                for record in records {
+                    seq_cursor = seq_cursor.max(record.seq);
                     if tx.send(state_change_sse_event(&record)).is_err() {
                         return;
                     }
@@ -2250,6 +2262,9 @@ pub fn build_router_with_directory(
         )
         .route("/api/events", get(get_events))
         .route("/api/events/log", get(get_events_log))
+        .route("/api/runs", get(crate::web::runs_api::list))
+        .route("/api/runs/{id}", get(crate::web::runs_api::detail))
+        .route("/api/runs/{id}/stream", get(crate::web::runs_api::stream))
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))
