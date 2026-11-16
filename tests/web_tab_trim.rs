@@ -301,6 +301,51 @@ impl CdpClient {
         }
         Err(format!("timed out waiting for response to message {id}"))
     }
+
+    fn dispatch_mouse_click(&mut self, x: f64, y: f64) -> Result<(), String> {
+        for event_type in ["mousePressed", "mouseReleased"] {
+            self.msg_id += 1;
+            let id = self.msg_id;
+            let msg = serde_json::json!({
+                "id": id,
+                "method": "Input.dispatchMouseEvent",
+                "params": {
+                    "type": event_type,
+                    "x": x,
+                    "y": y,
+                    "buttons": 1,
+                    "button": "left",
+                    "clickCount": 1
+                }
+            })
+            .to_string();
+            self.send(&msg).map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            let mut temp = [0u8; 4096];
+            let target_str = format!("\"id\":{id}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match self.stream.read(&mut temp) {
+                    Ok(0) => return Err("connection closed".to_string()),
+                    Ok(n) => {
+                        buf.extend_from_slice(&temp[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if text.contains(&target_str) {
+                            break;
+                        }
+                    }
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 struct ChromeSession {
@@ -632,6 +677,123 @@ fn tc_2820_top_bar_controls() {
         stray.as_bool(),
         Some(true),
         "secondary controls not in top bar"
+    );
+}
+
+// TC-2821 / FR-2821: More menu stacks above an open center view and accepts pointer hits.
+#[test]
+#[ignore]
+fn tc_2821_more_menu_above_center_view() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2821_more_menu_above_center_view: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new_with_config("");
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+
+    wait_for_truthy(
+        &mut session,
+        "!!document.getElementById('diff-toggle')",
+        "diff toggle",
+        15,
+    );
+    session
+        .cdp
+        .eval("document.getElementById('diff-toggle').click()")
+        .expect("open diff center");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('docs').classList.contains('open')",
+        "diff center open",
+        10,
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("open more");
+    wait_for_truthy(
+        &mut session,
+        "!document.getElementById('more-menu').hidden",
+        "more menu visible",
+        5,
+    );
+    wait_for_truthy(
+        &mut session,
+        "(() => { const h = document.querySelector('header.top'); return h && h.classList.contains('more-open') && getComputedStyle(h).zIndex === '30'; })()",
+        "header more-open z-index 30",
+        5,
+    );
+
+    let hits = session
+        .cdp
+        .eval(
+            r##"(() => {
+  const menu = document.getElementById('more-menu');
+  function inMenu(x, y) {
+    let el = document.elementFromPoint(x, y);
+    while (el) {
+      if (el === menu) return true;
+      el = el.parentElement;
+    }
+    return false;
+  }
+  const r = menu.getBoundingClientRect();
+  const probes = [];
+  probes.push({ label: 'menu-top+60', ok: inMenu(r.left + r.width / 2, r.top + 60) });
+  for (const el of menu.querySelectorAll('button[role="menuitem"], #theme-select, #accent-picker')) {
+    const b = el.getBoundingClientRect();
+    const x = b.left + b.width / 2;
+    const y = b.top + b.height / 2;
+    probes.push({ id: el.id, x, y, ok: inMenu(x, y) });
+  }
+  const skills = document.getElementById('skills-toggle');
+  const sr = skills.getBoundingClientRect();
+  return {
+    probes,
+    skillsX: sr.left + sr.width / 2,
+    skillsY: sr.top + sr.height / 2
+  };
+})()"##,
+        )
+        .expect("hit probes");
+    let probes = hits
+        .get("probes")
+        .and_then(|v| v.as_array())
+        .expect("probes array");
+    for probe in probes {
+        assert_eq!(
+            probe.get("ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "elementFromPoint must hit #more-menu: {probe:?}"
+        );
+    }
+
+    let skills_x = hits
+        .get("skillsX")
+        .and_then(|v| v.as_f64())
+        .expect("skillsX");
+    let skills_y = hits
+        .get("skillsY")
+        .and_then(|v| v.as_f64())
+        .expect("skillsY");
+    session
+        .cdp
+        .dispatch_mouse_click(skills_x, skills_y)
+        .expect("click skills via pointer");
+    wait_for_truthy(
+        &mut session,
+        "!document.getElementById('skills-popover').hidden",
+        "skills popover open after pointer click",
+        10,
+    );
+    wait_for_truthy(
+        &mut session,
+        "(() => { const h = document.querySelector('header.top'); return h && !h.classList.contains('more-open') && getComputedStyle(h).zIndex === '2'; })()",
+        "header z-index 2 after menu closed",
+        5,
     );
 }
 

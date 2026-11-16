@@ -266,6 +266,11 @@ body {
   z-index: 2;
 }
 
+/* FR-2821: only while the More dropdown is open (avoids blocking header-adjacent UI). */
+.top.more-open {
+  z-index: 30;
+}
+
 h1.brand {
   margin: 0;
   font-size: 1em;

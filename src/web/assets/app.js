@@ -249,6 +249,7 @@ function bindThemeControls() {
 function bindMoreMenu() {
   var moreToggle = $('more-toggle');
   var menu = $('more-menu');
+  var topHeader = document.querySelector('header.top');
   if (!moreToggle || !menu) { return; }
 
   function menuFocusables() {
@@ -264,6 +265,9 @@ function bindMoreMenu() {
   function setOpen(open) {
     moreToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
     menu.hidden = !open;
+    if (topHeader) {
+      topHeader.classList.toggle('more-open', open);
+    }
     if (open) {
       var items = menuFocusables();
       if (items.length && typeof items[0].focus === 'function') {
