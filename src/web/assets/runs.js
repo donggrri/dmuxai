@@ -134,6 +134,12 @@ function runsFetchJson(path) {
   });
 }
 
+window.dmuxaiFetchRunsList = function () {
+  return runsFetchJson('/api/runs').then(function (data) {
+    return data && data.runs ? data.runs : [];
+  });
+};
+
 function runsCopyText(text) {
   if (typeof navigator !== 'undefined' && navigator.clipboard && window.isSecureContext) {
     return navigator.clipboard.writeText(text);

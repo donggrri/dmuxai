@@ -1764,6 +1764,8 @@ var CENTER_VIEWS = {
 };
 var centerView = null;
 var serveRunsDefaultDone = false;
+var serveRunsDefaultPending = false;
+var serveRunsDefaultAborted = false;
 var runsAutoOpened = false;
 var centerViewReturnFocus = null;
 // Approval keys (graph id + plan rev) that already auto-opened the Graph view,
@@ -4306,21 +4308,47 @@ function onSnapshotEvent(e) {
   applySnapshot(snap);
 }
 
+function maybeAbortServeRunsDefault(snap) {
+  if (serveRunsDefaultPending && runsWouldObstructConversation(snap)) {
+    serveRunsDefaultAborted = true;
+  }
+}
+
+function tryServeRunsDefault(snap) {
+  if (serveRunsDefaultDone) { return; }
+  if (String(snap.source || '') !== 'files' || readCenterView() || centerView) {
+    serveRunsDefaultDone = true;
+    return;
+  }
+  serveRunsDefaultDone = true;
+  serveRunsDefaultPending = true;
+  serveRunsDefaultAborted = false;
+  var fetchList = window.dmuxaiFetchRunsList;
+  if (typeof fetchList !== 'function') {
+    serveRunsDefaultPending = false;
+    return;
+  }
+  fetchList().then(function (runs) {
+    serveRunsDefaultPending = false;
+    if (serveRunsDefaultAborted || centerView || readCenterView()) { return; }
+    if (runs && runs.length > 0) {
+      setCenterView('runs', { persist: false, focus: false });
+      runsAutoOpened = true;
+    }
+  }).catch(function () {
+    serveRunsDefaultPending = false;
+  });
+}
+
 function applySnapshot(snap) {
   snap.receivedAt = Date.now();
   snapshot = snap;
   lastRendered = Date.now();
+  maybeAbortServeRunsDefault(snap);
   applySnapshotUi(snap);
   render(lastRendered);
   syncCenterViewsWithSnapshot(snap);
-  if (!serveRunsDefaultDone) {
-    serveRunsDefaultDone = true;
-    if (String(snap.source || '') === 'files' && !readCenterView() && !centerView &&
-        !runsWouldObstructConversation(snap)) {
-      setCenterView('runs', { persist: false, focus: false });
-      runsAutoOpened = true;
-    }
-  }
+  tryServeRunsDefault(snap);
   maybeYieldRunsToConversation(snap);
   applyPendingRunFocus(snap);
   renderTodos(snap);

@@ -456,6 +456,28 @@ fn wait_for_runs_open(session: &mut ChromeSession) {
     panic!("timed out waiting for Runs view to open");
 }
 
+fn chat_toggle_active(session: &mut ChromeSession) -> bool {
+    session
+        .cdp
+        .eval(
+            "(() => { const b = document.querySelector('#chat-toggle'); return !!(b && b.classList.contains('active')); })()",
+        )
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn wait_for_chat_default(session: &mut ChromeSession) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if !runs_panel_open(session) && chat_toggle_active(session) {
+            return;
+        }
+    }
+    panic!("timed out waiting for chat default (Runs closed, chat active)");
+}
+
 /// Opens Runs when a workspace graph blocks the serve default (FR-2811).
 fn open_runs_view(session: &mut ChromeSession) {
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -482,6 +504,11 @@ fn tc_2811_runs_view_default_under_serve() {
     }
 
     let fixture = ServeFixture::new();
+    let run_id = "aaaaaaaaaaaaaaaa";
+    let run_dir = fixture.runs_dir().join(run_id);
+    let manifest = base_manifest(run_id, 1_700_000_000_000, "completed");
+    write_manifest(&run_dir, &manifest);
+
     let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
 
     wait_for_runs_open(&mut session);
@@ -505,6 +532,38 @@ fn tc_2811_runs_view_default_under_serve() {
     );
 }
 
+// TC-2811 / FR-2811: serve workspace without headless runs keeps chat as default.
+#[test]
+#[ignore]
+fn tc_2811_no_runs_keeps_chat_default() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2811_no_runs_keeps_chat_default: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_chat_default(&mut session);
+
+    let runs_open = session
+        .cdp
+        .eval(
+            "(() => { const p = document.querySelector('#runs'); return !!(p && !p.hidden && p.classList.contains('open')); })()",
+        )
+        .expect("eval runs panel");
+    assert_eq!(
+        runs_open.as_bool(),
+        Some(false),
+        "Runs panel must stay closed when there are no headless runs"
+    );
+
+    assert!(
+        chat_toggle_active(&mut session),
+        "chat toggle must be active when no runs default applies"
+    );
+}
+
 // TC-2811 / FR-2811: soft default Runs view yields when a conversation snapshot arrives.
 #[test]
 #[ignore]
@@ -516,6 +575,11 @@ fn tc_2811_runs_default_yields_to_conversation() {
     }
 
     let fixture = ServeFixture::new();
+    let run_id = "bbbbbbbbbbbbbbbb";
+    let run_dir = fixture.runs_dir().join(run_id);
+    let manifest = base_manifest(run_id, 1_700_000_000_001, "completed");
+    write_manifest(&run_dir, &manifest);
+
     let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
     wait_for_runs_open(&mut session);
 
@@ -585,7 +649,7 @@ fn tc_2811_runs_default_with_headless_transcript() {
     let fixture = ServeFixture::new();
     // Simulate a headless run having created a graph fixture and run manifest.
     write_graph_fixture(&fixture.workspace, "headless-graph");
-    let run_id = "run-headless-test";
+    let run_id = "ffffffffffffffff";
     let run_dir = fixture.runs_dir().join(run_id);
     let mut manifest = base_manifest(run_id, 1_700_000_000_000, "active");
     manifest["links"]["graph_id"] = json!("headless-graph");
