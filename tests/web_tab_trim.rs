@@ -485,7 +485,16 @@ fn tc_2825_reset_layout() {
     );
 }
 
-const TC_2828_PREVIEW: &str = "Follow these rules for TC-2828.";
+const TC_2828_TAIL: &str = "__TC2828_SECRET_TAIL_BEYOND_PREVIEW__";
+
+fn tc_2828_full_prompt() -> String {
+    let mut full = "Current rules prefix for TC-2828.".to_string();
+    while full.len() < 240 {
+        full.push('x');
+    }
+    full.push_str(TC_2828_TAIL);
+    full
+}
 
 // TC-2828 / FR-2828: configured prompt shows preview in placeholder, not value.
 #[test]
@@ -497,7 +506,10 @@ fn tc_2828_system_prompt_preview_placeholder() {
         return;
     }
 
-    let config = format!("[runners.codex]\nsystem_prompt = \"{TC_2828_PREVIEW}\"\n");
+    let full_prompt = tc_2828_full_prompt();
+    let preview_200: String = full_prompt.chars().take(200).collect();
+    let escaped = full_prompt.replace('\\', "\\\\").replace('\"', "\\\"");
+    let config = format!("[runners.codex]\nsystem_prompt = \"{escaped}\"\n");
     let fixture = ServeFixture::new_with_config(&config);
     let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
 
@@ -542,7 +554,7 @@ fn tc_2828_system_prompt_preview_placeholder() {
         "placeholder must show Current: prefix, got {ph:?}"
     );
     assert!(
-        ph.contains(TC_2828_PREVIEW),
+        ph.contains(&preview_200),
         "placeholder must include API preview, got {ph:?}"
     );
 
@@ -554,17 +566,23 @@ fn tc_2828_system_prompt_preview_placeholder() {
         .expect("preview span");
     assert_eq!(
         preview_in_dom.as_str().unwrap_or(""),
-        TC_2828_PREVIEW,
-        "preview field matches configured prompt"
+        preview_200,
+        "preview field matches truncated prompt"
     );
-    assert!(
-        session
-            .cdp
-            .eval("document.querySelector('.agent-prompt-row[data-runner=\"codex\"]').innerText.includes('Follow these rules')")
-            .ok()
-            .and_then(|v| v.as_bool())
-            == Some(true),
-        "preview text visible in row"
+    let tail_in_dom = session
+        .cdp
+        .eval(&format!(
+            "(() => {{ const row = document.querySelector('.agent-prompt-row[data-runner=\"codex\"]'); \
+              const pop = document.getElementById('agent-prompts-popover'); \
+              const hay = (row && row.innerText ? row.innerText : '') + (pop && pop.innerText ? pop.innerText : ''); \
+              return hay.includes({tail:?}); }})()",
+            tail = TC_2828_TAIL
+        ))
+        .expect("tail dom scan");
+    assert_eq!(
+        tail_in_dom.as_bool(),
+        Some(false),
+        "full prompt tail must not appear in the System prompts UI"
     );
 }
 
@@ -662,7 +680,7 @@ fn tc_2821_more_menu_items() {
     let items = session
         .cdp
         .eval(
-            "(() => [...document.querySelectorAll('#more-menu [role=\"menuitem\"]')]
+            "(() => [...document.querySelectorAll('#more-menu button[role=\"menuitem\"], #more-menu #theme-select, #more-menu #accent-picker')]
               .map(el => (el.tagName === 'SELECT' ? 'Theme' : (el.id === 'accent-picker' ? 'Accent' : el.textContent.trim().replace(/\\s+(Off|On)$/, '').split('\\n')[0]))))()",
         )
         .expect("menu items");
@@ -721,6 +739,153 @@ fn tc_2821_more_menu_items() {
         "document.getElementById('more-menu').hidden",
         "menu closed on esc",
         5,
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("open more again");
+    wait_for_truthy(
+        &mut session,
+        "!document.getElementById('more-menu').hidden",
+        "menu visible for outside click",
+        5,
+    );
+    session
+        .cdp
+        .eval("document.getElementById('runs-toggle').click()")
+        .expect("click outside menu");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('more-menu').hidden",
+        "menu closed on outside click",
+        5,
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("open more for tab");
+    session
+        .cdp
+        .eval("document.getElementById('theme-select').focus()")
+        .expect("focus theme");
+    let tab_reachable = session
+        .cdp
+        .eval("document.activeElement && document.activeElement.id === 'theme-select'")
+        .expect("theme focused");
+    assert_eq!(
+        tab_reachable.as_bool(),
+        Some(true),
+        "Theme select must be focusable while More is open"
+    );
+    session
+        .cdp
+        .eval("document.getElementById('accent-picker').focus()")
+        .expect("focus accent");
+    let accent_focused = session
+        .cdp
+        .eval("document.activeElement && document.activeElement.id === 'accent-picker'")
+        .expect("accent focused");
+    assert_eq!(
+        accent_focused.as_bool(),
+        Some(true),
+        "Accent picker must be focusable while More is open"
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('diff-toggle').click()")
+        .expect("open diff center");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('docs').classList.contains('open')",
+        "diff center open",
+        10,
+    );
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("open more over center");
+    wait_for_truthy(
+        &mut session,
+        "!document.getElementById('more-menu').hidden",
+        "menu over center",
+        5,
+    );
+    session
+        .cdp
+        .eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))",
+        )
+        .expect("esc with center");
+    wait_for_truthy(
+        &mut session,
+        "document.getElementById('more-menu').hidden",
+        "menu closed while center stays",
+        5,
+    );
+    let diff_still_open = session
+        .cdp
+        .eval("document.getElementById('docs').classList.contains('open')")
+        .expect("diff still open");
+    assert_eq!(
+        diff_still_open.as_bool(),
+        Some(true),
+        "Esc must close More without stealing center-view close"
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('more-toggle').click()")
+        .expect("open more for keyboard");
+    session
+        .cdp
+        .eval("document.getElementById('sessions-toggle').focus()")
+        .expect("focus first menu item");
+    session
+        .cdp
+        .eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}))",
+        )
+        .expect("arrow between menu items");
+    let moved = session
+        .cdp
+        .eval("document.activeElement && document.activeElement.id !== 'sessions-toggle'")
+        .expect("moved focus");
+    assert_eq!(
+        moved.as_bool(),
+        Some(true),
+        "ArrowDown must move between More menu buttons"
+    );
+
+    session
+        .cdp
+        .eval("document.getElementById('theme-select').focus()")
+        .expect("focus theme for arrows");
+    session
+        .cdp
+        .eval(
+            "document.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowDown', bubbles: true}))",
+        )
+        .expect("arrow on select");
+    let select_still_focused = session
+        .cdp
+        .eval("document.activeElement && document.activeElement.id === 'theme-select'")
+        .expect("theme still focused");
+    assert_eq!(
+        select_still_focused.as_bool(),
+        Some(true),
+        "ArrowDown on Theme must not hijack focus away from the native select"
+    );
+    let menu_open = session
+        .cdp
+        .eval("!document.getElementById('more-menu').hidden")
+        .expect("menu still open");
+    assert_eq!(
+        menu_open.as_bool(),
+        Some(true),
+        "Arrow keys on Theme select must not close the More menu"
     );
 }
 

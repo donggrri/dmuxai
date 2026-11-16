@@ -3,7 +3,7 @@
 /* FR-2811..FR-2814: headless runs dashboard view (read-only). */
 
 var RUNS_POLL_MS = 2000;
-var RUNS_INDICATOR_POLL_MS = 5000;
+var RUNS_INDICATOR_POLL_MS = 2000;
 var RUNS_TICK_MS = 1000;
 var RUNS_DETAIL_REFETCH_MS = 3000;
 var RUNS_STREAM_MAX_LINES = 2000;
@@ -291,7 +291,7 @@ function runsUpdateIndicator() {
   }
 }
 
-// While Runs is closed, reuse GET /api/runs at most once every 5 s so the
+// While Runs is closed, reuse GET /api/runs at most once every 2 s so the
 // indicator still reflects active runs without a new endpoint.
 function runsRefreshIndicator() {
   if (runsUiOpen || runsIndicatorInFlight) { return; }

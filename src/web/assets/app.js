@@ -252,10 +252,9 @@ function bindMoreMenu() {
   if (!moreToggle || !menu) { return; }
 
   function menuFocusables() {
-    var nodes = menu.querySelectorAll('[role="menuitem"]');
-    var list = [];
-    for (var i = 0; i < nodes.length; i++) { list.push(nodes[i]); }
-    return list;
+    return menu.querySelectorAll(
+      'button[role="menuitem"], #theme-select, #accent-picker'
+    );
   }
 
   function isOpen() {
@@ -296,9 +295,13 @@ function bindMoreMenu() {
     }
     if (!isOpen()) { return; }
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') { return; }
+    var active = document.activeElement;
+    if (!active || !menu.contains(active)) { return; }
+    var tag = active.tagName;
+    if (tag === 'SELECT' || tag === 'INPUT') { return; }
     e.preventDefault();
     var items = menuFocusables();
-    var idx = items.indexOf(document.activeElement);
+    var idx = Array.prototype.indexOf.call(items, active);
     if (idx === -1) { idx = 0; }
     var next = e.key === 'ArrowDown'
       ? items[(idx + 1) % items.length]
@@ -758,7 +761,9 @@ function nodeTitleText(node) {
 }
 
 function graphNodeElementById(id) {
-  var groups = document.querySelectorAll('.graph-svg g.node[data-id]');
+  var canvas = $('graph-canvas');
+  if (!canvas) { return null; }
+  var groups = canvas.querySelectorAll('.graph-svg g.node[data-id]');
   for (var i = 0; i < groups.length; i++) {
     if (groups[i].getAttribute('data-id') === id) { return groups[i]; }
   }
@@ -1512,7 +1517,9 @@ window.dmuxaiRenderGraphDiagram = function (target, graph, nowMs, opts) {
 };
 
 function updateGraphNodeSelection() {
-  var groups = document.querySelectorAll('.graph-svg g.node[data-id]');
+  var canvas = $('graph-canvas');
+  if (!canvas) { return; }
+  var groups = canvas.querySelectorAll('.graph-svg g.node[data-id]');
   for (var i = 0; i < groups.length; i++) {
     var id = groups[i].getAttribute('data-id');
     groups[i].classList.toggle('node-selected', id === graphSelectedId);
@@ -1550,7 +1557,7 @@ function syncGraphCanvas(graph, nowMs, revision) {
   var needsBuild = lastGraphCanvasRevision !== revision ||
     lastGraphCanvasGeometryKey !== key ||
     lastGraphCanvasNodesKey !== nodesKey ||
-    !document.querySelector('.graph-svg');
+    !document.querySelector('#graph-canvas .graph-svg');
   if (needsBuild) {
     renderGraphCanvas(graph, nowMs, geometry, key);
     lastGraphCanvasRevision = revision;
@@ -1785,7 +1792,7 @@ function resolveGraphViewMode(graph) {
 }
 
 function applyGraphViewMode() {
-  var graph = snapshot && snapshot.graph ? snapshot.graph : null;
+  var graph = activeGraph();
   graphViewMode = resolveGraphViewMode(graph);
 
   var list = $('nodes');
@@ -2205,6 +2212,8 @@ function bindCenterViews() {
   // sees their state before they close.
   window.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape' || !centerView || e.defaultPrevented) { return; }
+    var moreMenu = $('more-menu');
+    if (moreMenu && !moreMenu.hidden) { return; }
     // Inner layers close first: the document preview, node details, the
     // command palette and the plan edit box keep their own Esc.
     var preview = document.querySelector('.doc-overlay');

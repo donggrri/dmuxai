@@ -1263,7 +1263,7 @@ fn tc_2817_live_graph_and_approved_link() {
 // TC-2826 / FR-2826: the Runs button indicator shows the active-run count
 // (accessible label) and is hidden when no runs are active. The Runs view is
 // closed here, so the count refreshes from the reuse of GET /api/runs at most
-// every 5 s.
+// every 2 s.
 #[test]
 #[ignore]
 fn tc_2826_runs_indicator() {
@@ -1299,7 +1299,7 @@ fn tc_2826_runs_indicator() {
     }
 
     // An active run appears: indicator becomes visible with the count within
-    // the 5 s closed-view refresh window.
+    // the 2 s closed-view refresh window.
     let mut manifest = base_manifest(run_id, 1_000, "active");
     manifest["pid"] = json!(std::process::id());
     write_manifest(&runs.join(run_id), &manifest);
@@ -1548,5 +1548,85 @@ fn tc_2823_runs_detail_graph_and_full_graph() {
     assert!(
         opened_full,
         "Full graph button must open large Graph view focused on {graph_id}"
+    );
+
+    let snap = json!({
+        "source": "tui",
+        "workspace": fixture.workspace.display().to_string(),
+        "agents": [],
+        "graph": {
+            "id": "snap-only",
+            "phase": "running",
+            "layers": 1,
+            "nodes": [{
+                "id": "solo",
+                "role": "plan",
+                "job": "solo",
+                "runner": "codex",
+                "status": "running"
+            }],
+            "edges": []
+        },
+        "session": null,
+        "revision": 1
+    });
+    let snap_js = serde_json::to_string(&snap).expect("snap json");
+    session
+        .cdp
+        .eval(&format!(
+            "document.dispatchEvent(new CustomEvent('dmuxai:snapshot', {{detail: {snap_js}}}))"
+        ))
+        .expect("inject single-layer snapshot graph");
+
+    session
+        .cdp
+        .eval("document.getElementById('runs-full-graph').click()")
+        .expect("reopen full graph from run");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut swimlane_ok = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(ok) = session.cdp.eval(
+            "(() => { \
+                const stage = document.getElementById('graph-stage'); \
+                const svg = document.querySelector('#graph-canvas svg.graph-svg'); \
+                const gid = document.getElementById('graph-id'); \
+                return !!(stage && !stage.hidden && svg && gid && gid.textContent === 'g-2823'); \
+            })()",
+        ) && ok.as_bool() == Some(true)
+        {
+            swimlane_ok = true;
+            break;
+        }
+    }
+    assert!(
+        swimlane_ok,
+        "non-snapshot run graph must open as swimlane in #graph-canvas"
+    );
+
+    session
+        .cdp
+        .eval("window.dmuxaiFocusGraphNode('plan')")
+        .expect("select node in full graph");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut selection_ok = false;
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(ok) = session.cdp.eval(
+            "(() => { \
+                const main = document.querySelectorAll('#graph-canvas g.node-selected').length; \
+                const runs = document.querySelectorAll('#runs-graph-canvas g.node-selected').length; \
+                return main >= 1 && runs === 0; \
+            })()",
+        ) && ok.as_bool() == Some(true)
+        {
+            selection_ok = true;
+            break;
+        }
+    }
+    assert!(
+        selection_ok,
+        "node-selected must apply only to #graph-canvas, not the Runs detail diagram"
     );
 }
