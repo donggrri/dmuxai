@@ -11,8 +11,9 @@ use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
-    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
-    map_send_error, prompt_with_image_tokens,
+    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, classify_login_failure,
+    implement_outcome::ImplementTurnTracker, map_acp_error, map_send_error,
+    prompt_with_image_tokens,
 };
 use dmuxai::process::{apply_child_cwd_tokio, cursor_command};
 use dmuxai::runner_protocol::RunnerProtocol;
@@ -654,6 +655,9 @@ fn spawn_turn(
     let turn_terminal_seen = terminal_seen.clone();
     let acp_cancel = (protocol == RunnerProtocol::Acp).then(acp_runner::acp_cancel_for_turn);
     let cancel_for_turn = acp_cancel.clone();
+    let acp_error_emitted = (protocol == RunnerProtocol::Acp)
+        .then(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    let error_emitted_for_turn = acp_error_emitted.clone();
     let handle = tokio::spawn(async move {
         match run_turn_with_child(
             &request,
@@ -666,17 +670,25 @@ fn spawn_turn(
             &turn_terminal_seen,
             &turn_pgid,
             cancel_for_turn,
+            error_emitted_for_turn,
         )
         .await
         {
             Ok(session_id) => Ok(session_id),
             Err(error) => {
-                send_event(
-                    &event_tx,
-                    Some(&error_context),
-                    AgentEvent::Error(error.clone()),
-                )
-                .await;
+                let error =
+                    classify_login_failure("Cursor", error.kind, &error.message).unwrap_or(error);
+                if !acp_error_emitted
+                    .as_ref()
+                    .is_some_and(|emitted| emitted.load(std::sync::atomic::Ordering::SeqCst))
+                {
+                    send_event(
+                        &event_tx,
+                        Some(&error_context),
+                        AgentEvent::Error(error.clone()),
+                    )
+                    .await;
+                }
                 Err(error)
             }
         }
@@ -801,6 +813,7 @@ pub(crate) async fn run_turn(
         &std::sync::atomic::AtomicBool::new(false),
         &std::sync::atomic::AtomicU32::new(0),
         None,
+        None,
     )
     .await
 }
@@ -817,6 +830,7 @@ async fn run_turn_with_child(
     terminal_seen: &std::sync::atomic::AtomicBool,
     pgid: &std::sync::atomic::AtomicU32,
     acp_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    acp_error_emitted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Option<String>, AgentError> {
     if protocol == RunnerProtocol::Acp {
         if let Some(mut child) = warm_child {
@@ -852,13 +866,14 @@ async fn run_turn_with_child(
             super::acp::AcpRunnerKind::Cursor,
             super::acp::AcpLifecycle::Managed,
             cancel,
+            acp_error_emitted,
             selected_model.clone(),
             None,
             None,
         )
         .await
         .map(|outcome| outcome.session_id)
-        .map_err(|e| AgentError::provider(e.to_string()));
+        .map_err(|e| map_acp_error("Cursor", e));
     }
 
     let mut config = dmuxai::process::supervisor::SupervisorConfig::new("Cursor");
@@ -3294,6 +3309,7 @@ pub(crate) mod tests {
         }
 
         const FAKE_VARS: &[&str] = &[
+            "FAKE_ACP_AUTH_ERROR",
             "FAKE_ACP_FAST_ONLY",
             "FAKE_ACP_PERMISSION_OUTSIDE",
             "FAKE_ACP_PERMISSION_ID_COLLISION",
@@ -3575,6 +3591,7 @@ pub(crate) mod tests {
                     session_config_model: None,
                     reasoning_effort: None,
                     cancel: new_cancel_flag(),
+                    error_emitted: None,
                 },
             )
             .await
@@ -3647,6 +3664,68 @@ pub(crate) mod tests {
             assert!(
                 result.is_err() || events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
                 "result: {result:?}, events: {events:?}"
+            );
+        }
+
+        // TC-2837 / FR-2836: Cursor managed ACP login failure emits exactly one Auth error with "Cursor" casing.
+        #[tokio::test]
+        async fn tc_2837_cursor_acp_login_emits_single_auth_error() {
+            let _guard = lock_env().await;
+            set_fake_env(&[("FAKE_ACP_AUTH_ERROR", "1".as_ref())]);
+            let (event_tx, mut event_rx) = mpsc::channel(64);
+            let config = CursorAdapterConfig {
+                protocol: RunnerProtocol::Acp,
+                prewarm: false,
+                prewarm_idle_secs: 300,
+            };
+            let workspace = tempfile::tempdir().unwrap();
+            let (adapter, worker) =
+                spawn_cursor_adapter(event_tx, workspace.path().to_path_buf(), config);
+            adapter.send(linger_request("turn-auth", "hello")).unwrap();
+
+            let mut errors = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match timeout(Duration::from_millis(200), event_rx.recv()).await {
+                    Ok(Some(output)) => {
+                        if let AgentEvent::Error(err) = output.event {
+                            errors.push(err);
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            // Drain briefly to verify no second Error event is emitted by spawn_turn.
+            while let Ok(Some(output)) = timeout(Duration::from_millis(100), event_rx.recv()).await
+            {
+                if let AgentEvent::Error(err) = output.event {
+                    errors.push(err);
+                }
+            }
+            drop(adapter);
+            let _ = tokio::time::timeout(Duration::from_secs(3), worker)
+                .await
+                .expect("adapter worker did not finish after drop");
+
+            assert_eq!(
+                errors.len(),
+                1,
+                "expected exactly one AgentEvent::Error, got {errors:?}"
+            );
+            assert_eq!(errors[0].kind, AgentErrorKind::Auth);
+            assert!(
+                errors[0]
+                    .message
+                    .contains("Sign in to the Cursor CLI and retry."),
+                "unexpected message: {}",
+                errors[0].message
+            );
+            assert!(
+                !errors[0].message.contains("Sign in to the cursor CLI"),
+                "runner casing should be 'Cursor': {}",
+                errors[0].message
             );
         }
 

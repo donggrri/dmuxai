@@ -7,6 +7,9 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
+- **Subcommands `dmuxai runners [--json]` and `dmuxai models [--agent ID] [--json]` (FR-2831..FR-2833).** Added runner discovery, admission status, installation lookup without spawning processes, and model policies; added MCP `models` tool.
+- **Per-subcommand help (FR-2830).** `dmuxai <subcommand> --help` / `-h` prints that subcommand's own usage and flags for all agent-facing subcommands.
+
 - **Headless runs are visible to `dmuxai serve` (PR A of SPEC-headless-runs-dashboard,
   FR-2800..2810).** Headless `run` / `run --graph` / MCP runs write a run-journal manifest
   (active before dispatch, then completed / failed / awaiting_approval / cancelled) and a
@@ -165,6 +168,8 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- In `status --json`, `agents[].allowed` now means headless `run` admission (true for every runner when `[graph] allowed_runners` is unset), and the new `graph_allowed` field reports graph admission (built-in presets excluded when unset) (FR-2838).
+- grok/ACP login failures now report error_kind "auth" instead of "provider".
 - Workspace `dmuxai.toml` settings that run commands, read secret environment variables, or set outbound URLs now require `dmuxai trust` (pinned to the file hash); headless runs opt in with `DMUXAI_TRUST_WORKSPACE_CONFIG=1`.
 - Hardened workspace config trust checks (path confinement, trust store permissions, revoke, and clearer approval prompts).
 - Saving workspace settings from a write-capable dashboard keeps an existing trust record current when the file on disk still matches it; untrusted folders and one-process opt-in stay untrusted (FR-2226..FR-2231).

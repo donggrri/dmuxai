@@ -14,7 +14,10 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
-use crate::agent::{Agent, AgentError, AgentEvent, AgentOutput, OutputContext, TurnPolicy};
+use crate::agent::{
+    Agent, AgentError, AgentErrorKind, AgentEvent, AgentOutput, OutputContext, TurnPolicy,
+    classify_login_failure,
+};
 use dmuxai::process::{apply_child_cwd_tokio, apply_child_env_policy};
 
 use super::debug::acp_trace;
@@ -59,6 +62,7 @@ pub struct AcpTurnConfig {
     #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
     pub cancel: Arc<AtomicBool>,
+    pub error_emitted: Option<Arc<AtomicBool>>,
 }
 
 pub struct AcpRunOutcome {
@@ -186,7 +190,7 @@ pub async fn run_acp_turn(
     }
 
     let runner_label = match config.runner {
-        AcpRunnerKind::Cursor => "cursor",
+        AcpRunnerKind::Cursor => "Cursor",
         AcpRunnerKind::Grok => "grok",
     };
 
@@ -375,13 +379,13 @@ pub async fn run_acp_turn(
             } else {
                 let msg = format_acp_exit(status, &diagnostic);
                 if config.lifecycle == AcpLifecycle::Managed {
-                    send_event(
-                        event_tx,
-                        agent,
-                        context,
-                        AgentEvent::Error(AgentError::process_exit(msg.clone())),
-                    )
-                    .await;
+                    let err =
+                        classify_login_failure(runner_label, AgentErrorKind::ProcessExit, &msg)
+                            .unwrap_or_else(|| AgentError::process_exit(msg.clone()));
+                    send_event(event_tx, agent, context, AgentEvent::Error(err)).await;
+                    if let Some(flag) = &config.error_emitted {
+                        flag.store(true, Ordering::SeqCst);
+                    }
                 }
                 Err(io::Error::other(msg))
             }
@@ -393,14 +397,24 @@ pub async fn run_acp_turn(
                 format!("{error} ({diagnostic})")
             };
             if config.lifecycle == AcpLifecycle::Managed {
-                let err = if error == "cancelled" {
-                    AgentError::cancelled(msg.clone())
+                let (kind, default_err) = if error == "cancelled" {
+                    (
+                        AgentErrorKind::Cancelled,
+                        AgentError::cancelled(msg.clone()),
+                    )
                 } else if !status.success() {
-                    AgentError::process_exit(msg.clone())
+                    (
+                        AgentErrorKind::ProcessExit,
+                        AgentError::process_exit(msg.clone()),
+                    )
                 } else {
-                    AgentError::provider(msg.clone())
+                    (AgentErrorKind::Provider, AgentError::provider(msg.clone()))
                 };
+                let err = classify_login_failure(runner_label, kind, &msg).unwrap_or(default_err);
                 send_event(event_tx, agent, context, AgentEvent::Error(err)).await;
+                if let Some(flag) = &config.error_emitted {
+                    flag.store(true, Ordering::SeqCst);
+                }
             }
             Err(io::Error::other(msg))
         }

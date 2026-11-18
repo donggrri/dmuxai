@@ -31,6 +31,7 @@ pub trait McpBackend {
     fn run(&self, args: RunArgs) -> Result<Value, String>;
     fn status(&self) -> Result<Value, String>;
     fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String>;
+    fn models(&self, agent: Option<&str>) -> Result<Value, String>;
 }
 
 fn tool_definitions() -> Value {
@@ -59,7 +60,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "run",
-            "description": "Run a prompt (or an existing to-do with todo_id) through a DmuxAI agent or the graph planner and wait for the result. Returns JSON with ok, exit_code, text and messages. The deprecated mode argument is rejected.",
+            "description": "Run a prompt (or an existing to-do with todo_id) through a DmuxAI agent or the graph planner and wait for the result. Returns JSON with ok, exit_code, text, messages, and error_kind (e.g. auth for login failure, provider, process_exit). The deprecated mode argument is rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -99,6 +100,19 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "since": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                }
+            }
+        },
+        {
+            "name": "models",
+            "description": "List available models and runner model policy for all runners or a specific agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional runner id (e.g. agy, cursor, codex, or a custom agent name)"
+                    }
                 }
             }
         }
@@ -203,6 +217,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                 .map(|l| l.clamp(1, 1000) as usize);
             backend.events_since(since, limit)
         }
+        "models" => backend.models(str_arg(args, "agent")),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -267,7 +282,14 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let known = ["todo_add", "todo_list", "run", "status", "events_since"];
+            let known = [
+                "todo_add",
+                "todo_list",
+                "run",
+                "status",
+                "events_since",
+                "models",
+            ];
             if !known.contains(&name) {
                 return Some(
                     error_response(&id, -32602, &format!("unknown tool: {name}")).to_string(),
@@ -308,6 +330,7 @@ mod tests {
     struct Stub {
         runs: Mutex<Vec<RunArgs>>,
         run_result: Mutex<Option<Value>>,
+        models_calls: Mutex<Vec<Option<String>>>,
     }
 
     impl McpBackend for Stub {
@@ -331,6 +354,13 @@ mod tests {
         }
         fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String> {
             Ok(json!({ "since": since, "limit": limit }))
+        }
+        fn models(&self, agent: Option<&str>) -> Result<Value, String> {
+            self.models_calls
+                .lock()
+                .unwrap()
+                .push(agent.map(str::to_owned));
+            Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
         }
     }
 
@@ -369,7 +399,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["todo_add", "todo_list", "run", "status", "events_since"]
+            [
+                "todo_add",
+                "todo_list",
+                "run",
+                "status",
+                "events_since",
+                "models"
+            ]
         );
         let run_tool = list["result"]["tools"]
             .as_array()
@@ -683,5 +720,60 @@ mod tests {
 
     fn call_raw(stub: &Stub, line: &str) -> Value {
         serde_json::from_str(&handle_line(stub, line).unwrap()).unwrap()
+    }
+
+    // TC-2838 / FR-2837: docs and MCP run description document error_kind "auth"
+    #[test]
+    fn tc_2838_mcp_documents_auth_and_models_tool() {
+        let tools = tool_definitions();
+        let run_tool = tools
+            .as_array()
+            .and_then(|arr| arr.iter().find(|t| t["name"] == "run"))
+            .expect("run tool");
+        let desc = run_tool["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("auth"),
+            "run tool description should mention auth: {desc}"
+        );
+
+        let models_tool = tools
+            .as_array()
+            .and_then(|arr| arr.iter().find(|t| t["name"] == "models"))
+            .expect("models tool");
+        assert!(
+            models_tool["inputSchema"]["properties"]
+                .get("agent")
+                .is_some(),
+            "models tool schema should declare agent"
+        );
+
+        let api_md = include_str!("../docs/API.md");
+        assert!(
+            api_md.contains("`auth` (sign-in required; no runner fallback)"),
+            "docs/API.md should document auth error_kind"
+        );
+    }
+
+    // TC-2838 / FR-2832: MCP models tool dispatches agent parameter to backend
+    #[test]
+    fn tc_2838_mcp_models_tool_dispatch() {
+        let stub = Stub::default();
+        let res = call(
+            &stub,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "models",
+                    "arguments": {
+                        "agent": "agy"
+                    }
+                }
+            }),
+        );
+        assert_eq!(res["result"]["isError"], false);
+        let calls = stub.models_calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[Some("agy".to_owned())]);
     }
 }

@@ -16,7 +16,7 @@ use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentErrorKind, AgentEvent, AgentOutput,
-    AgentRequest, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy,
+    AgentRequest, ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, classify_login_failure,
 };
 
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
@@ -639,12 +639,13 @@ async fn run_turn(
             super::acp::AcpRunnerKind::Grok,
             super::acp::AcpLifecycle::Delegate,
             cancel,
+            None,
             Some(model_id.to_owned()),
             None,
             None,
         )
         .await
-        .map_err(AgentError::provider)?;
+        .map_err(|e| super::map_acp_error("grok", e))?;
         if outcome.cancelled && !user_cancel.load(std::sync::atomic::Ordering::SeqCst) {
             send(
                 event_tx,
@@ -1129,18 +1130,42 @@ async fn run_turn(
         }
 
         let message = format!("{} failed: {reason}", spec.label());
-        let err = if jsonl_error
+        let default_kind = if jsonl_error
             .as_deref()
             .map(str::trim)
             .is_some_and(|s| !s.is_empty())
         {
-            AgentError::provider(message)
+            AgentErrorKind::Provider
         } else if is_policy {
-            AgentError::policy(message)
+            AgentErrorKind::Policy
         } else if !exit_ok {
-            AgentError::process_exit(message)
+            AgentErrorKind::ProcessExit
         } else {
-            AgentError::provider(message)
+            AgentErrorKind::Provider
+        };
+
+        let runner_name = if is_builtin_grok(spec) {
+            "grok"
+        } else {
+            spec.label()
+        };
+
+        let err = if is_policy {
+            AgentError::policy(message)
+        } else if let Some(auth_err) = classify_login_failure(runner_name, default_kind, &message) {
+            auth_err
+        } else if let Some(auth_err) = jsonl_error
+            .as_deref()
+            .and_then(|text| classify_login_failure(runner_name, default_kind, text))
+            .or_else(|| classify_login_failure(runner_name, default_kind, &stderr_text))
+        {
+            let auth_msg = format!("{} failed: {}", spec.label(), auth_err.message);
+            AgentError::auth(auth_msg)
+        } else {
+            match default_kind {
+                AgentErrorKind::ProcessExit => AgentError::process_exit(message),
+                _ => AgentError::provider(message),
+            }
         };
         return Err(err);
     }

@@ -34,6 +34,8 @@ The following flags can be used before or after subcommands, or with the interac
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
 | `dmuxai trust` | `[--status]`, `[--json]`, `[--revoke]`, `[--yes]` | Trust management for workspace `dmuxai.toml` |
 | `dmuxai status` | `--json` | Workspace status (JSON if `--json`) |
+| `dmuxai runners` | `[--json]` | Registered runners, admission, installation and model policy |
+| `dmuxai models` | `[--agent ID]`, `[--json]` | Available models and runner policy |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
 
@@ -105,7 +107,7 @@ Notes:
 | `text` | string | Final agent text (still returned when the reply could not be saved, see exit code 4) |
 | `messages` | array | `{ role, agent, content }` per message |
 | `error` | string\|null | Failure detail when `ok` is false |
-| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, `sensitive_gate` (exit 7), or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
+| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `auth` (sign-in required; no runner fallback), `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, `sensitive_gate` (exit 7), or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
 | `todo` | object\|null | To-do after a `todo run` |
 | `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
@@ -154,10 +156,36 @@ dmuxai events --since 0 --limit 50 --json
 dmuxai events --follow --json
 ```
 
-`status --json` keys: `workspace`, `version`, `agents` (`{id, label, allowed, run}` where running runs include `started_at_ms` and `last_output_at_ms`),
+`status --json` keys: `workspace`, `version`, `agents` (`{id, label, allowed, graph_allowed, run}` where running runs include `started_at_ms` and `last_output_at_ms`),
 `allowed_runners`, `graph_enabled`, `todos` (`{open, running, done}` or `null`),
 `last_graph` (`{id, phase, counts}` or `null`), `events` (`{path, last_seq}`),
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
+
+In `agents[]`:
+- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `label`: display name
+- `allowed`: headless `run` admission under `[graph] allowed_runners` (true when unset)
+- `graph_allowed`: graph admission (built-in presets excluded when unset)
+- `run`: last run state (`{state, started_at_ms?, last_output_at_ms?, ended_at_ms?, duration_ms?, node?}`)
+
+### `runners` and `models` (SPEC-cli-runners-models)
+
+`dmuxai runners [--json]` lists registered runners in `status` order with:
+- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `label`: display name
+- `kind`: `"builtin"`, `"preset"`, or `"custom"`
+- `allowed`: headless admission under `[graph] allowed_runners` (true when unset)
+- `graph_allowed`: graph admission (built-in presets excluded when unset)
+- `installed`: bool indicating executable lookup without running a process (or null if unknown)
+- `default_model`: default model string or null
+- `model_policy`: human-readable policy summary
+
+`dmuxai models [--agent ID] [--json]` lists models per runner:
+- `id`: runner id
+- `allowed`: headless admission
+- `source`: `"command"`, `"static"`, or `"none"`
+- `models`: array of `{ "id", "label"?, "allowed" }` where `allowed` is policy verdict
+- `error` / `error_kind`: present when listing failed (e.g. `error_kind: "auth"` when grok is not signed in)
 
 ### `term`: persistent terminal sessions (Linux, SPEC-terminal-sessions)
 
@@ -378,6 +406,7 @@ Tools (`tools/list`):
 | `run` | `prompt`, `agent`, `model`, `approve_plan`, `allow_sensitive`, `graph`, `todo_id` | Run outcome JSON (same keys as `run --json`), plus `approval_required: true` when the child exits `7`. The fields forward to the same child flags as the CLI: `model` → `--model` (requires `agent`, conflicts with `graph`), `approve_plan` → `--approve-plan`, `allow_sensitive` → `--allow-sensitive`. `agent` and `graph` are mutually exclusive. The deprecated `mode` argument is rejected with a removed-mode tool error; the MCP server never passes `--mode` or `--read-only`. |
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
+| `models` | `agent` (optional) | Available models and runner policy JSON (same as `dmuxai models --json`) |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
 the forwarded flags, and blocks until it finishes, so the result is final. Tool

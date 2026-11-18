@@ -60,6 +60,10 @@ fn main() {
                         error(&mut stdout, id, -32603, "session/new refused for test");
                         continue;
                     }
+                    if std::env::var("FAKE_ACP_AUTH_ERROR").is_ok() {
+                        error(&mut stdout, id, -32000, "Authentication required");
+                        continue;
+                    }
                     session = "fake-session-1".to_owned();
                     let fast_only = std::env::var("FAKE_ACP_FAST_ONLY").is_ok();
                     let current = if fast_only {

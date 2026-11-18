@@ -14591,12 +14591,7 @@ impl App {
             };
             let target_agent = adapter.agent();
             let runner_id = runner_name(target_agent);
-            if let Some(allowed) = &self.settings.graph_allowed_runners
-                && (allowed.is_empty()
-                    || !allowed
-                        .iter()
-                        .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
-            {
+            if !dmuxai::agent_api::runner_run_admitted(&self.settings, runner_id) {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::FORBIDDEN,
                     self.conversation_id.as_str().to_owned(),
@@ -14628,12 +14623,7 @@ impl App {
         if req.agent.is_none() {
             let target_agent = self.adapters[self.selected].agent();
             let runner_id = runner_name(target_agent);
-            if let Some(allowed) = &self.settings.graph_allowed_runners
-                && (allowed.is_empty()
-                    || !allowed
-                        .iter()
-                        .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())))
-            {
+            if !dmuxai::agent_api::runner_run_admitted(&self.settings, runner_id) {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::FORBIDDEN,
                     self.conversation_id.as_str().to_owned(),
