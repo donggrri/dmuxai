@@ -292,9 +292,13 @@ impl fmt::Display for AgentError {
 impl Error for AgentError {}
 
 /// Classifies turn failure messages indicating authentication or login is required
+pub use acp_runner::map_acp_error;
+
+/// Classifies a runner error message into an `AgentError` of kind `Auth`
 /// (FR-2836). Returns an `AgentError` of kind `Auth` with an actionable login hint
 /// appended, or `None` if the error does not indicate an auth failure. Cancelled
-/// errors are never reclassified.
+/// errors are never reclassified. Idempotent: does not duplicate the hint if
+/// already present.
 pub fn classify_login_failure(
     runner: &str,
     kind: AgentErrorKind,
@@ -317,10 +321,15 @@ pub fn classify_login_failure(
         return None;
     }
     let runner_trimmed = runner.trim();
-    let new_message = if runner_trimmed.eq_ignore_ascii_case("grok") {
-        format!("{message} — Run `grok login` (or set XAI_API_KEY) and retry.")
+    let hint = if runner_trimmed.eq_ignore_ascii_case("grok") {
+        "Run `grok login` (or set XAI_API_KEY) and retry.".to_string()
     } else {
-        format!("{message} — Sign in to the {runner_trimmed} CLI and retry.")
+        format!("Sign in to the {runner_trimmed} CLI and retry.")
+    };
+    let new_message = if lower.contains(&hint.to_ascii_lowercase()) {
+        message.to_string()
+    } else {
+        format!("{message} — {hint}")
     };
     Some(AgentError::auth(new_message))
 }
@@ -724,5 +733,21 @@ mod tests {
         // Cancelled kind is never reclassified
         assert!(classify_login_failure("grok", AgentErrorKind::Cancelled, grok_cli).is_none());
         assert!(classify_login_failure("grok", AgentErrorKind::Cancelled, grok_json).is_none());
+
+        // Idempotency: reclassifying a message that already has the hint does not duplicate it
+        let err3 = classify_login_failure("grok", err.kind, &err.message)
+            .expect("should classify already-hinted message");
+        assert_eq!(err3.message, err.message);
+
+        let err4 = classify_login_failure(
+            "Cursor",
+            AgentErrorKind::Provider,
+            "not signed in — Sign in to the Cursor CLI and retry.",
+        )
+        .expect("should classify cursor");
+        assert_eq!(
+            err4.message,
+            "not signed in — Sign in to the Cursor CLI and retry."
+        );
     }
 }

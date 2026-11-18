@@ -161,6 +161,13 @@ dmuxai events --follow --json
 `last_graph` (`{id, phase, counts}` or `null`), `events` (`{path, last_seq}`),
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
 
+In `agents[]`:
+- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `label`: display name
+- `allowed`: headless `run` admission under `[graph] allowed_runners` (true when unset)
+- `graph_allowed`: graph admission (built-in presets excluded when unset)
+- `run`: last run state (`{state, started_at_ms?, last_output_at_ms?, ended_at_ms?, duration_ms?, node?}`)
+
 ### `runners` and `models` (SPEC-cli-runners-models)
 
 `dmuxai runners [--json]` lists registered runners in `status` order with:

@@ -644,7 +644,7 @@ async fn run_turn(
             None,
         )
         .await
-        .map_err(AgentError::provider)?;
+        .map_err(|e| super::map_acp_error("grok", e))?;
         if outcome.cancelled && !user_cancel.load(std::sync::atomic::Ordering::SeqCst) {
             send(
                 event_tx,

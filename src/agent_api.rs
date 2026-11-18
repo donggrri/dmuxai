@@ -955,6 +955,57 @@ mod tests {
                 "{runner} should be graph-rejected when allowed_runners is empty"
             );
         }
+
+        // 4. status_json on temp workspace with no config, set config, and empty config
+        let dir_none = tempfile::tempdir().unwrap();
+        let val_none = status_json(dir_none.path());
+        let agents_none = val_none["agents"].as_array().expect("agents array");
+        for a in agents_none {
+            assert_eq!(
+                a["allowed"], true,
+                "all runners allowed with no config: {a}"
+            );
+        }
+        let cursor_none = agents_none.iter().find(|a| a["id"] == "cursor").unwrap();
+        assert_eq!(cursor_none["allowed"], true);
+        assert_eq!(cursor_none["graph_allowed"], true);
+        let agy_none = agents_none.iter().find(|a| a["id"] == "agy").unwrap();
+        assert_eq!(agy_none["allowed"], true);
+        assert_eq!(agy_none["graph_allowed"], true);
+
+        let dir_set = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir_set.path().join("dmuxai.toml"),
+            "[graph]\nallowed_runners = [\"agy\"]\n",
+        )
+        .unwrap();
+        let val_set = status_json(dir_set.path());
+        let agents_set = val_set["agents"].as_array().expect("agents array");
+        let cursor_set = agents_set.iter().find(|a| a["id"] == "cursor").unwrap();
+        assert_eq!(cursor_set["allowed"], false);
+        assert_eq!(cursor_set["graph_allowed"], false);
+        let agy_set = agents_set.iter().find(|a| a["id"] == "agy").unwrap();
+        assert_eq!(agy_set["allowed"], true);
+        assert_eq!(agy_set["graph_allowed"], true);
+
+        let dir_empty = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir_empty.path().join("dmuxai.toml"),
+            "[graph]\nallowed_runners = []\n",
+        )
+        .unwrap();
+        let val_empty = status_json(dir_empty.path());
+        let agents_empty = val_empty["agents"].as_array().expect("agents array");
+        for a in agents_empty {
+            assert_eq!(a["allowed"], false);
+            assert_eq!(a["graph_allowed"], false);
+        }
+        let cursor_empty = agents_empty.iter().find(|a| a["id"] == "cursor").unwrap();
+        assert_eq!(cursor_empty["allowed"], false);
+        assert_eq!(cursor_empty["graph_allowed"], false);
+        let agy_empty = agents_empty.iter().find(|a| a["id"] == "agy").unwrap();
+        assert_eq!(agy_empty["allowed"], false);
+        assert_eq!(agy_empty["graph_allowed"], false);
     }
 
     // TC-2831 / FR-2831: runners_json fields and admission with unset/set allowed_runners

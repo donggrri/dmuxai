@@ -11,8 +11,9 @@ use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
 
 use super::{
     AdapterError, Agent, AgentAdapter, AgentError, AgentEvent, AgentOutput, AgentRequest,
-    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, implement_outcome::ImplementTurnTracker,
-    map_send_error, prompt_with_image_tokens,
+    ModelInfo, OutputContext, SpawnedAdapter, TurnPolicy, classify_login_failure,
+    implement_outcome::ImplementTurnTracker, map_acp_error, map_send_error,
+    prompt_with_image_tokens,
 };
 use dmuxai::process::{apply_child_cwd_tokio, cursor_command};
 use dmuxai::runner_protocol::RunnerProtocol;
@@ -671,6 +672,8 @@ fn spawn_turn(
         {
             Ok(session_id) => Ok(session_id),
             Err(error) => {
+                let error =
+                    classify_login_failure("Cursor", error.kind, &error.message).unwrap_or(error);
                 send_event(
                     &event_tx,
                     Some(&error_context),
@@ -858,7 +861,7 @@ async fn run_turn_with_child(
         )
         .await
         .map(|outcome| outcome.session_id)
-        .map_err(|e| AgentError::provider(e.to_string()));
+        .map_err(|e| map_acp_error("Cursor", e));
     }
 
     let mut config = dmuxai::process::supervisor::SupervisorConfig::new("Cursor");

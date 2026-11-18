@@ -168,7 +168,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
-- `status --json` reports headless admission in `allowed` and graph admission in `graph_allowed` (FR-2838).
+- In `status --json`, `agents[].allowed` now means headless `run` admission (true for every runner when `[graph] allowed_runners` is unset), and the new `graph_allowed` field reports graph admission (built-in presets excluded when unset) (FR-2838).
 - grok/ACP login failures now report error_kind "auth" instead of "provider".
 - Workspace `dmuxai.toml` settings that run commands, read secret environment variables, or set outbound URLs now require `dmuxai trust` (pinned to the file hash); headless runs opt in with `DMUXAI_TRUST_WORKSPACE_CONFIG=1`.
 - Hardened workspace config trust checks (path confinement, trust store permissions, revoke, and clearer approval prompts).

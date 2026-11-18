@@ -9,7 +9,20 @@ use tokio::sync::mpsc;
 use super::acp::{
     AcpLifecycle, AcpRunnerKind, AcpTurnConfig, PermissionContext, new_cancel_flag, run_acp_turn,
 };
-use super::{Agent, AgentRequest, OutputContext, prompt_with_image_tokens};
+use super::{
+    Agent, AgentError, AgentErrorKind, AgentRequest, OutputContext, classify_login_failure,
+    prompt_with_image_tokens,
+};
+
+/// Maps an ACP error (string or io::Error) into an [`AgentError`] (FR-2836).
+///
+/// Classifies login failures into [`AgentErrorKind::Auth`] with a runner-specific
+/// hint, falling back to [`AgentErrorKind::Provider`].
+pub fn map_acp_error(runner: &str, error: impl std::fmt::Display) -> AgentError {
+    let msg = error.to_string();
+    classify_login_failure(runner, AgentErrorKind::Provider, &msg)
+        .unwrap_or_else(|| AgentError::provider(msg))
+}
 
 pub fn acp_cancel_for_turn() -> Arc<AtomicBool> {
     new_cancel_flag()
@@ -197,5 +210,44 @@ mod tests {
             Some("grok-4.7")
         );
         assert_eq!(acp_model_arg("cursor", None).unwrap(), None);
+    }
+
+    // TC-2837 / FR-2836: ACP error mapping produces kind Auth with hint for auth failures
+    #[test]
+    fn tc_2837_acp_error_mapping_is_auth() {
+        let grok_err_text = r#"grok error: {"code":-32000,"data":"no auth method id provided","message":"Authentication required"}"#;
+        let io_err = std::io::Error::other(grok_err_text);
+        let err = map_acp_error("grok", io_err);
+        assert_eq!(err.kind, AgentErrorKind::Auth);
+        assert!(err.message.contains("Authentication required"));
+        assert!(
+            err.message
+                .contains("Run `grok login` (or set XAI_API_KEY) and retry.")
+        );
+
+        // Runner fallback must not trigger on Auth errors
+        assert_eq!(
+            dmuxai::runner_fallback::classify_failure(err.kind.as_str(), &err.message),
+            None,
+            "runner fallback must not trigger on auth errors"
+        );
+        assert_eq!(
+            dmuxai::runner_fallback::classify_failure("auth", &err.message),
+            None
+        );
+
+        // 429 text maps to Provider
+        let err_429 = map_acp_error("grok", std::io::Error::other("429 Too Many Requests"));
+        assert_eq!(err_429.kind, AgentErrorKind::Provider);
+        assert!(err_429.message.contains("429 Too Many Requests"));
+
+        // Cursor runner error mapping
+        let cursor_auth = map_acp_error("Cursor", std::io::Error::other("Cursor: not logged in"));
+        assert_eq!(cursor_auth.kind, AgentErrorKind::Auth);
+        assert!(
+            cursor_auth
+                .message
+                .contains("Sign in to the Cursor CLI and retry.")
+        );
     }
 }

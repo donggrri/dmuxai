@@ -839,6 +839,65 @@ fn tc_891_fresh_install_lists_grok() {
     assert!(agents.iter().all(|agent| agent["id"] != "grok"), "{json}");
 }
 
+// TC-2839 / FR-2838: status allowed matches headless run admission, graph_allowed reflects graph policy (CLI)
+#[cfg(unix)]
+#[test]
+fn tc_2839_status_allowed_matches_headless_run_cli() {
+    // 1. Unset allowed_runners (no config)
+    let sandbox = Sandbox::bare();
+    let json = stdout_json(&sandbox.run(&["status", "--json"]));
+    assert_eq!(json["allowed_runners"], Value::Null);
+    let agents = json["agents"].as_array().unwrap();
+    for agent in agents {
+        assert_eq!(
+            agent["allowed"], true,
+            "all runners allowed when unset: {agent}"
+        );
+    }
+    let cursor = agents.iter().find(|a| a["id"] == "cursor").unwrap();
+    assert_eq!(cursor["allowed"], true);
+    assert_eq!(cursor["graph_allowed"], true);
+    let agy = agents.iter().find(|a| a["id"] == "agy").unwrap();
+    assert_eq!(agy["allowed"], true);
+    assert_eq!(agy["graph_allowed"], true);
+
+    // 2. Set allowed_runners = ["agy"]
+    let sandbox_agy = Sandbox::bare();
+    std::fs::write(
+        sandbox_agy.workspace.join("dmuxai.toml"),
+        "[graph]\nallowed_runners = [\"agy\"]\n",
+    )
+    .unwrap();
+    let json_agy = stdout_json(&sandbox_agy.run(&["status", "--json"]));
+    let agents_agy = json_agy["agents"].as_array().unwrap();
+    let cursor_agy = agents_agy.iter().find(|a| a["id"] == "cursor").unwrap();
+    assert_eq!(cursor_agy["allowed"], false);
+    assert_eq!(cursor_agy["graph_allowed"], false);
+    let agy_agy = agents_agy.iter().find(|a| a["id"] == "agy").unwrap();
+    assert_eq!(agy_agy["allowed"], true);
+    assert_eq!(agy_agy["graph_allowed"], true);
+
+    // 3. Empty allowed_runners = []
+    let sandbox_empty = Sandbox::bare();
+    std::fs::write(
+        sandbox_empty.workspace.join("dmuxai.toml"),
+        "[graph]\nallowed_runners = []\n",
+    )
+    .unwrap();
+    let json_empty = stdout_json(&sandbox_empty.run(&["status", "--json"]));
+    let agents_empty = json_empty["agents"].as_array().unwrap();
+    for agent in agents_empty {
+        assert_eq!(agent["allowed"], false);
+        assert_eq!(agent["graph_allowed"], false);
+    }
+    let cursor_empty = agents_empty.iter().find(|a| a["id"] == "cursor").unwrap();
+    assert_eq!(cursor_empty["allowed"], false);
+    assert_eq!(cursor_empty["graph_allowed"], false);
+    let agy_empty = agents_empty.iter().find(|a| a["id"] == "agy").unwrap();
+    assert_eq!(agy_empty["allowed"], false);
+    assert_eq!(agy_empty["graph_allowed"], false);
+}
+
 /// Writes a fake `grok` executable. Registration only checks that the file exists.
 #[cfg(unix)]
 fn fake_grok(root: &Path) -> PathBuf {

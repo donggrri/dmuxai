@@ -83,7 +83,17 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
             }
         }
         "opencode" if lower.starts_with("opencode/") && lower.ends_with("-free") => Ok(()),
-        "codex" => validate_model_id(model_id),
+        "codex" => {
+            if trimmed.is_empty() {
+                Err("model id must not be empty".to_owned())
+            } else if !is_allowed_model(trimmed) {
+                Err(format!(
+                    "model {trimmed} is not allowed for codex; only {ALLOWED_MODEL} is permitted"
+                ))
+            } else {
+                Ok(())
+            }
+        }
         "grok" => Err(format!(
             "model {trimmed} is not allowed for grok; only grok-* models without fast are permitted"
         )),
@@ -757,9 +767,9 @@ mod tests {
         assert!(!err.contains("only composer-2.5 is permitted"));
 
         let codex_err = validate_model_for_runner("codex", "x").unwrap_err();
-        assert!(
-            codex_err.contains("only composer-2.5 is permitted"),
-            "codex message should retain composer-2.5: {codex_err}"
+        assert_eq!(
+            codex_err,
+            "model x is not allowed for codex; only composer-2.5 is permitted"
         );
     }
 }
