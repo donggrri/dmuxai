@@ -501,7 +501,10 @@ pub fn models_json(settings: &DmuxSettings, entries: Vec<(String, ModelListing)>
                 .iter()
                 .map(|(id, label)| {
                     let model_allowed = if let Some(spec) = custom_spec {
-                        crate::custom_agent::validate_custom_model(spec, id).is_ok()
+                        let trimmed = id.trim();
+                        !trimmed.is_empty()
+                            && !trimmed.to_ascii_lowercase().contains("fast")
+                            && crate::custom_agent::validate_custom_model(spec, id).is_ok()
                     } else {
                         crate::model_policy::validate_model_for_runner(&runner_id, id).is_ok()
                     };
@@ -595,7 +598,7 @@ pub async fn collect_model_listing(
         .find(|s| s.name.eq_ignore_ascii_case(runner))
     {
         if !spec.models_command.is_empty() {
-            match crate::custom_agent::list_model_ids(
+            match crate::custom_agent::list_listed_model_ids(
                 spec,
                 workspace_root,
                 Some(Duration::from_secs(10)),
@@ -1184,7 +1187,7 @@ mod tests {
         assert_eq!(grok["models"].as_array().unwrap().len(), 0);
     }
 
-    // TC-2833 / FR-2832: custom agent allowed_models regex
+    // TC-2833 / FR-2832: custom agent allowed_models regex and global empty/fast checks
     #[test]
     fn tc_2833_models_json_custom_allowed_models() {
         let mut settings = DmuxSettings::default();
@@ -1192,28 +1195,112 @@ mod tests {
             "name = \"mycustom\"\ncommand = [\"echo\"]\nallowed_models = \"^x/.*$\"",
         )
         .unwrap();
+        let unrestricted: CustomAgentSpec =
+            toml::from_str("name = \"open\"\ncommand = [\"echo\"]").unwrap();
         settings.custom_agents.push(spec);
+        settings.custom_agents.push(unrestricted);
 
-        let entries = vec![(
-            "mycustom".to_owned(),
-            ModelListing {
-                source: "command".to_owned(),
-                models: vec![("x/a".to_owned(), None), ("y/b".to_owned(), None)],
-                error: None,
-                error_kind: None,
-            },
-        )];
+        let entries = vec![
+            (
+                "mycustom".to_owned(),
+                ModelListing {
+                    source: "command".to_owned(),
+                    models: vec![
+                        ("x/a".to_owned(), None),
+                        ("x/a-fast".to_owned(), None),
+                        ("y/b".to_owned(), None),
+                    ],
+                    error: None,
+                    error_kind: None,
+                },
+            ),
+            (
+                "open".to_owned(),
+                ModelListing {
+                    source: "command".to_owned(),
+                    models: vec![
+                        ("foo".to_owned(), None),
+                        ("foo-fast".to_owned(), None),
+                        ("".to_owned(), None),
+                    ],
+                    error: None,
+                    error_kind: None,
+                },
+            ),
+        ];
 
         let val = models_json(&settings, entries);
         assert_eq!(val["ok"], true);
         let runners = val["runners"].as_array().expect("runners array");
-        assert_eq!(runners.len(), 1);
+        assert_eq!(runners.len(), 2);
+
         let models = runners[0]["models"].as_array().expect("models array");
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0]["id"], "x/a");
         assert_eq!(models[0]["allowed"], true);
-        assert_eq!(models[1]["id"], "y/b");
+        assert_eq!(models[1]["id"], "x/a-fast");
         assert_eq!(models[1]["allowed"], false);
+        assert_eq!(models[2]["id"], "y/b");
+        assert_eq!(models[2]["allowed"], false);
+
+        let open_models = runners[1]["models"].as_array().expect("open models array");
+        assert_eq!(open_models.len(), 3);
+        assert_eq!(open_models[0]["id"], "foo");
+        assert_eq!(open_models[0]["allowed"], true);
+        assert_eq!(open_models[1]["id"], "foo-fast");
+        assert_eq!(open_models[1]["allowed"], false);
+        assert_eq!(open_models[2]["id"], "");
+        assert_eq!(open_models[2]["allowed"], false);
+    }
+
+    // TC-2833 / FR-2832: models listing applies models_filter and keeps policy-disallowed ids
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_2833_models_listing_keeps_disallowed_ids() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("list-models.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'opencode/a-free\\nopencode/b-paid\\nother/c-free\\nopencode/d-fast-free\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut settings = DmuxSettings::default();
+        let spec = CustomAgentSpec {
+            name: "my-preset".to_owned(),
+            command: vec!["echo".to_owned()],
+            models_command: vec!["sh".to_owned(), script.display().to_string()],
+            models_filter: Some("-free$".to_owned()),
+            allowed_models: Some("^opencode/.*-free$".to_owned()),
+            builtin: true,
+            ..Default::default()
+        };
+        settings.custom_agents.push(spec.clone());
+
+        let listing = collect_model_listing(dir.path(), &spec.name, &settings).await;
+        assert_eq!(listing.source, "command");
+        assert_eq!(listing.error, None);
+        assert_eq!(
+            listing.models,
+            vec![
+                ("opencode/a-free".to_owned(), None),
+                ("other/c-free".to_owned(), None),
+                ("opencode/d-fast-free".to_owned(), None),
+            ]
+        );
+
+        let val = models_json(&settings, vec![(spec.name.clone(), listing)]);
+        let models = val["runners"][0]["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["id"], "opencode/a-free");
+        assert_eq!(models[0]["allowed"], true);
+        assert_eq!(models[1]["id"], "other/c-free");
+        assert_eq!(models[1]["allowed"], false);
+        assert_eq!(models[2]["id"], "opencode/d-fast-free");
+        assert_eq!(models[2]["allowed"], false);
     }
 
     // TC-2834 / FR-2833: parse agy models output drops banner, keeps labels and order

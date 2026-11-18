@@ -62,6 +62,7 @@ pub struct AcpTurnConfig {
     #[allow(dead_code)]
     pub reasoning_effort: Option<String>,
     pub cancel: Arc<AtomicBool>,
+    pub error_emitted: Option<Arc<AtomicBool>>,
 }
 
 pub struct AcpRunOutcome {
@@ -189,7 +190,7 @@ pub async fn run_acp_turn(
     }
 
     let runner_label = match config.runner {
-        AcpRunnerKind::Cursor => "cursor",
+        AcpRunnerKind::Cursor => "Cursor",
         AcpRunnerKind::Grok => "grok",
     };
 
@@ -382,6 +383,9 @@ pub async fn run_acp_turn(
                         classify_login_failure(runner_label, AgentErrorKind::ProcessExit, &msg)
                             .unwrap_or_else(|| AgentError::process_exit(msg.clone()));
                     send_event(event_tx, agent, context, AgentEvent::Error(err)).await;
+                    if let Some(flag) = &config.error_emitted {
+                        flag.store(true, Ordering::SeqCst);
+                    }
                 }
                 Err(io::Error::other(msg))
             }
@@ -408,6 +412,9 @@ pub async fn run_acp_turn(
                 };
                 let err = classify_login_failure(runner_label, kind, &msg).unwrap_or(default_err);
                 send_event(event_tx, agent, context, AgentEvent::Error(err)).await;
+                if let Some(flag) = &config.error_emitted {
+                    flag.store(true, Ordering::SeqCst);
+                }
             }
             Err(io::Error::other(msg))
         }

@@ -730,6 +730,7 @@ mod tests {
     #[test]
     fn tc_2835_agy_accepts_gemini_4_hydrogen() {
         for id in [
+            "gemini-4-hydrogen",
             "gemini-4-hydrogen-low",
             "gemini-4-hydrogen-medium",
             "gemini-4-hydrogen-high",

@@ -639,6 +639,7 @@ async fn run_turn(
             super::acp::AcpRunnerKind::Grok,
             super::acp::AcpLifecycle::Delegate,
             cancel,
+            None,
             Some(model_id.to_owned()),
             None,
             None,

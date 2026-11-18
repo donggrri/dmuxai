@@ -1651,6 +1651,41 @@ async fn list_grok_model_ids(
     }
 }
 
+fn check_opencode_bin_override(spec: &CustomAgentSpec, env: &RuntimeEnv) -> Result<(), String> {
+    if spec.builtin
+        && spec.name.eq_ignore_ascii_case("opencode")
+        && let Some(message) = crate::settings::opencode_bin_explicit_missing_message_from(env)
+    {
+        return Err(message);
+    }
+    Ok(())
+}
+
+/// Lists the model ids reported by `spec`'s `models_command` after
+/// `models_filter`, without applying the model policy filter (FR-2832).
+///
+/// Built-in grok keeps its own listing path (including login detection).
+pub async fn list_listed_model_ids_with_env(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+    env: &RuntimeEnv,
+) -> Result<Vec<String>, String> {
+    check_opencode_bin_override(spec, env)?;
+    if is_builtin_grok(spec) {
+        return list_grok_model_ids(spec, cwd, timeout).await;
+    }
+    run_models_command(spec, cwd, timeout).await
+}
+
+pub async fn list_listed_model_ids(
+    spec: &CustomAgentSpec,
+    cwd: &Path,
+    timeout: Option<Duration>,
+) -> Result<Vec<String>, String> {
+    list_listed_model_ids_with_env(spec, cwd, timeout, &RuntimeEnv::from_process()).await
+}
+
 /// Lists the model ids for `spec`, honouring the model policy (FR-812).
 ///
 /// For the built-in opencode preset a failure, a timeout, or a listing with no
@@ -1663,12 +1698,7 @@ pub async fn list_model_ids_with_env(
     timeout: Option<Duration>,
     env: &RuntimeEnv,
 ) -> Result<Vec<String>, String> {
-    if spec.builtin
-        && spec.name.eq_ignore_ascii_case("opencode")
-        && let Some(message) = crate::settings::opencode_bin_explicit_missing_message_from(env)
-    {
-        return Err(message);
-    }
+    check_opencode_bin_override(spec, env)?;
     if is_builtin_grok(spec) {
         return list_grok_model_ids(spec, cwd, timeout).await;
     }

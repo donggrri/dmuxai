@@ -40,6 +40,7 @@ pub async fn run_agent_acp_turn(
     runner: AcpRunnerKind,
     lifecycle: AcpLifecycle,
     cancel: Arc<AtomicBool>,
+    error_emitted: Option<Arc<AtomicBool>>,
     requested_model: Option<String>,
     session_config_model: Option<&str>,
     reasoning_effort: Option<&str>,
@@ -54,6 +55,7 @@ pub async fn run_agent_acp_turn(
         session_config_model: session_config_model.map(str::to_owned),
         reasoning_effort: reasoning_effort.map(str::to_owned),
         cancel,
+        error_emitted,
     };
     let outcome = run_acp_turn(
         program,

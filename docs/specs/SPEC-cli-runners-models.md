@@ -1,6 +1,6 @@
 # SPEC: cli-runners-models
 
-Status: Draft
+Status: Implemented
 
 Owner: dmuxai
 Created: 2026-11-18
@@ -100,5 +100,5 @@ See [PLAN-cli-runners-models.md](../plans/PLAN-cli-runners-models.md).
 
 ## 8. Review and test exit criteria
 
-- [ ] TC-2830..TC-2839 pass.
+- [x] TC-2830..TC-2839 pass.
 - [ ] Full local gates (fmt, clippy -D warnings, cargo test, check-spec, check-tc-links, gitleaks) pass.
