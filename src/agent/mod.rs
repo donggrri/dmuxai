@@ -291,6 +291,40 @@ impl fmt::Display for AgentError {
 
 impl Error for AgentError {}
 
+/// Classifies turn failure messages indicating authentication or login is required
+/// (FR-2836). Returns an `AgentError` of kind `Auth` with an actionable login hint
+/// appended, or `None` if the error does not indicate an auth failure. Cancelled
+/// errors are never reclassified.
+pub fn classify_login_failure(
+    runner: &str,
+    kind: AgentErrorKind,
+    message: &str,
+) -> Option<AgentError> {
+    if kind == AgentErrorKind::Cancelled {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "authentication required",
+        "auth_required",
+        "no auth method",
+        "not signed in",
+        "not logged in",
+        "not authenticated",
+        "grok login",
+    ];
+    if !PATTERNS.iter().any(|pat| lower.contains(pat)) {
+        return None;
+    }
+    let runner_trimmed = runner.trim();
+    let new_message = if runner_trimmed.eq_ignore_ascii_case("grok") {
+        format!("{message} — Run `grok login` (or set XAI_API_KEY) and retry.")
+    } else {
+        format!("{message} — Sign in to the {runner_trimmed} CLI and retry.")
+    };
+    Some(AgentError::auth(new_message))
+}
+
 /// A DmuxAI-owned identifier for a conversation spanning provider sessions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConversationId(String);
@@ -648,5 +682,47 @@ mod tests {
         assert_eq!(second.conversation_id, None);
         assert_eq!(second.turn_id, None);
         assert!(matches!(second.event, AgentEvent::Completed));
+    }
+
+    // TC-2837 / FR-2836: classify_login_failure maps login error messages to kind Auth
+    #[test]
+    fn tc_2837_login_failure_is_auth() {
+        let grok_json = r#"{"code":-32000,"data":"no auth method id provided","message":"Authentication required"}"#;
+        let err = classify_login_failure("grok", AgentErrorKind::Provider, grok_json)
+            .expect("should classify grok json");
+        assert_eq!(err.kind, AgentErrorKind::Auth);
+        assert_eq!(
+            err.message,
+            format!("{grok_json} — Run `grok login` (or set XAI_API_KEY) and retry.")
+        );
+
+        let grok_cli =
+            "Not signed in. To authenticate without a browser, run: grok login --device-code";
+        let err2 = classify_login_failure("grok", AgentErrorKind::ProcessExit, grok_cli)
+            .expect("should classify grok cli");
+        assert_eq!(err2.kind, AgentErrorKind::Auth);
+        assert_eq!(
+            err2.message,
+            format!("{grok_cli} — Run `grok login` (or set XAI_API_KEY) and retry.")
+        );
+
+        let other_err =
+            classify_login_failure("opencode", AgentErrorKind::Provider, "not authenticated")
+                .expect("should classify other runner");
+        assert_eq!(other_err.kind, AgentErrorKind::Auth);
+        assert_eq!(
+            other_err.message,
+            "not authenticated — Sign in to the opencode CLI and retry."
+        );
+
+        // 429 Too Many Requests is not auth
+        assert!(
+            classify_login_failure("grok", AgentErrorKind::Provider, "429 Too Many Requests")
+                .is_none()
+        );
+
+        // Cancelled kind is never reclassified
+        assert!(classify_login_failure("grok", AgentErrorKind::Cancelled, grok_cli).is_none());
+        assert!(classify_login_failure("grok", AgentErrorKind::Cancelled, grok_json).is_none());
     }
 }

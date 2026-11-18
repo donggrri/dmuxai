@@ -1,4 +1,4 @@
-//! Enforces the repository-wide composer-2.5-only model policy.
+//! Enforces runner-aware model policies and defaults across DmuxAI.
 
 pub const ALLOWED_MODEL: &str = "composer-2.5";
 
@@ -31,7 +31,7 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
 }
 
 /// Runner-aware validation: Cursor accepts any non-fast model id; AGY may use
-/// `gemini-*-flash-*` models (the dogfooding runner); opencode may use `*-free`;
+/// `gemini-*-flash-*` or `gemini-4-hydrogen-*` models or `composer-2.5`; opencode may use `*-free`;
 /// grok and cursor may use `grok-*` ids that do not contain `fast` (FR-910, FR-911, FR-2180..2182).
 pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), String> {
     let trimmed = model_id.trim();
@@ -68,9 +68,22 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
                 Ok(())
             }
         }
-        "agy" if lower.starts_with("gemini-") && lower.contains("-flash") => Ok(()),
+        "agy" => {
+            if trimmed.is_empty() {
+                Err("model id must not be empty".to_owned())
+            } else if (lower.starts_with("gemini-") && lower.contains("-flash"))
+                || lower.starts_with("gemini-4-hydrogen")
+                || is_allowed_model(trimmed)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "model {trimmed} is not allowed for agy; only gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5 models are permitted"
+                ))
+            }
+        }
         "opencode" if lower.starts_with("opencode/") && lower.ends_with("-free") => Ok(()),
-        "agy" | "codex" => validate_model_id(model_id),
+        "codex" => validate_model_id(model_id),
         "grok" => Err(format!(
             "model {trimmed} is not allowed for grok; only grok-* models without fast are permitted"
         )),
@@ -701,5 +714,52 @@ mod tests {
             }
             other => panic!("expected NotListed, got {:?}", other),
         }
+    }
+
+    // TC-2835 / FR-2834: agy accepts gemini-4-hydrogen family, rejects argon/pro/claude/fast
+    #[test]
+    fn tc_2835_agy_accepts_gemini_4_hydrogen() {
+        for id in [
+            "gemini-4-hydrogen-low",
+            "gemini-4-hydrogen-medium",
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-xhigh",
+            "GEMINI-4-HYDROGEN-HIGH",
+        ] {
+            assert!(
+                validate_model_for_runner("agy", id).is_ok(),
+                "should accept {id}"
+            );
+        }
+        // Keeps gemini-*-flash* and composer-2.5 accepted
+        assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
+        assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
+
+        // Fast rejected
+        assert!(validate_model_for_runner("agy", "gemini-4-hydrogen-fast").is_err());
+        assert!(validate_model_for_runner("agy", "gemini-3.8-flash-fast").is_err());
+
+        // Argon, pro, claude rejected
+        assert!(validate_model_for_runner("agy", "gemini-4-argon").is_err());
+        assert!(validate_model_for_runner("agy", "gemini-4-argon-low").is_err());
+        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
+        assert!(validate_model_for_runner("agy", "claude-3-5-sonnet").is_err());
+    }
+
+    // TC-2836 / FR-2835: rejection message for agy reflects policy, codex keeps composer-2.5
+    #[test]
+    fn tc_2836_agy_rejection_message_reflects_policy() {
+        let err = validate_model_for_runner("agy", "gemini-4-pro").unwrap_err();
+        assert_eq!(
+            err,
+            "model gemini-4-pro is not allowed for agy; only gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5 models are permitted"
+        );
+        assert!(!err.contains("only composer-2.5 is permitted"));
+
+        let codex_err = validate_model_for_runner("codex", "x").unwrap_err();
+        assert!(
+            codex_err.contains("only composer-2.5 is permitted"),
+            "codex message should retain composer-2.5: {codex_err}"
+        );
     }
 }

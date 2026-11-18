@@ -59,7 +59,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "run",
-            "description": "Run a prompt (or an existing to-do with todo_id) through a DmuxAI agent or the graph planner and wait for the result. Returns JSON with ok, exit_code, text and messages. The deprecated mode argument is rejected.",
+            "description": "Run a prompt (or an existing to-do with todo_id) through a DmuxAI agent or the graph planner and wait for the result. Returns JSON with ok, exit_code, text, messages, and error_kind (e.g. auth for login failure, provider, process_exit). The deprecated mode argument is rejected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -683,5 +683,26 @@ mod tests {
 
     fn call_raw(stub: &Stub, line: &str) -> Value {
         serde_json::from_str(&handle_line(stub, line).unwrap()).unwrap()
+    }
+
+    // TC-2838 / FR-2837: docs and MCP run description document error_kind "auth"
+    #[test]
+    fn tc_2838_mcp_documents_auth_and_models_tool() {
+        let tools = tool_definitions();
+        let run_tool = tools
+            .as_array()
+            .and_then(|arr| arr.iter().find(|t| t["name"] == "run"))
+            .expect("run tool");
+        let desc = run_tool["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("auth"),
+            "run tool description should mention auth: {desc}"
+        );
+
+        let api_md = include_str!("../docs/API.md");
+        assert!(
+            api_md.contains("`auth` (sign-in required; no runner fallback)"),
+            "docs/API.md should document auth error_kind"
+        );
     }
 }

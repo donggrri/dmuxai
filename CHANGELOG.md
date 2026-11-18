@@ -165,6 +165,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- grok/ACP login failures now report error_kind "auth" instead of "provider".
 - Workspace `dmuxai.toml` settings that run commands, read secret environment variables, or set outbound URLs now require `dmuxai trust` (pinned to the file hash); headless runs opt in with `DMUXAI_TRUST_WORKSPACE_CONFIG=1`.
 - Hardened workspace config trust checks (path confinement, trust store permissions, revoke, and clearer approval prompts).
 - Saving workspace settings from a write-capable dashboard keeps an existing trust record current when the file on disk still matches it; untrusted folders and one-process opt-in stay untrusted (FR-2226..FR-2231).

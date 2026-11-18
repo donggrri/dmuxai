@@ -758,7 +758,8 @@ fn tc_811_fresh_install_lists_opencode() {
         .iter()
         .find(|agent| agent["id"] == "opencode")
         .unwrap_or_else(|| panic!("opencode missing: {json}"));
-    assert_eq!(opencode["allowed"], false, "{json}");
+    assert_eq!(opencode["allowed"], true, "{json}");
+    assert_eq!(opencode["graph_allowed"], false, "{json}");
     let cursor = agents.iter().find(|agent| agent["id"] == "cursor").unwrap();
     assert_eq!(cursor["allowed"], true);
 
@@ -827,7 +828,8 @@ fn tc_891_fresh_install_lists_grok() {
         .iter()
         .find(|agent| agent["id"] == "grok")
         .unwrap_or_else(|| panic!("grok missing: {json}"));
-    assert_eq!(grok["allowed"], false, "{json}");
+    assert_eq!(grok["allowed"], true, "{json}");
+    assert_eq!(grok["graph_allowed"], false, "{json}");
     let cursor = agents.iter().find(|agent| agent["id"] == "cursor").unwrap();
     assert_eq!(cursor["allowed"], true);
 

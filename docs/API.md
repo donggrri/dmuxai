@@ -105,7 +105,7 @@ Notes:
 | `text` | string | Final agent text (still returned when the reply could not be saved, see exit code 4) |
 | `messages` | array | `{ role, agent, content }` per message |
 | `error` | string\|null | Failure detail when `ok` is false |
-| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, `sensitive_gate` (exit 7), or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
+| `error_kind` | string\|null | Stable failure category next to `error`: `provider`, `model_unavailable`, `auth` (sign-in required; no runner fallback), `process_exit`, `timeout`, `idle`, `stalled`, `cancelled`, `policy`, `sensitive_gate` (exit 7), or `conflict` (exit 4) / `internal` (exit 6); `null` when there is no error |
 | `todo` | object\|null | To-do after a `todo run` |
 | `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |

@@ -142,6 +142,18 @@ pub fn runner_allowed(settings: &DmuxSettings, runner: &str) -> bool {
     settings.graph_runner_allowed(runner)
 }
 
+/// Headless run admission: whether `runner` may run under `[graph] allowed_runners`
+/// (FR-2838). With the list unset, every registered runner is admitted (true).
+/// With the list set, membership decides admission (empty list = false).
+pub fn runner_run_admitted(settings: &DmuxSettings, runner: &str) -> bool {
+    match &settings.graph_allowed_runners {
+        None => true,
+        Some(allowed) => allowed
+            .iter()
+            .any(|r| r.trim().eq_ignore_ascii_case(runner.trim())),
+    }
+}
+
 /// `dmuxai status --json` (FR-763).
 pub fn status_json(workspace_root: &Path) -> Value {
     let settings = DmuxSettings::load(workspace_root);
@@ -224,12 +236,13 @@ pub fn status_json(workspace_root: &Path) -> Value {
     let agents: Vec<Value> = runner_ids(&settings)
         .into_iter()
         .map(|(id, label)| {
-            let allowed = runner_allowed(&settings, &id);
+            let allowed = runner_run_admitted(&settings, &id);
+            let graph_allowed = settings.graph_runner_allowed(&id);
             let run = last_agent_run
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| json!({ "state": "idle" }));
-            json!({ "id": id, "label": label, "allowed": allowed, "run": run })
+            json!({ "id": id, "label": label, "allowed": allowed, "graph_allowed": graph_allowed, "run": run })
         })
         .collect();
 
@@ -523,5 +536,59 @@ mod tests {
         assert_eq!(run2["state"], "running");
         assert_eq!(run2["started_at_ms"], 1000);
         assert_eq!(run2["last_output_at_ms"], 6000);
+    }
+
+    // TC-2839 / FR-2838: status allowed matches headless run admission, graph_allowed reflects graph policy
+    #[test]
+    fn tc_2839_status_allowed_matches_headless_run() {
+        let mut settings = DmuxSettings::default();
+        settings
+            .custom_agents
+            .push(crate::custom_agent::grok_preset("grok"));
+        settings
+            .custom_agents
+            .push(crate::custom_agent::opencode_preset("opencode"));
+
+        // 1. Unset allowed_runners: allowed = true for all, graph_allowed = false for builtin presets
+        assert_eq!(settings.graph_allowed_runners, None);
+        for runner in ["cursor", "agy", "codex", "grok", "opencode"] {
+            assert!(
+                runner_run_admitted(&settings, runner),
+                "{runner} should be admitted when allowed_runners is unset"
+            );
+        }
+        assert!(!settings.graph_runner_allowed("grok"));
+        assert!(!settings.graph_runner_allowed("opencode"));
+        assert!(settings.graph_runner_allowed("cursor"));
+        assert!(settings.graph_runner_allowed("agy"));
+
+        // 2. Set allowed_runners: both equal list membership
+        settings.graph_allowed_runners = Some(vec!["grok".to_string(), "cursor".to_string()]);
+        assert!(runner_run_admitted(&settings, "grok"));
+        assert!(runner_run_admitted(&settings, "cursor"));
+        assert!(!runner_run_admitted(&settings, "agy"));
+        assert!(!runner_run_admitted(&settings, "opencode"));
+
+        assert!(settings.graph_runner_allowed("grok"));
+        assert!(settings.graph_runner_allowed("cursor"));
+        assert!(!settings.graph_runner_allowed("agy"));
+        assert!(!settings.graph_runner_allowed("opencode"));
+
+        // Case insensitivity
+        assert!(runner_run_admitted(&settings, "GROK"));
+        assert!(runner_run_admitted(&settings, "CURSOR"));
+
+        // 3. Empty allowed_runners: all false
+        settings.graph_allowed_runners = Some(vec![]);
+        for runner in ["cursor", "agy", "codex", "grok", "opencode"] {
+            assert!(
+                !runner_run_admitted(&settings, runner),
+                "{runner} should be rejected when allowed_runners is empty"
+            );
+            assert!(
+                !settings.graph_runner_allowed(runner),
+                "{runner} should be graph-rejected when allowed_runners is empty"
+            );
+        }
     }
 }
