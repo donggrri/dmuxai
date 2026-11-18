@@ -2918,7 +2918,8 @@ main {
 
 .runs-stream li {
   display: grid;
-  grid-template-columns: auto auto 1fr;
+  /* fixed time and kind columns so text lines up across rows (FR-2844) */
+  grid-template-columns: 8ch 10ch minmax(0, 1fr);
   gap: 0 8px;
   align-items: baseline;
   margin: 0 0 2px;
@@ -2933,6 +2934,8 @@ main {
 .runs-stream-kind {
   color: var(--muted);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-weight: 600;
 }
 

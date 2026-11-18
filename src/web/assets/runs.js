@@ -760,6 +760,8 @@ function runsRenderProgressItem(item) {
   var kind = item.kind ? String(item.kind) : 'progress';
   var summary = item.summary !== undefined && item.summary !== null
     ? String(item.summary) : JSON.stringify(item);
+  // FR-2842: `started · started` / `completed · completed` carry no text.
+  if (summary.trim() === kind) { summary = ''; }
   if (kind === 'text' && summary) {
     runsStreamTextSummaries.push(summary);
     if (runsStreamTextSummaries.length > RUNS_STREAM_MAX_LINES) {
