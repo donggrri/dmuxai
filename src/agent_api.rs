@@ -454,7 +454,7 @@ pub fn parse_agy_models(stdout: &str) -> Vec<(String, Option<String>)> {
         };
 
         let id = raw_id.trim();
-        if id.is_empty() || id.contains(char::is_whitespace) || !id.contains('-') {
+        if id.is_empty() || id.contains(char::is_whitespace) {
             continue;
         }
 
@@ -491,12 +491,20 @@ pub fn models_json(settings: &DmuxSettings, entries: Vec<(String, ModelListing)>
             runner_obj.insert("allowed".to_owned(), json!(allowed));
             runner_obj.insert("source".to_owned(), json!(listing.source));
 
+            let custom_spec = settings
+                .custom_agents
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&runner_id));
+
             let models_arr: Vec<Value> = listing
                 .models
                 .iter()
                 .map(|(id, label)| {
-                    let model_allowed =
-                        crate::model_policy::validate_model_for_runner(&runner_id, id).is_ok();
+                    let model_allowed = if let Some(spec) = custom_spec {
+                        crate::custom_agent::validate_custom_model(spec, id).is_ok()
+                    } else {
+                        crate::model_policy::validate_model_for_runner(&runner_id, id).is_ok()
+                    };
                     let mut m = serde_json::Map::new();
                     m.insert("id".to_owned(), json!(id));
                     if let Some(lbl) = label {
@@ -552,6 +560,7 @@ pub async fn collect_model_listing(
         let mut cmd = crate::process::headless_command(program);
         cmd.arg("models");
         crate::process::apply_child_cwd_tokio(&mut cmd, workspace_root);
+        cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -600,10 +609,11 @@ pub async fn collect_model_listing(
                     error_kind: None,
                 },
                 Err(err) => {
-                    let error_kind = if spec.builtin && spec.name.eq_ignore_ascii_case("grok") {
+                    let error_kind = if spec.builtin
+                        && spec.name.eq_ignore_ascii_case("grok")
+                        && err == crate::custom_agent::grok_login_message()
+                    {
                         Some("auth".to_owned())
-                    } else if spec.builtin {
-                        Some(crate::custom_agent::builtin_probe_error_kind(spec, &err).to_owned())
                     } else {
                         None
                     };
@@ -1174,14 +1184,47 @@ mod tests {
         assert_eq!(grok["models"].as_array().unwrap().len(), 0);
     }
 
+    // TC-2833 / FR-2832: custom agent allowed_models regex
+    #[test]
+    fn tc_2833_models_json_custom_allowed_models() {
+        let mut settings = DmuxSettings::default();
+        let spec: CustomAgentSpec = toml::from_str(
+            "name = \"mycustom\"\ncommand = [\"echo\"]\nallowed_models = \"^x/.*$\"",
+        )
+        .unwrap();
+        settings.custom_agents.push(spec);
+
+        let entries = vec![(
+            "mycustom".to_owned(),
+            ModelListing {
+                source: "command".to_owned(),
+                models: vec![("x/a".to_owned(), None), ("y/b".to_owned(), None)],
+                error: None,
+                error_kind: None,
+            },
+        )];
+
+        let val = models_json(&settings, entries);
+        assert_eq!(val["ok"], true);
+        let runners = val["runners"].as_array().expect("runners array");
+        assert_eq!(runners.len(), 1);
+        let models = runners[0]["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], "x/a");
+        assert_eq!(models[0]["allowed"], true);
+        assert_eq!(models[1]["id"], "y/b");
+        assert_eq!(models[1]["allowed"], false);
+    }
+
     // TC-2834 / FR-2833: parse agy models output drops banner, keeps labels and order
     #[test]
     fn tc_2834_parse_agy_models_output() {
-        let fixture = "Fetching available models...\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\ngemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n";
+        let fixture = "Fetching available models...\nauto\tAuto\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\ngemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n";
         let parsed = parse_agy_models(fixture);
         assert_eq!(
             parsed,
             vec![
+                ("auto".to_owned(), Some("Auto".to_owned())),
                 (
                     "gemini-4-argon-medium".to_owned(),
                     Some("Gemini 4 Argon (Medium)".to_owned())

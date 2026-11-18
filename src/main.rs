@@ -1426,6 +1426,18 @@ mod tests {
             }
             other => panic!("expected Agent(Run) for run -- --help, got {other:?}"),
         }
+
+        // Both `run` and `todo run` help list the approval and sensitive flags
+        for flag in ["--approve-plan", "--approve-plan-id", "--allow-sensitive"] {
+            assert!(
+                cli::RUN_USAGE.contains(flag),
+                "RUN_USAGE must mention {flag}"
+            );
+            assert!(
+                cli::TODO_USAGE.contains(flag),
+                "TODO_USAGE must mention {flag}"
+            );
+        }
     }
 
     // TC-2617 / FR-2617 content: term help names the operations, every

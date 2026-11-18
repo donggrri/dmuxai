@@ -206,8 +206,11 @@ Subcommands:
 
 Options for `todo run`:
   --agent ID               Runner id (cannot be used with --graph)
-  --graph                  Use the graph planner
   --model M                Model id for the runner
+  --approve-plan           Approve a pending plan and confirm sensitive gates
+  --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
+  --allow-sensitive        Confirm every sensitive gate
+  --graph                  Use the graph planner
   --progress               Stream activity progress events to stderr
   --json                   Print machine-readable JSON on stdout
   --trust-workspace-config Trust workspace configuration without prompting
@@ -628,7 +631,7 @@ pub fn parse_flags(
     Ok(parsed)
 }
 
-const RUN_FLAGS: &[FlagSpec] = &[
+pub const RUN_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         names: &["--agent"],
         takes_value: true,
@@ -681,6 +684,140 @@ const RUN_FLAGS: &[FlagSpec] = &[
     },
     FlagSpec {
         names: &["--trust-workspace-config"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const TODO_ADD_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--body"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const TODO_LIST_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--status"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const STATUS_FLAGS: &[FlagSpec] = &[FlagSpec {
+    names: &["--json"],
+    takes_value: false,
+    hidden: false,
+}];
+
+pub const EVENTS_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--since"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--limit"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--follow", "-f"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const INIT_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--workspace"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--force"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const TRUST_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--status"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--revoke"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--yes"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const RUNS_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--limit"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--failed"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const RUNS_SHOW_FLAGS: &[FlagSpec] = &[FlagSpec {
+    names: &["--json"],
+    takes_value: false,
+    hidden: false,
+}];
+
+pub const RUNNERS_FLAGS: &[FlagSpec] = &[FlagSpec {
+    names: &["--json"],
+    takes_value: false,
+    hidden: false,
+}];
+
+pub const MODELS_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--agent"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
         takes_value: false,
         hidden: false,
     },
@@ -764,18 +901,6 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             let rest = &rest[1..];
             match sub.as_str() {
                 "add" => {
-                    const TODO_ADD_FLAGS: &[FlagSpec] = &[
-                        FlagSpec {
-                            names: &["--body"],
-                            takes_value: true,
-                            hidden: false,
-                        },
-                        FlagSpec {
-                            names: &["--json"],
-                            takes_value: false,
-                            hidden: false,
-                        },
-                    ];
                     let parsed = parse_flags(rest, TODO_ADD_FLAGS, true)?;
                     let title = parsed.positionals.join(" ");
                     let body = parsed
@@ -791,18 +916,6 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                     Ok(AgentCommand::TodoAdd { title, body, json })
                 }
                 "list" => {
-                    const TODO_LIST_FLAGS: &[FlagSpec] = &[
-                        FlagSpec {
-                            names: &["--status"],
-                            takes_value: true,
-                            hidden: false,
-                        },
-                        FlagSpec {
-                            names: &["--json"],
-                            takes_value: false,
-                            hidden: false,
-                        },
-                    ];
                     let parsed = parse_flags(rest, TODO_LIST_FLAGS, false)?;
                     let mut status = None;
                     if let Some(raw) = parsed.flags.get("--status").cloned().flatten() {
@@ -826,39 +939,12 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             }
         }
         "status" => {
-            const STATUS_FLAGS: &[FlagSpec] = &[FlagSpec {
-                names: &["--json"],
-                takes_value: false,
-                hidden: false,
-            }];
             let parsed = parse_flags(rest, STATUS_FLAGS, false)?;
             Ok(AgentCommand::Status {
                 json: parsed.flags.contains_key("--json"),
             })
         }
         "events" => {
-            const EVENTS_FLAGS: &[FlagSpec] = &[
-                FlagSpec {
-                    names: &["--since"],
-                    takes_value: true,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--limit"],
-                    takes_value: true,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--follow", "-f"],
-                    takes_value: false,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--json"],
-                    takes_value: false,
-                    hidden: false,
-                },
-            ];
             let parsed = parse_flags(rest, EVENTS_FLAGS, false)?;
             let mut since = 0;
             if let Some(raw) = parsed.flags.get("--since").cloned().flatten() {
@@ -890,18 +976,6 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             Ok(AgentCommand::Mcp)
         }
         "init" => {
-            const INIT_FLAGS: &[FlagSpec] = &[
-                FlagSpec {
-                    names: &["--workspace"],
-                    takes_value: false,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--force"],
-                    takes_value: false,
-                    hidden: false,
-                },
-            ];
             let parsed = parse_flags(rest, INIT_FLAGS, false)?;
             Ok(AgentCommand::Init {
                 workspace: parsed.flags.contains_key("--workspace"),
@@ -909,28 +983,6 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             })
         }
         "trust" => {
-            const TRUST_FLAGS: &[FlagSpec] = &[
-                FlagSpec {
-                    names: &["--status"],
-                    takes_value: false,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--json"],
-                    takes_value: false,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--revoke"],
-                    takes_value: false,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--yes"],
-                    takes_value: false,
-                    hidden: false,
-                },
-            ];
             let parsed = parse_flags(rest, TRUST_FLAGS, false)?;
             Ok(AgentCommand::Trust {
                 status: parsed.flags.contains_key("--status"),
@@ -940,31 +992,8 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             })
         }
         "runs" => {
-            const RUNS_FLAGS: &[FlagSpec] = &[
-                FlagSpec {
-                    names: &["--limit"],
-                    takes_value: true,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--failed"],
-                    takes_value: false,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--json"],
-                    takes_value: false,
-                    hidden: false,
-                },
-            ];
-
             if rest.first().map(String::as_str) == Some("show") {
-                const SHOW_FLAGS: &[FlagSpec] = &[FlagSpec {
-                    names: &["--json"],
-                    takes_value: false,
-                    hidden: false,
-                }];
-                let parsed = parse_flags(&rest[1..], SHOW_FLAGS, true)?;
+                let parsed = parse_flags(&rest[1..], RUNS_SHOW_FLAGS, true)?;
                 if parsed.positionals.is_empty() {
                     return Err("runs show requires a run id".to_owned());
                 }
@@ -1004,29 +1033,12 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             })
         }
         "runners" => {
-            const RUNNERS_FLAGS: &[FlagSpec] = &[FlagSpec {
-                names: &["--json"],
-                takes_value: false,
-                hidden: false,
-            }];
             let parsed = parse_flags(rest, RUNNERS_FLAGS, false)?;
             Ok(AgentCommand::Runners {
                 json: parsed.flags.contains_key("--json"),
             })
         }
         "models" => {
-            const MODELS_FLAGS: &[FlagSpec] = &[
-                FlagSpec {
-                    names: &["--agent"],
-                    takes_value: true,
-                    hidden: false,
-                },
-                FlagSpec {
-                    names: &["--json"],
-                    takes_value: false,
-                    hidden: false,
-                },
-            ];
             let parsed = parse_flags(rest, MODELS_FLAGS, false)?;
             let agent = parsed.flags.get("--agent").cloned().flatten();
             Ok(AgentCommand::Models {
@@ -1901,6 +1913,7 @@ pub async fn execute(command: AgentCommand) -> i32 {
         }
         AgentCommand::Models { agent, json } => {
             let settings = DmuxSettings::load(&workspace_root);
+            let _ = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
             match agent_api::collect_models_json(&workspace_root, &settings, agent.as_deref()).await
             {
                 Ok(val) => {
@@ -3075,6 +3088,7 @@ impl McpBackend for CliMcpBackend {
 
     fn models(&self, agent: Option<&str>) -> Result<Value, String> {
         let settings = DmuxSettings::load(&self.workspace_root);
+        let _ = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
         let fut = agent_api::collect_models_json(&self.workspace_root, &settings, agent);
         let value = match tokio::runtime::Handle::try_current() {
             Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
@@ -4085,5 +4099,56 @@ mod tests {
 
         let err = parse(&["models".into(), "--bogus".into()]);
         assert!(err.is_err());
+    }
+
+    // TC-2830 / FR-2830: subcommand usage texts list every non-hidden flag
+    #[test]
+    fn tc_2830_help_lists_parser_flags() {
+        let cases: &[(&str, &[FlagSpec])] = &[
+            (RUN_USAGE, RUN_FLAGS),
+            (TODO_USAGE, RUN_FLAGS),
+            (STATUS_USAGE, STATUS_FLAGS),
+            (EVENTS_USAGE, EVENTS_FLAGS),
+            (INIT_USAGE, INIT_FLAGS),
+            (TRUST_USAGE, TRUST_FLAGS),
+            (RUNS_USAGE, RUNS_FLAGS),
+            (RUNNERS_USAGE, RUNNERS_FLAGS),
+            (MODELS_USAGE, MODELS_FLAGS),
+        ];
+
+        for (usage, specs) in cases {
+            for spec in *specs {
+                if !spec.hidden {
+                    for name in spec.names {
+                        assert!(
+                            usage.contains(name),
+                            "usage text missing flag {name}:\n{usage}"
+                        );
+                    }
+                }
+            }
+        }
+
+        for spec in TODO_ADD_FLAGS {
+            if !spec.hidden {
+                for name in spec.names {
+                    assert!(TODO_USAGE.contains(name), "TODO_USAGE missing {name}");
+                }
+            }
+        }
+        for spec in TODO_LIST_FLAGS {
+            if !spec.hidden {
+                for name in spec.names {
+                    assert!(TODO_USAGE.contains(name), "TODO_USAGE missing {name}");
+                }
+            }
+        }
+        for spec in RUNS_SHOW_FLAGS {
+            if !spec.hidden {
+                for name in spec.names {
+                    assert!(RUNS_USAGE.contains(name), "RUNS_USAGE missing {name}");
+                }
+            }
+        }
     }
 }

@@ -1286,3 +1286,67 @@ fn tc_1790_sigterm_cancels_headless_run_and_reaps_runner() {
 fn tc_1791_sighup_cancels_headless_run_and_reaps_runner() {
     assert_stop_signal_cancels_run("-HUP");
 }
+
+// TC-2832 / FR-2832: models --agent nope --json exits 3 with structured JSON error
+#[cfg(unix)]
+#[test]
+fn tc_2832_models_unknown_agent_exits_3() {
+    let sandbox = Sandbox::bare();
+    let output = sandbox.run(&["models", "--agent", "nope", "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let json = stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["exit_code"], 3);
+    assert_eq!(json["error"], "unknown agent 'nope'");
+    assert_eq!(json["error_kind"], Value::Null);
+}
+
+// TC-2831 / FR-2831: runners --json does not spawn provider processes
+#[cfg(unix)]
+#[test]
+fn tc_2831_runners_spawns_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::bare();
+    let bin = sandbox.root.join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let marker = sandbox.root.join("marker.txt");
+    let script_content = format!("#!/bin/sh\ntouch \"{}\"\nexit 0\n", marker.display());
+
+    for name in ["agy", "grok"] {
+        let path = bin.join(name);
+        std::fs::write(&path, &script_content).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let env = [("PATH", path_with(&bin))];
+    let output = sandbox.run_in_env(&["runners", "--json"], None, &env);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        !marker.exists(),
+        "runners command must not spawn provider processes"
+    );
+
+    let runners_json = stdout_json(&output);
+    assert_eq!(runners_json["ok"], true);
+    let runners = runners_json["runners"].as_array().expect("runners array");
+
+    let status_output = sandbox.run_in_env(&["status", "--json"], None, &env);
+    let status_json = stdout_json(&status_output);
+    let agents = status_json["agents"].as_array().expect("agents array");
+
+    let runners_order: Vec<&str> = runners.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    let status_order: Vec<&str> = agents.iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        runners_order, status_order,
+        "agents order must match status --json"
+    );
+
+    let agy = runners
+        .iter()
+        .find(|r| r["id"] == "agy")
+        .expect("agy runner");
+    assert_eq!(
+        agy["installed"], true,
+        "fake agy on PATH must report installed: true"
+    );
+}

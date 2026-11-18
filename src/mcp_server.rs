@@ -330,6 +330,7 @@ mod tests {
     struct Stub {
         runs: Mutex<Vec<RunArgs>>,
         run_result: Mutex<Option<Value>>,
+        models_calls: Mutex<Vec<Option<String>>>,
     }
 
     impl McpBackend for Stub {
@@ -355,6 +356,10 @@ mod tests {
             Ok(json!({ "since": since, "limit": limit }))
         }
         fn models(&self, agent: Option<&str>) -> Result<Value, String> {
+            self.models_calls
+                .lock()
+                .unwrap()
+                .push(agent.map(str::to_owned));
             Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
         }
     }
@@ -747,5 +752,28 @@ mod tests {
             api_md.contains("`auth` (sign-in required; no runner fallback)"),
             "docs/API.md should document auth error_kind"
         );
+    }
+
+    // TC-2838 / FR-2832: MCP models tool dispatches agent parameter to backend
+    #[test]
+    fn tc_2838_mcp_models_tool_dispatch() {
+        let stub = Stub::default();
+        let res = call(
+            &stub,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "models",
+                    "arguments": {
+                        "agent": "agy"
+                    }
+                }
+            }),
+        );
+        assert_eq!(res["result"]["isError"], false);
+        let calls = stub.models_calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[Some("agy".to_owned())]);
     }
 }

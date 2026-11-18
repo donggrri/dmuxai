@@ -1638,7 +1638,7 @@ async fn list_grok_model_ids(
     let timeout = timeout.or(Some(BUILTIN_MODELS_TIMEOUT));
     let output = match run_models_output(spec, cwd, timeout).await {
         Ok(output) => output,
-        Err(_) => return Err(grok_login_message()),
+        Err(err) => return Err(err),
     };
     if !grok_models_authenticated(&output.stdout, output.status.success()) {
         return Err(grok_login_message());
