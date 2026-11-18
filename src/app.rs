@@ -4613,17 +4613,13 @@ impl App {
                 .runner_models
                 .get(&t.runner.to_ascii_lowercase())
                 .cloned();
-            if Self::model_resolution_for(
+            Self::model_resolution_for(
                 catalogs,
                 cand_agent,
                 t.model.as_deref(),
                 config_default.as_deref(),
             )
-            .is_err()
-            {
-                return false;
-            }
-            true
+            .is_ok()
         };
 
         let old_conv_id = active.conversation_id.clone();
@@ -5738,10 +5734,7 @@ impl App {
             self.push_system("Workspace switch in progress.".to_owned());
             return false;
         }
-        if text.trim().is_empty() {
-            return false;
-        }
-        true
+        !text.trim().is_empty()
     }
 
     pub fn submit_prompt(&mut self) {

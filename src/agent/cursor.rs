@@ -3225,32 +3225,64 @@ pub(crate) mod tests {
         }
         static BUILD: std::sync::Once = std::sync::Once::new();
 
+        /// Derives the cargo profile directory (e.g. `target/debug`) from the test executable path.
+        ///
+        /// Supports both Cargo layouts:
+        /// - Pre-Cargo 1.100 (old layout): `target/<profile>/deps/<test-exe>`
+        /// - Cargo 1.100+ (new layout): `target/<profile>/build/<crate>/<hash>/out/<test-exe>`
+        fn resolve_profile_dir(exe: &Path) -> PathBuf {
+            // Old layout: exe.parent() is named "deps" -> profile dir = its parent.
+            if let Some(deps_dir) = exe.parent()
+                && deps_dir.file_name().and_then(|n| n.to_str()) == Some("deps")
+                && let Some(profile_dir) = deps_dir.parent()
+            {
+                return profile_dir.to_path_buf();
+            }
+
+            // New layout: exe.parent() is named "out", and exe.parent().parent().parent().parent() is named "build"
+            // (i.e. `<profile>/build/<crate>/<hash>/out/<exe>`) -> profile dir = parent of that "build".
+            if let Some(out_dir) = exe.parent()
+                && out_dir.file_name().and_then(|n| n.to_str()) == Some("out")
+                && let Some(build_dir) = out_dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.parent())
+                && build_dir.file_name().and_then(|n| n.to_str()) == Some("build")
+                && let Some(profile_dir) = build_dir.parent()
+            {
+                return profile_dir.to_path_buf();
+            }
+
+            exe.parent().unwrap_or(exe).to_path_buf()
+        }
+
         /// Path to `fake-acp-agent`, building it on first use (needs the
         /// `test-fixtures` feature only for the bin target, not for tests).
         fn fake_acp_agent_bin() -> PathBuf {
-            let mut dir = std::env::current_exe().expect("test exe");
-            dir.pop();
-            if dir.ends_with("deps") {
-                dir.pop();
-            }
+            let exe = std::env::current_exe().expect("test exe");
+            let dir = resolve_profile_dir(&exe);
             let path = dir.join("fake-acp-agent");
             BUILD.call_once(|| {
-                let target_dir = dir.parent().expect("target dir").to_path_buf();
+                let target_dir = dir.parent().unwrap_or(&dir).to_path_buf();
                 let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-                let status = std::process::Command::new(cargo)
-                    .args([
-                        "build",
-                        "--quiet",
-                        "--bin",
-                        "fake-acp-agent",
-                        "--features",
-                        "test-fixtures",
-                    ])
-                    .arg("--target-dir")
+                let mut cmd = std::process::Command::new(cargo);
+                cmd.args([
+                    "build",
+                    "--quiet",
+                    "--bin",
+                    "fake-acp-agent",
+                    "--features",
+                    "test-fixtures",
+                ]);
+                if let Some(profile) = dir.file_name().and_then(|n| n.to_str())
+                    && profile != "debug"
+                {
+                    cmd.args(["--profile", profile]);
+                }
+                cmd.arg("--target-dir")
                     .arg(&target_dir)
-                    .current_dir(env!("CARGO_MANIFEST_DIR"))
-                    .status()
-                    .expect("spawn cargo build for fake-acp-agent");
+                    .current_dir(env!("CARGO_MANIFEST_DIR"));
+                let status = cmd.status().expect("spawn cargo build for fake-acp-agent");
                 assert!(status.success(), "building fake-acp-agent failed");
             });
             assert!(
@@ -3793,6 +3825,89 @@ pub(crate) mod tests {
 
             drop(adapter);
             let _ = worker.await;
+        }
+
+        #[test]
+        fn tc_resolve_profile_dir_both_layouts() {
+            let old_debug = Path::new("/workspace/target/debug/deps/dmuxai-test");
+            assert_eq!(
+                resolve_profile_dir(old_debug),
+                Path::new("/workspace/target/debug")
+            );
+
+            let old_release = Path::new("/workspace/target/release/deps/dmuxai-test");
+            assert_eq!(
+                resolve_profile_dir(old_release),
+                Path::new("/workspace/target/release")
+            );
+
+            let new_debug =
+                Path::new("/workspace/target/debug/build/dmuxai/d14bfbdcededc16f/out/dmuxai-test");
+            assert_eq!(
+                resolve_profile_dir(new_debug),
+                Path::new("/workspace/target/debug")
+            );
+
+            let new_release = Path::new(
+                "/workspace/target/release/build/dmuxai/d14bfbdcededc16f/out/dmuxai-test",
+            );
+            assert_eq!(
+                resolve_profile_dir(new_release),
+                Path::new("/workspace/target/release")
+            );
+
+            // A directory named `build` or `deps` appearing above `target` must still resolve
+            // to the right profile dir.
+            let build_above_target_old = Path::new("/build/ws/target/debug/deps/x");
+            assert_eq!(
+                resolve_profile_dir(build_above_target_old),
+                Path::new("/build/ws/target/debug")
+            );
+
+            let deps_above_target_new =
+                Path::new("/home/u/deps/ws/target/debug/build/dmuxai/abc/out/x");
+            assert_eq!(
+                resolve_profile_dir(deps_above_target_new),
+                Path::new("/home/u/deps/ws/target/debug")
+            );
+
+            let build_above_target_new = Path::new("/build/ws/target/debug/build/dmuxai/abc/out/x");
+            assert_eq!(
+                resolve_profile_dir(build_above_target_new),
+                Path::new("/build/ws/target/debug")
+            );
+
+            let deps_above_target_old = Path::new("/home/u/deps/ws/target/debug/deps/x");
+            assert_eq!(
+                resolve_profile_dir(deps_above_target_old),
+                Path::new("/home/u/deps/ws/target/debug")
+            );
+
+            let non_target_root = Path::new("/tmp/ct/debug/build/dmuxai/abc/out/x");
+            assert_eq!(
+                resolve_profile_dir(non_target_root),
+                Path::new("/tmp/ct/debug")
+            );
+
+            let target_triple_layout =
+                Path::new("/w/target/x86_64-unknown-linux-gnu/debug/build/dmuxai/abc/out/x");
+            assert_eq!(
+                resolve_profile_dir(target_triple_layout),
+                Path::new("/w/target/x86_64-unknown-linux-gnu/debug")
+            );
+
+            let custom_profile = Path::new("/w/target/ci/deps/x");
+            assert_eq!(
+                resolve_profile_dir(custom_profile),
+                Path::new("/w/target/ci")
+            );
+
+            let non_matching = Path::new("/opt/bin/test");
+            assert_eq!(resolve_profile_dir(non_matching), Path::new("/opt/bin"));
+
+            // Never panic on root or empty path in fallback
+            let _ = resolve_profile_dir(Path::new("/"));
+            let _ = resolve_profile_dir(Path::new(""));
         }
     }
 
