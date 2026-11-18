@@ -2754,9 +2754,9 @@ main {
   background: var(--bg-badge);
 }
 
-.run-status {
-  text-transform: lowercase;
+.runs-layout .run-status {
   font-size: 0.75em;
+  text-transform: none;
 }
 
 .run-status-active,
@@ -2800,6 +2800,7 @@ main {
 .runs-flag-stalled {
   margin-right: 4px;
   font-size: 0.7em;
+  text-transform: none;
   color: var(--warn);
   background: transparent;
   border: 1px solid var(--warn);
@@ -2851,6 +2852,13 @@ main {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.runs-graph-section[hidden],
+.runs-full-graph-btn[hidden],
+.runs-detail-pane[hidden],
+.runs-detail-pane [hidden] {
+  display: none !important;
 }
 
 .runs-graph-header {
@@ -2909,7 +2917,32 @@ main {
 }
 
 .runs-stream li {
+  display: grid;
+  /* fixed time and kind columns so text lines up across rows (FR-2844) */
+  grid-template-columns: 8ch 10ch minmax(0, 1fr);
+  gap: 0 8px;
+  align-items: baseline;
   margin: 0 0 2px;
+}
+
+.runs-stream-time {
+  color: var(--faint);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.runs-stream-kind {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+
+.runs-stream-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 @media (max-width: 900px) {
