@@ -2,9 +2,11 @@
 //! HTTP API (SPEC-agent-api FR-760..FR-767).
 
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::custom_agent::CustomAgentSpec;
 use crate::settings::DmuxSettings;
 use crate::todo::{NewTodo, Todo, TodoError, TodoSource, TodoStatus, TodoStore};
 
@@ -304,6 +306,369 @@ pub fn status_json(workspace_root: &Path) -> Value {
     })
 }
 
+fn runner_installed(id: &str, spec: Option<&CustomAgentSpec>) -> Option<bool> {
+    if id.eq_ignore_ascii_case("cursor") {
+        if let Some(bin) = std::env::var_os("DMUXAI_CURSOR_BIN") {
+            let text = bin.to_string_lossy();
+            if Path::new(&*text).is_absolute() || text.chars().any(std::path::is_separator) {
+                Some(crate::settings::is_executable_file(Path::new(&*text)))
+            } else {
+                Some(crate::settings::find_on_path(&text).is_some())
+            }
+        } else {
+            Some(crate::settings::find_on_path("cursor-agent").is_some())
+        }
+    } else if id.eq_ignore_ascii_case("agy") {
+        if let Some(bin) = std::env::var_os("DMUXAI_AGY_BIN") {
+            let text = bin.to_string_lossy();
+            if Path::new(&*text).is_absolute() || text.chars().any(std::path::is_separator) {
+                Some(crate::settings::is_executable_file(Path::new(&*text)))
+            } else {
+                Some(crate::settings::find_on_path(&text).is_some())
+            }
+        } else {
+            Some(crate::settings::find_on_path("agy").is_some())
+        }
+    } else if id.eq_ignore_ascii_case("codex") {
+        if let Some(bin) = std::env::var_os("DMUXAI_CODEX_BIN") {
+            let text = bin.to_string_lossy();
+            if Path::new(&*text).is_absolute() || text.chars().any(std::path::is_separator) {
+                Some(crate::settings::is_executable_file(Path::new(&*text)))
+            } else {
+                Some(crate::settings::find_on_path(&text).is_some())
+            }
+        } else {
+            Some(crate::settings::find_on_path("codex").is_some())
+        }
+    } else if let Some(spec) = spec {
+        if spec.builtin && spec.name.eq_ignore_ascii_case("grok") {
+            Some(crate::settings::find_grok_bin().is_some())
+        } else if spec.builtin && spec.name.eq_ignore_ascii_case("opencode") {
+            Some(crate::settings::find_opencode_bin().is_some())
+        } else if let Some(cmd) = spec
+            .command
+            .first()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            if Path::new(cmd).is_absolute() || cmd.chars().any(std::path::is_separator) {
+                Some(crate::settings::is_executable_file(Path::new(cmd)))
+            } else {
+                Some(crate::settings::find_on_path(cmd).is_some())
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// `dmuxai runners --json` (FR-2831).
+pub fn runners_json(settings: &DmuxSettings) -> Value {
+    let runners: Vec<Value> = runner_ids(settings)
+        .into_iter()
+        .map(|(id, label)| {
+            let spec = settings
+                .custom_agents
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&id));
+            let kind = if id.eq_ignore_ascii_case("cursor")
+                || id.eq_ignore_ascii_case("agy")
+                || id.eq_ignore_ascii_case("codex")
+            {
+                "builtin"
+            } else if spec.is_some_and(|s| s.builtin) {
+                "preset"
+            } else {
+                "custom"
+            };
+            let allowed = runner_run_admitted(settings, &id);
+            let graph_allowed = settings.graph_runner_allowed(&id);
+            let installed = runner_installed(&id, spec);
+            let default_model = settings
+                .runner_models
+                .get(&id)
+                .or_else(|| settings.runner_models.get(&id.to_ascii_lowercase()))
+                .cloned()
+                .or_else(|| spec.and_then(|s| s.default_model.clone()))
+                .or_else(|| crate::model_policy::default_model_for_runner(&id).map(str::to_owned));
+            let model_policy = if id.eq_ignore_ascii_case("cursor") {
+                "any non-fast model (default composer-2.5)".to_owned()
+            } else if id.eq_ignore_ascii_case("agy") {
+                "gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5; no fast".to_owned()
+            } else if id.eq_ignore_ascii_case("codex") {
+                "composer-2.5 only".to_owned()
+            } else if id.eq_ignore_ascii_case("grok") {
+                "grok-* without fast".to_owned()
+            } else if let Some(spec) = spec {
+                if let Some(pattern) = &spec.allowed_models {
+                    format!("allowed_models = {pattern}")
+                } else {
+                    "any non-fast model".to_owned()
+                }
+            } else {
+                "any non-fast model".to_owned()
+            };
+
+            let mut entry = serde_json::Map::new();
+            entry.insert("id".to_owned(), json!(id));
+            entry.insert("label".to_owned(), json!(label));
+            entry.insert("kind".to_owned(), json!(kind));
+            entry.insert("allowed".to_owned(), json!(allowed));
+            entry.insert("graph_allowed".to_owned(), json!(graph_allowed));
+            entry.insert("installed".to_owned(), json!(installed));
+            entry.insert("default_model".to_owned(), json!(default_model));
+            entry.insert("model_policy".to_owned(), json!(model_policy));
+            Value::Object(entry)
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "runners": runners,
+    })
+}
+
+/// Parses output from `agy models` (FR-2833).
+pub fn parse_agy_models(stdout: &str) -> Vec<(String, Option<String>)> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in stdout.lines() {
+        let trimmed_line = line.trim();
+        let Some(first_char) = trimmed_line.chars().next() else {
+            continue;
+        };
+        if !first_char.is_ascii_lowercase() && !first_char.is_ascii_digit() {
+            continue;
+        }
+
+        let (raw_id, raw_label) = if let Some((id, rest)) = trimmed_line.split_once('\t') {
+            (id, Some(rest))
+        } else if let Some((id, rest)) = trimmed_line.split_once(|c: char| c.is_ascii_whitespace())
+        {
+            (id, Some(rest))
+        } else {
+            (trimmed_line, None)
+        };
+
+        let id = raw_id.trim();
+        if id.is_empty() || id.contains(char::is_whitespace) || !id.contains('-') {
+            continue;
+        }
+
+        let label = raw_label
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        if seen.insert(id.to_owned()) {
+            results.push((id.to_owned(), label));
+        }
+    }
+
+    results
+}
+
+/// A listing result for one runner's models (FR-2832).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelListing {
+    pub source: String,
+    pub models: Vec<(String, Option<String>)>,
+    pub error: Option<String>,
+    pub error_kind: Option<String>,
+}
+
+/// Pure builder for `dmuxai models --json` (FR-2832).
+pub fn models_json(settings: &DmuxSettings, entries: Vec<(String, ModelListing)>) -> Value {
+    let runners: Vec<Value> = entries
+        .into_iter()
+        .map(|(runner_id, listing)| {
+            let allowed = runner_run_admitted(settings, &runner_id);
+            let mut runner_obj = serde_json::Map::new();
+            runner_obj.insert("id".to_owned(), json!(runner_id));
+            runner_obj.insert("allowed".to_owned(), json!(allowed));
+            runner_obj.insert("source".to_owned(), json!(listing.source));
+
+            let models_arr: Vec<Value> = listing
+                .models
+                .iter()
+                .map(|(id, label)| {
+                    let model_allowed =
+                        crate::model_policy::validate_model_for_runner(&runner_id, id).is_ok();
+                    let mut m = serde_json::Map::new();
+                    m.insert("id".to_owned(), json!(id));
+                    if let Some(lbl) = label {
+                        m.insert("label".to_owned(), json!(lbl));
+                    }
+                    m.insert("allowed".to_owned(), json!(model_allowed));
+                    Value::Object(m)
+                })
+                .collect();
+
+            runner_obj.insert("models".to_owned(), Value::Array(models_arr));
+
+            if let Some(err) = &listing.error {
+                runner_obj.insert("error".to_owned(), json!(err));
+            }
+            if let Some(kind) = &listing.error_kind {
+                runner_obj.insert("error_kind".to_owned(), json!(kind));
+            }
+
+            Value::Object(runner_obj)
+        })
+        .collect();
+
+    json!({
+        "ok": true,
+        "runners": runners,
+    })
+}
+
+/// Real model listing collection for a single runner.
+pub async fn collect_model_listing(
+    workspace_root: &Path,
+    runner: &str,
+    settings: &DmuxSettings,
+) -> ModelListing {
+    if runner.eq_ignore_ascii_case("agy") {
+        let static_agy = || ModelListing {
+            source: "static".to_owned(),
+            models: vec![
+                ("gemini-3.8-flash-low".to_owned(), None),
+                ("gemini-3.8-flash-medium".to_owned(), None),
+                ("gemini-3.8-flash-high".to_owned(), None),
+                ("gemini-4-hydrogen-low".to_owned(), None),
+                ("gemini-4-hydrogen-medium".to_owned(), None),
+                ("gemini-4-hydrogen-high".to_owned(), None),
+                ("gemini-4-hydrogen-xhigh".to_owned(), None),
+            ],
+            error: None,
+            error_kind: None,
+        };
+
+        let program = crate::process::resolve_program("DMUXAI_AGY_BIN", "agy");
+        let mut cmd = crate::process::headless_command(program);
+        cmd.arg("models");
+        crate::process::apply_child_cwd_tokio(&mut cmd, workspace_root);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        match tokio::time::timeout(Duration::from_secs(10), cmd.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let parsed = parse_agy_models(&stdout);
+                if parsed.is_empty() {
+                    static_agy()
+                } else {
+                    ModelListing {
+                        source: "command".to_owned(),
+                        models: parsed,
+                        error: None,
+                        error_kind: None,
+                    }
+                }
+            }
+            _ => static_agy(),
+        }
+    } else if runner.eq_ignore_ascii_case("cursor") || runner.eq_ignore_ascii_case("codex") {
+        ModelListing {
+            source: "static".to_owned(),
+            models: vec![("composer-2.5".to_owned(), None)],
+            error: None,
+            error_kind: None,
+        }
+    } else if let Some(spec) = settings
+        .custom_agents
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(runner))
+    {
+        if !spec.models_command.is_empty() {
+            match crate::custom_agent::list_model_ids(
+                spec,
+                workspace_root,
+                Some(Duration::from_secs(10)),
+            )
+            .await
+            {
+                Ok(ids) => ModelListing {
+                    source: "command".to_owned(),
+                    models: ids.into_iter().map(|id| (id, None)).collect(),
+                    error: None,
+                    error_kind: None,
+                },
+                Err(err) => {
+                    let error_kind = if spec.builtin && spec.name.eq_ignore_ascii_case("grok") {
+                        Some("auth".to_owned())
+                    } else if spec.builtin {
+                        Some(crate::custom_agent::builtin_probe_error_kind(spec, &err).to_owned())
+                    } else {
+                        None
+                    };
+                    ModelListing {
+                        source: "none".to_owned(),
+                        models: vec![],
+                        error: Some(err),
+                        error_kind,
+                    }
+                }
+            }
+        } else if let Some(default_model) = &spec.default_model {
+            ModelListing {
+                source: "static".to_owned(),
+                models: vec![(default_model.clone(), None)],
+                error: None,
+                error_kind: None,
+            }
+        } else {
+            ModelListing {
+                source: "none".to_owned(),
+                models: vec![],
+                error: None,
+                error_kind: None,
+            }
+        }
+    } else {
+        ModelListing {
+            source: "none".to_owned(),
+            models: vec![],
+            error: Some(format!("unknown runner: {runner}")),
+            error_kind: None,
+        }
+    }
+}
+
+/// Collects models for either all runners or a single target agent (FR-2832).
+pub async fn collect_models_json(
+    workspace_root: &Path,
+    settings: &DmuxSettings,
+    target_agent: Option<&str>,
+) -> Result<Value, ApiError> {
+    let known_runners = runner_ids(settings);
+    if let Some(target) = target_agent {
+        let matching = known_runners
+            .iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(target.trim()));
+        let Some((canonical_id, _)) = matching else {
+            return Err(ApiError::new(
+                exit::NOT_FOUND,
+                format!("unknown agent '{target}'"),
+            ));
+        };
+        let listing = collect_model_listing(workspace_root, canonical_id, settings).await;
+        Ok(models_json(settings, vec![(canonical_id.clone(), listing)]))
+    } else {
+        let mut entries = Vec::new();
+        for (id, _) in known_runners {
+            let listing = collect_model_listing(workspace_root, &id, settings).await;
+            entries.push((id, listing));
+        }
+        Ok(models_json(settings, entries))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +955,203 @@ mod tests {
                 "{runner} should be graph-rejected when allowed_runners is empty"
             );
         }
+    }
+
+    // TC-2831 / FR-2831: runners_json fields and admission with unset/set allowed_runners
+    #[test]
+    fn tc_2831_runners_json_fields_and_admission() {
+        let mut settings = DmuxSettings::default();
+        let custom = crate::custom_agent::CustomAgentSpec {
+            name: "my-custom".to_owned(),
+            label: Some("My Custom".to_owned()),
+            command: vec!["echo".to_owned()],
+            builtin: false,
+            allowed_models: Some("^custom-.*$".to_owned()),
+            ..Default::default()
+        };
+        settings.custom_agents.push(custom);
+        settings
+            .custom_agents
+            .push(crate::custom_agent::grok_preset("grok"));
+
+        // 1. Unset allowed_runners
+        assert_eq!(settings.graph_allowed_runners, None);
+        let val = runners_json(&settings);
+        assert_eq!(val["ok"], true);
+        let runners = val["runners"].as_array().expect("runners array");
+        assert_eq!(runners.len(), 5);
+
+        let find = |name: &str| runners.iter().find(|r| r["id"] == name).unwrap();
+
+        let cursor = find("cursor");
+        assert_eq!(cursor["label"], "Cursor");
+        assert_eq!(cursor["kind"], "builtin");
+        assert_eq!(cursor["allowed"], true);
+        assert_eq!(cursor["graph_allowed"], true);
+        assert_eq!(cursor["default_model"], "composer-2.5");
+        assert_eq!(
+            cursor["model_policy"],
+            "any non-fast model (default composer-2.5)"
+        );
+
+        let agy = find("agy");
+        assert_eq!(agy["label"], "AGY");
+        assert_eq!(agy["kind"], "builtin");
+        assert_eq!(agy["allowed"], true);
+        assert_eq!(agy["graph_allowed"], true);
+        assert_eq!(agy["default_model"], Value::Null);
+        assert_eq!(
+            agy["model_policy"],
+            "gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5; no fast"
+        );
+
+        let codex = find("codex");
+        assert_eq!(codex["label"], "Codex");
+        assert_eq!(codex["kind"], "builtin");
+        assert_eq!(codex["allowed"], true);
+        assert_eq!(codex["graph_allowed"], true);
+        assert_eq!(codex["default_model"], Value::Null);
+        assert_eq!(codex["model_policy"], "composer-2.5 only");
+
+        let grok = find("grok");
+        assert_eq!(grok["label"], "grok");
+        assert_eq!(grok["kind"], "preset");
+        assert_eq!(grok["allowed"], true);
+        assert_eq!(grok["graph_allowed"], false);
+        assert_eq!(grok["model_policy"], "grok-* without fast");
+
+        let my_custom = find("my-custom");
+        assert_eq!(my_custom["label"], "My Custom");
+        assert_eq!(my_custom["kind"], "custom");
+        assert_eq!(my_custom["allowed"], true);
+        assert_eq!(my_custom["graph_allowed"], true);
+        assert_eq!(my_custom["model_policy"], "allowed_models = ^custom-.*$");
+
+        // 2. Set allowed_runners
+        settings.graph_allowed_runners = Some(vec!["grok".to_owned(), "cursor".to_owned()]);
+        let val2 = runners_json(&settings);
+        let runners2 = val2["runners"].as_array().expect("runners array");
+        let find2 = |name: &str| runners2.iter().find(|r| r["id"] == name).unwrap();
+        assert_eq!(find2("cursor")["allowed"], true);
+        assert_eq!(find2("cursor")["graph_allowed"], true);
+        assert_eq!(find2("agy")["allowed"], false);
+        assert_eq!(find2("agy")["graph_allowed"], false);
+        assert_eq!(find2("grok")["allowed"], true);
+        assert_eq!(find2("grok")["graph_allowed"], true);
+        assert_eq!(find2("my-custom")["allowed"], false);
+        assert_eq!(find2("my-custom")["graph_allowed"], false);
+    }
+
+    // TC-2833 / FR-2832: models_json policy and errors
+    #[test]
+    fn tc_2833_models_json_policy_and_errors() {
+        let settings = DmuxSettings::default();
+        let entries = vec![
+            (
+                "agy".to_owned(),
+                ModelListing {
+                    source: "command".to_owned(),
+                    models: vec![
+                        (
+                            "gemini-4-hydrogen-high".to_owned(),
+                            Some("Gemini 4 Hydrogen (High)".to_owned()),
+                        ),
+                        (
+                            "claude-sonnet-5-5-high".to_owned(),
+                            Some("Claude Sonnet 5.5 (High)".to_owned()),
+                        ),
+                    ],
+                    error: None,
+                    error_kind: None,
+                },
+            ),
+            (
+                "cursor".to_owned(),
+                ModelListing {
+                    source: "none".to_owned(),
+                    models: vec![],
+                    error: Some("command timed out".to_owned()),
+                    error_kind: None,
+                },
+            ),
+            (
+                "grok".to_owned(),
+                ModelListing {
+                    source: "none".to_owned(),
+                    models: vec![],
+                    error: Some(crate::custom_agent::grok_login_message()),
+                    error_kind: Some("auth".to_owned()),
+                },
+            ),
+        ];
+
+        let val = models_json(&settings, entries);
+        assert_eq!(val["ok"], true);
+        let runners = val["runners"].as_array().expect("runners array");
+        assert_eq!(runners.len(), 3);
+
+        // agy
+        let agy = &runners[0];
+        assert_eq!(agy["id"], "agy");
+        assert_eq!(agy["allowed"], true);
+        assert_eq!(agy["source"], "command");
+        assert!(agy.get("error").is_none());
+        assert!(agy.get("error_kind").is_none());
+        let agy_models = agy["models"].as_array().expect("models array");
+        assert_eq!(agy_models.len(), 2);
+        assert_eq!(agy_models[0]["id"], "gemini-4-hydrogen-high");
+        assert_eq!(agy_models[0]["label"], "Gemini 4 Hydrogen (High)");
+        assert_eq!(agy_models[0]["allowed"], true);
+        assert_eq!(agy_models[1]["id"], "claude-sonnet-5-5-high");
+        assert_eq!(agy_models[1]["label"], "Claude Sonnet 5.5 (High)");
+        assert_eq!(agy_models[1]["allowed"], false);
+
+        // cursor (failed listing)
+        let cursor = &runners[1];
+        assert_eq!(cursor["id"], "cursor");
+        assert_eq!(cursor["source"], "none");
+        assert_eq!(cursor["error"], "command timed out");
+        assert!(cursor.get("error_kind").is_none());
+        assert_eq!(cursor["models"].as_array().unwrap().len(), 0);
+
+        // grok (unauthenticated)
+        let grok = &runners[2];
+        assert_eq!(grok["id"], "grok");
+        assert_eq!(grok["source"], "none");
+        assert_eq!(grok["error"], crate::custom_agent::grok_login_message());
+        assert_eq!(grok["error_kind"], "auth");
+        assert_eq!(grok["models"].as_array().unwrap().len(), 0);
+    }
+
+    // TC-2834 / FR-2833: parse agy models output drops banner, keeps labels and order
+    #[test]
+    fn tc_2834_parse_agy_models_output() {
+        let fixture = "Fetching available models...\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\ngemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\nclaude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\n";
+        let parsed = parse_agy_models(fixture);
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "gemini-4-argon-medium".to_owned(),
+                    Some("Gemini 4 Argon (Medium)".to_owned())
+                ),
+                (
+                    "gemini-4-hydrogen-high".to_owned(),
+                    Some("Gemini 4 Hydrogen (High)".to_owned())
+                ),
+                (
+                    "gemini-4-hydrogen-xhigh".to_owned(),
+                    Some("Gemini 4 Hydrogen (XHigh)".to_owned())
+                ),
+                (
+                    "gemini-3.8-flash-high".to_owned(),
+                    Some("Gemini 3.8 Flash (High)".to_owned())
+                ),
+                (
+                    "claude-sonnet-5-5-high".to_owned(),
+                    Some("Claude Sonnet 5.5 (High)".to_owned())
+                ),
+            ]
+        );
     }
 }

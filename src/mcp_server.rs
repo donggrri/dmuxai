@@ -31,6 +31,7 @@ pub trait McpBackend {
     fn run(&self, args: RunArgs) -> Result<Value, String>;
     fn status(&self) -> Result<Value, String>;
     fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String>;
+    fn models(&self, agent: Option<&str>) -> Result<Value, String>;
 }
 
 fn tool_definitions() -> Value {
@@ -99,6 +100,19 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "since": { "type": "integer", "minimum": 0 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                }
+            }
+        },
+        {
+            "name": "models",
+            "description": "List available models and runner model policy for all runners or a specific agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional runner id (e.g. agy, cursor, codex, or a custom agent name)"
+                    }
                 }
             }
         }
@@ -203,6 +217,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                 .map(|l| l.clamp(1, 1000) as usize);
             backend.events_since(since, limit)
         }
+        "models" => backend.models(str_arg(args, "agent")),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -267,7 +282,14 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let known = ["todo_add", "todo_list", "run", "status", "events_since"];
+            let known = [
+                "todo_add",
+                "todo_list",
+                "run",
+                "status",
+                "events_since",
+                "models",
+            ];
             if !known.contains(&name) {
                 return Some(
                     error_response(&id, -32602, &format!("unknown tool: {name}")).to_string(),
@@ -332,6 +354,9 @@ mod tests {
         fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String> {
             Ok(json!({ "since": since, "limit": limit }))
         }
+        fn models(&self, agent: Option<&str>) -> Result<Value, String> {
+            Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
+        }
     }
 
     fn call(stub: &Stub, line: Value) -> Value {
@@ -369,7 +394,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["todo_add", "todo_list", "run", "status", "events_since"]
+            [
+                "todo_add",
+                "todo_list",
+                "run",
+                "status",
+                "events_since",
+                "models"
+            ]
         );
         let run_tool = list["result"]["tools"]
             .as_array()
@@ -697,6 +729,17 @@ mod tests {
         assert!(
             desc.contains("auth"),
             "run tool description should mention auth: {desc}"
+        );
+
+        let models_tool = tools
+            .as_array()
+            .and_then(|arr| arr.iter().find(|t| t["name"] == "models"))
+            .expect("models tool");
+        assert!(
+            models_tool["inputSchema"]["properties"]
+                .get("agent")
+                .is_some(),
+            "models tool schema should declare agent"
         );
 
         let api_md = include_str!("../docs/API.md");

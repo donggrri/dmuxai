@@ -66,6 +66,15 @@ pub enum AgentCommand {
         failed: bool,
         json: bool,
     },
+    /// `runners [--json]` (FR-2831).
+    Runners {
+        json: bool,
+    },
+    /// `models [--agent ID] [--json]` (FR-2832).
+    Models {
+        agent: Option<String>,
+        json: bool,
+    },
     /// Persistent named terminal sessions (SPEC-terminal-sessions).
     Term(TermCommand),
 }
@@ -160,9 +169,159 @@ pub struct RunOptions {
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 9] = [
-    "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "term",
+pub const SUBCOMMANDS: [&str; 11] = [
+    "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models", "term",
 ];
+
+pub const RUN_USAGE: &str = "\
+Usage: dmuxai run <prompt|-> [options]
+
+Run one prompt headless and exit.
+
+Arguments:
+  <prompt|->               Prompt text to run, or - to read from stdin
+
+Options:
+  --agent ID               Runner id (e.g. cursor, agy, codex, or a custom agent)
+  --model M                Model id for the runner
+  --approve-plan           Approve a pending plan and confirm sensitive gates
+  --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
+  --allow-sensitive        Confirm every sensitive gate
+  --graph                  Use the graph planner
+  --progress               Stream one JSON line per agent activity to stderr
+  --json                   Print machine-readable JSON on stdout
+  --trust-workspace-config Trust workspace configuration without prompting
+  -h, --help               Print help information
+";
+
+pub const TODO_USAGE: &str = "\
+Usage: dmuxai todo <subcommand> [options]
+
+Add, list or run to-dos without the TUI.
+
+Subcommands:
+  add <title> [--body TEXT] [--json]       Add a to-do
+  list [--status open|running|done] [--json] List to-dos
+  run <id> [options]                       Run a to-do
+
+Options for `todo run`:
+  --agent ID               Runner id (cannot be used with --graph)
+  --graph                  Use the graph planner
+  --model M                Model id for the runner
+  --progress               Stream activity progress events to stderr
+  --json                   Print machine-readable JSON on stdout
+  --trust-workspace-config Trust workspace configuration without prompting
+  -h, --help               Print help information
+";
+
+pub const STATUS_USAGE: &str = "\
+Usage: dmuxai status [options]
+
+Print workspace status (agents, to-dos, last graph, events).
+
+Options:
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+pub const EVENTS_USAGE: &str = "\
+Usage: dmuxai events [options]
+
+Print state-change events from .dmuxai/events.jsonl.
+
+Options:
+  --since N                Only print events with seq greater than N
+  --limit N                Maximum number of events to print
+  -f, --follow             Keep waiting for new events to arrive
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+pub const MCP_USAGE: &str = "\
+Usage: dmuxai mcp [options]
+
+Serve DmuxAI as an MCP server over stdio.
+
+Options:
+  -h, --help               Print help information
+";
+
+pub const INIT_USAGE: &str = "\
+Usage: dmuxai init [options]
+
+Write a commented starter dmuxai.toml to the user config or workspace.
+
+Options:
+  --workspace              Write configuration to workspace instead of user config
+  --force                  Overwrite existing configuration file
+  -h, --help               Print help information
+";
+
+pub const TRUST_USAGE: &str = "\
+Usage: dmuxai trust [options]
+
+Manage workspace configuration trust for dmuxai.toml.
+
+Options:
+  --status                 Show workspace trust status
+  --revoke                 Revoke trust for the current workspace
+  --yes                    Confirm trusting workspace configuration without prompting
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+pub const RUNS_USAGE: &str = "\
+Usage: dmuxai runs [options]
+
+List or inspect recorded execution runs.
+
+Subcommands:
+  show <id> [--json]       Show details for a recorded run
+
+Options:
+  --limit N                Maximum number of runs to list (default 20)
+  --failed                 Only list failed runs
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+pub const RUNNERS_USAGE: &str = "\
+Usage: dmuxai runners [options]
+
+List registered runners, admission, installation and model policy.
+
+Options:
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+pub const MODELS_USAGE: &str = "\
+Usage: dmuxai models [options]
+
+List available models and runner model policy.
+
+Options:
+  --agent ID               Only list models for the given runner id
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+/// Subcommand-local help for agent-facing subcommands (FR-2830).
+pub fn subcommand_usage(name: &str) -> Option<&'static str> {
+    match name {
+        "run" => Some(RUN_USAGE),
+        "todo" => Some(TODO_USAGE),
+        "status" => Some(STATUS_USAGE),
+        "events" => Some(EVENTS_USAGE),
+        "mcp" => Some(MCP_USAGE),
+        "init" => Some(INIT_USAGE),
+        "trust" => Some(TRUST_USAGE),
+        "runs" => Some(RUNS_USAGE),
+        "runners" => Some(RUNNERS_USAGE),
+        "models" => Some(MODELS_USAGE),
+        _ => None,
+    }
+}
 
 /// Subcommand-local help for `dmuxai term --help` / `-h` (FR-2617). This text
 /// replaces the root usage for term; the root `dmuxai --help` is unchanged.
@@ -842,6 +1001,37 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 limit,
                 failed,
                 json,
+            })
+        }
+        "runners" => {
+            const RUNNERS_FLAGS: &[FlagSpec] = &[FlagSpec {
+                names: &["--json"],
+                takes_value: false,
+                hidden: false,
+            }];
+            let parsed = parse_flags(rest, RUNNERS_FLAGS, false)?;
+            Ok(AgentCommand::Runners {
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "models" => {
+            const MODELS_FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--agent"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, MODELS_FLAGS, false)?;
+            let agent = parsed.flags.get("--agent").cloned().flatten();
+            Ok(AgentCommand::Models {
+                agent,
+                json: parsed.flags.contains_key("--json"),
             })
         }
         "term" => parse_term(rest).map(AgentCommand::Term),
@@ -1677,6 +1867,72 @@ pub async fn execute(command: AgentCommand) -> i32 {
             failed,
             json,
         } => execute_runs(&workspace_root, show_id, limit, failed, json),
+        AgentCommand::Runners { json } => {
+            let settings = DmuxSettings::load(&workspace_root);
+            let val = agent_api::runners_json(&settings);
+            if json {
+                print_json(&val);
+            } else if let Some(runners) = val["runners"].as_array() {
+                for runner in runners {
+                    let id = runner["id"].as_str().unwrap_or_default();
+                    let label = runner["label"].as_str().unwrap_or_default();
+                    let kind = runner["kind"].as_str().unwrap_or_default();
+                    let allowed = runner["allowed"].as_bool().unwrap_or(false);
+                    let graph_allowed = runner["graph_allowed"].as_bool().unwrap_or(false);
+                    let installed = match runner.get("installed") {
+                        Some(Value::Bool(true)) => "installed",
+                        Some(Value::Bool(false)) => "not installed",
+                        _ => "unknown",
+                    };
+                    let default_model = runner
+                        .get("default_model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-");
+                    let policy = runner
+                        .get("model_policy")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-");
+                    println!(
+                        "{id}\t{label} ({kind})\tallowed: {allowed}\tgraph_allowed: {graph_allowed}\tinstalled: {installed}\tdefault: {default_model}\tpolicy: {policy}"
+                    );
+                }
+            }
+            exit::OK
+        }
+        AgentCommand::Models { agent, json } => {
+            let settings = DmuxSettings::load(&workspace_root);
+            match agent_api::collect_models_json(&workspace_root, &settings, agent.as_deref()).await
+            {
+                Ok(val) => {
+                    if json {
+                        print_json(&val);
+                    } else if let Some(runners) = val["runners"].as_array() {
+                        for runner in runners {
+                            let id = runner["id"].as_str().unwrap_or_default();
+                            let source = runner["source"].as_str().unwrap_or_default();
+                            println!("{id} (source: {source}):");
+                            if let Some(err) = runner.get("error").and_then(Value::as_str) {
+                                println!("  error: {err}");
+                            }
+                            if let Some(models) = runner.get("models").and_then(Value::as_array) {
+                                for m in models {
+                                    let mid = m["id"].as_str().unwrap_or_default();
+                                    let allowed = m["allowed"].as_bool().unwrap_or(false);
+                                    let marker = if allowed { "" } else { " [disallowed]" };
+                                    if let Some(label) = m.get("label").and_then(Value::as_str) {
+                                        println!("  {mid} ({label}){marker}");
+                                    } else {
+                                        println!("  {mid}{marker}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    exit::OK
+                }
+                Err(error) => fail(error, json),
+            }
+        }
         AgentCommand::Term(command) => execute_term(&workspace_root, command),
         AgentCommand::Mcp => {
             let backend = CliMcpBackend {
@@ -2816,6 +3072,21 @@ impl McpBackend for CliMcpBackend {
         let last_seq = events.last().map(|e| e.seq).unwrap_or(since);
         Ok(json!({ "events": events, "last_seq": last_seq }))
     }
+
+    fn models(&self, agent: Option<&str>) -> Result<Value, String> {
+        let settings = DmuxSettings::load(&self.workspace_root);
+        let fut = agent_api::collect_models_json(&self.workspace_root, &settings, agent);
+        let value = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())?
+                .block_on(fut),
+        };
+        match value {
+            Ok(v) => Ok(v),
+            Err(err) => Ok(err.to_json()),
+        }
+    }
 }
 
 /// Waits for any of Ctrl+C, SIGTERM or SIGHUP (Unix); Ctrl+C only elsewhere.
@@ -3786,5 +4057,33 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
+    }
+
+    // TC-2832 / FR-2832: parsing runners and models commands
+    #[test]
+    fn tc_2832_parse_runners_and_models() {
+        let cmd = parse(&["runners".into(), "--json".into()]).expect("parse runners");
+        assert_eq!(cmd, AgentCommand::Runners { json: true });
+
+        let cmd = parse(&[
+            "models".into(),
+            "--agent".into(),
+            "agy".into(),
+            "--json".into(),
+        ])
+        .expect("parse models");
+        assert_eq!(
+            cmd,
+            AgentCommand::Models {
+                agent: Some("agy".into()),
+                json: true,
+            }
+        );
+
+        let err = parse(&["runners".into(), "--bogus".into()]);
+        assert!(err.is_err());
+
+        let err = parse(&["models".into(), "--bogus".into()]);
+        assert!(err.is_err());
     }
 }

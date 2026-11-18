@@ -96,6 +96,8 @@ Usage:
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
   dmuxai status [--json]
+  dmuxai runners [--json]
+  dmuxai models [--agent ID] [--json]
   dmuxai runs [--limit N] [--failed] [--json]
   dmuxai runs show <id> [--json]
   dmuxai events [--since N] [--limit N] [--follow] [--json]
@@ -128,6 +130,8 @@ Options:
                    --approve-plan confirms sensitive gates), 130 cancelled)
   todo             Add, list or run to-dos without the TUI
   status           Print workspace status (agents, to-dos, last graph, events)
+  runners          List registered runners, admission, installation and model policy
+  models           List available models and runner model policy
   runs             List or inspect recorded execution runs
   events           Print state-change events from .dmuxai/events.jsonl
   term             Manage persistent named terminal sessions
@@ -184,6 +188,11 @@ where
             return CliAction::HelpTopic(text);
         }
         if wants_help {
+            if let Some(sub) = args.first().map(String::as_str)
+                && let Some(text) = cli::subcommand_usage(sub)
+            {
+                return CliAction::HelpTopic(text);
+            }
             return CliAction::Help;
         }
         return match cli::parse(&args) {
@@ -1319,7 +1328,10 @@ mod tests {
             parse_cli(["status", "--json"]),
             CliAction::Agent(_)
         ));
-        assert_eq!(parse_cli(["run", "--help"]), CliAction::Help);
+        assert_eq!(
+            parse_cli(["run", "--help"]),
+            CliAction::HelpTopic(cli::RUN_USAGE)
+        );
         match parse_cli(["run", "--", "--help"]) {
             CliAction::Agent(cli::AgentCommand::Run(options)) => {
                 assert_eq!(options.prompt, "--help")
@@ -1332,7 +1344,7 @@ mod tests {
 
     // TC-2617 / FR-2617: `term --help`, `term open --help` and every other
     // term subcommand's `--help` / `-h` print subcommand-local help; `dmuxai
-    // --help` and `dmuxai run --help` keep the root usage.
+    // --help` keeps the root usage.
     #[test]
     fn tc_2617_term_help_topics_are_subcommand_local() {
         assert_eq!(
@@ -1361,13 +1373,58 @@ mod tests {
             }
         }
         assert_eq!(parse_cli(["--help"]), CliAction::Help);
-        assert_eq!(parse_cli(["run", "--help"]), CliAction::Help);
+        assert_eq!(
+            parse_cli(["run", "--help"]),
+            CliAction::HelpTopic(cli::RUN_USAGE)
+        );
         // `--help` after `--` is a shell argument, not help.
         match parse_cli(["term", "exec", "sh", "--", "--help"]) {
             CliAction::Agent(cli::AgentCommand::Term(command)) => {
                 assert!(matches!(command.op, cli::TermOp::Exec { .. }));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // TC-2830 / FR-2830: per-subcommand help is local for all agent-facing subcommands
+    #[test]
+    fn tc_2830_subcommand_help_is_local() {
+        let subcommands = [
+            "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models",
+        ];
+        for sub in subcommands {
+            for flag in ["--help", "-h"] {
+                match parse_cli([sub, flag]) {
+                    CliAction::HelpTopic(text) => {
+                        assert!(
+                            text.starts_with(&format!("Usage: dmuxai {sub}")),
+                            "{sub} {flag} must start with Usage: dmuxai {sub}, got: {text}"
+                        );
+                    }
+                    other => panic!("expected HelpTopic for {sub} {flag}, got {other:?}"),
+                }
+            }
+        }
+
+        // `todo add --help` and `todo add -h` print todo usage
+        for flag in ["--help", "-h"] {
+            match parse_cli(["todo", "add", flag]) {
+                CliAction::HelpTopic(text) => {
+                    assert!(
+                        text.starts_with("Usage: dmuxai todo"),
+                        "todo add {flag} must start with Usage: dmuxai todo, got: {text}"
+                    );
+                }
+                other => panic!("expected HelpTopic for todo add {flag}, got {other:?}"),
+            }
+        }
+
+        // `run -- --help` treats --help as prompt text
+        match parse_cli(["run", "--", "--help"]) {
+            CliAction::Agent(cli::AgentCommand::Run(options)) => {
+                assert_eq!(options.prompt, "--help");
+            }
+            other => panic!("expected Agent(Run) for run -- --help, got {other:?}"),
         }
     }
 

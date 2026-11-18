@@ -1831,12 +1831,12 @@ fn tc_2617_term_help_and_open_help_are_subcommand_local() {
         !out.stdout.contains("--no-usbipd-attach"),
         "root help must not document term-open serial flags: {out:?}"
     );
-    // `dmuxai run --help` keeps the root usage too.
+    // FR-2830: `dmuxai run --help` prints its own usage.
     let out = sandbox.run(&["run", "--help"]);
     assert_eq!(out.code, 0, "run help must exit 0: {out:?}");
     assert!(
-        out.stdout.contains("dmuxai [--help|--version]"),
-        "run help must print the root usage: {out:?}"
+        out.stdout.contains("Usage: dmuxai run"),
+        "run help must print the run usage: {out:?}"
     );
 }
 

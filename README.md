@@ -231,7 +231,9 @@ stdout machine-readable and sends diagnostics to stderr; `--progress` streams li
 progress JSON lines to stderr while a turn runs:
 
 ```bash
-dmuxai status --json                                  # agents (with last_output_at_ms), to-dos, last graph, last event seq
+dmuxai status --json                                  # agents (with last_output_at_ms, allowed, graph_allowed), to-dos, last graph, last event seq
+dmuxai runners --json                                 # registered runners, admission, installation and model policy
+dmuxai models [--agent ID] [--json]                   # available models and runner model policy
 dmuxai run "summarize this repo" --agent agy --json   # one-shot; add --progress for live progress, --graph for the planner
 dmuxai todo add "Write docs" --body "API.md first"
 dmuxai events --follow --json                         # tail .dmuxai/events.jsonl (agent, activity, node, graph, todo)
@@ -249,7 +251,7 @@ directory when that is unset. Claude Desktop has no `cwd` field, so pass the
 repo explicitly. These configs are **not yet tested with Claude Desktop
 itself**. `dmuxai mcp` was checked with a raw stdio JSON-RPC session:
 `initialize` and `tools/list` (`todo_add`, `todo_list`, `run`, `status`,
-`events_since`) both answer.
+`events_since`, `models`) both answer.
 
 Claude Desktop on Linux (`claude_desktop_config.json`):
 
@@ -912,7 +914,7 @@ similar to move-capturing owning C++ values in a task lambda.
 - `src/agent/cursor.rs`: Cursor NDJSON process and session adapter
 - `src/agent/agy.rs`: AGY NDJSON process and conversation adapter
 - `src/process/mod.rs`: executable resolution and headless-process boundary
-- `src/cli.rs`, `src/agent_api.rs`: headless `run`/`todo`/`status`/`events` subcommands, JSON output and exit codes
+- `src/cli.rs`, `src/agent_api.rs`: headless `run`/`todo`/`status`/`runners`/`models`/`events` subcommands, JSON output and exit codes
 - `src/mcp_server.rs`: `dmuxai mcp` stdio MCP server for other agents
 - `src/events.rs`, `src/notify.rs`: `.dmuxai/events.jsonl` state-change log, webhooks and command hooks
 - `src/graph/`: agent-graph planning and orchestration
