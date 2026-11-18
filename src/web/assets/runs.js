@@ -86,8 +86,39 @@ function runsFormatLocalStart(tsMs) {
   }
 }
 
+var RUNS_STATUS_LABELS = {
+  active: 'Active',
+  running: 'Running',
+  awaiting_approval: 'Awaiting approval',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  approved: 'Approved',
+  pending: 'Pending',
+  process_exit: 'Process exit',
+  stale: 'Stale',
+  stalled: 'Stalled'
+};
+
+function runsStatusLabel(token) {
+  if (token === null || token === undefined) { return ''; }
+  var raw = String(token);
+  if (!raw) { return ''; }
+  if (Object.prototype.hasOwnProperty.call(RUNS_STATUS_LABELS, raw)) {
+    return RUNS_STATUS_LABELS[raw];
+  }
+  var spaced = raw.replace(/_/g, ' ');
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+window.dmuxaiStatusLabel = runsStatusLabel;
+
 function runsIsActive(status) {
   return status === 'active' || status === 'running';
+}
+
+function runsIsLive(run) {
+  return !!(run && runsIsActive(run.status) && !run.stale);
 }
 
 function runsIsTerminal(status) {
@@ -174,6 +205,7 @@ var runsDetailRun = null;
 var runsDetailGraph = null;
 var runsDetailGen = 0;
 var runsStreamLines = 0;
+var runsStreamTextSummaries = [];
 var runsStreamStickBottom = true;
 var runsStreamBackoffIx = 0;
 var runsStreamReconnectTimer = null;
@@ -267,28 +299,58 @@ function runsRefreshList() {
 }
 
 // FR-2826: the Runs button shows how many headless runs are active.
+// FR-2846: stale runs are excluded from active counts.
 function runsActiveCount() {
   var count = 0;
   for (var i = 0; i < runsListData.length; i++) {
-    if (runsIsActive(runsListData[i].status)) { count += 1; }
+    if (runsIsLive(runsListData[i])) { count += 1; }
   }
   return count;
+}
+
+// FR-2840: export live count and newest run status for the top status pill.
+window.dmuxaiHeadlessRunsSummary = function () {
+  var live = 0;
+  var newest = null;
+  var newestTs = -1;
+  for (var i = 0; i < runsListData.length; i++) {
+    var r = runsListData[i];
+    if (!r) { continue; }
+    if (runsIsLive(r)) { live += 1; }
+    var ts = typeof r.created_at_ms === 'number' && isFinite(r.created_at_ms) ? r.created_at_ms : 0;
+    if (!newest || ts > newestTs) {
+      newest = r;
+      newestTs = ts;
+    }
+  }
+  return {
+    live: live,
+    newestStatus: newest && newest.status ? String(newest.status) : null
+  };
+};
+
+function runsNotifyRunStatus() {
+  if (typeof window.dmuxaiRefreshRunStatus === 'function') {
+    window.dmuxaiRefreshRunStatus();
+  }
 }
 
 function runsUpdateIndicator() {
   var ind = document.getElementById('runs-indicator');
   var toggle = document.getElementById('runs-toggle');
-  if (!ind || !toggle) { return; }
-  var count = runsActiveCount();
-  if (count > 0) {
-    ind.hidden = false;
-    ind.textContent = String(count);
-    toggle.setAttribute('aria-label', 'Runs, ' + count + ' active');
-  } else {
-    ind.hidden = true;
-    ind.textContent = '';
-    toggle.setAttribute('aria-label', 'Runs');
+  if (ind && toggle) {
+    var count = runsActiveCount();
+    if (count > 0) {
+      ind.hidden = false;
+      ind.textContent = String(count);
+      toggle.setAttribute('aria-label', 'Runs, ' + count + ' active');
+    } else {
+      ind.hidden = true;
+      ind.textContent = '';
+      toggle.setAttribute('aria-label', 'Runs');
+    }
   }
+  runsNotifyRunStatus();
 }
 
 // While Runs is closed, reuse GET /api/runs at most once every 2 s so the
@@ -335,7 +397,9 @@ function runsRenderList() {
     if (selected) { tr.classList.add('runs-row-selected'); }
 
     var tdStatus = document.createElement('td');
-    var badge = runsEl('span', 'badge run-status run-status-' + run.status, run.status);
+    var rawStatus = run.status ? String(run.status) : '';
+    var badge = runsEl('span', 'badge run-status run-status-' + rawStatus, runsStatusLabel(rawStatus));
+    badge.setAttribute('data-status', rawStatus);
     tdStatus.appendChild(badge);
     tr.appendChild(tdStatus);
 
@@ -348,7 +412,7 @@ function runsRenderList() {
     var tdElapsed = runsEl('td', 'runs-col-elapsed runs-elapsed');
     tdElapsed.setAttribute('data-run-id', run.run_id);
     tdElapsed.setAttribute('data-created', String(run.created_at_ms || 0));
-    tdElapsed.setAttribute('data-active', runsIsActive(run.status) ? '1' : '0');
+    tdElapsed.setAttribute('data-active', runsIsLive(run) ? '1' : '0');
     tdElapsed.setAttribute('data-elapsed', String(run.elapsed_ms || 0));
     tdElapsed.textContent = runsFormatElapsed(run.elapsed_ms || 0);
     tr.appendChild(tdElapsed);
@@ -356,10 +420,14 @@ function runsRenderList() {
     var tdFlags = document.createElement('td');
     tdFlags.className = 'runs-col-flags';
     if (run.stale) {
-      tdFlags.appendChild(runsEl('span', 'badge runs-flag-stale', 'stale'));
+      var staleBadge = runsEl('span', 'badge runs-flag-stale', runsStatusLabel('stale'));
+      staleBadge.setAttribute('data-status', 'stale');
+      tdFlags.appendChild(staleBadge);
     }
     if (run.stalled) {
-      tdFlags.appendChild(runsEl('span', 'badge runs-flag-stalled', 'stalled'));
+      var stalledBadge = runsEl('span', 'badge runs-flag-stalled', runsStatusLabel('stalled'));
+      stalledBadge.setAttribute('data-status', 'stalled');
+      tdFlags.appendChild(stalledBadge);
     }
     tr.appendChild(tdFlags);
 
@@ -384,7 +452,7 @@ function runsTickElapsed() {
     var ms = now - created;
     cell.textContent = runsFormatElapsed(ms);
   }
-  if (runsDetailRun && runsIsActive(runsDetailRun.status)) {
+  if (runsDetailRun && runsIsLive(runsDetailRun)) {
     runsUpdateDetailMeta();
   }
 }
@@ -472,7 +540,7 @@ function runsRenderDetailHeader(data) {
   runsDetailRun = run;
 
   var title = runsEl('h3', 'runs-detail-title',
-    runsShortId(run.run_id) + ' \u00b7 ' + (run.status || ''));
+    runsShortId(run.run_id) + ' \u00b7 ' + runsStatusLabel(run.status || ''));
   header.appendChild(title);
 
   var meta = runsEl('div', 'runs-detail-meta');
@@ -486,7 +554,7 @@ function runsRenderDetailHeader(data) {
     lines.push('Exit code: ' + String(run.dmuxai_exit_code));
   }
   if (run.error_kind) {
-    lines.push('Error kind: ' + String(run.error_kind));
+    lines.push('Error kind: ' + runsStatusLabel(run.error_kind));
   }
   if (run.error_summary) {
     lines.push('Error: ' + String(run.error_summary));
@@ -507,7 +575,7 @@ function runsUpdateDetailMeta() {
   var lines = meta.querySelectorAll('.runs-detail-line');
   if (lines.length < 4) { return; }
   var elapsedMs = runsDetailRun.elapsed_ms || 0;
-  if (runsIsActive(runsDetailRun.status)) {
+  if (runsIsLive(runsDetailRun)) {
     elapsedMs = Date.now() - (runsDetailRun.created_at_ms || 0);
   }
   if (lines[3]) {
@@ -584,7 +652,10 @@ function runsRenderGraphNodes(graph) {
     var title = node.job || node.id || '';
     li.appendChild(runsEl('span', 'runs-graph-node-id', node.id + ' / ' + title));
     li.appendChild(runsEl('span', 'runs-graph-node-runner', node.runner || ''));
-    li.appendChild(runsEl('span', 'badge run-status run-status-' + node.status, node.status));
+    var nodeStatus = node.status ? String(node.status) : '';
+    var nodeBadge = runsEl('span', 'badge run-status run-status-' + nodeStatus, runsStatusLabel(nodeStatus));
+    nodeBadge.setAttribute('data-status', nodeStatus);
+    li.appendChild(nodeBadge);
     list.appendChild(li);
   });
 }
@@ -598,21 +669,76 @@ function runsTrimStream() {
   if (!ol) { return; }
   while (ol.children.length > RUNS_STREAM_MAX_LINES) {
     ol.removeChild(ol.firstChild);
-    runsStreamLines -= 1;
+  }
+  runsStreamLines = ol.children.length;
+}
+
+function runsStreamLiTs(li) {
+  var raw = li && li.getAttribute ? li.getAttribute('data-ts') : null;
+  if (!raw) { return Infinity; }
+  var n = Number(raw);
+  return isFinite(n) && n > 0 ? n : Infinity;
+}
+
+function runsInsertStreamLi(ol, li, tsMs) {
+  var myTs = (typeof tsMs === 'number' && isFinite(tsMs) && tsMs > 0) ? tsMs : Infinity;
+  if (myTs < Infinity) {
+    li.setAttribute('data-ts', String(myTs));
+  }
+  if (myTs === Infinity || !ol.lastElementChild || runsStreamLiTs(ol.lastElementChild) <= myTs) {
+    ol.appendChild(li);
+    return;
+  }
+  var cur = ol.lastElementChild;
+  while (cur && runsStreamLiTs(cur) > myTs) {
+    cur = cur.previousElementSibling;
+  }
+  if (cur) {
+    ol.insertBefore(li, cur.nextSibling);
+  } else {
+    ol.insertBefore(li, ol.firstElementChild);
   }
 }
 
-function runsAppendStreamLine(className, parts) {
+function runsHasTextSummary(needle) {
+  if (!needle) { return false; }
+  for (var i = 0; i < runsStreamTextSummaries.length; i++) {
+    if (runsStreamTextSummaries[i].indexOf(needle) !== -1) { return true; }
+  }
+  return false;
+}
+
+function runsRemoveMatchingOutputs(ol, summary) {
+  if (!ol || !summary) { return; }
+  var outputs = ol.querySelectorAll('li[data-stream-output="1"]');
+  for (var i = 0; i < outputs.length; i++) {
+    var outText = outputs[i].getAttribute('data-output-text') || '';
+    if (outText && summary.indexOf(outText) !== -1) {
+      ol.removeChild(outputs[i]);
+    }
+  }
+}
+
+function runsAppendStreamLine(className, tsMs, kindLabel, text, opts) {
   var ol = runsStreamOl();
   if (!ol) { return; }
+  var timeStr = (typeof tsMs === 'number' && isFinite(tsMs) && tsMs > 0)
+    ? runsFormatClock(tsMs) : '';
+  var kindStr = kindLabel ? String(kindLabel) : '';
+  var textStr = text !== undefined && text !== null ? String(text) : '';
+  if (!kindStr && !textStr) { return; }
+
   var li = document.createElement('li');
   li.className = className;
-  parts.forEach(function (part, ix) {
-    if (ix > 0) { li.appendChild(document.createTextNode(' \u00b7 ')); }
-    li.appendChild(runsEl('span', 'runs-stream-part', part));
-  });
-  ol.appendChild(li);
-  runsStreamLines += 1;
+  if (opts && opts.outputText) {
+    li.setAttribute('data-stream-output', '1');
+    li.setAttribute('data-output-text', opts.outputText);
+  }
+  li.appendChild(runsEl('span', 'runs-stream-time', timeStr));
+  li.appendChild(runsEl('span', 'runs-stream-kind', kindStr));
+  li.appendChild(runsEl('span', 'runs-stream-text', textStr));
+
+  runsInsertStreamLi(ol, li, tsMs);
   runsTrimStream();
   if (runsStreamStickBottom) {
     var wrap = document.getElementById('runs-stream-wrap');
@@ -630,10 +756,18 @@ function runsParseProgressLine(raw) {
 
 function runsRenderProgressItem(item) {
   if (!item || typeof item !== 'object') { return; }
-  var ts = item.ts_ms ? runsFormatClock(item.ts_ms) : '';
+  var tsMs = typeof item.ts_ms === 'number' && isFinite(item.ts_ms) ? item.ts_ms : 0;
   var kind = item.kind ? String(item.kind) : 'progress';
-  var summary = item.summary ? String(item.summary) : JSON.stringify(item);
-  runsAppendStreamLine('runs-stream-progress', [ts, kind, summary]);
+  var summary = item.summary !== undefined && item.summary !== null
+    ? String(item.summary) : JSON.stringify(item);
+  if (kind === 'text' && summary) {
+    runsStreamTextSummaries.push(summary);
+    if (runsStreamTextSummaries.length > RUNS_STREAM_MAX_LINES) {
+      runsStreamTextSummaries.shift();
+    }
+    runsRemoveMatchingOutputs(runsStreamOl(), summary);
+  }
+  runsAppendStreamLine('runs-stream-progress', tsMs, kind, summary);
 }
 
 function runsConnectStream(id) {
@@ -642,6 +776,7 @@ function runsConnectStream(id) {
   var ol = runsStreamOl();
   if (ol) { ol.textContent = ''; }
   runsStreamLines = 0;
+  runsStreamTextSummaries = [];
   runsStreamStickBottom = true;
   if (typeof EventSource === 'undefined') { return; }
   var tok = runsToken();
@@ -686,10 +821,35 @@ function runsConnectStream(id) {
   runsStreamSse.addEventListener('state-change', function (e) {
     var rec;
     try { rec = JSON.parse(e.data); } catch (err) { return; }
+    if (!rec || typeof rec !== 'object') { return; }
+    var tsMs = typeof rec.ts_ms === 'number' && isFinite(rec.ts_ms) ? rec.ts_ms : 0;
     var kind = rec.kind ? String(rec.kind) : '';
     var toState = rec.to_state ? String(rec.to_state) : '';
-    var msg = rec.message ? String(rec.message) : '';
-    runsAppendStreamLine('runs-stream-state', [kind, toState, msg]);
+    var msg = rec.message !== undefined && rec.message !== null ? String(rec.message) : '';
+    var trimmedMsg = msg.trim();
+    if (kind === 'agent' && !trimmedMsg) { return; }
+    if (kind === 'activity' && toState === 'output') {
+      if (!trimmedMsg || runsHasTextSummary(trimmedMsg)) { return; }
+      runsAppendStreamLine('runs-stream-state', tsMs, 'output', msg, { outputText: trimmedMsg });
+      return;
+    }
+    var kindLabel = '';
+    var text = '';
+    if (kind === 'agent') {
+      kindLabel = toState ? runsStatusLabel(toState) : 'agent';
+      text = msg;
+    } else if (kind === 'activity') {
+      kindLabel = toState || 'activity';
+      text = msg;
+    } else {
+      kindLabel = kind || 'event';
+      var parts = [];
+      if (toState) { parts.push(runsStatusLabel(toState)); }
+      if (trimmedMsg) { parts.push(msg); }
+      text = parts.join(' \u00b7 ');
+    }
+    if (!kindLabel && !text.trim()) { return; }
+    runsAppendStreamLine('runs-stream-state', tsMs, kindLabel, text);
   });
 
   runsStreamSse.addEventListener('end', function () {

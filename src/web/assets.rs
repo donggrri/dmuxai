@@ -2424,4 +2424,33 @@ mod tests {
             "muted stall marker style"
         );
     }
+
+    // TC-2840 / FR-2840: top status pill reads headless summary exported by runs.js.
+    #[test]
+    fn tc_2840_status_pill_reads_headless_summary() {
+        assert!(APP_JS.contains("dmuxaiHeadlessRunsSummary"));
+        assert!(APP_JS.contains("dmuxaiRefreshRunStatus"));
+        assert!(RUNS_JS.contains("window.dmuxaiHeadlessRunsSummary"));
+        assert!(RUNS_JS.contains("dmuxaiRefreshRunStatus"));
+    }
+
+    // TC-2841 / FR-2841: [hidden] beats display rules on runs detail graph section.
+    #[test]
+    fn tc_2841_hidden_beats_display_rules() {
+        assert!(APP_CSS.contains(".runs-graph-section[hidden]"));
+        assert!(APP_CSS.contains("display: none !important;"));
+    }
+
+    // TC-2845 / FR-2845: human-readable status label map and raw data-status attribute.
+    #[test]
+    fn tc_2845_status_label_map() {
+        assert!(RUNS_JS.contains("Awaiting approval"));
+        assert!(RUNS_JS.contains("Process exit"));
+        assert!(RUNS_JS.contains("data-status"));
+        let runs_css = APP_CSS
+            .split("/* FR-2811..FR-2814: headless runs center view */")
+            .nth(1)
+            .expect("runs css section");
+        assert!(!runs_css.contains("text-transform: lowercase;"));
+    }
 }

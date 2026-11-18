@@ -805,7 +805,7 @@ fn tc_2812_runs_list_rows() {
     let elapsed_before = session
         .cdp
         .eval(&format!(
-            "document.querySelector('[data-run-id=\"{active}\"] .runs-col-elapsed') && document.querySelector('[data-run-id=\"{active}\"] .runs-col-elapsed').innerText"
+            "document.querySelector('[data-run-id=\"{stalled_id}\"] .runs-col-elapsed') && document.querySelector('[data-run-id=\"{stalled_id}\"] .runs-col-elapsed').innerText"
         ))
         .expect("elapsed before")
         .as_str()
@@ -821,7 +821,7 @@ fn tc_2812_runs_list_rows() {
     while Instant::now() < tick_deadline {
         std::thread::sleep(Duration::from_millis(150));
         if let Ok(text) = session.cdp.eval(&format!(
-            "document.querySelector('[data-run-id=\"{active}\"] .runs-col-elapsed').innerText"
+            "document.querySelector('[data-run-id=\"{stalled_id}\"] .runs-col-elapsed').innerText"
         )) {
             let t = text.as_str().unwrap_or("").to_owned();
             if t != elapsed_before {
@@ -1196,7 +1196,7 @@ fn tc_2817_live_graph_and_approved_link() {
         std::thread::sleep(Duration::from_millis(200));
         if let Ok(text) = session.cdp.eval(&format!(
             "document.querySelector('[data-run-id=\"{approved_id}\"] .run-status')?.textContent"
-        )) && text.as_str().unwrap_or("") == "approved"
+        )) && text.as_str().unwrap_or("") == "Approved"
         {
             saw_approved_row = true;
             break;
@@ -1629,4 +1629,667 @@ fn tc_2823_runs_detail_graph_and_full_graph() {
         selection_ok,
         "node-selected must apply only to #graph-canvas, not the Runs detail diagram"
     );
+}
+
+fn write_event_line(
+    fixture: &ServeFixture,
+    seq: u64,
+    ts_ms: u64,
+    kind: &str,
+    to_state: &str,
+    message: Option<&str>,
+    run_id: &str,
+) {
+    let events_path = fixture.workspace.join(".dmuxai").join("events.jsonl");
+    let rec = json!({
+        "v": 1,
+        "seq": seq,
+        "ts": "2026-11-18T00:00:00.000Z",
+        "ts_ms": ts_ms,
+        "workspace": fixture.workspace.display().to_string(),
+        "kind": kind,
+        "to_state": to_state,
+        "message": message,
+        "run_id": run_id
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)
+        .expect("open events.jsonl");
+    writeln!(file, "{}", serde_json::to_string(&rec).unwrap()).expect("write event line");
+}
+
+// TC-2840 / FR-2840: top status pill reflects live, awaiting_approval, and failed headless runs.
+#[test]
+#[ignore]
+fn tc_2840_status_pill_headless_runs() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2840_status_pill_headless_runs: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let run_id = "2840aaaaaaaaaaaa";
+    let mut m_active = base_manifest(run_id, 10_000, "active");
+    m_active["pid"] = json!(std::process::id());
+    write_manifest(&runs.join(run_id), &m_active);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut saw_running = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(
+            "(() => { \
+                const p = document.getElementById('run-status'); \
+                const c = document.getElementById('conn'); \
+                return p && c ? { text: p.textContent, cls: p.className, spin: !!p.querySelector('.spinner'), conn: c.textContent } : null; \
+            })()",
+        ) && val.is_object()
+        {
+            let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let cls = val.get("cls").and_then(|v| v.as_str()).unwrap_or("");
+            let spin = val.get("spin").and_then(|v| v.as_bool()).unwrap_or(false);
+            let conn = val.get("conn").and_then(|v| v.as_str()).unwrap_or("");
+            if text == "Running · 1 headless run"
+                && cls.contains("run-status-running")
+                && spin
+            {
+                assert!(
+                    matches!(conn, "live" | "polling" | "connecting"),
+                    "conn must remain a connection word: {conn}"
+                );
+                saw_running = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_running, "pill must show Running · 1 headless run");
+
+    let mut m_wait = base_manifest(run_id, 10_000, "awaiting_approval");
+    m_wait["completed_at_ms"] = json!(10_500);
+    m_wait["duration_ms"] = json!(500);
+    write_manifest(&runs.join(run_id), &m_wait);
+
+    let mut saw_wait = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(
+            "(() => { const p = document.getElementById('run-status'); return p ? { text: p.textContent, cls: p.className } : null; })()",
+        ) && val.is_object()
+        {
+            let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let cls = val.get("cls").and_then(|v| v.as_str()).unwrap_or("");
+            if text == "Awaiting approval" && cls.contains("run-status-awaiting-approval") {
+                saw_wait = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_wait, "pill must show Awaiting approval");
+
+    let fail_id = "2840bbbbbbbbbbbb";
+    let mut m_fail = base_manifest(fail_id, 20_000, "failed");
+    m_fail["completed_at_ms"] = json!(20_500);
+    m_fail["duration_ms"] = json!(500);
+    m_fail["dmuxai_exit_code"] = json!(1);
+    write_manifest(&runs.join(fail_id), &m_fail);
+
+    let mut saw_fail = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(
+            "(() => { \
+                const p = document.getElementById('run-status'); \
+                const c = document.getElementById('conn'); \
+                return p && c ? { text: p.textContent, cls: p.className, conn: c.textContent } : null; \
+            })()",
+        ) && val.is_object()
+        {
+            let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let cls = val.get("cls").and_then(|v| v.as_str()).unwrap_or("");
+            let conn = val.get("conn").and_then(|v| v.as_str()).unwrap_or("");
+            if text == "✗ Failed" && cls.contains("run-status-failed") {
+                assert!(
+                    matches!(conn, "live" | "polling" | "connecting"),
+                    "conn must remain a connection word: {conn}"
+                );
+                saw_fail = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_fail, "pill must show ✗ Failed for newest failed run");
+}
+
+// TC-2841 / FR-2841: Graph section and Full graph button are computed display:none without a graph.
+#[test]
+#[ignore]
+fn tc_2841_no_graph_section_hidden() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2841_no_graph_section_hidden: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let run_id = "2841aaaaaaaaaaaa";
+    let mut manifest = base_manifest(run_id, 10_000, "completed");
+    manifest["completed_at_ms"] = json!(10_500);
+    manifest["duration_ms"] = json!(500);
+    write_manifest(&runs.join(run_id), &manifest);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut ok = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(&format!(
+            "(() => {{ \
+                const hdr = document.getElementById('runs-detail-header'); \
+                const sec = document.getElementById('runs-graph-section'); \
+                const btn = document.getElementById('runs-full-graph'); \
+                const wrap = document.getElementById('runs-stream-wrap'); \
+                if (!hdr || hdr.getAttribute('data-run-id') !== '{run_id}' || !sec || !btn || !wrap) {{ return null; }} \
+                const secDisplay = getComputedStyle(sec).display; \
+                const btnDisplay = getComputedStyle(btn).display; \
+                const hdrBottom = hdr.getBoundingClientRect().bottom; \
+                const wrapTop = wrap.getBoundingClientRect().top; \
+                return {{ secDisplay, btnDisplay, gap: wrapTop - hdrBottom }}; \
+            }})()"
+        )) && val.is_object()
+        {
+            let sec_display = val.get("secDisplay").and_then(|v| v.as_str());
+            let btn_display = val.get("btnDisplay").and_then(|v| v.as_str());
+            let gap = val.get("gap").and_then(|v| v.as_f64()).unwrap_or(999.0);
+            assert_eq!(sec_display, Some("none"), "graph section must be display:none");
+            assert_eq!(btn_display, Some("none"), "full graph btn must be display:none");
+            assert!(
+                (0.0..=24.0).contains(&gap),
+                "stream wrap must sit directly below header, gap={gap}"
+            );
+            ok = true;
+            break;
+        }
+    }
+    assert!(ok, "runs detail did not render run {run_id}");
+}
+
+// TC-2842 / FR-2842: stream drops empty agent state transitions and has no trailing ' · '.
+#[test]
+#[ignore]
+fn tc_2842_stream_drops_empty_agent_lines() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2842_stream_drops_empty_agent_lines: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let run_id = "2842aaaaaaaaaaaa";
+    let mut manifest = base_manifest(run_id, 10_000, "completed");
+    manifest["completed_at_ms"] = json!(10_500);
+    manifest["duration_ms"] = json!(500);
+    write_manifest(&runs.join(run_id), &manifest);
+
+    write_event_line(&fixture, 1, 10_000, "agent", "pending", None, run_id);
+    write_event_line(&fixture, 2, 10_100, "agent", "started", Some(""), run_id);
+    write_event_line(
+        &fixture,
+        3,
+        10_200,
+        "agent",
+        "running",
+        Some("starting"),
+        run_id,
+    );
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut lines: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(
+            "Array.from(document.querySelectorAll('#runs-stream li')).map(li => li.innerText)",
+        ) && let Some(arr) = val.as_array()
+            && !arr.is_empty()
+        {
+            lines = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            if lines.iter().any(|l| l.contains("starting")) {
+                break;
+            }
+        }
+    }
+    assert!(!lines.is_empty(), "expected starting line in stream");
+    for l in &lines {
+        assert!(
+            !l.contains("pending"),
+            "empty pending line must be dropped: {l}"
+        );
+        assert!(
+            !l.contains("started"),
+            "empty started line must be dropped: {l}"
+        );
+        assert!(!l.ends_with(" · "), "no trailing separator: {l}");
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Running") && l.contains("starting")),
+        "running/starting line must render: {lines:?}"
+    );
+}
+
+// TC-2843 / FR-2843: activity/output heartbeat lines matching text progress are deduped in both orders.
+#[test]
+#[ignore]
+fn tc_2843_stream_dedupes_output_heartbeat() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2843_stream_dedupes_output_heartbeat: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let run_id = "2843aaaaaaaaaaaa";
+    let mut manifest = base_manifest(run_id, 10_000, "active");
+    manifest["pid"] = json!(std::process::id());
+    write_manifest(&runs.join(run_id), &manifest);
+
+    write_event_line(
+        &fixture,
+        1,
+        10_000,
+        "activity",
+        "output",
+        Some("matched output text"),
+        run_id,
+    );
+    write_event_line(
+        &fixture,
+        2,
+        10_500,
+        "activity",
+        "output",
+        Some("unmatched output text"),
+        run_id,
+    );
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut saw_initial = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session
+            .cdp
+            .eval("document.querySelectorAll('#runs-stream li').length")
+            && val.as_u64() == Some(2)
+        {
+            saw_initial = true;
+            break;
+        }
+    }
+    assert!(saw_initial, "expected initial 2 activity/output lines");
+
+    let progress_path = runs.join(run_id).join("progress.jsonl");
+    fs::write(
+        &progress_path,
+        "{\"type\":\"progress\",\"ts_ms\":10100,\"kind\":\"text\",\"summary\":\"prefix matched output text suffix\"}\n",
+    )
+    .expect("write progress");
+    write_event_line(
+        &fixture,
+        3,
+        10_200,
+        "activity",
+        "output",
+        Some("matched output text"),
+        run_id,
+    );
+
+    let mut deduped = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(150));
+        if let Ok(val) = session.cdp.eval(
+            "Array.from(document.querySelectorAll('#runs-stream li')).map(li => ({ \
+                kind: li.querySelector('.runs-stream-kind')?.textContent || '', \
+                text: li.querySelector('.runs-stream-text')?.textContent || '' \
+            }))",
+        ) && let Some(arr) = val.as_array()
+        {
+            let has_text_progress = arr.iter().any(|x| {
+                x.get("kind").and_then(|v| v.as_str()) == Some("text")
+                    && x.get("text").and_then(|v| v.as_str())
+                        == Some("prefix matched output text suffix")
+            });
+            let has_matched_output = arr.iter().any(|x| {
+                x.get("kind").and_then(|v| v.as_str()) == Some("output")
+                    && x.get("text").and_then(|v| v.as_str()) == Some("matched output text")
+            });
+            let has_unmatched_output = arr.iter().any(|x| {
+                x.get("kind").and_then(|v| v.as_str()) == Some("output")
+                    && x.get("text").and_then(|v| v.as_str()) == Some("unmatched output text")
+            });
+            if has_text_progress && !has_matched_output && has_unmatched_output {
+                deduped = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        deduped,
+        "matched activity/output must be removed/suppressed while unmatched stays visible"
+    );
+}
+
+// TC-2844 / FR-2844: stream lines are ordered by ts_ms and laid out in three columns.
+#[test]
+#[ignore]
+fn tc_2844_stream_time_order_and_columns() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2844_stream_time_order_and_columns: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let run_id = "2844aaaaaaaaaaaa";
+    let mut manifest = base_manifest(run_id, 10_000, "completed");
+    manifest["completed_at_ms"] = json!(40_000);
+    manifest["duration_ms"] = json!(30_000);
+    write_manifest(&runs.join(run_id), &manifest);
+
+    let progress_path = runs.join(run_id).join("progress.jsonl");
+    fs::write(
+        &progress_path,
+        concat!(
+            "{\"type\":\"progress\",\"ts_ms\":10000,\"kind\":\"text\",\"summary\":\"line A\"}\n",
+            "{\"type\":\"progress\",\"ts_ms\":30000,\"kind\":\"text\",\"summary\":\"line C\"}\n",
+            "{\"type\":\"progress\",\"kind\":\"text\",\"summary\":\"line no-ts\"}\n"
+        ),
+    )
+    .expect("write progress");
+    write_event_line(
+        &fixture,
+        1,
+        20_000,
+        "activity",
+        "tool",
+        Some("line B"),
+        run_id,
+    );
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut items: Vec<Value> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(
+            "Array.from(document.querySelectorAll('#runs-stream li')).map(li => { \
+                const t = li.querySelector('.runs-stream-time'); \
+                const k = li.querySelector('.runs-stream-kind'); \
+                const x = li.querySelector('.runs-stream-text'); \
+                return { \
+                    hasCols: !!(t && k && x), \
+                    text: x ? x.textContent : '', \
+                    timeRight: t ? t.getBoundingClientRect().right : 0, \
+                    textLeft: x ? x.getBoundingClientRect().left : 0 \
+                }; \
+            })",
+        ) && let Some(arr) = val.as_array()
+            && arr.len() == 4
+        {
+            items = arr.clone();
+            break;
+        }
+    }
+    assert_eq!(items.len(), 4, "expected 4 stream lines, got {items:?}");
+    let texts: Vec<&str> = items
+        .iter()
+        .filter_map(|v| v.get("text").and_then(|s| s.as_str()))
+        .collect();
+    assert_eq!(texts, vec!["line A", "line B", "line C", "line no-ts"]);
+    for item in &items {
+        assert_eq!(item.get("hasCols").and_then(|v| v.as_bool()), Some(true));
+        let time_right = item
+            .get("timeRight")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let text_left = item.get("textLeft").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        assert!(
+            text_left > time_right,
+            "text column must sit to the right of time column: {item:?}"
+        );
+    }
+}
+
+// TC-2845 / FR-2845: human-readable status, flag, and error_kind labels with raw data-status.
+#[test]
+#[ignore]
+fn tc_2845_human_status_labels() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2845_human_status_labels: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let wait_id = "2845aaaaaaaaaaaa";
+    let fail_id = "2845bbbbbbbbbbbb";
+
+    let mut m_wait = base_manifest(wait_id, 20_000, "awaiting_approval");
+    m_wait["completed_at_ms"] = json!(20_500);
+    m_wait["duration_ms"] = json!(500);
+    write_manifest(&runs.join(wait_id), &m_wait);
+
+    let mut m_fail = base_manifest(fail_id, 10_000, "failed");
+    m_fail["completed_at_ms"] = json!(10_500);
+    m_fail["duration_ms"] = json!(500);
+    m_fail["dmuxai_exit_code"] = json!(1);
+    m_fail["error_kind"] = json!("process_exit");
+    write_manifest(&runs.join(fail_id), &m_fail);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut badge_ok = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(&format!(
+            "(() => {{ \
+                const b = document.querySelector('[data-run-id=\"{wait_id}\"] .run-status'); \
+                return b ? {{ text: b.textContent, inner: b.innerText, cls: b.className, raw: b.getAttribute('data-status') }} : null; \
+            }})()"
+        )) && val.is_object()
+        {
+            assert_eq!(val.get("text").and_then(|v| v.as_str()), Some("Awaiting approval"));
+            assert_eq!(val.get("inner").and_then(|v| v.as_str()), Some("Awaiting approval"));
+            assert_eq!(val.get("raw").and_then(|v| v.as_str()), Some("awaiting_approval"));
+            assert!(
+                val.get("cls")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .contains("run-status-awaiting_approval")
+            );
+            badge_ok = true;
+            break;
+        }
+    }
+    assert!(badge_ok, "awaiting_approval badge must show display label");
+
+    session
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-run-id=\"{fail_id}\"]').click()"
+        ))
+        .expect("select failed run");
+
+    let mut detail_ok = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(&format!(
+            "(() => {{ \
+                const hdr = document.getElementById('runs-detail-header'); \
+                return hdr && hdr.getAttribute('data-run-id') === '{fail_id}' ? hdr.innerText : null; \
+            }})()"
+        )) && let Some(text) = val.as_str()
+        {
+            assert!(text.contains("Failed"), "detail title must show Failed: {text}");
+            assert!(
+                text.contains("Error kind: Process exit"),
+                "detail must show Error kind: Process exit: {text}"
+            );
+            detail_ok = true;
+            break;
+        }
+    }
+    assert!(
+        detail_ok,
+        "failed run detail must show human-readable error_kind"
+    );
+}
+
+// TC-2846 / FR-2846: stale active runs are excluded from indicator/pill and elapsed does not tick.
+#[test]
+#[ignore]
+fn tc_2846_stale_runs_not_live() {
+    let chrome_bin = find_chrome_binary();
+    if chrome_bin.is_none() {
+        println!("skipping tc_2846_stale_runs_not_live: chrome binary not found");
+        return;
+    }
+
+    let fixture = ServeFixture::new();
+    let runs = fixture.runs_dir();
+    let stale_id = "2846aaaaaaaaaaaa";
+    let mut m_stale = base_manifest(stale_id, 1_000, "active");
+    m_stale["pid"] = json!(999_999);
+    write_manifest(&runs.join(stale_id), &m_stale);
+
+    let mut session = open_dashboard_in_chrome(&fixture.dashboard_url).expect("open chrome");
+    wait_for_runs_open(&mut session);
+
+    let mut initial = serde_json::Value::Null;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Ok(val) = session.cdp.eval(&format!(
+            "(() => {{ \
+                const row = document.querySelector('[data-run-id=\"{stale_id}\"]'); \
+                const cell = document.querySelector('[data-run-id=\"{stale_id}\"] .runs-col-elapsed'); \
+                const flag = document.querySelector('[data-run-id=\"{stale_id}\"] .runs-flag-stale'); \
+                const ind = document.getElementById('runs-indicator'); \
+                const pill = document.getElementById('run-status'); \
+                const hdr = document.getElementById('runs-detail-header'); \
+                if (!row || !cell || !flag || !ind || !pill || !hdr || hdr.getAttribute('data-run-id') !== '{stale_id}') {{ return null; }} \
+                return {{ \
+                    indHidden: ind.hidden, \
+                    pillText: pill.textContent, \
+                    flagText: flag.textContent, \
+                    activeAttr: cell.getAttribute('data-active'), \
+                    cellElapsed: cell.textContent \
+                }}; \
+            }})()"
+        )) && val.is_object()
+        {
+            initial = val;
+            break;
+        }
+    }
+    assert!(initial.is_object(), "stale run row did not render");
+    assert_eq!(
+        initial.get("indHidden").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        initial.get("flagText").and_then(|v| v.as_str()),
+        Some("Stale")
+    );
+    assert_eq!(
+        initial.get("activeAttr").and_then(|v| v.as_str()),
+        Some("0")
+    );
+    assert!(
+        !initial
+            .get("pillText")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains("Running"),
+        "stale run must not make pill Running: {initial:?}"
+    );
+    let elapsed_before = initial
+        .get("cellElapsed")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    assert!(
+        elapsed_before.contains(':'),
+        "stale elapsed must render M:SS: {elapsed_before}"
+    );
+
+    // Over > 1 s (longer than RUNS_TICK_MS = 1000 ms), client ticking must never
+    // advance the cell or detail elapsed line past the server-reported data-elapsed value.
+    for _ in 0..8 {
+        std::thread::sleep(Duration::from_millis(200));
+        let check = session
+            .cdp
+            .eval(&format!(
+                "(() => {{ \
+                    const cell = document.querySelector('[data-run-id=\"{stale_id}\"] .runs-col-elapsed'); \
+                    const hdr = document.getElementById('runs-detail-header'); \
+                    if (!cell || !hdr) return null; \
+                    const ms = Number(cell.getAttribute('data-elapsed') || 0); \
+                    const totalSec = Math.floor(ms / 1000); \
+                    const m = Math.floor(totalSec / 60); \
+                    const s = totalSec % 60; \
+                    const expected = m + ':' + (s < 10 ? '0' : '') + s; \
+                    return {{ active: cell.getAttribute('data-active'), text: cell.textContent, expected, hdr: hdr.innerText }}; \
+                }})()"
+            ))
+            .expect("poll stale cell");
+        assert_eq!(check.get("active").and_then(|v| v.as_str()), Some("0"));
+        assert_eq!(
+            check.get("text").and_then(|v| v.as_str()),
+            check.get("expected").and_then(|v| v.as_str()),
+            "stale run elapsed must stay at server elapsed_ms: {check:?}"
+        );
+        let expected_detail = format!(
+            "Elapsed: {}",
+            check.get("expected").and_then(|v| v.as_str()).unwrap_or("")
+        );
+        assert!(
+            check
+                .get("hdr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains(&expected_detail),
+            "stale detail elapsed must stay at server elapsed_ms: {check:?}"
+        );
+    }
 }

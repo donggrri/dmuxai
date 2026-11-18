@@ -4285,6 +4285,39 @@ function updateRunStatus(snap, nowMs) {
       pill.appendChild(el('span', 'run-status-activity', ' \u00b7 ' + activityText));
     }
   } else {
+    var headless = typeof window.dmuxaiHeadlessRunsSummary === 'function'
+      ? window.dmuxaiHeadlessRunsSummary()
+      : null;
+    if (headless && headless.live >= 1) {
+      var hText = 'Running \u00b7 ' + headless.live + ' headless ' + (headless.live === 1 ? 'run' : 'runs');
+      var hKey = 'headless-running:' + headless.live;
+      if (lastRunStatusKey !== hKey || !pill.classList.contains('run-status-running')) {
+        lastRunStatusKey = hKey;
+        pill.className = 'run-status run-status-running';
+        pill.replaceChildren();
+        pill.appendChild(el('span', 'spinner'));
+        pill.appendChild(el('span', 'run-status-text', hText));
+      }
+      return;
+    }
+    if (headless && headless.newestStatus === 'awaiting_approval') {
+      var aKey = 'headless-awaiting-approval';
+      if (lastRunStatusKey !== aKey) {
+        lastRunStatusKey = aKey;
+        pill.className = 'run-status run-status-awaiting-approval';
+        pill.textContent = 'Awaiting approval';
+      }
+      return;
+    }
+    if (headless && headless.newestStatus === 'failed') {
+      var fKey = 'headless-failed';
+      if (lastRunStatusKey !== fKey) {
+        lastRunStatusKey = fKey;
+        pill.className = 'run-status run-status-failed';
+        pill.textContent = '\u2717 Failed';
+      }
+      return;
+    }
     var lastEnded = getMostRecentEndedRun(snap);
     var statusKey = 'idle';
     if (lastEnded && lastEnded.state === 'done') {
@@ -4330,6 +4363,10 @@ function updateRunStatus(snap, nowMs) {
     }
   }
 }
+
+window.dmuxaiRefreshRunStatus = function () {
+  updateRunStatus(snapshot, Date.now());
+};
 
 function updateTabTitle(snap) {
   var runningAgents = getRunningAgents(snap);
