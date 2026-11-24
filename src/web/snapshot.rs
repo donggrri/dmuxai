@@ -1154,6 +1154,7 @@ mod tests {
                 user_prompt: "Build dashboard".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![
                     GraphNode {
                         id: "step-1".to_string(),
@@ -1290,6 +1291,7 @@ mod tests {
                 user_prompt: "prompt".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![
                     make_node("a", "root"),
                     make_node("b", "left"),
@@ -1444,6 +1446,7 @@ mod tests {
                 user_prompt: "go".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -1525,6 +1528,7 @@ mod tests {
                 user_prompt: "p".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![make_node("node-a"), make_node("node-b")],
                 edges: Vec::new(),
             },
@@ -1637,6 +1641,7 @@ mod tests {
                 user_prompt: "p".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![make_node("node-a"), make_node("node-b")],
                 edges: Vec::new(),
             },
@@ -1718,6 +1723,7 @@ mod tests {
                 user_prompt: "p".to_string(),
                 limits: GraphLimits::default(),
                 tasks,
+                dynamic_cap: None,
                 nodes: vec![
                     GraphNode {
                         id: "s1".to_string(),
@@ -1807,6 +1813,7 @@ mod tests {
                     user_prompt: format!("prompt turn {turn_index}"),
                     limits: GraphLimits::default(),
                     tasks: Vec::new(),
+                    dynamic_cap: None,
                     nodes: vec![GraphNode {
                         id: node_id.to_string(),
                         role: NodeRole::Implement,
@@ -1952,6 +1959,7 @@ mod tests {
                 user_prompt: "p".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },

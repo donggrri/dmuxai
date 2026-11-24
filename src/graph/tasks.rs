@@ -494,6 +494,7 @@ mod tests {
             edges: Vec::new(),
             limits: GraphLimits::default(),
             tasks,
+            dynamic_cap: None,
         }
     }
 

@@ -54,20 +54,22 @@ use dmuxai::{
     },
     events::EventDraft,
     graph::{
-        AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
-        GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache, GraphRunPhase, GraphRunSession,
-        GraphStopReason, GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, NodeTurnPolicy,
-        OverrideKind, PanelLineKind, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext,
-        PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls,
-        PlannerIo, PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit,
-        Triage, TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
-        build_judge_prompt, build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt,
-        cap_replan_step_summary, cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
+        AllowedRunner, Approval, ApprovalState, DecisionBy, DynamicNodeSpec, FallbackCause,
+        GraphAction, GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache,
+        GraphRunPhase, GraphRunSession, GraphStopReason, GraphStore, MAX_PLAN_REVISIONS,
+        NodeAssignment, NodeRole, NodeTurnPolicy, OverrideKind, PanelLineKind, PlanChange,
+        PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest,
+        PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo, PlannerIoKind,
+        QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
+        apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
+        build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
+        cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
         graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
-        judge_line_text, judging_line_text, next_plan_change_rev, node_turn_policy, parse_plan,
-        parse_replan, parse_replan_marker, parse_verdict, pin_graph_plan_runners,
-        plan_json_for_edit, replan_allowed, replan_revision_steps, revision_needs_approval,
-        save_run, strip_replan_marker, task_counter_text, validate_plan_with_limit,
+        judge_line_text, judging_line_text, next_plan_change_rev, node_turn_policy,
+        parse_add_nodes_marker, parse_plan, parse_replan, parse_replan_marker, parse_verdict,
+        pin_graph_plan_runners, plan_json_for_edit, replan_allowed, replan_revision_steps,
+        revision_needs_approval, save_run, strip_add_nodes_marker, strip_replan_marker,
+        task_counter_text, validate_add_nodes, validate_plan_with_limit,
         write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
@@ -1080,6 +1082,8 @@ struct HeadlessPendingPlan {
     prompt: String,
     tasks: Vec<PlanTask>,
     steps: Vec<PlanStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -6731,6 +6735,7 @@ impl App {
                 edges: Vec::new(),
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             };
             let mut run = self.build_graph_run(
                 plan,
@@ -8262,7 +8267,16 @@ impl App {
         {
             return self.approve_replan_awaiting(by);
         }
-        let (triage, steps, tasks, user_prompt, plan_id, orchestrate_started, plan_fixed) = {
+        let (
+            triage,
+            steps,
+            tasks,
+            user_prompt,
+            plan_id,
+            orchestrate_started,
+            plan_fixed,
+            run_dynamic_cap,
+        ) = {
             let run = self
                 .last_graph_run
                 .as_ref()
@@ -8285,6 +8299,7 @@ impl App {
                 run.plan.id.clone(),
                 run.orchestrate_started_ms.unwrap_or_else(unix_ms_now),
                 run.plan_fixed_ms.unwrap_or_else(unix_ms_now),
+                run.plan.dynamic_cap,
             )
         };
         let limits = self.graph_limits();
@@ -8308,6 +8323,7 @@ impl App {
                     .join("; "),
             )
         })?;
+        graph_plan.dynamic_cap = run_dynamic_cap;
         Self::attach_orchestrate_node(&mut graph_plan, &triage, orchestrate_started, plan_fixed);
         let decided_at = unix_ms_now();
         let (plan_id, rev, save_error) = {
@@ -8330,6 +8346,7 @@ impl App {
             approval.decided_at_ms = Some(decided_at);
             run.phase = GraphRunPhase::Active;
             run.plan = graph_plan;
+            run.dynamic_cap = run.plan.dynamic_cap;
             let (added, changed, removed) = if run.plan_history.is_empty() {
                 diff_plan_steps(&[], &revision_steps)
             } else {
@@ -8887,6 +8904,9 @@ impl App {
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
         plan.limits = self.graph_limits();
+        if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
+            plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
+        }
         let step = PlanStep {
             id: "step-1".to_owned(),
             role: "implement".to_owned(),
@@ -9171,6 +9191,7 @@ impl App {
                 edges: Vec::new(),
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             };
             let mut planning_run = self.build_graph_run(
                 planning_plan,
@@ -9394,6 +9415,9 @@ impl App {
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
+        if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
+            graph_plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
+        }
         let approval = Approval {
             state: ApprovalState::Pending,
             revisions: vec![PlanRevision {
@@ -9461,6 +9485,11 @@ impl App {
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
+        if let Some(existing_run) = self.last_graph_run.as_ref() {
+            graph_plan.dynamic_cap = existing_run.plan.dynamic_cap;
+        } else if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
+            graph_plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
+        }
         let feedback = pending.edit_feedback.clone();
         let steps = Self::revision_steps_from_doc(doc);
         let Some(run) = self
@@ -11374,6 +11403,16 @@ impl App {
         if success {
             self.note_replan_summary(&node_id, &display_text);
         }
+        // SPEC-graph-dynamic-nodes (FR-2940..FR-2947, NFR-2940):
+        // ONLY when the feature is on and the node succeeded, scan for DMUXAI_ADD_NODES.
+        if self.settings.graph_dynamic_nodes
+            && success
+            && let Some(marker_res) = parse_add_nodes_marker(output_text)
+        {
+            display_text = strip_add_nodes_marker(&display_text);
+            self.rewrite_last_agent_message(agent, display_text.clone());
+            self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
+        }
         let (actions, failed_message, run_snapshot) = {
             let Some(session) = self.graph_session.as_mut() else {
                 return;
@@ -11429,6 +11468,147 @@ impl App {
         self.dispatch_graph_actions(actions);
     }
 
+    fn record_dynamic_node_rejection(&mut self, node_id: &str, error: String) {
+        self.push_system(format!("Dynamic nodes rejected: {error}"));
+        let Some(session) = self.graph_session.as_mut() else {
+            return;
+        };
+        let run = session.run_mut();
+        let rev = next_plan_change_rev(run);
+        let change = PlanChange {
+            rev,
+            kind: PlanChangeKind::DynamicAdd,
+            at_ms: unix_ms_now(),
+            after_node: Some(node_id.to_owned()),
+            reason: error.clone(),
+            trigger: Some(PlanChangeTrigger::DynamicAdd),
+            prompt_chars: None,
+            response_chars: None,
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: Vec::new(),
+            tasks_added: 0,
+            tasks_changed: 0,
+            tasks_removed: 0,
+            applied: false,
+            error: Some(error),
+            response_excerpt: None,
+            decided_by: None,
+        };
+        run.push_plan_change(change);
+        let _ = save_run(&self.workspace_root, run);
+    }
+
+    fn handle_dynamic_add_nodes_marker(
+        &mut self,
+        node_id: &str,
+        marker_res: Result<Vec<DynamicNodeSpec>, String>,
+    ) {
+        let (already_added, approved_cap, dynamic_added, max_nodes, plan_snapshot) = {
+            let Some(session) = self.graph_session.as_ref() else {
+                return;
+            };
+            let run = session.run();
+            let already_added = run.plan_history.iter().any(|c| {
+                c.trigger == Some(PlanChangeTrigger::DynamicAdd)
+                    && c.after_node.as_deref() == Some(node_id)
+                    && c.applied
+            });
+            let approved_cap = run.plan.dynamic_cap.or(run.dynamic_cap).unwrap_or(0);
+            let dynamic_added = run.dynamic_added.unwrap_or(0);
+            let max_nodes = run.plan.limits.max_nodes;
+            (
+                already_added,
+                approved_cap,
+                dynamic_added,
+                max_nodes,
+                run.plan.clone(),
+            )
+        };
+
+        if already_added {
+            let msg = format!("node {node_id} already added nodes");
+            self.record_dynamic_node_rejection(node_id, msg);
+            return;
+        }
+
+        let new_nodes = match marker_res {
+            Ok(specs) => specs,
+            Err(parse_err) => {
+                self.record_dynamic_node_rejection(node_id, parse_err);
+                return;
+            }
+        };
+
+        let cap_remaining = approved_cap.saturating_sub(dynamic_added);
+        let allowed_runners = self.settings.graph_allowed_runners.as_deref();
+        let company_workspace = self.settings.fanout_company_workspace;
+
+        let validated_nodes = match validate_add_nodes(
+            &plan_snapshot,
+            &new_nodes,
+            cap_remaining,
+            allowed_runners,
+            max_nodes,
+            company_workspace,
+        ) {
+            Ok(nodes) => nodes,
+            Err(validation_err) => {
+                self.record_dynamic_node_rejection(node_id, validation_err);
+                return;
+            }
+        };
+
+        let added_ids: Vec<String> = validated_nodes.iter().map(|n| n.id.clone()).collect();
+        let Some(session) = self.graph_session.as_mut() else {
+            return;
+        };
+        let run = session.run_mut();
+        for spec in &new_nodes {
+            for dep in &spec.depends_on {
+                run.plan.edges.push(GraphEdge {
+                    from: dep.clone(),
+                    to: spec.id.clone(),
+                });
+            }
+        }
+        run.plan.nodes.extend(validated_nodes);
+        run.dynamic_added = Some(dynamic_added + added_ids.len());
+
+        let rev = next_plan_change_rev(run);
+        let change = PlanChange {
+            rev,
+            kind: PlanChangeKind::DynamicAdd,
+            at_ms: unix_ms_now(),
+            after_node: Some(node_id.to_owned()),
+            reason: format!("dynamic add by node {node_id}"),
+            trigger: Some(PlanChangeTrigger::DynamicAdd),
+            prompt_chars: None,
+            response_chars: None,
+            added: added_ids,
+            changed: Vec::new(),
+            removed: Vec::new(),
+            tasks_added: 0,
+            tasks_changed: 0,
+            tasks_removed: 0,
+            applied: true,
+            error: None,
+            response_excerpt: None,
+            decided_by: None,
+        };
+        run.push_plan_change(change);
+        let plan_id = run.plan.id.clone();
+        let _ = save_run(&self.workspace_root, run);
+        if self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|stored| stored.plan.id == plan_id)
+        {
+            self.last_graph_run = Some(run.clone());
+        }
+        self.emit_plan_revised_event(&plan_id, rev);
+    }
+
     fn build_graph_run(
         &self,
         plan: GraphPlan,
@@ -11442,6 +11622,7 @@ impl App {
             + 1;
         // A to-do link: still pending (judge stage) or already bound to this plan id.
         let todo_id = self.todos.todo_for_new_run(&plan.id);
+        let dynamic_cap = plan.dynamic_cap;
         GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -11462,6 +11643,8 @@ impl App {
             pending_replan_plan: None,
             planner_io: Vec::new(),
             todo_id,
+            dynamic_cap,
+            dynamic_added: None,
         }
     }
 
@@ -14472,7 +14655,7 @@ impl App {
 
     /// FR-2545: writes the awaiting graph plan plus its hash under the state dir.
     fn headless_write_pending_plan(&mut self) -> Option<String> {
-        let (prompt, tasks, steps) = {
+        let (prompt, tasks, steps, dynamic_cap) = {
             let run = self.last_graph_run.as_ref()?;
             if run.phase != GraphRunPhase::AwaitingApproval {
                 return None;
@@ -14490,12 +14673,14 @@ impl App {
                 run.plan.user_prompt.clone(),
                 run.plan.tasks.clone(),
                 revision.steps.clone(),
+                run.plan.dynamic_cap,
             )
         };
         let pending = HeadlessPendingPlan {
             prompt,
             tasks,
             steps,
+            dynamic_cap,
         };
         let json = match serde_json::to_string(&pending) {
             Ok(json) => json,
@@ -14632,7 +14817,7 @@ impl App {
                 ctx,
             )
         });
-        let graph_plan = match result {
+        let mut graph_plan = match result {
             Ok(plan) => plan,
             Err(errors) => {
                 let message = errors
@@ -14646,6 +14831,7 @@ impl App {
                 ));
             }
         };
+        graph_plan.dynamic_cap = pending.dynamic_cap;
         let doc = PlanDoc {
             steps: pending.steps.clone(),
             tasks: pending.tasks.clone(),
@@ -19793,6 +19979,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
@@ -20223,6 +20410,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
@@ -20349,6 +20537,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         app.graph_session = Some(GraphRunSession::new(GraphRun {
             plan,
@@ -20566,6 +20755,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         });
     }
 
@@ -20667,6 +20857,7 @@ mod tests {
                 user_prompt: "build the dashboard".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -20739,6 +20930,7 @@ mod tests {
                 user_prompt: "old conversation".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![],
                 edges: vec![],
             },
@@ -20781,6 +20973,7 @@ mod tests {
                 user_prompt: prompt.to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: dmuxai::graph::NodeRole::Implement,
@@ -21401,6 +21594,7 @@ mod tests {
                 user_prompt: "track details".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -21555,6 +21749,7 @@ mod tests {
                 user_prompt: "track activity".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -21644,6 +21839,7 @@ out3
                 user_prompt: "track".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -21701,6 +21897,7 @@ out3
                     ..dmuxai::graph::GraphLimits::default()
                 },
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![
                     dmuxai::graph::GraphNode {
                         id: "node-a".to_owned(),
@@ -21803,6 +22000,7 @@ out3
                 user_prompt: "retry".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -22592,6 +22790,7 @@ out3
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
 
         app.graph_session = Some(GraphRunSession::new(GraphRun {
@@ -22836,6 +23035,7 @@ out3
             edges: vec![],
             limits: dmuxai::graph::GraphLimits::default(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         let run = GraphRun {
             plan,
@@ -26602,6 +26802,7 @@ out3
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
@@ -26865,6 +27066,7 @@ out3
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         app.start_graph_run(plan);
 
@@ -26930,6 +27132,7 @@ out3
                     ..dmuxai::graph::GraphLimits::default()
                 },
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             conversation_id: conv_before.clone(),
             phase: GraphRunPhase::Failed,
@@ -33137,6 +33340,7 @@ out3
             }],
             edges: vec![],
             tasks: vec![],
+            dynamic_cap: None,
         };
         harness.app.apply_runner_pin_to_plan(&mut plan);
         assert_eq!(plan.nodes[0].runner, "codex");
@@ -34091,6 +34295,7 @@ out3
                 user_prompt: "ship".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -34124,6 +34329,7 @@ out3
                 user_prompt: "planning".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -34827,6 +35033,7 @@ out3
                 user_prompt: "ship".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -36287,6 +36494,7 @@ out3
                 edges: Vec::new(),
                 limits: dmuxai::graph::default_limits(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             conversation_id: app.conversation_id.to_string(),
             phase: GraphRunPhase::AwaitingApproval,
@@ -38866,6 +39074,7 @@ out3
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         app.graph_session = Some(GraphRunSession::new(GraphRun {
             plan,
@@ -39712,6 +39921,7 @@ out3
             orchestrator_model: "composer-2.5".to_owned(),
             user_prompt: "graph fallback".to_owned(),
             tasks: Vec::new(),
+            dynamic_cap: None,
             nodes: vec![dmuxai::graph::GraphNode {
                 id: "step-1".to_owned(),
                 role: NodeRole::Implement,
@@ -40116,6 +40326,390 @@ out3
         assert_eq!(
             App::headless_answer_text(&mapped, &[]),
             "partial output of the failed runner\n\nfinal answer"
+        );
+    }
+
+    // TC-2941 / FR-2941: with dynamic_nodes = false or cap 0, markers are ignored,
+    // plan, its hash, and the run are byte-for-byte as before.
+    #[test]
+    fn tc_2941_marker_ignored_when_feature_off() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = false;
+        let mut plan = two_step_cursor_chain_plan("p-2941", 1);
+        plan.dynamic_cap = None;
+        app.start_graph_run(plan);
+
+        let marker = "Finished step 1.\nDMUXAI_ADD_NODES: [{\"id\":\"extra-1\",\"role\":\"implement\",\"job\":\"extra\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            2,
+            "no nodes added when feature is off"
+        );
+        assert_eq!(session.run().plan.dynamic_cap, None);
+        assert!(
+            session.run().plan_history.is_empty(),
+            "no plan change recorded"
+        );
+    }
+
+    // TC-2942 / FR-2942: cap is in the plan hash and approval summary,
+    // and run never exceeds approved cap even if config changes later.
+    #[test]
+    fn tc_2942_cap_in_plan_hash_and_not_exceeded_after_config_change() {
+        // 1. Plan hash checks
+        let plan_none = HeadlessPendingPlan {
+            prompt: "task prompt".to_owned(),
+            tasks: Vec::new(),
+            steps: Vec::new(),
+            dynamic_cap: None,
+        };
+        let plan_cap1 = HeadlessPendingPlan {
+            prompt: "task prompt".to_owned(),
+            tasks: Vec::new(),
+            steps: Vec::new(),
+            dynamic_cap: Some(1),
+        };
+        let plan_cap3 = HeadlessPendingPlan {
+            prompt: "task prompt".to_owned(),
+            tasks: Vec::new(),
+            steps: Vec::new(),
+            dynamic_cap: Some(3),
+        };
+        let json_none = serde_json::to_string(&plan_none).unwrap();
+        let json_cap1 = serde_json::to_string(&plan_cap1).unwrap();
+        let json_cap3 = serde_json::to_string(&plan_cap3).unwrap();
+        assert_ne!(json_none, json_cap1);
+        assert_ne!(json_cap1, json_cap3);
+        let hash_none: String = dmuxai::docs::sha256_hex(json_none.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let hash_cap1: String = dmuxai::docs::sha256_hex(json_cap1.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let hash_cap3: String = dmuxai::docs::sha256_hex(json_cap3.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        assert_ne!(hash_none, hash_cap1);
+        assert_ne!(hash_cap1, hash_cap3);
+
+        // 2. Approval summary check
+        let mut test_plan = two_step_cursor_chain_plan("p-2942", 1);
+        test_plan.dynamic_cap = Some(2);
+        let run = GraphRun {
+            plan: test_plan.clone(),
+            conversation_id: "c-2942".to_owned(),
+            phase: GraphRunPhase::AwaitingApproval,
+            approval: Some(Approval {
+                state: ApprovalState::Pending,
+                revisions: vec![PlanRevision {
+                    n: 1,
+                    source: "agent".to_owned(),
+                    steps: Vec::new(),
+                    added: Vec::new(),
+                    changed: Vec::new(),
+                    feedback: None,
+                    errors: None,
+                    raw: None,
+                }],
+                decided_by: None,
+                decided_at_ms: None,
+            }),
+            ..Default::default()
+        };
+        let lines = dmuxai::graph::approval_panel_lines_with_skills(&run, 80, &|_| Vec::new());
+        let joined = lines
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("dynamic cap 2"),
+            "approval summary includes cap"
+        );
+
+        // 3. Run with approved cap 1 does not exceed it even if config changes to 5
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 1;
+        let mut run_plan = two_step_cursor_chain_plan("p-2942-run", 1);
+        run_plan.dynamic_cap = Some(1);
+        app.start_graph_run(run_plan);
+
+        // Config changes later to cap 5
+        app.settings.graph_dynamic_node_cap = 5;
+
+        // Node outputs marker requesting 2 nodes (exceeding approved cap 1)
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"extra-1\",\"role\":\"implement\",\"job\":\"j1\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]},{\"id\":\"extra-2\",\"role\":\"test\",\"job\":\"j2\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            2,
+            "nodes rejected because approved cap was 1"
+        );
+        assert_eq!(session.run().plan_history.len(), 1);
+        assert!(!session.run().plan_history[0].applied);
+        assert!(
+            session.run().plan_history[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("cap")
+        );
+    }
+
+    // TC-2944 / FR-2944: accepted nodes appended in pending state, scheduled by executor,
+    // recorded as PlanChange with trigger dynamic_add, without re-approval.
+    #[test]
+    fn tc_2944_accepted_nodes_scheduled_and_recorded_as_plan_change() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 3;
+        let mut plan = two_step_cursor_chain_plan("p-2944", 1);
+        plan.dynamic_cap = Some(3);
+        app.start_graph_run(plan);
+
+        let marker = "Working on research.\nDMUXAI_ADD_NODES: [{\"id\":\"step-dyn\",\"role\":\"implement\",\"job\":\"dynamic job\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[\"step-1\"]}]\nResearch done.";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(session.run().plan.nodes.len(), 3, "dynamic node appended");
+        assert_eq!(session.run().dynamic_added, Some(1));
+        let dyn_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-dyn")
+            .unwrap();
+        assert_eq!(dyn_node.role, NodeRole::Implement);
+        assert_ne!(
+            session.run().phase,
+            GraphRunPhase::AwaitingApproval,
+            "no re-approval prompted"
+        );
+
+        assert_eq!(session.run().plan_history.len(), 1);
+        let change = &session.run().plan_history[0];
+        assert_eq!(change.kind, PlanChangeKind::DynamicAdd);
+        assert_eq!(change.trigger, Some(PlanChangeTrigger::DynamicAdd));
+        assert_eq!(change.after_node.as_deref(), Some("step-1"));
+        assert!(change.applied);
+        assert_eq!(change.added, vec!["step-dyn"]);
+
+        // Marker was stripped from agent message
+        let last_agent_msg = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(!last_agent_msg.content.contains("DMUXAI_ADD_NODES"));
+        assert!(last_agent_msg.content.contains("Research done."));
+    }
+
+    // TC-2945 / FR-2945: with enforce_read_only_roles, added read-only roles run read-only.
+    // Added nodes cannot clear requires_gate for gated roles / sensitive keywords.
+    #[test]
+    fn tc_2945_added_nodes_keep_read_only_policy_and_gate() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 3;
+        app.settings.graph_enforce_read_only_roles = true;
+
+        let mut plan = two_step_cursor_chain_plan("p-2945", 1);
+        plan.dynamic_cap = Some(3);
+        app.start_graph_run(plan);
+
+        // Marker with one read-only node and one gated node (job contains sensitive keyword "deploy")
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-read\",\"role\":\"research\",\"job\":\"investigate logs\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]},{\"id\":\"dyn-gated\",\"role\":\"implement\",\"job\":\"deploy to production\",\"sensitive\":false,\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        let read_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "dyn-read")
+            .unwrap();
+        assert_eq!(
+            dmuxai::graph::node_turn_policy(read_node.role),
+            Some(dmuxai::graph::NodeTurnPolicy::ReadOnly)
+        );
+
+        let gated_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "dyn-gated")
+            .unwrap();
+        assert!(
+            gated_node.requires_gate,
+            "sensitive keyword forces requires_gate = true"
+        );
+    }
+
+    // TC-2946 / FR-2946: when [fanout] company_workspace = true, free runner is rejected.
+    #[test]
+    fn tc_2946_company_workspace_rejects_free_runner_marker() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 3;
+        app.settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "opencode".to_owned()]);
+        app.settings.fanout_company_workspace = true;
+
+        let mut plan = two_step_cursor_chain_plan("p-2946", 1);
+        plan.dynamic_cap = Some(3);
+        app.start_graph_run(plan);
+
+        // Free runner "opencode" in company workspace
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-free\",\"role\":\"implement\",\"job\":\"work\",\"runner\":\"opencode\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            2,
+            "free runner marker rejected"
+        );
+        assert_eq!(session.run().plan_history.len(), 1);
+        let change = &session.run().plan_history[0];
+        assert!(!change.applied);
+        assert!(change.error.as_ref().unwrap().contains("free runner"));
+
+        // Step-1 still completed normally
+        let step1 = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-1")
+            .unwrap();
+        assert_eq!(step1.status, dmuxai::graph::GraphNodeStatus::Completed);
+    }
+
+    // TC-2947 / FR-2947: a node may add nodes at most once; second marker rejected.
+    // A failed or cancelled node adds nothing.
+    #[test]
+    fn tc_2947_second_marker_and_failed_node_add_nothing() {
+        // Part 1: Second marker from same node
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 5;
+
+        let mut plan = two_step_cursor_chain_plan("p-2947", 1);
+        plan.dynamic_cap = Some(5);
+        app.start_graph_run(plan);
+
+        let marker1 = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-1\",\"role\":\"implement\",\"job\":\"j1\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker1);
+
+        assert_eq!(
+            app.graph_session.as_ref().unwrap().run().plan.nodes.len(),
+            3
+        );
+
+        // Attempt second marker from step-1
+        let marker2 = Ok(vec![dmuxai::graph::DynamicNodeSpec {
+            id: "dyn-2".to_owned(),
+            role: "implement".to_owned(),
+            job: "j2".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: Some("composer-2.5".to_owned()),
+            depends_on: Vec::new(),
+            sensitive: None,
+        }]);
+        app.handle_dynamic_add_nodes_marker("step-1", marker2);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            3,
+            "second marker adds nothing"
+        );
+        assert_eq!(session.run().plan_history.len(), 2);
+        assert!(!session.run().plan_history[1].applied);
+        assert!(
+            session.run().plan_history[1]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("already added")
+        );
+
+        // Part 2: Failed node with marker adds nothing
+        let (mut app2, sent2) = test_app();
+        app2.settings.graph_dynamic_nodes = true;
+        app2.settings.graph_dynamic_node_cap = 5;
+        let mut plan2 = two_step_cursor_chain_plan("p-2947-fail", 1);
+        plan2.dynamic_cap = Some(5);
+        app2.start_graph_run(plan2);
+
+        // Send TextDelta with marker, then Error event
+        let (agent, req) = sent2.lock().unwrap()[0].clone();
+        let fail_marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-fail\",\"role\":\"implement\",\"job\":\"jf\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        app2.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::TextDelta(fail_marker.to_owned()),
+        });
+        app2.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("node crashed")),
+        });
+
+        // Failed node added nothing
+        if let Some(s) = app2.graph_session.as_ref() {
+            assert_eq!(s.run().plan.nodes.len(), 2);
+            assert!(s.run().plan_history.is_empty());
+        }
+    }
+
+    // TC-2948 / NFR-2940: with feature off, marker scanning does not run on node-finish path.
+    #[test]
+    fn tc_2948_no_marker_scan_when_feature_off() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = false;
+
+        let mut plan = two_step_cursor_chain_plan("p-2948", 1);
+        plan.dynamic_cap = None;
+        app.start_graph_run(plan);
+
+        // Text with malformed marker that would produce parse error if scanned
+        let raw_text = "Progress update.\nDMUXAI_ADD_NODES: [ { malformed json syntax ]\nAll done.";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, raw_text);
+
+        // Feature is off: marker is NOT scanned, NOT parsed, NOT stripped, NO plan change recorded
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(session.run().plan.nodes.len(), 2);
+        assert!(
+            session.run().plan_history.is_empty(),
+            "no rejection or addition recorded"
+        );
+
+        // The text remains untouched in the agent message
+        let last_agent_msg = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(
+            last_agent_msg
+                .content
+                .contains("DMUXAI_ADD_NODES: [ { malformed json syntax ]")
         );
     }
 }

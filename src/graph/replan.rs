@@ -922,6 +922,7 @@ mod tests {
                 edges,
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             ..Default::default()
         }
@@ -1624,6 +1625,7 @@ mod tests {
             edges: Vec::new(),
             limits: GraphLimits::default(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
