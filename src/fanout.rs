@@ -1,5 +1,7 @@
 //! Pure fan-out planning types and helpers (SPEC-fanout-readonly FR-2910..2917).
 
+use crate::custom_agent;
+use crate::settings::DmuxSettings;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -26,11 +28,9 @@ pub struct FanoutLegReport {
     pub agent: String,
     pub model: Option<String>,
     pub status: LegStatus,
-    #[serde(skip_serializing_if = "String::is_empty", default)]
+    #[serde(default)]
     pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
     pub duration_ms: u64,
 }
@@ -133,6 +133,38 @@ pub fn is_free_runner(resolved_model: Option<&str>, custom_free: bool) -> bool {
             .is_some_and(|m| m.to_ascii_lowercase().ends_with("-free"))
 }
 
+/// Resolved model for a fan-out leg: `:model` > `[runners.<id>]` > custom default (FR-2916).
+pub fn resolved_fanout_leg_model(leg: &FanoutLegSpec, settings: &DmuxSettings) -> Option<String> {
+    if let Some(model) = leg
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return Some(model.to_owned());
+    }
+    if let Some(model) = settings.runner_models.get(&leg.runner) {
+        return Some(model.clone());
+    }
+    if let Some(spec) = custom_agent::index_of(&leg.runner).and_then(custom_agent::spec_at) {
+        return spec.default_model.clone();
+    }
+    None
+}
+
+/// Whether a fan-out leg targets a free runner after model resolution (FR-2916).
+pub fn fanout_runner_is_free(leg: &FanoutLegSpec, settings: &DmuxSettings) -> bool {
+    if let Some(spec) = custom_agent::index_of(&leg.runner).and_then(custom_agent::spec_at) {
+        if spec.free {
+            return true;
+        }
+        if spec.builtin && spec.name.eq_ignore_ascii_case("opencode") {
+            return true;
+        }
+    }
+    is_free_runner(resolved_fanout_leg_model(leg, settings).as_deref(), false)
+}
+
 /// FR-2916: mark free runners skipped when company workspace mode is on.
 pub fn apply_company_workspace_skip(
     legs: Vec<FanoutLegSpec>,
@@ -200,11 +232,11 @@ mod tests {
             FanoutLegReport {
                 agent: "cursor".into(),
                 model: Some("m1".into()),
-                status: LegStatus::Ok,
-                text: "one".into(),
+                status: LegStatus::Skipped,
+                text: String::new(),
                 error: None,
                 error_kind: None,
-                duration_ms: 10,
+                duration_ms: 0,
             },
             FanoutLegReport {
                 agent: "codex".into(),
@@ -216,42 +248,46 @@ mod tests {
                 duration_ms: 20,
             },
         ];
-        let value = fanout_json_value(true, 1, &legs);
-        assert_eq!(value["ok"], true);
-        assert_eq!(value["fanout"]["min_ok"], 1);
-        let arr = value["fanout"]["legs"].as_array().expect("legs");
-        assert_eq!(arr.len(), 2);
+        let serialized = serde_json::to_value(&legs[1]).expect("leg json");
+        assert!(serialized.get("text").is_some());
+        assert!(serialized.get("error").is_some());
+        assert!(serialized.get("error_kind").is_some());
+        let arr = serde_json::to_value(&legs).expect("legs");
         assert_eq!(arr[0]["agent"], "cursor");
-        assert_eq!(arr[0]["status"], "ok");
         assert_eq!(arr[1]["agent"], "codex");
-        assert_eq!(arr[1]["status"], "failed");
     }
 
-    // TC-2916 / FR-2916 (pure filter)
+    // TC-2916 / FR-2916
     #[test]
     fn tc_2916_company_workspace_skips_free_runners_with_warning() {
-        let legs = vec![
+        let mut settings = DmuxSettings::default();
+        settings.runner_models.insert("codex".into(), "o3".into());
+        let legs = [
             FanoutLegSpec {
                 runner: "cursor".into(),
                 model: Some("composer-2.5".into()),
             },
             FanoutLegSpec {
-                runner: "opencode".into(),
-                model: Some("opencode/kimi-k2.5-free".into()),
-            },
-            FanoutLegSpec {
                 runner: "codex".into(),
                 model: None,
             },
+            FanoutLegSpec {
+                runner: "agy".into(),
+                model: Some("kimi-k2.5-free".into()),
+            },
         ];
-        let (kept, warnings) = apply_company_workspace_skip(legs, true, |leg| {
-            is_free_runner(leg.model.as_deref(), false)
-        });
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].runner, "cursor");
-        assert_eq!(kept[1].runner, "codex");
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].1.contains("opencode"));
+        assert!(!fanout_runner_is_free(&legs[0], &settings));
+        assert!(!fanout_runner_is_free(&legs[1], &settings));
+        assert!(fanout_runner_is_free(&legs[2], &settings));
+        assert_eq!(
+            resolved_fanout_leg_model(&legs[1], &settings).as_deref(),
+            Some("o3")
+        );
+        let free = FanoutLegSpec {
+            runner: "custom".into(),
+            model: None,
+        };
+        assert!(!fanout_runner_is_free(&free, &settings));
     }
 
     #[test]

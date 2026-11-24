@@ -1467,6 +1467,14 @@ fn restricted_workspace_keys_with_user(
     if parsed.terminal.is_some() {
         keys.push("terminal".to_owned());
     }
+    if parsed
+        .fanout
+        .as_ref()
+        .and_then(|fanout| fanout.company_workspace)
+        .is_some()
+    {
+        keys.push("fanout.company_workspace".to_owned());
+    }
     if let Some(runners) = &parsed.runners {
         for (id, raw) in runners {
             if let Some(file) = &raw.system_prompt_file
@@ -1618,6 +1626,9 @@ fn strip_restricted_workspace_keys_with_user(
     }
     parsed.jira = None;
     parsed.terminal = None;
+    if let Some(fanout) = &mut parsed.fanout {
+        fanout.company_workspace = None;
+    }
     if let Some(runners) = &mut parsed.runners {
         for raw in runners.values_mut() {
             if let Some(file) = &raw.system_prompt_file

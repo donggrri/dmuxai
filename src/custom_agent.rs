@@ -492,6 +492,28 @@ impl CustomAgentSpec {
         self.label.as_deref().unwrap_or(&self.name)
     }
 
+    /// Whether fan-out can enforce read-only for this agent (FR-2911).
+    pub fn has_read_only_mode(&self) -> bool {
+        if !self.modes.ask.is_empty() {
+            return true;
+        }
+        let supports_placeholders = |text: &str| text.contains("{mode}") || text.contains("{edit}");
+        if self.command.iter().any(|part| supports_placeholders(part)) {
+            return true;
+        }
+        if self.env.values().any(|value| supports_placeholders(value)) {
+            return true;
+        }
+        if self
+            .temp_config_template
+            .as_deref()
+            .is_some_and(supports_placeholders)
+        {
+            return true;
+        }
+        false
+    }
+
     /// Returns the UI theme color, defaulting to "white".
     pub fn color(&self) -> &str {
         self.color.as_deref().unwrap_or("white")

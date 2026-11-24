@@ -4346,21 +4346,41 @@ impl App {
 
     fn apply_agent_output(&mut self, mut output: AgentOutput) -> bool {
         self.attach_model_catalog_hint(&mut output);
-        if self.in_fanout_run
-            && let (Some(conversation_id), Some(turn_id)) =
-                (&output.conversation_id, &output.turn_id)
-            && let Some(track) = self.fanout_trackers.get_mut(&output.agent)
-            && track.conversation_id.as_str() == conversation_id.as_str()
-            && track.turn_id.as_str() == turn_id.as_str()
-        {
-            match &output.event {
-                AgentEvent::TextDelta(delta) => track.buffer.push(delta),
-                AgentEvent::Error(err) => {
-                    track.error = Some(err.to_string());
-                    track.error_kind = Some(err.kind.as_str().to_owned());
+        if self.in_fanout_run {
+            let leg_event = match (&output.conversation_id, &output.turn_id) {
+                (Some(conversation_id), Some(turn_id)) => self
+                    .fanout_trackers
+                    .get(&output.agent)
+                    .is_some_and(|track| {
+                        track.conversation_id.as_str() == conversation_id.as_str()
+                            && track.turn_id.as_str() == turn_id.as_str()
+                    }),
+                _ => false,
+            };
+            if leg_event {
+                if let Some(track) = self.fanout_trackers.get_mut(&output.agent) {
+                    match &output.event {
+                        AgentEvent::TextDelta(delta) => track.buffer.push(delta),
+                        AgentEvent::Error(err) => {
+                            track.error = Some(err.to_string());
+                            track.error_kind = Some(err.kind.as_str().to_owned());
+                        }
+                        AgentEvent::Cancelled => {
+                            track.error = Some("cancelled".to_owned());
+                            track.error_kind = Some(AgentErrorKind::Cancelled.as_str().to_owned());
+                        }
+                        AgentEvent::Completed => track.ok = true,
+                        _ => {}
+                    }
                 }
-                AgentEvent::Completed => track.ok = true,
-                _ => {}
+                if matches!(
+                    output.event,
+                    AgentEvent::Completed | AgentEvent::Error(_) | AgentEvent::Cancelled
+                ) {
+                    self.busy_agents.remove(&output.agent);
+                    self.active_turns.remove(&output.agent);
+                }
+                return true;
             }
         }
         if output
@@ -4538,6 +4558,9 @@ impl App {
     /// change. Other adapters are covered only when their error text matches
     /// the same patterns.
     fn try_fresh_resume_retry(&mut self, agent: Agent, err: &AgentError) -> bool {
+        if self.in_fanout_run {
+            return false;
+        }
         if !is_resume_rejection_message(&err.message) {
             return false;
         }
@@ -4594,6 +4617,9 @@ impl App {
     /// that fails to start leaves the original error to the normal error path
     /// (FR-2130..FR-2133).
     fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
+        if self.in_fanout_run {
+            return false;
+        }
         // FR-2130 / TC-2130: a pending handover from an earlier attempt must never leak
         // into this one.
         self.pending_fallback = None;
@@ -4638,6 +4664,8 @@ impl App {
         };
 
         let fanout_reserved = self.fanout_reserved_runners.clone();
+        let fanout_company = self.in_fanout_run && self.settings.fanout_company_workspace;
+        let fanout_settings = self.settings.clone();
         let is_usable = |t: &dmuxai::runner_fallback::FallbackTarget,
                          adapters: &[Box<dyn AgentAdapter>],
                          busy_agents: &HashSet<Agent>,
@@ -4656,6 +4684,15 @@ impl App {
             }
             if fanout_reserved.contains(&t.runner.to_ascii_lowercase()) {
                 return false;
+            }
+            if fanout_company {
+                let leg = dmuxai::fanout::FanoutLegSpec {
+                    runner: t.runner.to_ascii_lowercase(),
+                    model: t.model.clone(),
+                };
+                if dmuxai::fanout::fanout_runner_is_free(&leg, &fanout_settings) {
+                    return false;
+                }
             }
             if !allowed_fn(&t.runner) {
                 return false;
@@ -14859,6 +14896,16 @@ impl App {
                 "not_found",
             );
         }
+        if let Agent::Custom(custom_index) = agent
+            && let Some(spec) = dmuxai::custom_agent::spec_at(custom_index)
+            && !spec.has_read_only_mode()
+        {
+            return fail(
+                &leg.runner,
+                format!("{agent} does not support read-only mode"),
+                "no_read_only_mode",
+            );
+        }
         if let Some(model_value) = leg.model.clone() {
             if let Err(err) = Self::model_resolution_for(
                 &self.model_catalogs,
@@ -14871,7 +14918,9 @@ impl App {
             ) {
                 return fail(&leg.runner, err, "policy");
             }
-            let _ = self.adapters[index].select_model(model_value);
+            if let Err(err) = self.adapters[index].select_model(model_value) {
+                return fail(&leg.runner, err.to_string(), "internal");
+            }
         }
         let saved_main = self.conversation_id.clone();
         let Ok(snapshot) = self.engine.select(ConversationSelection::New {
@@ -14902,15 +14951,11 @@ impl App {
         let send_result = self.adapters[index].send(adapter_request);
         self.fanout_restore_main_conversation(&saved_main);
         if let Err(error) = send_result {
-            let (message, kind) = if matches!(error, AdapterError::Unsupported) {
-                (
-                    format!("{agent} does not support read-only mode"),
-                    "no_read_only_mode",
-                )
-            } else {
-                (format!("Could not start {agent}: {error}"), "internal")
-            };
-            return fail(&leg.runner, message, kind);
+            return fail(
+                &leg.runner,
+                format!("Could not start {agent}: {error}"),
+                "internal",
+            );
         }
         self.busy_agents.insert(agent);
         self.active_turns.insert(
@@ -14930,7 +14975,10 @@ impl App {
                 retry_fresh_request: None,
             },
         );
-        let model = self.selected_run_model(agent).ok().flatten();
+        let model = leg
+            .model
+            .clone()
+            .or_else(|| self.selected_run_model(agent).ok().flatten());
         FanoutLegTracker {
             runner: leg.runner.clone(),
             conversation_id: leg_conversation_id,
@@ -14951,18 +14999,18 @@ impl App {
         user_prompt: String,
         legs: Vec<dmuxai::fanout::FanoutLegSpec>,
         min_ok: usize,
-        mut skipped: Vec<dmuxai::fanout::FanoutLegReport>,
+        skipped: Vec<dmuxai::fanout::FanoutLegReport>,
+        cli_order: Vec<String>,
         cancel: Arc<AtomicBool>,
     ) -> HeadlessOutcome {
         let prompt_prefix = user_prompt.trim().chars().take(40).collect::<String>();
         let before_fp = dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await;
         self.in_fanout_run = true;
-        self.fanout_reserved_runners = legs.iter().map(|leg| leg.runner.clone()).collect();
-        let order: Vec<String> = skipped
+        self.fanout_reserved_runners = cli_order
             .iter()
-            .map(|s| s.agent.clone())
-            .chain(legs.iter().map(|l| l.runner.clone()))
+            .map(|runner| runner.to_ascii_lowercase())
             .collect();
+        let order = cli_order;
         let mut trackers: HashMap<String, FanoutLegTracker> = HashMap::new();
         for leg in &legs {
             let title = format!("fanout: {prompt_prefix} [{}]", leg.runner);
@@ -15017,7 +15065,9 @@ impl App {
 
         let mut reports: Vec<dmuxai::fanout::FanoutLegReport> = Vec::new();
         for key in order {
-            if let Some(track) = trackers.get(&key) {
+            if let Some(skip) = skipped.iter().find(|s| s.agent == key) {
+                reports.push(skip.clone());
+            } else if let Some(track) = trackers.get(&key) {
                 let status = if track.finished && track.ok {
                     dmuxai::fanout::LegStatus::Ok
                 } else {
@@ -15032,12 +15082,8 @@ impl App {
                     error_kind: track.error_kind.clone(),
                     duration_ms: track.started.elapsed().as_millis() as u64,
                 });
-            } else if let Some(skip) = skipped.iter().find(|s| s.agent == key) {
-                reports.push(skip.clone());
             }
         }
-        skipped.retain(|s| !reports.iter().any(|r| r.agent == s.agent));
-        reports.extend(skipped);
 
         let ok_count = reports
             .iter()
@@ -27363,8 +27409,16 @@ out3
     // TC-2911 / FR-2911
     #[tokio::test]
     async fn tc_2911_leg_without_read_only_mode_fails_not_writes() {
-        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[Agent::Codex]);
+        let write_only = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
+        assert!(!write_only.has_read_only_mode());
+        dmuxai::custom_agent::install_registry(vec![write_only]);
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
         complete_fanout_requests(&sent, event_tx);
+        let order = vec!["cursor".into(), "nowrite".into()];
         let outcome = app
             .run_fanout_headless(
                 "hello".into(),
@@ -27374,25 +27428,26 @@ out3
                         model: None,
                     },
                     dmuxai::fanout::FanoutLegSpec {
-                        runner: "codex".into(),
+                        runner: "nowrite".into(),
                         model: None,
                     },
                 ],
                 1,
                 Vec::new(),
+                order,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
-        let codex = outcome
+        let custom = outcome
             .fanout
             .as_ref()
             .unwrap()
             .legs
             .iter()
-            .find(|leg| leg.agent == "codex")
-            .expect("codex leg");
-        assert_eq!(codex.status, dmuxai::fanout::LegStatus::Failed);
-        assert_eq!(codex.error_kind.as_deref(), Some("no_read_only_mode"));
+            .find(|leg| leg.agent == "nowrite")
+            .expect("nowrite leg");
+        assert_eq!(custom.status, dmuxai::fanout::LegStatus::Failed);
+        assert_eq!(custom.error_kind.as_deref(), Some("no_read_only_mode"));
         let requests = sent.lock().unwrap();
         assert_eq!(
             requests
@@ -27400,6 +27455,12 @@ out3
                 .filter(|(_, r)| r.policy == TurnPolicy::ReadOnly)
                 .count(),
             1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(agent, _)| { runner_name(*agent).eq_ignore_ascii_case("nowrite") }),
+            "custom agent without read-only mode must never be sent"
         );
     }
 
@@ -27424,6 +27485,7 @@ out3
                 ],
                 1,
                 Vec::new(),
+                vec!["cursor".into(), "codex".into()],
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27443,28 +27505,47 @@ out3
     // TC-2913 / FR-2913
     #[tokio::test]
     async fn tc_2913_failed_leg_tolerated_by_quorum() {
+        let legs = vec![
+            dmuxai::fanout::FanoutLegSpec {
+                runner: "cursor".into(),
+                model: None,
+            },
+            dmuxai::fanout::FanoutLegSpec {
+                runner: "codex".into(),
+                model: None,
+            },
+        ];
+        let order = vec!["cursor".into(), "codex".into()];
         let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex], &[]);
         complete_fanout_requests(&sent, event_tx);
         let outcome = app
             .run_fanout_headless(
                 "hello".into(),
-                vec![
-                    dmuxai::fanout::FanoutLegSpec {
-                        runner: "cursor".into(),
-                        model: None,
-                    },
-                    dmuxai::fanout::FanoutLegSpec {
-                        runner: "codex".into(),
-                        model: None,
-                    },
-                ],
+                legs.clone(),
                 1,
                 Vec::new(),
+                order.clone(),
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
         assert!(outcome.ok);
         assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::OK);
+
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex, Agent::Cursor], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                legs,
+                2,
+                Vec::new(),
+                order,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::FAILED);
+        assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
     }
 
     // TC-2914 / FR-2914
@@ -27486,6 +27567,30 @@ out3
         app.settings.runner_fallback = fallback;
         let event_tx2 = event_tx.clone();
         let sent2 = Arc::clone(&sent);
+        let event_tx3 = event_tx.clone();
+        let sent3 = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let req = {
+                    let lock = sent3.lock().unwrap();
+                    lock.iter()
+                        .find(|(a, _)| *a == Agent::Cursor)
+                        .map(|(_, r)| (r.conversation_id.clone(), r.turn_id.clone()))
+                };
+                if let Some((conversation_id, turn_id)) = req {
+                    let _ = event_tx3
+                        .send(AgentOutput {
+                            agent: Agent::Cursor,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
         tokio::spawn(async move {
             for _ in 0..400 {
                 let req = {
@@ -27510,7 +27615,6 @@ out3
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
-        complete_fanout_requests(&sent, event_tx);
         let outcome = app
             .run_fanout_headless(
                 "hello".into(),
@@ -27526,6 +27630,7 @@ out3
                 ],
                 1,
                 Vec::new(),
+                vec!["agy".into(), "cursor".into()],
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27638,6 +27743,7 @@ out3
                 ],
                 1,
                 Vec::new(),
+                vec!["cursor".into(), "codex".into()],
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
