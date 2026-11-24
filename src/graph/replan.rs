@@ -445,6 +445,7 @@ pub fn apply_replan(
             plan.orchestrator_model = run.plan.orchestrator_model.clone();
             plan.user_prompt = run.plan.user_prompt.clone();
             plan.limits = run.plan.limits.clone();
+            plan.dynamic_cap = run.plan.dynamic_cap;
 
             let mut nodes = Vec::new();
             for node in &run.plan.nodes {

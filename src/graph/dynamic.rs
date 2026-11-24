@@ -4,9 +4,13 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fanout::{FanoutLegSpec, fanout_runner_is_free};
+use crate::model_policy::validate_model_for_runner;
+use crate::settings::DmuxSettings;
+
 use super::plan_doc::{parse_role, valid_step_id};
 use super::planner::sensitive_keyword_match;
-use super::policy::{model_for_role, validate_model_id};
+use super::policy::{is_runner_allowed, model_for_role};
 use super::types::{GraphNode, GraphNodeStatus, GraphPlan, NodeRole};
 
 /// One proposed node parsed from a `DMUXAI_ADD_NODES` marker.
@@ -56,6 +60,15 @@ fn strip_leading_marker_decoration(line: &str) -> &str {
     rest
 }
 
+fn is_add_nodes_marker_line(line: &str) -> bool {
+    let stripped = strip_leading_marker_decoration(line);
+    stripped.starts_with("DMUXAI_ADD_NODES:")
+        || ["**", "__", "`", "*", "_"].iter().any(|prefix| {
+            stripped.starts_with(&format!("DMUXAI_ADD_NODES{prefix}:"))
+                || stripped.starts_with(&format!("DMUXAI_ADD_NODES:{prefix}"))
+        })
+}
+
 fn parse_add_nodes_marker_line(line: &str) -> Option<&str> {
     let stripped = strip_leading_marker_decoration(line);
     let after = stripped.strip_prefix("DMUXAI_ADD_NODES:").or_else(|| {
@@ -81,14 +94,19 @@ fn parse_add_nodes_marker_line(line: &str) -> Option<&str> {
 /// - `Some(Err(msg))` if a marker line exists but JSON is malformed or not an array of objects.
 /// - `Some(Ok(nodes))` if valid dynamic node specs were parsed.
 pub fn parse_add_nodes_marker(text: &str) -> Option<Result<Vec<DynamicNodeSpec>, String>> {
-    let line = text.lines().rev().find(|line| {
-        let stripped = strip_leading_marker_decoration(line);
-        stripped.starts_with("DMUXAI_ADD_NODES:")
-            || ["**", "__", "`", "*", "_"].iter().any(|prefix| {
-                stripped.starts_with(&format!("DMUXAI_ADD_NODES{prefix}:"))
-                    || stripped.starts_with(&format!("DMUXAI_ADD_NODES:{prefix}"))
-            })
-    })?;
+    let marker_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| is_add_nodes_marker_line(line))
+        .collect();
+    if marker_lines.is_empty() {
+        return None;
+    }
+    if marker_lines.len() > 1 {
+        return Some(Err(
+            "multiple DMUXAI_ADD_NODES markers in one reply".to_string()
+        ));
+    }
+    let line = marker_lines[0];
     let payload = match parse_add_nodes_marker_line(line) {
         Some(p) => p,
         None => return Some(Err("empty DMUXAI_ADD_NODES marker".to_string())),
@@ -122,26 +140,42 @@ pub fn parse_add_nodes_marker(text: &str) -> Option<Result<Vec<DynamicNodeSpec>,
 
 /// Removes the `DMUXAI_ADD_NODES: [ ... ]` line from the given text.
 pub fn strip_add_nodes_marker(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let Some(index) = lines.iter().rposition(|line| {
-        let stripped = strip_leading_marker_decoration(line);
-        stripped.starts_with("DMUXAI_ADD_NODES:")
-            || ["**", "__", "`", "*", "_"].iter().any(|prefix| {
-                stripped.starts_with(&format!("DMUXAI_ADD_NODES{prefix}:"))
-                    || stripped.starts_with(&format!("DMUXAI_ADD_NODES:{prefix}"))
-            })
-    }) else {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| !is_add_nodes_marker_line(line))
+        .collect();
+    if kept.len() == text.lines().count() {
         return text.to_owned();
-    };
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != index)
-        .map(|(_, line)| *line)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim_end()
-        .to_owned()
+    }
+    kept.join("\n").trim_end().to_owned()
+}
+
+/// Resolved model for a dynamic node: explicit `model_id` > `[runners.<id>]` >
+/// custom default > role preset (FR-2946, same order as fan-out).
+pub fn resolved_dynamic_node_model(
+    spec: &DynamicNodeSpec,
+    role: NodeRole,
+    settings: &DmuxSettings,
+) -> String {
+    if let Some(model) = spec
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        return model.to_owned();
+    }
+    let runner = spec.runner.trim().to_ascii_lowercase();
+    if let Some(model) = settings.runner_models.get(&runner) {
+        return model.clone();
+    }
+    if let Some(agent) =
+        crate::custom_agent::index_of(&runner).and_then(crate::custom_agent::spec_at)
+        && let Some(default) = &agent.default_model
+    {
+        return default.clone();
+    }
+    model_for_role(role).to_owned()
 }
 
 /// Pure validation function implementing every rule of FR-2943, FR-2945, FR-2946:
@@ -162,7 +196,7 @@ pub fn validate_add_nodes(
     plan: &GraphPlan,
     new_nodes: &[DynamicNodeSpec],
     cap_remaining: usize,
-    allowed_runners: Option<&[String]>,
+    settings: &DmuxSettings,
     max_nodes: usize,
     company_workspace: bool,
 ) -> Result<Vec<GraphNode>, String> {
@@ -214,25 +248,18 @@ pub fn validate_add_nodes(
             return Err(format!("job cannot be empty for node '{}'", spec.id));
         }
         let runner = spec.runner.trim().to_ascii_lowercase();
-        if let Some(allowed) = allowed_runners {
-            if !allowed
-                .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(&runner))
-            {
-                return Err(format!("runner '{}' is not allowed", spec.runner));
-            }
-        } else if !matches!(runner.as_str(), "agy" | "codex" | "cursor") {
+        if !is_runner_allowed(&runner, settings) {
             return Err(format!("runner '{}' is not allowed", spec.runner));
         }
 
         let role = parse_role(&spec.role).unwrap();
-        let model_id = spec
-            .model_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| model_for_role(role));
-        if let Err(err) = validate_model_id(model_id) {
+        if let Some(model) = spec.model_id.as_deref()
+            && model.trim().is_empty()
+        {
+            return Err(format!("model_id cannot be empty for node '{}'", spec.id));
+        }
+        let model_id = resolved_dynamic_node_model(spec, role, settings);
+        if let Err(err) = validate_model_for_runner(&runner, &model_id) {
             return Err(format!(
                 "invalid model '{}' for node '{}': {}",
                 model_id, spec.id, err
@@ -240,24 +267,28 @@ pub fn validate_add_nodes(
         }
 
         if company_workspace {
-            let is_free = runner.eq_ignore_ascii_case("opencode")
-                || runner.ends_with("-free")
-                || model_id.to_ascii_lowercase().ends_with("-free")
-                || crate::fanout::is_free_runner(Some(model_id), false)
-                || crate::custom_agent::index_of(&runner)
-                    .and_then(crate::custom_agent::spec_at)
-                    .is_some_and(|s| {
-                        s.free || (s.builtin && s.name.eq_ignore_ascii_case("opencode"))
-                    });
-            if is_free {
+            let settings_free = settings.custom_agents.iter().any(|s| {
+                s.name.eq_ignore_ascii_case(&runner)
+                    && (s.free || (s.builtin && s.name.eq_ignore_ascii_case("opencode")))
+            });
+            let leg = FanoutLegSpec {
+                runner: runner.clone(),
+                model: Some(model_id.clone()),
+            };
+            if settings_free || fanout_runner_is_free(&leg, settings) {
                 return Err(format!(
-                    "free runner '{}' rejected in company workspace",
+                    "warning: free runner '{}' rejected in company workspace",
                     spec.runner
                 ));
             }
         }
     }
 
+    let mut edge_keys: HashSet<(String, String)> = plan
+        .edges
+        .iter()
+        .map(|edge| (edge.from.clone(), edge.to.clone()))
+        .collect();
     let mut seen_earlier: HashSet<&str> = plan.nodes.iter().map(|n| n.id.as_str()).collect();
     for spec in new_nodes {
         for dep in &spec.depends_on {
@@ -267,6 +298,27 @@ pub fn validate_add_nodes(
                     spec.id, dep
                 ));
             }
+            if let Some(node) = plan.nodes.iter().find(|node| node.id == *dep)
+                && matches!(
+                    node.status,
+                    GraphNodeStatus::Failed | GraphNodeStatus::Skipped
+                )
+            {
+                return Err(format!(
+                    "node '{}' cannot depend on {} node '{}'",
+                    spec.id,
+                    match node.status {
+                        GraphNodeStatus::Failed => "failed",
+                        GraphNodeStatus::Skipped => "skipped",
+                        _ => "unavailable",
+                    },
+                    dep
+                ));
+            }
+            let edge = (dep.clone(), spec.id.clone());
+            if !edge_keys.insert(edge) {
+                return Err(format!("duplicate edge from '{}' to '{}'", dep, spec.id));
+            }
         }
         seen_earlier.insert(spec.id.as_str());
     }
@@ -275,13 +327,7 @@ pub fn validate_add_nodes(
     for spec in new_nodes {
         let role = parse_role(&spec.role).unwrap();
         let runner = spec.runner.trim().to_ascii_lowercase();
-        let model_id = spec
-            .model_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| model_for_role(role))
-            .to_owned();
+        let model_id = resolved_dynamic_node_model(spec, role, settings);
         let keyword =
             sensitive_keyword_match(&plan.user_prompt) || sensitive_keyword_match(&spec.job);
         let requires_gate = spec.sensitive == Some(true) || keyword;
@@ -308,6 +354,11 @@ pub fn validate_add_nodes(
 mod tests {
     use super::*;
     use crate::graph::types::GraphLimits;
+    use crate::settings::DmuxSettings;
+
+    fn sample_settings() -> DmuxSettings {
+        DmuxSettings::default()
+    }
 
     fn sample_plan() -> GraphPlan {
         GraphPlan {
@@ -345,6 +396,7 @@ mod tests {
     #[test]
     fn tc_2943_marker_validation_rejects_each_violation() {
         let plan = sample_plan();
+        let settings = sample_settings();
 
         // 1. Invalid JSON marker parsing
         let parsed_err = parse_add_nodes_marker("DMUXAI_ADD_NODES: not a json array").unwrap();
@@ -363,55 +415,109 @@ mod tests {
         // 4. Role orchestrate rejected
         let mut orch_spec = parsed_ok.clone();
         orch_spec[0].role = "orchestrate".to_string();
-        let err = validate_add_nodes(&plan, &orch_spec, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &orch_spec, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("orchestrate"), "must reject orchestrate role");
 
         // 5. Unknown role rejected
         let mut unknown_role = parsed_ok.clone();
         unknown_role[0].role = "invalid_role".to_string();
-        let err = validate_add_nodes(&plan, &unknown_role, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &unknown_role, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("invalid role"), "must reject unknown role");
 
         // 6. Duplicate / existing id rejected
         let mut dup_id = parsed_ok.clone();
         dup_id[0].id = "step-1".to_string(); // already in plan
-        let err = validate_add_nodes(&plan, &dup_id, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &dup_id, 3, &settings, 5, false).unwrap_err();
         assert!(
             err.contains("duplicate or existing"),
             "must reject existing id"
         );
 
+        // 6b. Intra-marker duplicate ids rejected
+        let intra_dup = vec![
+            parsed_ok[0].clone(),
+            DynamicNodeSpec {
+                id: "step-2".to_string(),
+                ..parsed_ok[0].clone()
+            },
+        ];
+        let err = validate_add_nodes(&plan, &intra_dup, 3, &settings, 5, false).unwrap_err();
+        assert!(err.contains("duplicate or existing"));
+
         // 7. Malformed id rejected
         let mut bad_id = parsed_ok.clone();
         bad_id[0].id = "Step_2!".to_string();
-        let err = validate_add_nodes(&plan, &bad_id, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &bad_id, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("invalid node id"), "must reject bad id format");
 
         // 8. Runner not allowed rejected
         let mut bad_runner = parsed_ok.clone();
         bad_runner[0].runner = "unauthorized_runner".to_string();
-        let err = validate_add_nodes(
-            &plan,
-            &bad_runner,
-            3,
-            Some(&["codex".to_string()]),
-            5,
-            false,
-        )
-        .unwrap_err();
+        let mut allow_codex = settings.clone();
+        allow_codex.graph_allowed_runners = Some(vec!["codex".to_string()]);
+        let err = validate_add_nodes(&plan, &bad_runner, 3, &allow_codex, 5, false).unwrap_err();
         assert!(err.contains("runner 'unauthorized_runner' is not allowed"));
 
-        // 9. Model invalid rejected
+        // 8b. Custom runner allowed when graph_runner_allowed admits it
+        let mut custom_settings = settings.clone();
+        custom_settings
+            .custom_agents
+            .push(crate::custom_agent::CustomAgentSpec {
+                name: "pi".to_string(),
+                default_model: Some("composer-2.5".to_string()),
+                ..Default::default()
+            });
+        let mut custom_runner = parsed_ok.clone();
+        custom_runner[0].runner = "pi".to_string();
+        assert!(validate_add_nodes(&plan, &custom_runner, 3, &custom_settings, 5, false).is_ok());
+
+        // 9. Model invalid / empty rejected
         let mut bad_model = parsed_ok.clone();
         bad_model[0].model_id = Some("gpt-4-invalid".to_string());
-        let err = validate_add_nodes(&plan, &bad_model, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &bad_model, 3, &settings, 5, false).unwrap_err();
+        assert!(err.contains("invalid model"));
+        let mut empty_model = parsed_ok.clone();
+        empty_model[0].model_id = Some("".to_string());
+        let err = validate_add_nodes(&plan, &empty_model, 3, &settings, 5, false).unwrap_err();
+        assert!(err.contains("empty"));
+
+        // 9b. Runner-specific model (agy) accepted when valid
+        let mut agy_spec = parsed_ok.clone();
+        agy_spec[0].runner = "agy".to_string();
+        agy_spec[0].model_id = Some("gemini-3.8-flash-high".to_string());
+        assert!(validate_add_nodes(&plan, &agy_spec, 3, &settings, 5, false).is_ok());
+        let mut agy_bad = agy_spec.clone();
+        agy_bad[0].model_id = Some("not-a-real-model".to_string());
+        let err = validate_add_nodes(&plan, &agy_bad, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("invalid model"));
 
         // 10. depends_on unknown id rejected
         let mut bad_dep = parsed_ok.clone();
         bad_dep[0].depends_on = vec!["nonexistent-step".to_string()];
-        let err = validate_add_nodes(&plan, &bad_dep, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &bad_dep, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("unknown or future"));
+
+        // 10b. depends_on failed/skipped rejected
+        let mut failed_plan = plan.clone();
+        failed_plan.nodes.push(GraphNode {
+            id: "step-failed".to_string(),
+            role: NodeRole::Test,
+            job: "x".to_string(),
+            runner: "cursor".to_string(),
+            model_id: "composer-2.5".to_string(),
+            skill: None,
+            requires_gate: false,
+            status: GraphNodeStatus::Failed,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        });
+        let mut dep_failed = parsed_ok.clone();
+        dep_failed[0].depends_on = vec!["step-failed".to_string()];
+        let err =
+            validate_add_nodes(&failed_plan, &dep_failed, 3, &settings, 5, false).unwrap_err();
+        assert!(err.contains("failed"));
 
         // 11. depends_on forward / cycle reference rejected
         let forward_specs = vec![
@@ -434,7 +540,7 @@ mod tests {
                 sensitive: None,
             },
         ];
-        let err = validate_add_nodes(&plan, &forward_specs, 3, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &forward_specs, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("unknown or future"));
 
         // 12. Exceeding max_nodes rejected
@@ -450,29 +556,53 @@ mod tests {
                 sensitive: None,
             })
             .collect();
-        let err = validate_add_nodes(&plan, &five_specs, 10, None, 5, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &five_specs, 10, &settings, 5, false).unwrap_err();
         assert!(err.contains("would exceed max_nodes"));
 
         // 13. Exceeding cap_remaining rejected
-        let err = validate_add_nodes(&plan, &parsed_ok, 0, None, 10, false).unwrap_err();
+        let err = validate_add_nodes(&plan, &parsed_ok, 0, &settings, 10, false).unwrap_err();
         assert!(err.contains("exceeds remaining cap"));
 
-        // 14. Free runner rejected when company_workspace = true
+        // 14. Free runner rejected when company_workspace = true (resolved model)
+        let mut free_settings = settings.clone();
+        free_settings.graph_allowed_runners = Some(vec!["opencode".to_string()]);
+        free_settings.fanout_company_workspace = true;
+        free_settings
+            .custom_agents
+            .push(crate::custom_agent::CustomAgentSpec {
+                name: "opencode".to_string(),
+                builtin: true,
+                free: true,
+                ..Default::default()
+            });
         let mut free_runner_spec = parsed_ok.clone();
         free_runner_spec[0].runner = "opencode".to_string();
-        let err = validate_add_nodes(
-            &plan,
-            &free_runner_spec,
-            3,
-            Some(&["opencode".to_string()]),
-            5,
-            true,
-        )
-        .unwrap_err();
+        free_runner_spec[0].model_id = None;
+        let err =
+            validate_add_nodes(&plan, &free_runner_spec, 3, &free_settings, 5, true).unwrap_err();
         assert!(err.contains("company workspace"));
 
-        // 15. All rules passed: returns Ok
-        let ok = validate_add_nodes(&plan, &parsed_ok, 3, None, 5, false);
+        // 14b. Resolved runner_models -free triggers free rejection
+        let mut resolved_free = settings.clone();
+        resolved_free.fanout_company_workspace = true;
+        resolved_free.runner_models.insert(
+            "cursor".to_string(),
+            "opencode/glm-5.3-flash-free".to_string(),
+        );
+        let mut omit_model = parsed_ok.clone();
+        omit_model[0].runner = "cursor".to_string();
+        omit_model[0].model_id = None;
+        let err = validate_add_nodes(&plan, &omit_model, 3, &resolved_free, 5, true).unwrap_err();
+        assert!(err.contains("company workspace"));
+
+        // 15. Multiple markers rejected at parse time
+        let two_markers = "DMUXAI_ADD_NODES: []\nDMUXAI_ADD_NODES: []";
+        let parsed = parse_add_nodes_marker(two_markers).unwrap();
+        assert!(parsed.is_err());
+        assert!(parsed.unwrap_err().contains("multiple"));
+
+        // 16. All rules passed: returns Ok
+        let ok = validate_add_nodes(&plan, &parsed_ok, 3, &settings, 5, false);
         assert!(ok.is_ok());
         let validated = ok.unwrap();
         assert_eq!(validated.len(), 1);

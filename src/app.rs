@@ -1090,6 +1090,8 @@ struct HeadlessPendingPlan {
 pub struct HeadlessPlan {
     pub steps: Vec<PlanStep>,
     pub tasks: Vec<PlanTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -9415,7 +9417,10 @@ impl App {
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
-        if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
+        if graph_plan.dynamic_cap.is_none()
+            && self.settings.graph_dynamic_nodes
+            && self.settings.graph_dynamic_node_cap > 0
+        {
             graph_plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
         }
         let approval = Approval {
@@ -11207,6 +11212,39 @@ impl App {
         self.replan_summaries.push((node_id.to_owned(), capped));
     }
 
+    fn graph_plan_is_quiet(run: &GraphRun) -> bool {
+        run.plan
+            .nodes
+            .iter()
+            .all(|node| node.role != NodeRole::Orchestrate)
+            && run
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| node.role != NodeRole::Orchestrate)
+                .count()
+                <= 1
+    }
+
+    /// Whether node output should be scanned for `DMUXAI_ADD_NODES` (FR-2941, NFR-2940).
+    fn graph_dynamic_markers_enabled_for_run(&self, run: &GraphRun) -> bool {
+        if !self.settings.graph_dynamic_nodes || Self::graph_plan_is_quiet(run) {
+            return false;
+        }
+        let approved_cap = run.plan.dynamic_cap.or(run.dynamic_cap).unwrap_or(0);
+        approved_cap > 0 && self.settings.graph_dynamic_node_cap > 0
+    }
+
+    fn graph_dynamic_markers_enabled(&self) -> bool {
+        if self.quiet_graph_run {
+            return false;
+        }
+        let Some(session) = self.graph_session.as_ref() else {
+            return false;
+        };
+        self.graph_dynamic_markers_enabled_for_run(session.run())
+    }
+
     fn active_stored_graph_run_for_node(
         workspace: &std::path::Path,
         conversation_id: &str,
@@ -11270,6 +11308,7 @@ impl App {
         conversation_id: &str,
         node_id: String,
         success: bool,
+        output_text: &str,
         error: Option<&str>,
     ) {
         if !success && error == Some("cancelled") {
@@ -11304,19 +11343,52 @@ impl App {
             .as_ref()
             .is_some_and(|session| session.run().conversation_id == conversation_id);
 
+        let stored_run = (!session_is_target)
+            .then(|| {
+                Self::active_stored_graph_run_for_node(
+                    &self.workspace_root,
+                    conversation_id,
+                    &node_id,
+                )
+            })
+            .flatten();
+
+        let run_for_policy = if session_is_target {
+            self.graph_session.as_ref().map(|s| s.run().clone())
+        } else {
+            stored_run.clone()
+        };
+        let Some(run_for_policy) = run_for_policy else {
+            return;
+        };
+
+        let dynamic_marker =
+            if self.graph_dynamic_markers_enabled_for_run(&run_for_policy) && success {
+                parse_add_nodes_marker(output_text)
+            } else {
+                None
+            };
+
         let (actions, run_snapshot) = if session_is_target {
+            if let Some(marker_res) = dynamic_marker {
+                self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
+            }
             let session = self.graph_session.as_mut().expect("graph session");
             let actions = session.on_node_finished(&node_id, success);
             let snapshot = session.run().clone();
             let _ = save_run(&self.workspace_root, session.run());
             (actions, snapshot)
-        } else if let Some(run) =
-            Self::active_stored_graph_run_for_node(&self.workspace_root, conversation_id, &node_id)
-        {
-            let mut session = GraphRunSession::new(run);
+        } else if let Some(run) = stored_run {
+            let prior = self.graph_session.take();
+            self.graph_session = Some(GraphRunSession::new(run));
+            if let Some(marker_res) = dynamic_marker {
+                self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
+            }
+            let session = self.graph_session.as_mut().expect("graph session");
             let actions = session.on_node_finished(&node_id, success);
             let snapshot = session.run().clone();
             let _ = save_run(&self.workspace_root, &snapshot);
+            self.graph_session = prior;
             (actions, snapshot)
         } else {
             return;
@@ -11400,17 +11472,19 @@ impl App {
             }
             marker_reason = Some(reason);
         }
+        let dynamic_marker = if self.graph_dynamic_markers_enabled() && success {
+            parse_add_nodes_marker(output_text)
+        } else {
+            None
+        };
         if success {
+            if dynamic_marker.is_some() {
+                display_text = strip_add_nodes_marker(&display_text);
+                self.rewrite_last_agent_message(agent, display_text.clone());
+            }
             self.note_replan_summary(&node_id, &display_text);
         }
-        // SPEC-graph-dynamic-nodes (FR-2940..FR-2947, NFR-2940):
-        // ONLY when the feature is on and the node succeeded, scan for DMUXAI_ADD_NODES.
-        if self.settings.graph_dynamic_nodes
-            && success
-            && let Some(marker_res) = parse_add_nodes_marker(output_text)
-        {
-            display_text = strip_add_nodes_marker(&display_text);
-            self.rewrite_last_agent_message(agent, display_text.clone());
+        if let Some(marker_res) = dynamic_marker {
             self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
         }
         let (actions, failed_message, run_snapshot) = {
@@ -11469,6 +11543,9 @@ impl App {
     }
 
     fn record_dynamic_node_rejection(&mut self, node_id: &str, error: String) {
+        if error.contains("company workspace") && self.headless {
+            eprintln!("{error}");
+        }
         self.push_system(format!("Dynamic nodes rejected: {error}"));
         let Some(session) = self.graph_session.as_mut() else {
             return;
@@ -11496,7 +11573,16 @@ impl App {
             decided_by: None,
         };
         run.push_plan_change(change);
-        let _ = save_run(&self.workspace_root, run);
+        let plan_id = run.plan.id.clone();
+        let snapshot = run.clone();
+        let _ = save_run(&self.workspace_root, &snapshot);
+        if self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|stored| stored.plan.id == plan_id)
+        {
+            self.last_graph_run = Some(snapshot);
+        }
     }
 
     fn handle_dynamic_add_nodes_marker(
@@ -11541,14 +11627,13 @@ impl App {
         };
 
         let cap_remaining = approved_cap.saturating_sub(dynamic_added);
-        let allowed_runners = self.settings.graph_allowed_runners.as_deref();
         let company_workspace = self.settings.fanout_company_workspace;
 
         let validated_nodes = match validate_add_nodes(
             &plan_snapshot,
             &new_nodes,
             cap_remaining,
-            allowed_runners,
+            &self.settings,
             max_nodes,
             company_workspace,
         ) {
@@ -11559,6 +11644,20 @@ impl App {
             }
         };
 
+        let parent_task = plan_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .and_then(|node| node.task.clone());
+        let mut validated_nodes = validated_nodes;
+        if !plan_snapshot.tasks.is_empty() {
+            for node in &mut validated_nodes {
+                if node.task.is_none() {
+                    node.task = parent_task.clone();
+                }
+            }
+        }
+
         let added_ids: Vec<String> = validated_nodes.iter().map(|n| n.id.clone()).collect();
         let Some(session) = self.graph_session.as_mut() else {
             return;
@@ -11566,10 +11665,18 @@ impl App {
         let run = session.run_mut();
         for spec in &new_nodes {
             for dep in &spec.depends_on {
-                run.plan.edges.push(GraphEdge {
+                let edge = GraphEdge {
                     from: dep.clone(),
                     to: spec.id.clone(),
-                });
+                };
+                if !run
+                    .plan
+                    .edges
+                    .iter()
+                    .any(|existing| existing.from == edge.from && existing.to == edge.to)
+                {
+                    run.plan.edges.push(edge);
+                }
             }
         }
         run.plan.nodes.extend(validated_nodes);
@@ -12435,6 +12542,7 @@ impl App {
                         conversation_id.as_str(),
                         node_id,
                         success,
+                        &output_text,
                         error_string.as_deref(),
                     );
                 }
@@ -12485,6 +12593,7 @@ impl App {
                     conversation_id.as_str(),
                     node_id,
                     success,
+                    &output_text,
                     error_string.as_deref(),
                 );
             }
@@ -12505,6 +12614,7 @@ impl App {
                 conversation_id.as_str(),
                 node_id,
                 success,
+                &output_text,
                 error_string.as_deref(),
             );
         }
@@ -14503,6 +14613,7 @@ impl App {
             approval.revisions.last().map(|revision| HeadlessPlan {
                 steps: revision.steps.clone(),
                 tasks: run.plan.tasks.clone(),
+                dynamic_cap: run.plan.dynamic_cap,
             })
         });
         (triage, plan)
@@ -40332,14 +40443,16 @@ out3
     // TC-2941 / FR-2941: with dynamic_nodes = false or cap 0, markers are ignored,
     // plan, its hash, and the run are byte-for-byte as before.
     #[test]
-    fn tc_2941_marker_ignored_when_feature_off() {
+    fn tc_2941_marker_ignored_when_feature_off_or_cap_zero() {
+        let marker = "Finished step 1.\nDMUXAI_ADD_NODES: [{\"id\":\"extra-1\",\"role\":\"implement\",\"job\":\"extra\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+
         let (mut app, sent) = test_app();
         app.settings.graph_dynamic_nodes = false;
         let mut plan = two_step_cursor_chain_plan("p-2941", 1);
         plan.dynamic_cap = None;
+        let plan_before = plan.clone();
         app.start_graph_run(plan);
 
-        let marker = "Finished step 1.\nDMUXAI_ADD_NODES: [{\"id\":\"extra-1\",\"role\":\"implement\",\"job\":\"extra\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
         complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
 
         let session = app.graph_session.as_ref().unwrap();
@@ -40353,6 +40466,36 @@ out3
             session.run().plan_history.is_empty(),
             "no plan change recorded"
         );
+        let last_agent_msg = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(
+            last_agent_msg.content.contains("DMUXAI_ADD_NODES"),
+            "marker not stripped when feature off"
+        );
+        let _ = plan_before;
+
+        // cap = 0: no scan, strip, or PlanChange even when dynamic_nodes = true
+        let (mut app2, sent2) = test_app();
+        app2.settings.graph_dynamic_nodes = true;
+        app2.settings.graph_dynamic_node_cap = 0;
+        let mut plan2 = two_step_cursor_chain_plan("p-2941-cap0", 1);
+        plan2.dynamic_cap = Some(0);
+        app2.start_graph_run(plan2);
+        complete_sent_graph_turn_with_text(&mut app2, &sent2, 0, marker);
+        let session2 = app2.graph_session.as_ref().unwrap();
+        assert_eq!(session2.run().plan.nodes.len(), 2);
+        assert!(session2.run().plan_history.is_empty());
+        let msg2 = app2
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(msg2.content.contains("DMUXAI_ADD_NODES"));
     }
 
     // TC-2942 / FR-2942: cap is in the plan hash and approval summary,
@@ -40463,6 +40606,44 @@ out3
                 .unwrap()
                 .contains("cap")
         );
+        assert_eq!(session.run().plan.dynamic_cap, Some(1));
+
+        // 4. HeadlessPlan JSON includes dynamic_cap
+        let hp = HeadlessPlan {
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            dynamic_cap: Some(2),
+        };
+        assert!(serde_json::to_string(&hp).unwrap().contains("dynamic_cap"));
+
+        // 5. Cumulative cap: second marker from another node after cap exhausted
+        let (mut app3, sent3) = test_app();
+        app3.settings.graph_dynamic_nodes = true;
+        app3.settings.graph_dynamic_node_cap = 1;
+        let mut plan3 = two_step_cursor_chain_plan("p-2942-cum", 1);
+        plan3.dynamic_cap = Some(1);
+        app3.start_graph_run(plan3);
+        let ok_marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-a\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app3, &sent3, 0, ok_marker);
+        assert_eq!(
+            app3.graph_session.as_ref().unwrap().run().plan.nodes.len(),
+            3
+        );
+        let overflow = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-b\",\"role\":\"implement\",\"job\":\"j2\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app3, &sent3, 1, overflow);
+        assert_eq!(
+            app3.graph_session.as_ref().unwrap().run().plan.nodes.len(),
+            3
+        );
+        assert!(
+            app3.graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan_history
+                .iter()
+                .any(|c| !c.applied && c.error.as_ref().is_some_and(|e| e.contains("cap")))
+        );
     }
 
     // TC-2944 / FR-2944: accepted nodes appended in pending state, scheduled by executor,
@@ -40513,6 +40694,31 @@ out3
             .unwrap();
         assert!(!last_agent_msg.content.contains("DMUXAI_ADD_NODES"));
         assert!(last_agent_msg.content.contains("Research done."));
+        assert!(
+            !app.replan_summaries
+                .iter()
+                .any(|(_, t)| t.contains("DMUXAI_ADD_NODES"))
+        );
+
+        let dyn_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-dyn")
+            .unwrap();
+        assert_eq!(dyn_node.status, dmuxai::graph::GraphNodeStatus::Pending);
+        let actions = app.graph_session.as_mut().unwrap().schedule();
+        app.dispatch_graph_actions(actions);
+        assert!(
+            graph_node_requests(&sent).len() >= 2,
+            "step-dyn should be scheduled for dispatch"
+        );
+        assert!(app.last_graph_run.as_ref().is_some_and(|r| {
+            r.plan_history
+                .iter()
+                .any(|c| c.applied && c.added.contains(&"step-dyn".to_string()))
+        }));
     }
 
     // TC-2945 / FR-2945: with enforce_read_only_roles, added read-only roles run read-only.
@@ -40566,13 +40772,17 @@ out3
         app.settings.graph_dynamic_node_cap = 3;
         app.settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "opencode".to_owned()]);
         app.settings.fanout_company_workspace = true;
-
         let mut plan = two_step_cursor_chain_plan("p-2946", 1);
         plan.dynamic_cap = Some(3);
         app.start_graph_run(plan);
 
-        // Free runner "opencode" in company workspace
-        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-free\",\"role\":\"implement\",\"job\":\"work\",\"runner\":\"opencode\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        app.settings.runner_models.insert(
+            "cursor".to_string(),
+            "opencode/glm-5.3-flash-free".to_string(),
+        );
+
+        // Resolved free model in company workspace
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-free\",\"role\":\"implement\",\"job\":\"work\",\"runner\":\"cursor\",\"depends_on\":[]}]";
         complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
 
         let session = app.graph_session.as_ref().unwrap();
@@ -40595,6 +40805,36 @@ out3
             .find(|n| n.id == "step-1")
             .unwrap();
         assert_eq!(step1.status, dmuxai::graph::GraphNodeStatus::Completed);
+
+        // Builtin free agent (opencode) in company workspace
+        let (mut app3, sent3) = test_app();
+        app3.settings.graph_dynamic_nodes = true;
+        app3.settings.graph_dynamic_node_cap = 3;
+        app3.settings.fanout_company_workspace = true;
+        app3.settings.graph_allowed_runners =
+            Some(vec!["cursor".to_owned(), "opencode".to_owned()]);
+        app3.settings
+            .custom_agents
+            .push(dmuxai::custom_agent::CustomAgentSpec {
+                name: "opencode".to_string(),
+                builtin: true,
+                free: true,
+                ..Default::default()
+            });
+        let mut plan3 = two_step_cursor_chain_plan("p-2946-opencode", 1);
+        plan3.dynamic_cap = Some(3);
+        app3.start_graph_run(plan3);
+        let marker2 = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-oc\",\"role\":\"implement\",\"job\":\"work\",\"runner\":\"opencode\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app3, &sent3, 0, marker2);
+        let session3 = app3.graph_session.as_ref().unwrap();
+        assert_eq!(session3.run().plan.nodes.len(), 2);
+        assert!(
+            session3.run().plan_history[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("free runner")
+        );
     }
 
     // TC-2947 / FR-2947: a node may add nodes at most once; second marker rejected.
@@ -40646,6 +40886,37 @@ out3
                 .contains("already added")
         );
 
+        // Two markers in one reply rejected
+        let (mut app_multi, sent_multi) = test_app();
+        app_multi.settings.graph_dynamic_nodes = true;
+        app_multi.settings.graph_dynamic_node_cap = 5;
+        let mut plan_multi = two_step_cursor_chain_plan("p-2947-multi", 1);
+        plan_multi.dynamic_cap = Some(5);
+        app_multi.start_graph_run(plan_multi);
+        let two_in_one = "line1\nDMUXAI_ADD_NODES: [{\"id\":\"a\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]\nDMUXAI_ADD_NODES: [{\"id\":\"b\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app_multi, &sent_multi, 0, two_in_one);
+        assert_eq!(
+            app_multi
+                .graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan
+                .nodes
+                .len(),
+            2
+        );
+        assert!(
+            !app_multi
+                .graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan_history
+                .iter()
+                .any(|c| c.applied)
+        );
+
         // Part 2: Failed node with marker adds nothing
         let (mut app2, sent2) = test_app();
         app2.settings.graph_dynamic_nodes = true;
@@ -40675,6 +40946,18 @@ out3
             assert_eq!(s.run().plan.nodes.len(), 2);
             assert!(s.run().plan_history.is_empty());
         }
+
+        // Rejection syncs last_graph_run
+        let (mut app4, sent4) = test_app();
+        app4.settings.graph_dynamic_nodes = true;
+        app4.settings.graph_dynamic_node_cap = 3;
+        let mut plan4 = two_step_cursor_chain_plan("p-2947-sync", 1);
+        plan4.dynamic_cap = Some(3);
+        app4.start_graph_run(plan4.clone());
+        app4.last_graph_run = Some(app4.graph_session.as_ref().unwrap().run().clone());
+        let bad = "DMUXAI_ADD_NODES: [{\"id\":\"step-1\",\"role\":\"implement\",\"job\":\"dup\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app4, &sent4, 0, bad);
+        assert_eq!(app4.last_graph_run.as_ref().unwrap().plan_history.len(), 1);
     }
 
     // TC-2948 / NFR-2940: with feature off, marker scanning does not run on node-finish path.
@@ -40710,6 +40993,35 @@ out3
             last_agent_msg
                 .content
                 .contains("DMUXAI_ADD_NODES: [ { malformed json syntax ]")
+        );
+
+        // Single-agent quiet run: no scan even when feature is on
+        let (mut app_q, sent_q) = test_app();
+        app_q.settings.graph_dynamic_nodes = true;
+        app_q.settings.graph_dynamic_node_cap = 3;
+        let mut quiet_plan = two_step_cursor_chain_plan("p-2948-quiet", 1);
+        quiet_plan.nodes.truncate(1);
+        quiet_plan.edges.clear();
+        quiet_plan.dynamic_cap = Some(3);
+        app_q.start_graph_run(quiet_plan);
+        assert!(app_q.quiet_graph_run);
+        let raw = "DMUXAI_ADD_NODES: [{\"id\":\"x\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app_q, &sent_q, 0, raw);
+        assert!(
+            app_q
+                .last_graph_run
+                .as_ref()
+                .is_none_or(|r| r.plan_history.is_empty())
+        );
+        assert!(
+            app_q
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, Role::Agent(_)))
+                .unwrap()
+                .content
+                .contains("DMUXAI_ADD_NODES")
         );
     }
 }
