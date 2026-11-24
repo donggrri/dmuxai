@@ -756,6 +756,7 @@ mod tests {
             finish_reason_path: None,
             finish_ok: vec![],
             builtin: false,
+            free: false,
         };
         assert_eq!(delivery("custom", Some(&custom_spec)), Delivery::Prepend);
     }
@@ -1333,6 +1334,7 @@ mod tests {
             finish_reason_path: None,
             finish_ok: vec![],
             builtin: false,
+            free: false,
         };
         assert_eq!(delivery("custom", Some(&spec)), Delivery::Native);
 

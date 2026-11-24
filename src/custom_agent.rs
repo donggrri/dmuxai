@@ -211,6 +211,9 @@ pub struct CustomAgentSpec {
     /// True for a built-in preset (opencode, grok). Not configurable.
     #[serde(skip)]
     pub builtin: bool,
+    /// When true, treat this agent as a free runner (FR-2916).
+    #[serde(default)]
+    pub free: bool,
 }
 
 /// The built-in `opencode` runner (SPEC-first-run FR-810..FR-812, SPEC-custom-agent-provider

@@ -9,6 +9,7 @@ pub mod conversation;
 pub mod custom_agent;
 pub mod docs;
 pub mod events;
+pub mod fanout;
 pub mod graph;
 pub mod grok_activity;
 pub mod init;
