@@ -1123,6 +1123,14 @@ pub struct HeadlessOutcome {
     pub fallbacks: Vec<dmuxai::runner_fallback::FallbackRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout: Option<dmuxai::fanout::FanoutReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<dmuxai::fanout::FanoutAggregate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_skipped: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_judge: Option<dmuxai::fanout::FanoutJudgeMeta>,
 }
 
 impl HeadlessOutcome {
@@ -1150,6 +1158,10 @@ impl HeadlessOutcome {
             run_id: None,
             fallbacks: Vec::new(),
             fanout: None,
+            aggregate: None,
+            aggregate_error: None,
+            aggregate_skipped: None,
+            fanout_judge: None,
         }
     }
 
@@ -14993,7 +15005,9 @@ impl App {
         }
     }
 
-    /// Headless read-only fan-out across distinct runners (FR-2910..FR-2917).
+    /// Headless read-only fan-out across distinct runners (FR-2910..FR-2917,
+    /// FR-2920..FR-2926 with optional judge).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_fanout_headless(
         &mut self,
         user_prompt: String,
@@ -15001,6 +15015,7 @@ impl App {
         min_ok: usize,
         skipped: Vec<dmuxai::fanout::FanoutLegReport>,
         cli_order: Vec<String>,
+        judge: Option<dmuxai::fanout::FanoutLegSpec>,
         cancel: Arc<AtomicBool>,
     ) -> HeadlessOutcome {
         let prompt_prefix = user_prompt.trim().chars().take(40).collect::<String>();
@@ -15057,12 +15072,6 @@ impl App {
         self.fanout_reserved_runners.clear();
         self.fanout_trackers.clear();
 
-        let policy_violation = dmuxai::workspace::read_only_workspace_write_detected(
-            before_fp.as_deref(),
-            &self.workspace_root,
-        )
-        .await;
-
         let mut reports: Vec<dmuxai::fanout::FanoutLegReport> = Vec::new();
         for key in order {
             if let Some(skip) = skipped.iter().find(|s| s.agent == key) {
@@ -15089,6 +15098,111 @@ impl App {
             .iter()
             .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
             .count();
+
+        let mut aggregate = None;
+        let mut aggregate_error = None;
+        let mut aggregate_skipped = None;
+        let mut fanout_judge = None;
+        let had_judge = judge.is_some();
+        if let Some(ref judge_spec) = judge {
+            if ok_count < 2 {
+                aggregate_skipped = Some("too_few_legs".to_owned());
+            } else {
+                let judge_started = Instant::now();
+                let nonce = uuid::Uuid::new_v4().simple().to_string();
+                for leg in &mut reports {
+                    if leg.status == dmuxai::fanout::LegStatus::Ok
+                        && dmuxai::fanout::fanout_leg_judge_blocked(&nonce, &leg.text)
+                    {
+                        leg.error_kind = Some("blocked".to_owned());
+                    }
+                }
+                let inputs: Vec<dmuxai::fanout::AggregateLegInput> = reports
+                    .iter()
+                    .filter(|leg| {
+                        leg.status == dmuxai::fanout::LegStatus::Ok
+                            && leg.error_kind.as_deref() != Some("blocked")
+                    })
+                    .map(|leg| dmuxai::fanout::AggregateLegInput {
+                        agent: leg.agent.clone(),
+                        text: leg.text.clone(),
+                    })
+                    .collect();
+                let allowed_refs: Vec<&str> = inputs.iter().map(|l| l.agent.as_str()).collect();
+                let title = format!("fanout judge: {prompt_prefix}");
+                let judge_prompt = match dmuxai::fanout::build_aggregate_prompt(&inputs, &nonce) {
+                    Ok(prompt) => prompt,
+                    Err(_) => {
+                        aggregate_error = Some("invalid_aggregate".to_owned());
+                        String::new()
+                    }
+                };
+                if aggregate_error.is_some() {
+                    // Prompt could not be built safely; skip the judge turn.
+                } else {
+                    let mut track = self.fanout_start_leg(&judge_prompt, judge_spec, &title);
+                    fanout_judge = Some(dmuxai::fanout::FanoutJudgeMeta {
+                        agent: judge_spec.runner.clone(),
+                        model: track.model.clone().or(judge_spec.model.clone()),
+                        duration_ms: judge_started.elapsed().as_millis() as u64,
+                    });
+                    if track.finished {
+                        if track.error_kind.as_deref() == Some("no_read_only_mode") {
+                            aggregate_error = Some("no_read_only_mode".to_owned());
+                        } else {
+                            aggregate_error = Some("invalid_aggregate".to_owned());
+                        }
+                    } else if let Some(agent) = runner_from_str(&judge_spec.runner) {
+                        self.in_fanout_run = true;
+                        self.fanout_trackers.insert(agent, track.clone());
+                        while self.busy_agents.contains(&agent) {
+                            if cancel.load(Ordering::Relaxed) {
+                                let idx = adapter_index(agent);
+                                if idx < self.adapters.len() {
+                                    let _ = self.adapters[idx].cancel();
+                                }
+                                break;
+                            }
+                            let _ = self.drain_agent_events();
+                            self.tick();
+                            if !self.busy_agents.contains(&agent)
+                                && let Some(finished) = self.fanout_trackers.remove(&agent)
+                            {
+                                track = finished;
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        self.in_fanout_run = false;
+                        self.fanout_trackers.clear();
+                        if let Some(meta) = fanout_judge.as_mut() {
+                            meta.duration_ms = judge_started.elapsed().as_millis() as u64;
+                            meta.model = track.model.clone().or(meta.model.clone());
+                        }
+                        if track.ok {
+                            match dmuxai::fanout::parse_aggregate(
+                                track.buffer.as_str(),
+                                &allowed_refs,
+                            ) {
+                                Ok(agg) => aggregate = Some(agg),
+                                Err(_) => aggregate_error = Some("invalid_aggregate".to_owned()),
+                            }
+                        } else if track.error_kind.as_deref() == Some("no_read_only_mode") {
+                            aggregate_error = Some("no_read_only_mode".to_owned());
+                        } else {
+                            aggregate_error = Some("invalid_aggregate".to_owned());
+                        }
+                    }
+                }
+            }
+        }
+
+        let policy_violation = dmuxai::workspace::read_only_workspace_write_detected(
+            before_fp.as_deref(),
+            &self.workspace_root,
+        )
+        .await;
+
         let mut ok = dmuxai::fanout::fanout_run_ok(ok_count, min_ok) && !policy_violation;
         let mut exit_code = dmuxai::fanout::fanout_exit_code(ok, false);
         let mut error = if policy_violation {
@@ -15116,7 +15230,16 @@ impl App {
                 }
             }
         }
-        let text = dmuxai::fanout::fanout_text_output(&reports);
+        let text = if had_judge {
+            dmuxai::fanout::fanout_text_with_aggregate(
+                &reports,
+                aggregate.as_ref(),
+                aggregate_error.as_deref(),
+                aggregate_skipped.as_deref(),
+            )
+        } else {
+            dmuxai::fanout::fanout_text_output(&reports)
+        };
         HeadlessOutcome {
             ok,
             exit_code,
@@ -15138,6 +15261,10 @@ impl App {
                 min_ok,
                 legs: reports,
             }),
+            aggregate,
+            aggregate_error,
+            aggregate_skipped,
+            fanout_judge,
         }
     }
 
@@ -15734,6 +15861,10 @@ impl App {
             run_id: None,
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
             fanout: None,
+            aggregate: None,
+            aggregate_error: None,
+            aggregate_skipped: None,
+            fanout_judge: None,
         }
     }
 
@@ -27441,6 +27572,7 @@ out3
                 1,
                 Vec::new(),
                 order,
+                None,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27492,6 +27624,7 @@ out3
                 1,
                 Vec::new(),
                 vec!["cursor".into(), "codex".into()],
+                None,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27531,6 +27664,7 @@ out3
                 1,
                 Vec::new(),
                 order.clone(),
+                None,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27546,6 +27680,7 @@ out3
                 2,
                 Vec::new(),
                 order,
+                None,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27637,6 +27772,7 @@ out3
                 1,
                 Vec::new(),
                 vec!["agy".into(), "cursor".into()],
+                None,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27750,6 +27886,7 @@ out3
                 1,
                 Vec::new(),
                 vec!["cursor".into(), "codex".into()],
+                None,
                 Arc::new(AtomicBool::new(false)),
             )
             .await;
@@ -27778,6 +27915,216 @@ out3
             .await;
         assert!(outcome.ok, "{outcome:?}");
         assert!(outcome.fanout.is_none());
+    }
+
+    // TC-2920 / FR-2920
+    #[tokio::test]
+    async fn tc_2920_judge_flag_requires_agents_and_read_only_runner() {
+        assert!(
+            crate::cli::parse(&["run".into(), "x".into(), "--judge".into(), "codex".into(),])
+                .is_err()
+        );
+        assert!(
+            crate::cli::parse(&[
+                "run".into(),
+                "x".into(),
+                "--agents".into(),
+                "cursor,codex".into(),
+                "--judge".into(),
+                "codex".into(),
+            ])
+            .is_ok()
+        );
+        let write_only = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
+        assert!(!write_only.has_read_only_mode());
+        dmuxai::custom_agent::install_registry(vec![write_only]);
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Some(dmuxai::fanout::FanoutLegSpec {
+                    runner: "nowrite".into(),
+                    model: None,
+                }),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(
+            outcome.aggregate_error.as_deref(),
+            Some("no_read_only_mode")
+        );
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    // TC-2921 / FR-2921
+    #[tokio::test]
+    async fn tc_2921_judge_skipped_with_fewer_than_two_ok_legs() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Some(dmuxai::fanout::FanoutLegSpec {
+                    runner: "agy".into(),
+                    model: None,
+                }),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(outcome.aggregate_skipped.as_deref(), Some("too_few_legs"));
+        assert!(outcome.aggregate.is_none());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-2925 / FR-2925
+    #[tokio::test]
+    async fn tc_2925_judge_turn_is_read_only_and_guarded() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        let sent_bg = Arc::clone(&sent);
+        let aggregate = r#"{"recommendation":"aligned","agreements":[],"disagreements":[],"unique_findings":{}}"#;
+        tokio::spawn(async move {
+            let mut done = HashSet::new();
+            for _ in 0..400 {
+                let pending: Vec<(Agent, AgentRequest)> = {
+                    let lock = sent_bg.lock().unwrap();
+                    lock.iter()
+                        .filter(|(agent, _)| !done.contains(agent))
+                        .cloned()
+                        .collect()
+                };
+                for (agent, req) in pending {
+                    let text = if req.prompt.contains("Agent answers:") {
+                        aggregate
+                    } else {
+                        "fanout-answer"
+                    };
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta(text.into()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    done.insert(agent);
+                }
+                if done.len() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Some(dmuxai::fanout::FanoutLegSpec {
+                    runner: "agy".into(),
+                    model: None,
+                }),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|(_, r)| r.policy == TurnPolicy::ReadOnly)
+        );
+        let judge_req = requests
+            .iter()
+            .find(|(_, r)| r.prompt.contains("Agent answers:"))
+            .expect("judge prompt");
+        assert!(judge_req.1.prompt.contains("<<<DATA-"));
+        assert_eq!(
+            outcome
+                .aggregate
+                .as_ref()
+                .map(|a| a.recommendation.as_str()),
+            Some("aligned")
+        );
+    }
+
+    // TC-2927 / NFR-2920
+    #[tokio::test]
+    async fn tc_2927_no_judge_flag_runs_no_judge_turn() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let _ = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert_eq!(sent.lock().unwrap().len(), 2);
     }
 
     // TC-1824 / FR-1824 (#212): a headless --read-only turn reaches every runner with
