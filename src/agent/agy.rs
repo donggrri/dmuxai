@@ -355,10 +355,11 @@ fn spawn_turn(
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
 ) -> ActiveTurn {
+    let leg_cwd = super::request_cwd(&cwd, &request);
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
-        if let Err(error) = run_turn(&request, selected_model, &cwd, &event_tx).await {
+        if let Err(error) = run_turn(&request, selected_model, &leg_cwd, &event_tx).await {
             send_event(&event_tx, Some(&error_context), AgentEvent::Error(error)).await;
         }
     });
@@ -1131,6 +1132,33 @@ mod tests {
         for var in dmuxai::process::INTERNAL_ENV_VARS {
             assert!(env_removed(&command, var), "cursor_command: {var}");
         }
+    }
+
+    // TC-2930 / FR-2930: fan-out leg worktrees set AGY child cwd.
+    #[test]
+    fn tc_2930_agy_spawn_uses_working_directory() {
+        use dmuxai::process::apply_child_cwd_tokio;
+        let default_cwd = Path::new("/tmp/main-ws");
+        let leg = Path::new("/tmp/main-ws/.dmuxai/fanout/run1/agy");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c"),
+            turn_id: super::super::TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+            working_directory: Some(leg.to_path_buf()),
+        };
+        let leg_cwd = super::super::request_cwd(default_cwd, &request);
+        let mut command = tokio::process::Command::new("agy");
+        configure_command_for_resume(&mut command, &request, None, TurnPolicy::Agent, None);
+        apply_child_cwd_tokio(&mut command, &leg_cwd);
+        assert_eq!(
+            command.as_std().get_current_dir().map(PathBuf::from),
+            Some(leg.to_path_buf())
+        );
     }
 
     #[test]

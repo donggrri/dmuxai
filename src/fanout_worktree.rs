@@ -104,9 +104,23 @@ pub fn validate_write_fanout_workspace(workspace: &Path) -> Result<(), FanoutWor
     Ok(())
 }
 
+const DISK_GUARD_SKIP_PREFIXES: &[&str] = &[".git/", "target/", "node_modules/", ".dmuxai/"];
+
+fn git_path_excluded_for_disk_guard(relative: &str) -> bool {
+    DISK_GUARD_SKIP_PREFIXES
+        .iter()
+        .any(|prefix| relative.starts_with(prefix))
+}
+
 pub fn working_tree_bytes(workspace: &Path) -> Result<u64, FanoutWorktreeError> {
     let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(workspace)
         .output()
         .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
@@ -115,46 +129,20 @@ pub fn working_tree_bytes(workspace: &Path) -> Result<u64, FanoutWorktreeError> 
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
-    let top = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    du_bytes(&top)
-}
-
-fn du_bytes(path: &Path) -> Result<u64, FanoutWorktreeError> {
-    let output = Command::new("du")
-        .args(["-sb", "."])
-        .current_dir(path)
-        .output()
-        .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
-    if !output.status.success() {
-        return walk_dir_bytes(path);
-    }
-    let line = String::from_utf8_lossy(&output.stdout);
-    let bytes = line
-        .split_whitespace()
-        .next()
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(0);
-    Ok(bytes)
-}
-
-fn walk_dir_bytes(path: &Path) -> Result<u64, FanoutWorktreeError> {
     let mut total = 0u64;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read = std::fs::read_dir(&dir).map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
-        for entry in read {
-            let entry = entry.map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
-            let meta = entry
-                .metadata()
-                .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
-            if meta.is_dir() {
-                if entry.file_name() == ".git" {
-                    continue;
-                }
-                stack.push(entry.path());
-            } else {
-                total = total.saturating_add(meta.len());
-            }
+    for rel in output.stdout.split(|byte| *byte == 0) {
+        if rel.is_empty() {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(rel);
+        if git_path_excluded_for_disk_guard(rel.trim_start_matches("./")) {
+            continue;
+        }
+        let path = workspace.join(rel.as_ref());
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.is_file()
+        {
+            total = total.saturating_add(meta.len());
         }
     }
     Ok(total)
@@ -215,6 +203,54 @@ pub fn disk_guard_check(
     Ok(())
 }
 
+pub fn leg_base_commit_path(workspace: &Path, run_id: &str, agent: &str) -> PathBuf {
+    fanout_run_root(workspace, run_id).join(format!("{}.base", sanitize_agent_dir(agent)))
+}
+
+fn read_leg_base_commit(
+    workspace: &Path,
+    run_id: &str,
+    agent: &str,
+) -> Result<String, FanoutWorktreeError> {
+    let path = leg_base_commit_path(workspace, run_id, agent);
+    let raw = std::fs::read_to_string(&path).map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
+    let sha = raw.trim();
+    if sha.is_empty() {
+        return Err(FanoutWorktreeError::Git(
+            "missing leg base commit".to_owned(),
+        ));
+    }
+    Ok(sha.to_owned())
+}
+
+/// FR-2934: run ids must be a single safe path component (no `/` or `..`).
+pub fn validate_fanout_run_id(run_id: &str) -> Result<(), FanoutWorktreeError> {
+    if run_id.is_empty() {
+        return Err(FanoutWorktreeError::Usage(
+            "fanout run id must not be empty".to_owned(),
+        ));
+    }
+    if run_id == "." || run_id == ".." || run_id.contains("..") {
+        return Err(FanoutWorktreeError::Usage(
+            "fanout run id is not allowed".to_owned(),
+        ));
+    }
+    if run_id.contains('/') || run_id.contains('\\') {
+        return Err(FanoutWorktreeError::Usage(
+            "fanout run id must not contain path separators".to_owned(),
+        ));
+    }
+    if !run_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(FanoutWorktreeError::Usage(
+            "fanout run id contains invalid characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn create_leg_worktree(
     workspace: &Path,
     run_id: &str,
@@ -231,6 +267,7 @@ pub fn create_leg_worktree(
             wt.display()
         )));
     }
+    let head = git_output(workspace, &["rev-parse", "HEAD"])?;
     git_cmd(
         workspace,
         &[
@@ -239,9 +276,15 @@ pub fn create_leg_worktree(
             "--detach",
             wt.to_str()
                 .ok_or_else(|| FanoutWorktreeError::Io("non-utf8 path".to_owned()))?,
-            "HEAD",
+            &head,
         ],
     )?;
+    let base_path = leg_base_commit_path(workspace, run_id, agent);
+    if let Some(parent) = base_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
+    }
+    std::fs::write(&base_path, format!("{head}\n"))
+        .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
     Ok(wt)
 }
 
@@ -256,8 +299,9 @@ pub fn produce_leg_patch(
     if let Some(parent) = patch_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
     }
+    let base = read_leg_base_commit(workspace, run_id, agent)?;
     let diff = Command::new("git")
-        .args(["diff", "HEAD", "--binary"])
+        .args(["diff", &base, "--binary"])
         .current_dir(worktree)
         .output()
         .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
@@ -268,7 +312,7 @@ pub fn produce_leg_patch(
     }
     std::fs::write(&patch_path, &diff.stdout)
         .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
-    let diff_stat = parse_numstat(worktree)?;
+    let diff_stat = parse_numstat(worktree, &base)?;
     let changed = !diff.stdout.is_empty() && diff_stat.files > 0;
     Ok(LegPatchResult {
         diff_stat,
@@ -277,9 +321,9 @@ pub fn produce_leg_patch(
     })
 }
 
-fn parse_numstat(worktree: &Path) -> Result<FanoutDiffStat, FanoutWorktreeError> {
+fn parse_numstat(worktree: &Path, base: &str) -> Result<FanoutDiffStat, FanoutWorktreeError> {
     let output = Command::new("git")
-        .args(["diff", "--numstat", "HEAD"])
+        .args(["diff", "--numstat", base])
         .current_dir(worktree)
         .output()
         .map_err(|e| FanoutWorktreeError::Io(e.to_string()))?;
@@ -336,7 +380,16 @@ pub fn fanout_clean(
     all: bool,
 ) -> Result<(), FanoutWorktreeError> {
     let fanout_root = workspace.join(WORKSPACE_STATE_DIR).join(FANOUT_SUBDIR);
+    if !all {
+        let Some(run_id) = run_id else {
+            return Err(FanoutWorktreeError::Usage(
+                "fanout clean needs a run id or --all".to_owned(),
+            ));
+        };
+        validate_fanout_run_id(run_id)?;
+    }
     if !fanout_root.is_dir() {
+        let _ = git_cmd(workspace, &["worktree", "prune"]);
         return Ok(());
     }
     if all {
@@ -354,15 +407,12 @@ pub fn fanout_clean(
         }
         return Ok(());
     }
-    let Some(run_id) = run_id else {
-        return Err(FanoutWorktreeError::Usage(
-            "fanout clean needs a run id or --all".to_owned(),
-        ));
-    };
+    let run_id = run_id.expect("validated above");
     let run_dir = fanout_root.join(run_id);
     if run_dir.is_dir() {
         clean_one_run(workspace, &run_dir)?;
     }
+    let _ = git_cmd(workspace, &["worktree", "prune"]);
     Ok(())
 }
 
@@ -386,6 +436,12 @@ fn clean_one_run(workspace: &Path, run_dir: &Path) -> Result<(), FanoutWorktreeE
 
 pub fn path_under_fanout(workspace: &Path, path: &Path) -> bool {
     let fanout = workspace.join(WORKSPACE_STATE_DIR).join(FANOUT_SUBDIR);
+    let Ok(fanout) = fanout.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
     path.strip_prefix(&fanout).is_ok()
 }
 
@@ -543,6 +599,15 @@ mod tests {
         disk_guard_check(ws, 1, 0).expect("tiny repo should pass with 0 min");
         let err = disk_guard_check(ws, 1, u64::MAX / GIB).expect_err("absurd min");
         assert!(matches!(err, FanoutWorktreeError::DiskGuard { .. }));
+    }
+
+    // TC-2934: reject path traversal in fanout clean run ids
+    #[test]
+    fn tc_2934_rejects_traversal_run_id_in_fanout_clean() {
+        let dir = temp_repo();
+        let ws = dir.path();
+        assert!(fanout_clean(ws, Some("../.."), false).is_err());
+        assert!(fanout_clean(ws, Some("foo/bar"), false).is_err());
     }
 
     // TC-2930 partial: git preconditions

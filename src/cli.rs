@@ -1015,6 +1015,9 @@ fn parse_run_options_with_flags(
     if options.keep_worktrees && !options.write {
         return Err("--keep-worktrees requires --write".to_owned());
     }
+    if options.write && options.read_only {
+        return Err("--write cannot be used with --read-only".to_owned());
+    }
     if options.judge.is_some() && options.agents.is_none() {
         return Err("--judge requires --agents".to_owned());
     }
@@ -2961,24 +2964,7 @@ async fn run_fanout_headless(
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
-    let (db_path, _) =
-        dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
-    let engine = ConversationEngine::open(&db_path, workspace_root)
-        .map_err(|error| conversation_open_error(&error))?;
-    for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
-        eprintln!("warning: {warning}");
-    }
-    let sink = build_event_sink(workspace_root, &settings);
-    let first_seq = sink.log().last_seq() + 1;
-    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
-        .unwrap_or_else(|_| workspace_root.display().to_string());
-    let hub = headless_dashboard_hub(workspace, sink.clone());
     let company_workspace = settings.fanout_company_workspace;
-    let mut app = App::new(engine, workspace_root.to_path_buf(), settings.clone())
-        .map_err(|error| conversation_open_error(&error))?;
-    app.attach_dashboard(hub);
-    app.set_headless(true);
-
     let agents_raw = options.agents.as_deref().unwrap_or_default();
     let all_specs = dmuxai::fanout::parse_agents_flag(agents_raw)
         .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
@@ -3036,26 +3022,6 @@ async fn run_fanout_headless(
     )
     .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_signal = cancel.clone();
-    let finished = Arc::new(AtomicBool::new(false));
-    let finished_signal = finished.clone();
-    let signal_task = tokio::spawn(async move {
-        wait_for_stop_signal().await;
-        cancel_signal.store(true, Ordering::SeqCst);
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
-            _ = wait_for_stop_signal() => {}
-        }
-        if !finished_signal.load(Ordering::SeqCst) {
-            dmuxai::process::supervisor::stop_live_groups_of(
-                dmuxai::process::supervisor::GroupOwner::DEFAULT,
-                Duration::from_secs(2),
-            );
-            eprintln!("error: stopped after signal");
-            std::process::exit(130);
-        }
-    });
     let user_prompt = prompt.unwrap_or_default();
     if options.write
         && dmuxai::graph::sensitive_keyword_match(&user_prompt)
@@ -3084,6 +3050,52 @@ async fn run_fanout_headless(
     } else {
         None
     };
+
+    let (db_path, _) =
+        dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
+    let engine = ConversationEngine::open(&db_path, workspace_root)
+        .map_err(|error| conversation_open_error(&error))?;
+    for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
+        eprintln!("warning: {warning}");
+    }
+    let sink = build_event_sink(workspace_root, &settings);
+    let first_seq = sink.log().last_seq() + 1;
+    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
+        .unwrap_or_else(|_| workspace_root.display().to_string());
+    let hub = headless_dashboard_hub(workspace, sink.clone());
+    let mut app = App::new(engine, workspace_root.to_path_buf(), settings.clone())
+        .map_err(|error| conversation_open_error(&error))?;
+    app.attach_dashboard(hub);
+    app.set_headless(true);
+
+    let write_cleanup = Arc::new(std::sync::Mutex::new(None::<(PathBuf, String)>));
+    if let Some(ref cfg) = write {
+        *write_cleanup.lock().unwrap() = Some((workspace_root.to_path_buf(), cfg.run_id.clone()));
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_signal = cancel.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_signal = finished.clone();
+    let write_cleanup_signal = write_cleanup.clone();
+    let signal_task = tokio::spawn(async move {
+        wait_for_stop_signal().await;
+        cancel_signal.store(true, Ordering::SeqCst);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = wait_for_stop_signal() => {}
+        }
+        if !finished_signal.load(Ordering::SeqCst) {
+            if let Some((ws, run_id)) = write_cleanup_signal.lock().unwrap().take() {
+                let _ = dmuxai::fanout_worktree::fanout_clean(&ws, Some(&run_id), false);
+            }
+            dmuxai::process::supervisor::stop_live_groups_of(
+                dmuxai::process::supervisor::GroupOwner::DEFAULT,
+                Duration::from_secs(2),
+            );
+            eprintln!("error: stopped after signal");
+            std::process::exit(130);
+        }
+    });
     let outcome = app
         .run_fanout_headless(
             user_prompt,
@@ -3098,6 +3110,7 @@ async fn run_fanout_headless(
         .await;
     app.shutdown().await;
     finished.store(true, Ordering::SeqCst);
+    write_cleanup.lock().unwrap().take();
     signal_task.abort();
     let last_seq = sink.log().last_seq();
     Ok((outcome, first_seq, last_seq))

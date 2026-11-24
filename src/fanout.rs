@@ -93,13 +93,13 @@ pub struct FanoutLegReport {
     #[serde(default)]
     pub blocked: bool,
     pub duration_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub diff_stat: Option<crate::fanout_worktree::FanoutDiffStat>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub patch_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub worktree_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub changed: Option<bool>,
 }
 

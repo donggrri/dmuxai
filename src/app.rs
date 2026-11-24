@@ -4385,12 +4385,6 @@ impl App {
                 _ => false,
             };
             if leg_event {
-                if let AgentEvent::Error(err) = &output.event
-                    && self.fanout_write_mode
-                    && self.try_runner_fallback(output.agent, err)
-                {
-                    return true;
-                }
                 if let Some(track) = self.fanout_trackers.get_mut(&output.agent) {
                     match &output.event {
                         AgentEvent::TextDelta(delta) => track.buffer.push(delta),
@@ -4591,7 +4585,7 @@ impl App {
     /// change. Other adapters are covered only when their error text matches
     /// the same patterns.
     fn try_fresh_resume_retry(&mut self, agent: Agent, err: &AgentError) -> bool {
-        if self.in_fanout_run && !self.fanout_write_mode {
+        if self.in_fanout_run {
             return false;
         }
         if !is_resume_rejection_message(&err.message) {
@@ -4650,7 +4644,7 @@ impl App {
     /// that fails to start leaves the original error to the normal error path
     /// (FR-2130..FR-2133).
     fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
-        if self.in_fanout_run && !self.fanout_write_mode {
+        if self.in_fanout_run {
             return false;
         }
         // FR-2130 / TC-2130: a pending handover from an earlier attempt must never leak
@@ -14951,22 +14945,55 @@ impl App {
         write_worktree: Option<&Path>,
     ) -> FanoutLegTracker {
         let started = Instant::now();
-        let fail = |runner: &str, error: String, kind: &str| FanoutLegTracker {
-            runner: runner.to_owned(),
-            conversation_id: StoredConversationId::new("fanout-failed"),
-            turn_id: StoredTurnId::new("fanout-failed"),
-            buffer: TurnBuffer::new(),
-            started,
-            model: leg.model.clone(),
-            finished: true,
-            ok: false,
-            error: Some(error),
-            error_kind: Some(kind.to_owned()),
-            worktree: write_worktree.map(Path::to_path_buf),
-            diff_stat: None,
-            patch_path: None,
-            worktree_path: write_worktree.and_then(|p| p.to_str().map(str::to_owned)),
-            changed: None,
+        let workspace_root = self.workspace_root.clone();
+        let fanout_run_id = self
+            .fanout_run_id
+            .clone()
+            .unwrap_or_else(|| "fanout".to_owned());
+        let leg_runner = leg.runner.clone();
+        let write_fields = move |wt: Option<&Path>| {
+            if wt.is_none() {
+                (None, None, None, None)
+            } else {
+                (
+                    Some(dmuxai::fanout_worktree::FanoutDiffStat {
+                        files: 0,
+                        insertions: 0,
+                        deletions: 0,
+                    }),
+                    wt.and_then(|_| {
+                        dmuxai::fanout_worktree::leg_patch_path(
+                            &workspace_root,
+                            &fanout_run_id,
+                            &leg_runner,
+                        )
+                        .to_str()
+                        .map(str::to_owned)
+                    }),
+                    wt.and_then(|p| p.to_str().map(str::to_owned)),
+                    Some(false),
+                )
+            }
+        };
+        let fail = |runner: &str, error: String, kind: &str| {
+            let (diff_stat, patch_path, worktree_path, changed) = write_fields(write_worktree);
+            FanoutLegTracker {
+                runner: runner.to_owned(),
+                conversation_id: StoredConversationId::new("fanout-failed"),
+                turn_id: StoredTurnId::new("fanout-failed"),
+                buffer: TurnBuffer::new(),
+                started,
+                model: leg.model.clone(),
+                finished: true,
+                ok: false,
+                error: Some(error),
+                error_kind: Some(kind.to_owned()),
+                worktree: write_worktree.map(Path::to_path_buf),
+                diff_stat,
+                patch_path,
+                worktree_path,
+                changed,
+            }
         };
         let Some(agent) = runner_from_str(&leg.runner) else {
             return fail(
@@ -15173,11 +15200,26 @@ impl App {
                 trackers.insert(runner, track);
             }
         }
+        let fanout_deadline = Instant::now()
+            + Duration::from_secs(dmuxai::runner_fallback::DEFAULT_STALL_TIMEOUT_SECS);
         while self
             .busy_agents
             .iter()
             .any(|agent| self.fanout_trackers.contains_key(agent))
         {
+            if Instant::now() >= fanout_deadline {
+                for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                    let idx = adapter_index(agent);
+                    if idx < self.adapters.len() {
+                        let _ = self.adapters[idx].cancel();
+                    }
+                    if let Some(track) = self.fanout_trackers.get_mut(&agent) {
+                        track.error = Some("fan-out leg timed out".to_owned());
+                        track.error_kind = Some(AgentErrorKind::Timeout.as_str().to_owned());
+                    }
+                }
+                break;
+            }
             if cancel.load(Ordering::Relaxed) {
                 for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
                     let idx = adapter_index(agent);
@@ -15185,12 +15227,41 @@ impl App {
                         let _ = self.adapters[idx].cancel();
                     }
                 }
-                self.fanout_cleanup_all_write_worktrees();
+                let wait_deadline = Instant::now() + Duration::from_secs(30);
+                while self
+                    .busy_agents
+                    .iter()
+                    .any(|agent| self.fanout_trackers.contains_key(agent))
+                    && Instant::now() < wait_deadline
+                {
+                    let _ = self.drain_agent_events();
+                    self.tick();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
                 break;
             }
             let _ = self.drain_agent_events();
             self.tick();
             for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                if let Some(track) = self.fanout_trackers.get(&agent) {
+                    let leg_timeout_secs = self
+                        .settings
+                        .runner_fallback
+                        .config_for(&track.runner)
+                        .map(|cfg| cfg.effective_stall_timeout_secs())
+                        .unwrap_or(dmuxai::runner_fallback::DEFAULT_STALL_TIMEOUT_SECS);
+                    let leg_timeout = Duration::from_secs(leg_timeout_secs);
+                    if track.started.elapsed() > leg_timeout {
+                        let idx = adapter_index(agent);
+                        if idx < self.adapters.len() {
+                            let _ = self.adapters[idx].cancel();
+                        }
+                        if let Some(track) = self.fanout_trackers.get_mut(&agent) {
+                            track.error = Some("fan-out leg timed out".to_owned());
+                            track.error_kind = Some(AgentErrorKind::Timeout.as_str().to_owned());
+                        }
+                    }
+                }
                 if !self.busy_agents.contains(&agent)
                     && let Some(mut track) = self.fanout_trackers.remove(&agent)
                 {
@@ -15205,6 +15276,27 @@ impl App {
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let wait_deadline = Instant::now() + Duration::from_secs(30);
+        while self
+            .busy_agents
+            .iter()
+            .any(|a| self.fanout_trackers.contains_key(a))
+            && Instant::now() < wait_deadline
+        {
+            let _ = self.drain_agent_events();
+            self.tick();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+            if let Some(mut track) = self.fanout_trackers.remove(&agent) {
+                track.finished = true;
+                track.ok = track.error.is_none();
+                if self.fanout_write_mode {
+                    self.fanout_finalize_write_leg(&mut track);
+                }
+                trackers.insert(track.runner.clone(), track);
+            }
         }
         self.fanout_cleanup_all_write_worktrees();
         self.in_fanout_run = false;
@@ -27685,7 +27777,8 @@ out3
         let sent = Arc::clone(sent);
         tokio::spawn(async move {
             let mut done = HashSet::new();
-            for _ in 0..400 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while tokio::time::Instant::now() < deadline {
                 let pending: Vec<(Agent, AgentRequest)> = {
                     let lock = sent.lock().unwrap();
                     lock.iter()
@@ -28429,8 +28522,9 @@ out3
             run_id: "t2930".into(),
             keep_worktrees: true,
         };
-        let _ = app
-            .run_fanout_headless(
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            app.run_fanout_headless(
                 "hello".into(),
                 vec![
                     dmuxai::fanout::FanoutLegSpec {
@@ -28448,8 +28542,10 @@ out3
                 None,
                 Arc::new(AtomicBool::new(false)),
                 Some(write),
-            )
-            .await;
+            ),
+        )
+        .await
+        .expect("tc_2930 timed out");
         let requests = sent.lock().unwrap();
         for (_, req) in requests.iter() {
             assert_eq!(req.policy, TurnPolicy::Agent);
@@ -28520,8 +28616,9 @@ out3
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
-        let outcome = app
-            .run_fanout_headless(
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            app.run_fanout_headless(
                 "hello".into(),
                 vec![
                     dmuxai::fanout::FanoutLegSpec {
@@ -28542,8 +28639,10 @@ out3
                     run_id: "t2931".into(),
                     keep_worktrees: false,
                 }),
-            )
-            .await;
+            ),
+        )
+        .await
+        .expect("tc_2931 timed out");
         assert!(outcome.ok, "{outcome:?}");
         let after = dmuxai::workspace::git_worktree_fingerprint_sync(&workspace).unwrap();
         assert_eq!(before, after);
@@ -28553,7 +28652,7 @@ out3
     // TC-2938 / FR-2938
     #[tokio::test]
     #[cfg(unix)]
-    async fn tc_2938_fallback_keeps_worktree_and_avoids_other_leg_runners() {
+    async fn tc_2938_write_fanout_disables_runner_fallback() {
         pin_test_state_dir();
         let dir = tempfile::tempdir().expect("tempdir");
         let workspace = dir.path().to_path_buf();
@@ -28577,45 +28676,63 @@ out3
         let event_tx2 = event_tx.clone();
         let workspace_for_task = workspace.clone();
         tokio::spawn(async move {
-            for _ in 0..400 {
-                let pending = {
+            let mut done = HashSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while tokio::time::Instant::now() < deadline {
+                let pending: Vec<(Agent, AgentRequest)> = {
                     let lock = sent2.lock().unwrap();
                     lock.iter()
-                        .find(|(a, _)| *a == Agent::Agy)
-                        .map(|(agent, req)| {
-                            (
-                                *agent,
-                                req.conversation_id.clone(),
-                                req.turn_id.clone(),
-                                req.working_directory.clone(),
-                            )
-                        })
+                        .filter(|(agent, _)| !done.contains(agent))
+                        .cloned()
+                        .collect()
                 };
-                if let Some((agent, conversation_id, turn_id, wt)) = pending {
-                    let _ = event_tx2
-                        .send(AgentOutput {
-                            agent,
-                            conversation_id: Some(conversation_id),
-                            turn_id: Some(turn_id),
-                            event: AgentEvent::Error(AgentError::provider("model unavailable")),
-                        })
-                        .await;
-                    if let Some(wt) = wt {
-                        assert!(dmuxai::fanout_worktree::path_under_fanout(
-                            &workspace_for_task,
-                            &wt
-                        ));
+                for (agent, req) in pending {
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    if agent == Agent::Agy {
+                        if let Some(wt) = &req.working_directory {
+                            assert!(dmuxai::fanout_worktree::path_under_fanout(
+                                &workspace_for_task,
+                                wt
+                            ));
+                        }
+                        let _ = event_tx2
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conversation_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Error(AgentError::provider("model unavailable")),
+                            })
+                            .await;
+                    } else {
+                        let _ = event_tx2
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conversation_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::TextDelta("ok".into()),
+                            })
+                            .await;
+                        let _ = event_tx2
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conversation_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Completed,
+                            })
+                            .await;
                     }
+                    done.insert(agent);
+                }
+                if done.contains(&Agent::Agy) && done.contains(&Agent::Codex) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
-        let sent_done = Arc::clone(&sent);
-        let event_tx_done = event_tx.clone();
-        tokio::spawn(async move { complete_fanout_requests(&sent_done, event_tx_done) });
-        let _outcome = app
-            .run_fanout_headless(
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            app.run_fanout_headless(
                 "hello".into(),
                 vec![
                     dmuxai::fanout::FanoutLegSpec {
@@ -28636,17 +28753,23 @@ out3
                     run_id: "t2938".into(),
                     keep_worktrees: false,
                 }),
-            )
-            .await;
-        assert_eq!(
+            ),
+        )
+        .await
+        .expect("tc_2938 timed out");
+        assert!(
             sent.lock()
                 .unwrap()
                 .iter()
-                .filter(|(a, _)| *a == Agent::Cursor)
-                .count(),
-            1,
-            "fallback must not start the other leg's runner"
+                .all(|(a, _)| *a != Agent::Cursor),
+            "write fan-out must not fall back to another runner"
         );
+        let agy_leg = outcome
+            .fanout
+            .as_ref()
+            .and_then(|f| f.legs.iter().find(|leg| leg.agent == "agy"))
+            .expect("agy leg");
+        assert_eq!(agy_leg.status, dmuxai::fanout::LegStatus::Failed);
         dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2938"), false).ok();
     }
 

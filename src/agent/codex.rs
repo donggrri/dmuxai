@@ -576,11 +576,12 @@ async fn runtime_loop(
         if client.is_none() {
             match command_rx.recv().await {
                 Some(CodexCommand::Send(request)) => {
+                    let leg_cwd = super::request_cwd(&cwd, &request);
                     client = connect_for_request(
                         &request,
                         selected_model.as_deref(),
                         selected_effort.as_deref(),
-                        &cwd,
+                        &leg_cwd,
                         &event_tx,
                     )
                     .await;
@@ -672,6 +673,7 @@ async fn runtime_loop(
             command = command_rx.recv() => {
                 match command {
                     Some(CodexCommand::Send(request)) => {
+                        let leg_cwd = super::request_cwd(&cwd, &request);
                         let context = OutputContext::from(&request);
                         if active_client.active_turn_id.is_some()
                             || active_client.pending_turn_request_id.is_some()
@@ -696,7 +698,7 @@ async fn runtime_loop(
                             selected_model.as_deref(),
                             selected_effort.as_deref(),
                             request.policy,
-                            &cwd,
+                            &leg_cwd,
                             &event_tx,
                         ).await {
                             send_event(
@@ -843,13 +845,14 @@ async fn runtime_loop(
         }
 
         if let Some(request) = reconnect_request {
+            let leg_cwd = super::request_cwd(&cwd, &request);
             let previous = client.take().expect("a conversation client was active");
             previous.shutdown().await;
             client = connect_for_request(
                 &request,
                 selected_model.as_deref(),
                 selected_effort.as_deref(),
-                &cwd,
+                &leg_cwd,
                 &event_tx,
             )
             .await;
@@ -1688,6 +1691,30 @@ mod tests {
                 .is_object()
         );
         assert_eq!(implement.pointer("/params/model"), Some(&json!("model")));
+    }
+
+    // TC-2930 / FR-2930: Codex thread/open cwd follows AgentRequest.working_directory.
+    #[test]
+    fn tc_2930_codex_thread_open_uses_working_directory() {
+        let default_cwd = Path::new("/tmp/main-ws");
+        let leg = Path::new("/tmp/main-ws/.dmuxai/fanout/run1/codex");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c"),
+            turn_id: super::super::TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::ReadOnly,
+            require_file_edits: false,
+            system_prompt: None,
+            working_directory: Some(leg.to_path_buf()),
+        };
+        let leg_cwd = super::super::request_cwd(default_cwd, &request);
+        let message = thread_open_request(1, &leg_cwd, None, None);
+        assert_eq!(
+            message.pointer("/params/cwd").and_then(|v| v.as_str()),
+            Some(leg.to_str().unwrap())
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

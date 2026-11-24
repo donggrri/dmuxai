@@ -359,6 +359,7 @@ async fn runtime_loop(
 
             match command {
                 CursorCommand::Send { request, is_graph } => {
+                    let leg_cwd = super::request_cwd(&cwd, &request);
                     if is_graph {
                         if let Some(warm) = warm_process.take() {
                             reap_warm_process(warm).await;
@@ -383,7 +384,7 @@ async fn runtime_loop(
                                 request.resume_session.as_deref(),
                                 selected_model.as_deref(),
                                 request.policy,
-                                &cwd,
+                                &leg_cwd,
                             );
                         }
                         let turn_program = check_cmd
@@ -411,7 +412,7 @@ async fn runtime_loop(
                                     Ok(None) => {
                                         let matches = Some(&warm.program) == turn_program.as_ref()
                                             && warm.argv == turn_argv
-                                            && warm.cwd == cwd
+                                            && warm.cwd == leg_cwd
                                             && warm.env_bin == turn_env_bin;
                                         if matches {
                                             // Drop the warm process group guard before adopting the
@@ -649,6 +650,7 @@ fn spawn_turn(
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
         warm_child.as_ref().and_then(|c| c.id()).unwrap_or(0),
     ));
+    let leg_cwd = super::request_cwd(&cwd, &request);
     let turn_pgid = pgid.clone();
     let context = OutputContext::from(&request);
     let error_context = context.clone();
@@ -665,7 +667,7 @@ fn spawn_turn(
             warm_child,
             selected_model,
             mode,
-            &cwd,
+            &leg_cwd,
             &event_tx,
             protocol,
             &turn_terminal_seen,
@@ -1932,6 +1934,43 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(text, "II will");
+    }
+
+    // TC-2930 / FR-2930: fan-out leg worktrees flow into cursor argv and cwd.
+    #[test]
+    fn tc_2930_cursor_spawn_uses_working_directory() {
+        use dmuxai::process::apply_child_cwd_tokio;
+        let default_cwd = Path::new("/tmp/main-ws");
+        let leg = Path::new("/tmp/main-ws/.dmuxai/fanout/run1/cursor");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c"),
+            turn_id: super::super::TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+            working_directory: Some(leg.to_path_buf()),
+        };
+        let leg_cwd = super::super::request_cwd(default_cwd, &request);
+        let mut command = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut command, None, None, TurnPolicy::Agent, &leg_cwd);
+        apply_child_cwd_tokio(&mut command, &leg_cwd);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--workspace" && pair[1] == leg.to_string_lossy()),
+            "cursor argv: {args:?}"
+        );
+        assert_eq!(
+            command.as_std().get_current_dir().map(PathBuf::from),
+            Some(leg.to_path_buf())
+        );
     }
 
     #[test]
