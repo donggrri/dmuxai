@@ -18810,14 +18810,20 @@ mod tests {
     type CancelRequests = Arc<Mutex<Vec<Agent>>>;
     type SelectedModels = Arc<Mutex<Vec<(Agent, String)>>>;
 
-    fn install_shared_test_registry() -> Vec<String> {
+    fn install_test_custom_agents() -> Vec<String> {
         let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
+        let nowrite = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
         dmuxai::custom_agent::install_registry(vec![
             dmuxai::custom_agent::grok_preset("grok"),
             spec,
+            nowrite,
         ])
     }
     struct RecordingAdapter {
@@ -24563,8 +24569,8 @@ out3
     // adapter Cancelled does not write a second one.
     #[test]
     fn tc_984_cancel_appends_one_cancelled_notice_for_every_runner() {
-        // First install wins process-wide; the other test installs the same grok preset.
-        let _ = install_shared_test_registry();
+        // First install wins process-wide; every test installs the same shared list.
+        let _ = install_test_custom_agents();
         assert!(dmuxai::custom_agent::index_of("grok").is_some());
         let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
@@ -27415,7 +27421,7 @@ out3
             ..Default::default()
         };
         assert!(!write_only.has_read_only_mode());
-        dmuxai::custom_agent::install_registry(vec![write_only]);
+        let _ = install_test_custom_agents();
         let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
         complete_fanout_requests(&sent, event_tx);
         let order = vec!["cursor".into(), "nowrite".into()];
@@ -30952,7 +30958,7 @@ out3
     // TC-904 / FR-896
     #[test]
     fn tc_904_selecting_grok_requests_a_model_probe() {
-        let warnings = install_shared_test_registry();
+        let warnings = install_test_custom_agents();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -31675,7 +31681,7 @@ out3
         assert!(tiny.ends_with("just now"), "{tiny}");
         assert!(UnicodeWidthStr::width(tiny.as_str()) <= 10, "{tiny}");
 
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let (mut app, _sent) = test_app();
         app.settings.custom_agents = vec![dmuxai::custom_agent::CustomAgentSpec {
             name: "grok".to_owned(),
@@ -35278,7 +35284,7 @@ out3
     // pinned to Cursor's composer-2.5; it plans and runs on provider default.
     #[test]
     fn tc_1460_grok_follow_up_without_model_uses_provider_default() {
-        let warnings = install_shared_test_registry();
+        let warnings = install_test_custom_agents();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -35351,7 +35357,7 @@ out3
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35418,7 +35424,7 @@ out3
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35464,7 +35470,7 @@ out3
     // TC-1746 / FR-1729: catalog missing default_model pushes exact hint and turn is still sent
     #[test]
     fn tc_1746_catalog_missing_pushes_warning() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35490,7 +35496,7 @@ out3
     // TC-1747 / FR-1729: listed model and empty/not-loaded catalog produce no message
     #[test]
     fn tc_1747_catalog_listed_or_empty_no_message() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35521,7 +35527,7 @@ out3
     // TC-1748 / FR-1729: failing turn after NotListed warning gets hint
     #[test]
     fn tc_1748_notlisted_error_gets_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35551,7 +35557,7 @@ out3
     // turn had a catalog warning; only the hint is attached.
     #[test]
     fn tc_2129_generic_provider_error_keeps_provider_kind_with_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35585,7 +35591,7 @@ out3
     // TC-1749 / FR-1729 (#214): idle timeout for a listed model carries no "not offered" hint.
     #[test]
     fn tc_1749_idle_timeout_has_no_not_offered_hint_for_listed_model() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35620,7 +35626,7 @@ out3
     // TC-1749 / FR-1729 (#214): a model truly absent from a loaded list still gets the hint.
     #[test]
     fn tc_1749_absent_model_still_gets_not_offered_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35653,7 +35659,7 @@ out3
     // TC-1748 / FR-1729: drain path captures model_unavailable kind
     #[test]
     fn tc_1748_drain_error_kind_is_model_unavailable() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -35688,7 +35694,7 @@ out3
     // TC-1755 / FR-1731: resolver precedence explicit > selected > config > custom default > runner default
     #[test]
     fn tc_1755_resolver_precedence_config_model() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
