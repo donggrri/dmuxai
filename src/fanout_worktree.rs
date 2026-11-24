@@ -104,6 +104,19 @@ pub fn validate_write_fanout_workspace(workspace: &Path) -> Result<(), FanoutWor
     Ok(())
 }
 
+/// `git rev-parse HEAD` for the main workspace (write fan-out guard, FR-2931).
+pub fn main_workspace_head_sha(workspace: &Path) -> Option<String> {
+    git_output(workspace, &["rev-parse", "HEAD"]).ok()
+}
+
+/// True when HEAD changed since `before` (write fan-out main-workspace guard, FR-2931).
+pub fn main_workspace_head_changed(before: Option<&str>, workspace: &Path) -> bool {
+    let Some(before) = before else {
+        return false;
+    };
+    main_workspace_head_sha(workspace).is_some_and(|after| after != before)
+}
+
 const DISK_GUARD_SKIP_PREFIXES: &[&str] = &[".git/", "target/", "node_modules/", ".dmuxai/"];
 
 fn git_path_excluded_for_disk_guard(relative: &str) -> bool {

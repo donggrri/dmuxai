@@ -15151,6 +15151,9 @@ impl App {
     ) -> HeadlessOutcome {
         let prompt_prefix = user_prompt.trim().chars().take(40).collect::<String>();
         let before_fp = dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await;
+        let before_head = write
+            .as_ref()
+            .and_then(|_| dmuxai::fanout_worktree::main_workspace_head_sha(&self.workspace_root));
         self.in_fanout_run = true;
         self.fanout_write_mode = write.is_some();
         self.fanout_keep_worktrees = write.as_ref().is_some_and(|w| w.keep_worktrees);
@@ -15335,7 +15338,11 @@ impl App {
             before_fp.as_deref(),
             &self.workspace_root,
         )
-        .await;
+        .await
+            || dmuxai::fanout_worktree::main_workspace_head_changed(
+                before_head.as_deref(),
+                &self.workspace_root,
+            );
 
         let mut aggregate = None;
         let mut aggregate_error = None;

@@ -656,9 +656,7 @@ pub fn git_worktree_fingerprint_sync(workspace: &Path) -> Option<String> {
     let repo_root = run_git_quiet(workspace, &["rev-parse", "--show-toplevel"])?;
     let repo_root = PathBuf::from(String::from_utf8_lossy(&repo_root).trim().to_owned());
 
-    let head = run_git_quiet(workspace, &["rev-parse", "HEAD"])?;
-    let head_sha = String::from_utf8_lossy(&head).trim().to_owned();
-    let mut fingerprint = format!("HEAD:{head_sha}\n");
+    let mut fingerprint = String::new();
     let mut entries = 0usize;
     for raw in status.split(|byte| *byte == 0) {
         if raw.is_empty() {
