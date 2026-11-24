@@ -15089,15 +15089,17 @@ impl App {
                     text: track.buffer.as_str().to_owned(),
                     error: track.error.clone(),
                     error_kind: track.error_kind.clone(),
+                    blocked: false,
                     duration_ms: track.started.elapsed().as_millis() as u64,
                 });
             }
         }
 
-        let ok_count = reports
-            .iter()
-            .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
-            .count();
+        let leg_policy_violation = dmuxai::workspace::read_only_workspace_write_detected(
+            before_fp.as_deref(),
+            &self.workspace_root,
+        )
+        .await;
 
         let mut aggregate = None;
         let mut aggregate_error = None;
@@ -15105,8 +15107,18 @@ impl App {
         let mut fanout_judge = None;
         let had_judge = judge.is_some();
         if let Some(ref judge_spec) = judge {
-            if ok_count < 2 {
-                aggregate_skipped = Some("too_few_legs".to_owned());
+            if leg_policy_violation {
+                let write_error = READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned();
+                let write_kind = AgentErrorKind::Policy.as_str().to_owned();
+                for leg in &mut reports {
+                    if leg.status == dmuxai::fanout::LegStatus::Ok {
+                        leg.status = dmuxai::fanout::LegStatus::Failed;
+                        leg.error = Some(write_error.clone());
+                        leg.error_kind = Some(write_kind.clone());
+                    }
+                }
+            } else if cancel.load(Ordering::Relaxed) {
+                aggregate_skipped = Some("cancelled".to_owned());
             } else {
                 let judge_started = Instant::now();
                 let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -15114,97 +15126,121 @@ impl App {
                     if leg.status == dmuxai::fanout::LegStatus::Ok
                         && dmuxai::fanout::fanout_leg_judge_blocked(&nonce, &leg.text)
                     {
+                        leg.blocked = true;
                         leg.error_kind = Some("blocked".to_owned());
                     }
                 }
                 let inputs: Vec<dmuxai::fanout::AggregateLegInput> = reports
                     .iter()
-                    .filter(|leg| {
-                        leg.status == dmuxai::fanout::LegStatus::Ok
-                            && leg.error_kind.as_deref() != Some("blocked")
-                    })
+                    .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok && !leg.blocked)
                     .map(|leg| dmuxai::fanout::AggregateLegInput {
                         agent: leg.agent.clone(),
                         text: leg.text.clone(),
                     })
                     .collect();
-                let allowed_refs: Vec<&str> = inputs.iter().map(|l| l.agent.as_str()).collect();
-                let title = format!("fanout judge: {prompt_prefix}");
-                let judge_prompt = match dmuxai::fanout::build_aggregate_prompt(&inputs, &nonce) {
-                    Ok(prompt) => prompt,
-                    Err(_) => {
-                        aggregate_error = Some("invalid_aggregate".to_owned());
-                        String::new()
-                    }
-                };
-                if aggregate_error.is_some() {
-                    // Prompt could not be built safely; skip the judge turn.
+                if inputs.len() < 2 {
+                    aggregate_skipped = Some("too_few_legs".to_owned());
                 } else {
-                    let mut track = self.fanout_start_leg(&judge_prompt, judge_spec, &title);
-                    fanout_judge = Some(dmuxai::fanout::FanoutJudgeMeta {
-                        agent: judge_spec.runner.clone(),
-                        model: track.model.clone().or(judge_spec.model.clone()),
-                        duration_ms: judge_started.elapsed().as_millis() as u64,
-                    });
-                    if track.finished {
-                        if track.error_kind.as_deref() == Some("no_read_only_mode") {
-                            aggregate_error = Some("no_read_only_mode".to_owned());
-                        } else {
+                    let allowed_refs: Vec<&str> = inputs.iter().map(|l| l.agent.as_str()).collect();
+                    let title = format!("fanout judge: {prompt_prefix}");
+                    let judge_prompt = match dmuxai::fanout::build_aggregate_prompt(&inputs, &nonce)
+                    {
+                        Ok(prompt) => prompt,
+                        Err(_) => {
                             aggregate_error = Some("invalid_aggregate".to_owned());
+                            String::new()
                         }
-                    } else if let Some(agent) = runner_from_str(&judge_spec.runner) {
-                        self.in_fanout_run = true;
-                        self.fanout_trackers.insert(agent, track.clone());
-                        while self.busy_agents.contains(&agent) {
-                            if cancel.load(Ordering::Relaxed) {
-                                let idx = adapter_index(agent);
-                                if idx < self.adapters.len() {
-                                    let _ = self.adapters[idx].cancel();
+                    };
+                    if aggregate_error.is_none() {
+                        let mut judge_leg = judge_spec.clone();
+                        if judge_leg.model.is_none() {
+                            judge_leg.model =
+                                dmuxai::fanout::resolved_fanout_leg_model(&judge_leg, &self.settings);
+                        }
+                        let mut track = self.fanout_start_leg(&judge_prompt, &judge_leg, &title);
+                        fanout_judge = Some(dmuxai::fanout::FanoutJudgeMeta {
+                            agent: judge_spec.runner.clone(),
+                            model: track.model.clone().or(judge_leg.model.clone()),
+                            duration_ms: judge_started.elapsed().as_millis() as u64,
+                        });
+                        let map_track_aggregate_error = |track: &FanoutLegTracker| -> String {
+                            track
+                                .error_kind
+                                .clone()
+                                .filter(|kind| kind != "internal")
+                                .unwrap_or_else(|| "provider".to_owned())
+                        };
+                        if track.finished {
+                            aggregate_error = Some(map_track_aggregate_error(&track));
+                        } else if let Some(agent) = runner_from_str(&judge_spec.runner) {
+                            self.in_fanout_run = true;
+                            self.fanout_trackers.insert(agent, track.clone());
+                            let mut judge_cancelled = false;
+                            while self.busy_agents.contains(&agent) {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let idx = adapter_index(agent);
+                                    if idx < self.adapters.len() {
+                                        let _ = self.adapters[idx].cancel();
+                                    }
+                                    judge_cancelled = true;
+                                    break;
                                 }
-                                break;
+                                let _ = self.drain_agent_events();
+                                self.tick();
+                                if !self.busy_agents.contains(&agent)
+                                    && let Some(finished) = self.fanout_trackers.remove(&agent)
+                                {
+                                    track = finished;
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
                             }
-                            let _ = self.drain_agent_events();
-                            self.tick();
-                            if !self.busy_agents.contains(&agent)
-                                && let Some(finished) = self.fanout_trackers.remove(&agent)
-                            {
-                                track = finished;
-                                break;
+                            self.in_fanout_run = false;
+                            self.fanout_trackers.clear();
+                            self.busy_agents.remove(&agent);
+                            self.active_turns.remove(&agent);
+                            if let Some(meta) = fanout_judge.as_mut() {
+                                meta.duration_ms = judge_started.elapsed().as_millis() as u64;
+                                meta.model = track.model.clone().or(meta.model.clone());
                             }
-                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            if judge_cancelled {
+                                aggregate_error = Some("cancelled".to_owned());
+                            } else if track.ok {
+                                match dmuxai::fanout::parse_aggregate(
+                                    track.buffer.as_str(),
+                                    &allowed_refs,
+                                ) {
+                                    Ok(agg) => aggregate = Some(agg),
+                                    Err(_) => {
+                                        aggregate_error = Some("invalid_aggregate".to_owned())
+                                    }
+                                }
+                            } else {
+                                aggregate_error = Some(map_track_aggregate_error(&track));
+                            }
                         }
-                        self.in_fanout_run = false;
-                        self.fanout_trackers.clear();
-                        if let Some(meta) = fanout_judge.as_mut() {
-                            meta.duration_ms = judge_started.elapsed().as_millis() as u64;
-                            meta.model = track.model.clone().or(meta.model.clone());
-                        }
-                        if track.ok {
-                            match dmuxai::fanout::parse_aggregate(
-                                track.buffer.as_str(),
-                                &allowed_refs,
-                            ) {
-                                Ok(agg) => aggregate = Some(agg),
-                                Err(_) => aggregate_error = Some("invalid_aggregate".to_owned()),
-                            }
-                        } else if track.error_kind.as_deref() == Some("no_read_only_mode") {
-                            aggregate_error = Some("no_read_only_mode".to_owned());
-                        } else {
-                            aggregate_error = Some("invalid_aggregate".to_owned());
+                        let judge_write = dmuxai::workspace::read_only_workspace_write_detected(
+                            before_fp.as_deref(),
+                            &self.workspace_root,
+                        )
+                        .await;
+                        if judge_write {
+                            aggregate = None;
+                            aggregate_error = Some(AgentErrorKind::Policy.as_str().to_owned());
                         }
                     }
                 }
             }
         }
 
-        let policy_violation = dmuxai::workspace::read_only_workspace_write_detected(
-            before_fp.as_deref(),
-            &self.workspace_root,
-        )
-        .await;
+        let policy_violation = leg_policy_violation;
+        let ok_count_after = reports
+            .iter()
+            .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
+            .count();
 
-        let mut ok = dmuxai::fanout::fanout_run_ok(ok_count, min_ok) && !policy_violation;
-        let mut exit_code = dmuxai::fanout::fanout_exit_code(ok, false);
+        let ok = dmuxai::fanout::fanout_run_ok(ok_count_after, min_ok) && !policy_violation;
+        let exit_code = dmuxai::fanout::fanout_exit_code(ok, false);
         let mut error = if policy_violation {
             Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned())
         } else {
@@ -15218,17 +15254,6 @@ impl App {
         if !ok && error.is_none() {
             error = Some("fan-out quorum not met".to_owned());
             error_kind = Some(AgentErrorKind::Policy.as_str().to_owned());
-        }
-        if policy_violation {
-            ok = false;
-            exit_code = dmuxai::agent_api::exit::FAILED;
-            for leg in &mut reports {
-                if leg.status == dmuxai::fanout::LegStatus::Ok {
-                    leg.status = dmuxai::fanout::LegStatus::Failed;
-                    leg.error = error.clone();
-                    leg.error_kind = error_kind.clone();
-                }
-            }
         }
         let text = if had_judge {
             dmuxai::fanout::fanout_text_with_aggregate(
@@ -15260,6 +15285,7 @@ impl App {
             fanout: Some(dmuxai::fanout::FanoutReport {
                 min_ok,
                 legs: reports,
+                judge_enabled: had_judge,
             }),
             aggregate,
             aggregate_error,
@@ -27935,13 +27961,7 @@ out3
             ])
             .is_ok()
         );
-        let write_only = dmuxai::custom_agent::CustomAgentSpec {
-            name: "nowrite".to_owned(),
-            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
-            ..Default::default()
-        };
-        assert!(!write_only.has_read_only_mode());
-        dmuxai::custom_agent::install_registry(vec![write_only]);
+        install_test_custom_agents();
         let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
         complete_fanout_requests(&sent, event_tx);
         let outcome = app
@@ -28009,22 +28029,58 @@ out3
 
     // TC-2925 / FR-2925
     #[tokio::test]
+    #[cfg(unix)]
     async fn tc_2925_judge_turn_is_read_only_and_guarded() {
-        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "fanout@test"][..],
+            &["config", "user.name", "fanout"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&workspace)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(workspace.join("tracked.txt"), "a").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, sent, event_tx) =
+            test_app_with_engine_and_event_sender(engine, workspace.clone());
+        let main_conversation = app.conversation_id.clone();
+        app.set_headless(true);
         let sent_bg = Arc::clone(&sent);
+        let workspace_bg = workspace.clone();
         let aggregate = r#"{"recommendation":"aligned","agreements":[],"disagreements":[],"unique_findings":{}}"#;
         tokio::spawn(async move {
-            let mut done = HashSet::new();
+            let mut replied = HashSet::new();
             for _ in 0..400 {
                 let pending: Vec<(Agent, AgentRequest)> = {
                     let lock = sent_bg.lock().unwrap();
                     lock.iter()
-                        .filter(|(agent, _)| !done.contains(agent))
+                        .filter(|(agent, _)| !replied.contains(agent))
                         .cloned()
                         .collect()
                 };
                 for (agent, req) in pending {
                     let text = if req.prompt.contains("Agent answers:") {
+                        std::fs::write(workspace_bg.join("judge-write.txt"), "w").unwrap();
                         aggregate
                     } else {
                         "fanout-answer"
@@ -28047,9 +28103,9 @@ out3
                             event: AgentEvent::Completed,
                         })
                         .await;
-                    done.insert(agent);
+                    replied.insert(agent);
                 }
-                if done.len() >= 3 {
+                if replied.len() >= 3 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -28090,12 +28146,22 @@ out3
             .find(|(_, r)| r.prompt.contains("Agent answers:"))
             .expect("judge prompt");
         assert!(judge_req.1.prompt.contains("<<<DATA-"));
-        assert_eq!(
+        assert_ne!(
+            judge_req.1.conversation_id.as_str(),
+            main_conversation.as_str()
+        );
+        assert_eq!(outcome.aggregate_error.as_deref(), Some("policy"));
+        assert!(outcome.aggregate.is_none());
+        assert!(
             outcome
-                .aggregate
+                .fanout
                 .as_ref()
-                .map(|a| a.recommendation.as_str()),
-            Some("aligned")
+                .unwrap()
+                .legs
+                .iter()
+                .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
+                .count()
+                >= 2
         );
     }
 

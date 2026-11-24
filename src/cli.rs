@@ -989,6 +989,9 @@ fn parse_run_options_with_flags(
     } else if options.min_ok.is_some() {
         return Err("--min-ok requires --agents".to_owned());
     }
+    if let Some(raw) = options.judge.as_deref() {
+        dmuxai::fanout::parse_judge_flag(raw)?;
+    }
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
     }
@@ -2731,6 +2734,7 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
             ok: outcome.ok,
             min_ok: report.min_ok,
             legs: &report.legs,
+            judge_enabled: report.judge_enabled,
             aggregate: outcome.aggregate.as_ref(),
             aggregate_error: outcome.aggregate_error.as_deref(),
             aggregate_skipped: outcome.aggregate_skipped.as_deref(),
@@ -2922,6 +2926,7 @@ async fn run_fanout_headless(
                 text: String::new(),
                 error: None,
                 error_kind: None,
+                blocked: false,
                 duration_ms: 0,
             });
         } else {
@@ -2937,15 +2942,16 @@ async fn run_fanout_headless(
     let judge = if let Some(raw) = options.judge.as_deref() {
         let judge_spec = dmuxai::fanout::parse_judge_flag(raw)
             .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
-        if company_workspace && dmuxai::fanout::fanout_runner_is_free(&judge_spec, &settings) {
+        if let Err(message) = dmuxai::fanout::reject_free_judge_in_company_workspace(
+            &judge_spec,
+            company_workspace,
+            &settings,
+        ) {
             eprintln!(
-                "warning: rejecting free runner '{}' as --judge in company workspace",
-                judge_spec.runner
+                "{}",
+                dmuxai::fanout::free_judge_company_workspace_warning(&judge_spec.runner)
             );
-            return Err(ApiError::new(
-                dmuxai::agent_api::exit::USAGE,
-                "fan-out judge cannot be a free runner in company workspace".to_owned(),
-            ));
+            return Err(ApiError::new(dmuxai::agent_api::exit::USAGE, message));
         }
         Some(judge_spec)
     } else {
@@ -3803,6 +3809,7 @@ mod tests {
             fanout_judge: None,
             fanout: Some(dmuxai::fanout::FanoutReport {
                 min_ok: 2,
+                judge_enabled: false,
                 legs: vec![
                     dmuxai::fanout::FanoutLegReport {
                         agent: "cursor".into(),
@@ -3811,6 +3818,7 @@ mod tests {
                         text: "a".into(),
                         error: None,
                         error_kind: None,
+                        blocked: false,
                         duration_ms: 1,
                     },
                     dmuxai::fanout::FanoutLegReport {
@@ -3820,6 +3828,7 @@ mod tests {
                         text: String::new(),
                         error: Some("err".into()),
                         error_kind: Some("provider".into()),
+                        blocked: false,
                         duration_ms: 2,
                     },
                 ],
@@ -3893,6 +3902,7 @@ mod tests {
             }),
             fanout: Some(dmuxai::fanout::FanoutReport {
                 min_ok: 1,
+                judge_enabled: true,
                 legs: vec![
                     dmuxai::fanout::FanoutLegReport {
                         agent: "cursor".into(),
@@ -3901,6 +3911,7 @@ mod tests {
                         text: "a".into(),
                         error: None,
                         error_kind: None,
+                        blocked: false,
                         duration_ms: 1,
                     },
                     dmuxai::fanout::FanoutLegReport {
@@ -3910,6 +3921,7 @@ mod tests {
                         text: "b".into(),
                         error: None,
                         error_kind: None,
+                        blocked: false,
                         duration_ms: 2,
                     },
                 ],
@@ -3919,7 +3931,20 @@ mod tests {
         assert_eq!(json["aggregate"]["recommendation"], "go");
         assert_eq!(json["judge"]["agent"], "codex");
         assert!(json["aggregate"].is_object());
-        assert!(json.get("aggregate_skipped").is_none() || json["aggregate_skipped"].is_null());
+        assert!(json["aggregate_skipped"].is_null());
+        assert!(json["aggregate_error"].is_null());
+
+        let no_judge = HeadlessOutcome {
+            fanout: Some(dmuxai::fanout::FanoutReport {
+                min_ok: 1,
+                judge_enabled: false,
+                legs: outcome.fanout.as_ref().unwrap().legs.clone(),
+            }),
+            ..outcome.clone()
+        };
+        let plain = outcome_json(&no_judge, 0, 0);
+        assert!(plain.get("aggregate").is_none());
+        assert!(plain.get("judge").is_none());
     }
 
     // TC-2926 / FR-2926
@@ -3927,12 +3952,37 @@ mod tests {
     fn tc_2926_company_workspace_rejects_free_judge() {
         let mut settings = DmuxSettings::default();
         settings.fanout_company_workspace = true;
-        let judge = dmuxai::fanout::FanoutLegSpec {
-            runner: "codex".into(),
-            model: Some("kimi-k2.5-free".into()),
-        };
+        let judge = dmuxai::fanout::parse_judge_flag("codex:kimi-k2.5-free").unwrap();
         assert!(dmuxai::fanout::fanout_runner_is_free(&judge, &settings));
-        assert!(dmuxai::fanout::parse_judge_flag("codex:composer-2.5").is_ok());
+        let err = dmuxai::fanout::reject_free_judge_in_company_workspace(&judge, true, &settings)
+            .expect_err("free judge");
+        assert!(err.contains("company workspace"));
+        let warning = dmuxai::fanout::free_judge_company_workspace_warning(&judge.runner);
+        assert!(warning.contains("warning:"));
+        assert!(warning.contains("codex"));
+        assert_eq!(dmuxai::agent_api::exit::USAGE, 2);
+        assert!(
+            crate::cli::parse(&[
+                "run".into(),
+                "x".into(),
+                "--agents".into(),
+                "cursor,codex".into(),
+                "--judge".into(),
+                "codex:kimi-k2.5-free".into(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::cli::parse(&[
+                "run".into(),
+                "x".into(),
+                "--agents".into(),
+                "cursor,codex".into(),
+                "--judge".into(),
+                ":bad".into(),
+            ])
+            .is_err()
+        );
     }
 
     // TC-1695 / FR-1682: headless JSON includes error_kind next to error.
