@@ -9,7 +9,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Added
 
-- **Subcommands `dmuxai runners [--json]` and `dmuxai models [--agent ID] [--json]` (FR-2831..FR-2833).** Added runner discovery, admission status, installation lookup without spawning processes, and model policies; added MCP `models` tool.
+- **Subcommands `dmuxai runners [--json]` and `dmuxai models [--agent ID] [--json]` (FR-2831..FR-2833).** Added runner discovery, admission status, installation lookup without spawning processes, and model policies; added MCP `models` tool. `models` reports `error_kind: "auth"` when a runner such as grok is not signed in.
 - **Per-subcommand help (FR-2830).** `dmuxai <subcommand> --help` / `-h` prints that subcommand's own usage and flags for all agent-facing subcommands.
 
 - **Headless runs are visible to `dmuxai serve` (PR A of SPEC-headless-runs-dashboard,
