@@ -5,9 +5,11 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+## [0.4.0] - 2026-11-24
+
 ### Added
 
-- **Subcommands `dmuxai runners [--json]` and `dmuxai models [--agent ID] [--json]` (FR-2831..FR-2833).** Added runner discovery, admission status, installation lookup without spawning processes, and model policies; added MCP `models` tool.
+- **Subcommands `dmuxai runners [--json]` and `dmuxai models [--agent ID] [--json]` (FR-2831..FR-2833).** Added runner discovery, admission status, installation lookup without spawning processes, and model policies; added MCP `models` tool. `models` reports `error_kind: "auth"` when a runner such as grok is not signed in.
 - **Per-subcommand help (FR-2830).** `dmuxai <subcommand> --help` / `-h` prints that subcommand's own usage and flags for all agent-facing subcommands.
 
 - **Headless runs are visible to `dmuxai serve` (PR A of SPEC-headless-runs-dashboard,
@@ -60,6 +62,15 @@ All notable changes to dmuxai are listed here. Versions follow
   `--match`, `--idle`, `--timeout`, and `--since`. `dmuxai --help` and `dmuxai run --help`
   are unchanged.
 
+### Changed
+
+- **Dashboard top bar is trimmed to Runs | Diff | Chat | Workspace | More (#329).**
+  Workspace holds Files and To-dos; More holds Sessions, Memory, Skills, System prompts,
+  and Theme/Accent. The run graph is shown inside the Runs detail with a "Full graph"
+  button. `dmuxai serve` opens Runs when runs exist; `--web` opens Chat.
+- **Dashboard run status pill for headless runs (#332).** The Runs view shows a status
+  pill, hides an empty graph, streams cleaner progress text, and uses readable labels.
+
 ### Fixed
 
 - **`term wait --match` searches accumulated output after a stronger CSI strip (#315).**
@@ -87,6 +98,7 @@ All notable changes to dmuxai are listed here. Versions follow
 - **`term close --all` does not start a host when none is running (#314).** It exits 0
   with an empty `closed` list. `close NAME` with no host exits 3 (`not_found`) and
   also does not spawn one. `term list` already behaved this way.
+- **Local gates work again on Rust/Cargo 1.100 (#330).**
 
 ## [0.3.1] - 2026-11-09
 
@@ -810,6 +822,7 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)
 
+[0.4.0]: https://github.com/donggrri/dmuxai/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/donggrri/dmuxai/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/donggrri/dmuxai/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/donggrri/dmuxai/compare/v0.2.1...v0.2.2
