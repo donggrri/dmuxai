@@ -13,6 +13,26 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
     validate_policy_model(model_id)
 }
 
+/// Role-derived turn policy when `[graph] enforce_read_only_roles` is on (FR-2901).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeTurnPolicy {
+    ReadOnly,
+    Write,
+}
+
+/// Turn policy for a graph node when `[graph] enforce_read_only_roles` is on (FR-2901).
+pub fn node_turn_policy(role: NodeRole) -> Option<NodeTurnPolicy> {
+    match role {
+        NodeRole::Orchestrate => None,
+        NodeRole::Research
+        | NodeRole::Explore
+        | NodeRole::Plan
+        | NodeRole::Route
+        | NodeRole::Review => Some(NodeTurnPolicy::ReadOnly),
+        NodeRole::Implement | NodeRole::Draft | NodeRole::Test => Some(NodeTurnPolicy::Write),
+    }
+}
+
 pub fn model_for_role(role: NodeRole) -> &'static str {
     match role {
         NodeRole::Orchestrate => ORCHESTRATOR_MODEL,
@@ -134,6 +154,25 @@ mod tests {
         settings.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
         assert!(is_runner_allowed("opencode", &settings));
         assert_eq!(assign_runner(NodeRole::Implement, &settings), "opencode");
+    }
+
+    // TC-2901 / FR-2901
+    #[test]
+    fn tc_2901_role_policy_mapping_read_only_vs_write_roles() {
+        use super::NodeTurnPolicy;
+        for role in [
+            NodeRole::Research,
+            NodeRole::Explore,
+            NodeRole::Plan,
+            NodeRole::Route,
+            NodeRole::Review,
+        ] {
+            assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::ReadOnly));
+        }
+        for role in [NodeRole::Implement, NodeRole::Draft, NodeRole::Test] {
+            assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::Write));
+        }
+        assert_eq!(node_turn_policy(NodeRole::Orchestrate), None);
     }
 
     // TC-901 / FR-899

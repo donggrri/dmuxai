@@ -66,6 +66,8 @@ pub struct DmuxSettings {
     /// `[graph] tasks_file` (FR-967). When true, writes
     /// `<workspace>/.dmuxai/tasks/TASKS-<run id>.md` on approval and task status changes.
     pub graph_tasks_file: bool,
+    /// `[graph] enforce_read_only_roles` (FR-2900): role-derived turn policy per graph node.
+    pub graph_enforce_read_only_roles: bool,
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
@@ -271,6 +273,7 @@ struct GraphToml {
     replan_budget_chars: Option<u32>,
     max_nodes: Option<u32>,
     tasks_file: Option<bool>,
+    enforce_read_only_roles: Option<bool>,
     allowed_runners: Option<Vec<String>>,
 }
 
@@ -1116,6 +1119,9 @@ impl DmuxSettings {
             if let Some(tasks_file) = graph.tasks_file {
                 self.graph_tasks_file = tasks_file;
             }
+            if let Some(enforce) = graph.enforce_read_only_roles {
+                self.graph_enforce_read_only_roles = enforce;
+            }
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
                 for runner in runners {
@@ -1908,6 +1914,7 @@ impl Default for DmuxSettings {
             graph_replan_budget_chars: DEFAULT_GRAPH_REPLAN_BUDGET_CHARS,
             graph_max_nodes: DEFAULT_GRAPH_MAX_NODES,
             graph_tasks_file: false,
+            graph_enforce_read_only_roles: false,
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
@@ -2698,6 +2705,45 @@ text_path = "/part/text"
     #[test]
     fn tc_365_ui_config_activity_rendering_parsing() {
         parses_ui_section();
+    }
+
+    // TC-2900 / FR-2900
+    #[test]
+    fn tc_2900_enforce_read_only_roles_default_off_and_workspace_overrides_user() {
+        let defaults = DmuxSettings::default();
+        assert!(!defaults.graph_enforce_read_only_roles);
+
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-ro-roles-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(
+            user_dir.join("dmuxai.toml"),
+            "[graph]\nenforce_read_only_roles = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\nenforce_read_only_roles = false\n",
+        )
+        .unwrap();
+
+        let settings =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(!settings.graph_enforce_read_only_roles);
+
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\nenforce_read_only_roles = true\n",
+        )
+        .unwrap();
+        let settings_on =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(settings_on.graph_enforce_read_only_roles);
+
+        std::fs::remove_dir_all(&temp_base).ok();
     }
 
     #[test]
