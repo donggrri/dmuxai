@@ -15154,8 +15154,10 @@ impl App {
                     if aggregate_error.is_none() {
                         let mut judge_leg = judge_spec.clone();
                         if judge_leg.model.is_none() {
-                            judge_leg.model =
-                                dmuxai::fanout::resolved_fanout_leg_model(&judge_leg, &self.settings);
+                            judge_leg.model = dmuxai::fanout::resolved_fanout_leg_model(
+                                &judge_leg,
+                                &self.settings,
+                            );
                         }
                         let mut track = self.fanout_start_leg(&judge_prompt, &judge_leg, &title);
                         fanout_judge = Some(dmuxai::fanout::FanoutJudgeMeta {
