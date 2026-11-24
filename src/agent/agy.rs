@@ -114,6 +114,7 @@ fn current_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AgyCommand {
     Send(AgentRequest),
     Cancel,
@@ -1143,6 +1144,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -1182,6 +1184,7 @@ mod tests {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("agy");
         configure_command(&mut command, None, TurnPolicy::ReadOnly);
@@ -1266,6 +1269,7 @@ mod tests {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
@@ -1573,6 +1577,7 @@ mod tests {
             policy: mode,
             require_file_edits,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, _event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1765,6 +1770,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1844,6 +1850,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1950,6 +1957,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1998,6 +2006,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2056,6 +2065,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2136,6 +2146,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
 
@@ -2214,6 +2225,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
 
@@ -2267,6 +2279,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: true,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2337,6 +2350,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: true,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2397,6 +2411,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2681,6 +2696,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2747,6 +2763,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2819,6 +2836,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2903,6 +2921,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2975,6 +2994,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -3040,6 +3060,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {

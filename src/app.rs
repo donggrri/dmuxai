@@ -436,6 +436,8 @@ struct ActiveTurn {
     /// projection instead of a native resume, ready for the one fresh retry
     /// after the provider rejects the stored session id (FR-2325).
     retry_fresh_request: Option<AgentRequest>,
+    /// Write fan-out leg worktree (FR-2938 fallback keeps the same directory).
+    fanout_worktree: Option<PathBuf>,
 }
 
 /// Handover state for the turn that takes over a failed runner
@@ -802,6 +804,11 @@ struct FanoutLegTracker {
     ok: bool,
     error: Option<String>,
     error_kind: Option<String>,
+    worktree: Option<PathBuf>,
+    diff_stat: Option<dmuxai::fanout_worktree::FanoutDiffStat>,
+    patch_path: Option<String>,
+    worktree_path: Option<String>,
+    changed: Option<bool>,
 }
 
 /// FR-932: an internal read-only judge turn. Its streamed text is buffered and
@@ -1543,6 +1550,10 @@ pub struct App {
     fanout_reserved_runners: HashSet<String>,
     in_fanout_run: bool,
     fanout_trackers: HashMap<Agent, FanoutLegTracker>,
+    fanout_write_mode: bool,
+    fanout_keep_worktrees: bool,
+    fanout_run_id: Option<String>,
+    fanout_active_worktrees: Vec<PathBuf>,
     /// FR-1008: planner_io recorded before the run row exists (e.g. judge).
     deferred_planner_io: HashMap<String, Vec<PlannerIo>>,
     deferred_turns: Vec<DeferredTurn>,
@@ -2010,6 +2021,10 @@ impl App {
             fanout_reserved_runners: HashSet::new(),
             in_fanout_run: false,
             fanout_trackers: HashMap::new(),
+            fanout_write_mode: false,
+            fanout_keep_worktrees: false,
+            fanout_run_id: None,
+            fanout_active_worktrees: Vec::new(),
             deferred_planner_io: HashMap::new(),
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
@@ -4370,6 +4385,12 @@ impl App {
                 _ => false,
             };
             if leg_event {
+                if let AgentEvent::Error(err) = &output.event
+                    && self.fanout_write_mode
+                    && self.try_runner_fallback(output.agent, err)
+                {
+                    return true;
+                }
                 if let Some(track) = self.fanout_trackers.get_mut(&output.agent) {
                     match &output.event {
                         AgentEvent::TextDelta(delta) => track.buffer.push(delta),
@@ -4570,7 +4591,7 @@ impl App {
     /// change. Other adapters are covered only when their error text matches
     /// the same patterns.
     fn try_fresh_resume_retry(&mut self, agent: Agent, err: &AgentError) -> bool {
-        if self.in_fanout_run {
+        if self.in_fanout_run && !self.fanout_write_mode {
             return false;
         }
         if !is_resume_rejection_message(&err.message) {
@@ -4629,7 +4650,7 @@ impl App {
     /// that fails to start leaves the original error to the normal error path
     /// (FR-2130..FR-2133).
     fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
-        if self.in_fanout_run {
+        if self.in_fanout_run && !self.fanout_write_mode {
             return false;
         }
         // FR-2130 / TC-2130: a pending handover from an earlier attempt must never leak
@@ -6334,7 +6355,17 @@ impl App {
             ),
             RequestContext::Fresh(_) => (None, Vec::new(), String::new()),
         };
-        let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
+        let fanout_worktree = self
+            .active_turns
+            .get(&agent)
+            .and_then(|active| active.fanout_worktree.clone());
+        let mut adapter_request = adapter_request(
+            request,
+            image_paths,
+            policy,
+            require_file_edits,
+            fanout_worktree,
+        );
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
 
         // Determine the prompt role for this turn.
@@ -6548,6 +6579,7 @@ impl App {
                         fallback_policy,
                         fallback_chain: pending_fallback.map(|fallback| fallback.chain),
                         retry_fresh_request,
+                        fanout_worktree: None,
                     },
                 );
                 // FR-2140: the next turn starts with a fresh busy-retry budget
@@ -7041,6 +7073,7 @@ impl App {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         match self.adapters[slot].send(request) {
             Ok(()) => {
@@ -7264,6 +7297,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let run_id = self
             .todos
@@ -9098,6 +9132,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let triage = Triage {
             route,
@@ -10190,6 +10225,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -10421,6 +10457,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -10466,6 +10503,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -10504,6 +10542,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -14858,6 +14897,43 @@ impl App {
         agent_texts.join("\n\n")
     }
 
+    fn fanout_finalize_write_leg(&mut self, track: &mut FanoutLegTracker) {
+        let Some(run_id) = self.fanout_run_id.as_deref() else {
+            return;
+        };
+        let Some(wt) = track.worktree.as_ref() else {
+            return;
+        };
+        if let Ok(patch) = dmuxai::fanout_worktree::produce_leg_patch(
+            &self.workspace_root,
+            run_id,
+            &track.runner,
+            wt,
+        ) {
+            track.diff_stat = Some(patch.diff_stat);
+            track.changed = Some(patch.changed);
+            track.patch_path = patch.patch_path.to_str().map(|s| s.to_owned());
+        }
+        if self.fanout_keep_worktrees {
+            track.worktree_path = wt.to_str().map(str::to_owned);
+        } else {
+            let _ = dmuxai::fanout_worktree::remove_leg_worktree(&self.workspace_root, wt);
+            self.fanout_active_worktrees.retain(|p| p != wt);
+            track.worktree_path = None;
+        }
+    }
+
+    fn fanout_cleanup_all_write_worktrees(&mut self) {
+        if self.fanout_keep_worktrees || !self.fanout_write_mode {
+            return;
+        }
+        let workspace = self.workspace_root.clone();
+        let paths = std::mem::take(&mut self.fanout_active_worktrees);
+        for wt in paths {
+            let _ = dmuxai::fanout_worktree::remove_leg_worktree(&workspace, &wt);
+        }
+    }
+
     fn fanout_restore_main_conversation(&mut self, saved: &StoredConversationId) {
         if let Ok(snapshot) = self
             .engine
@@ -14872,6 +14948,7 @@ impl App {
         user_prompt: &str,
         leg: &dmuxai::fanout::FanoutLegSpec,
         title: &str,
+        write_worktree: Option<&Path>,
     ) -> FanoutLegTracker {
         let started = Instant::now();
         let fail = |runner: &str, error: String, kind: &str| FanoutLegTracker {
@@ -14885,6 +14962,11 @@ impl App {
             ok: false,
             error: Some(error),
             error_kind: Some(kind.to_owned()),
+            worktree: write_worktree.map(Path::to_path_buf),
+            diff_stat: None,
+            patch_path: None,
+            worktree_path: write_worktree.and_then(|p| p.to_str().map(str::to_owned)),
+            changed: None,
         };
         let Some(agent) = runner_from_str(&leg.runner) else {
             return fail(
@@ -14908,7 +14990,8 @@ impl App {
                 "not_found",
             );
         }
-        if let Agent::Custom(custom_index) = agent
+        if write_worktree.is_none()
+            && let Agent::Custom(custom_index) = agent
             && let Some(spec) = dmuxai::custom_agent::spec_at(custom_index)
             && !spec.has_read_only_mode()
         {
@@ -14959,7 +15042,21 @@ impl App {
             );
         };
         let turn_id = request.turn_id.clone();
-        let adapter_request = adapter_request(request, Vec::new(), TurnPolicy::ReadOnly, false);
+        let leg_policy = if write_worktree.is_some() {
+            TurnPolicy::Agent
+        } else {
+            TurnPolicy::ReadOnly
+        };
+        let mut adapter_request = adapter_request(
+            request,
+            Vec::new(),
+            leg_policy,
+            false,
+            write_worktree.map(Path::to_path_buf),
+        );
+        if let Some(dir) = write_worktree {
+            adapter_request.working_directory = Some(dir.to_path_buf());
+        }
         let send_result = self.adapters[index].send(adapter_request);
         self.fanout_restore_main_conversation(&saved_main);
         if let Err(error) = send_result {
@@ -14982,9 +15079,10 @@ impl App {
                 model_catalog_hint: None,
                 fallback_original_prompt: user_prompt.to_owned(),
                 fallback_display_text: None,
-                fallback_policy: Some(TurnPolicy::ReadOnly),
+                fallback_policy: Some(leg_policy),
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: write_worktree.map(Path::to_path_buf),
             },
         );
         let model = leg
@@ -15002,6 +15100,11 @@ impl App {
             ok: false,
             error: None,
             error_kind: None,
+            worktree: write_worktree.map(Path::to_path_buf),
+            diff_stat: None,
+            patch_path: None,
+            worktree_path: write_worktree.and_then(|p| p.to_str().map(str::to_owned)),
+            changed: None,
         }
     }
 
@@ -15017,19 +15120,50 @@ impl App {
         cli_order: Vec<String>,
         judge: Option<dmuxai::fanout::FanoutLegSpec>,
         cancel: Arc<AtomicBool>,
+        write: Option<dmuxai::fanout_worktree::FanoutWriteRunConfig>,
     ) -> HeadlessOutcome {
         let prompt_prefix = user_prompt.trim().chars().take(40).collect::<String>();
         let before_fp = dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await;
         self.in_fanout_run = true;
+        self.fanout_write_mode = write.is_some();
+        self.fanout_keep_worktrees = write.as_ref().is_some_and(|w| w.keep_worktrees);
+        self.fanout_run_id = write.as_ref().map(|w| w.run_id.clone());
         self.fanout_reserved_runners = cli_order
             .iter()
             .map(|runner| runner.to_ascii_lowercase())
             .collect();
+        let mut leg_worktrees: HashMap<String, PathBuf> = HashMap::new();
+        if let Some(ref cfg) = write {
+            for leg in &legs {
+                match dmuxai::fanout_worktree::create_leg_worktree(
+                    &self.workspace_root,
+                    &cfg.run_id,
+                    &leg.runner,
+                ) {
+                    Ok(path) => {
+                        self.fanout_active_worktrees.push(path.clone());
+                        leg_worktrees.insert(leg.runner.clone(), path);
+                    }
+                    Err(error) => {
+                        self.fanout_cleanup_all_write_worktrees();
+                        self.in_fanout_run = false;
+                        self.fanout_write_mode = false;
+                        return HeadlessOutcome::failure(
+                            dmuxai::agent_api::exit::USAGE,
+                            self.conversation_id.as_str().to_owned(),
+                            None,
+                            error.to_string(),
+                        );
+                    }
+                }
+            }
+        }
         let order = cli_order;
         let mut trackers: HashMap<String, FanoutLegTracker> = HashMap::new();
         for leg in &legs {
             let title = format!("fanout: {prompt_prefix} [{}]", leg.runner);
-            let track = self.fanout_start_leg(&user_prompt, leg, &title);
+            let wt = leg_worktrees.get(&leg.runner).map(PathBuf::as_path);
+            let track = self.fanout_start_leg(&user_prompt, leg, &title, wt);
             let runner = leg.runner.clone();
             if track.finished {
                 trackers.insert(runner, track);
@@ -15051,6 +15185,7 @@ impl App {
                         let _ = self.adapters[idx].cancel();
                     }
                 }
+                self.fanout_cleanup_all_write_worktrees();
                 break;
             }
             let _ = self.drain_agent_events();
@@ -15063,12 +15198,17 @@ impl App {
                     if track.error.is_some() {
                         track.ok = false;
                     }
+                    if self.fanout_write_mode {
+                        self.fanout_finalize_write_leg(&mut track);
+                    }
                     trackers.insert(track.runner.clone(), track);
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        self.fanout_cleanup_all_write_worktrees();
         self.in_fanout_run = false;
+        self.fanout_write_mode = false;
         self.fanout_reserved_runners.clear();
         self.fanout_trackers.clear();
 
@@ -15091,6 +15231,10 @@ impl App {
                     error_kind: track.error_kind.clone(),
                     blocked: false,
                     duration_ms: track.started.elapsed().as_millis() as u64,
+                    diff_stat: track.diff_stat.clone(),
+                    patch_path: track.patch_path.clone(),
+                    worktree_path: track.worktree_path.clone(),
+                    changed: track.changed,
                 });
             }
         }
@@ -15159,7 +15303,8 @@ impl App {
                                 &self.settings,
                             );
                         }
-                        let mut track = self.fanout_start_leg(&judge_prompt, &judge_leg, &title);
+                        let mut track =
+                            self.fanout_start_leg(&judge_prompt, &judge_leg, &title, None);
                         fanout_judge = Some(dmuxai::fanout::FanoutJudgeMeta {
                             agent: judge_spec.runner.clone(),
                             model: track.model.clone().or(judge_leg.model.clone()),
@@ -18036,6 +18181,7 @@ fn adapter_request(
     image_paths: Vec<PathBuf>,
     policy: TurnPolicy,
     require_file_edits: bool,
+    working_directory: Option<PathBuf>,
 ) -> AgentRequest {
     let prompt = match &request.context {
         RequestContext::Resume { delta, fallback } if request.resume_session.is_some() => {
@@ -18055,6 +18201,7 @@ fn adapter_request(
         policy,
         require_file_edits,
         system_prompt: None,
+        working_directory,
     }
 }
 
@@ -24714,6 +24861,7 @@ out3
                 fallback_policy: None,
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: None,
             },
         );
 
@@ -25891,6 +26039,7 @@ out3
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         // Empty memory: unchanged.
         let mut r = request(None);
@@ -26221,6 +26370,7 @@ out3
                 fallback_policy: None,
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: None,
             },
         );
         app.busy_agents.insert(Agent::Cursor);
@@ -26274,6 +26424,7 @@ out3
                 fallback_policy: None,
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: None,
             },
         );
         app.activities.insert(
@@ -27602,6 +27753,7 @@ out3
                 order,
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         let custom = outcome
@@ -27654,6 +27806,7 @@ out3
                 vec!["cursor".into(), "codex".into()],
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         let requests = sent.lock().unwrap();
@@ -27694,6 +27847,7 @@ out3
                 order.clone(),
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         assert!(outcome.ok);
@@ -27710,6 +27864,7 @@ out3
                 order,
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         assert!(!outcome.ok);
@@ -27802,6 +27957,7 @@ out3
                 vec!["agy".into(), "cursor".into()],
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         let agy = outcome
@@ -27916,6 +28072,7 @@ out3
                 vec!["cursor".into(), "codex".into()],
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         assert!(!outcome.ok);
@@ -27987,6 +28144,7 @@ out3
                     model: None,
                 }),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         assert_eq!(
@@ -28022,6 +28180,7 @@ out3
                     model: None,
                 }),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         assert_eq!(outcome.aggregate_skipped.as_deref(), Some("too_few_legs"));
@@ -28134,6 +28293,7 @@ out3
                     model: None,
                 }),
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         let requests = sent.lock().unwrap();
@@ -28190,9 +28350,346 @@ out3
                 vec!["cursor".into(), "codex".into()],
                 None,
                 Arc::new(AtomicBool::new(false)),
+                None,
             )
             .await;
         assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    fn init_git_workspace(dir: &std::path::Path) {
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "fanout@test"][..],
+            &["config", "user.name", "fanout"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.join("tracked.txt"), "base\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+    }
+
+    // TC-2930 / FR-2930 (leg cwd via AgentRequest.working_directory)
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2930_write_flag_preconditions_and_leg_cwd() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::new(Mutex::new(Vec::new())),
+                    fail_send: false,
+                    fail_select_model: false,
+                    unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace.clone(),
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.set_headless(true);
+        let event_tx_bg = event_tx.clone();
+        let sent_bg = Arc::clone(&sent);
+        tokio::spawn(async move { complete_fanout_requests(&sent_bg, event_tx_bg) });
+        let write = dmuxai::fanout_worktree::FanoutWriteRunConfig {
+            run_id: "t2930".into(),
+            keep_worktrees: true,
+        };
+        let _ = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Some(write),
+            )
+            .await;
+        let requests = sent.lock().unwrap();
+        for (_, req) in requests.iter() {
+            assert_eq!(req.policy, TurnPolicy::Agent);
+            let wt = req.working_directory.as_ref().expect("leg worktree cwd");
+            assert!(wt.ends_with("cursor") || wt.ends_with("codex"));
+            assert!(dmuxai::fanout_worktree::path_under_fanout(&workspace, wt));
+        }
+        dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2930"), false).expect("clean");
+    }
+
+    // TC-2931 / FR-2931
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2931_main_workspace_unchanged_by_write_fanout() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let before = dmuxai::workspace::git_worktree_fingerprint_sync(&workspace).unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::new(Mutex::new(Vec::new())),
+                    fail_send: false,
+                    fail_select_model: false,
+                    unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace.clone(),
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let event_tx_bg = event_tx.clone();
+        let sent_bg = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let wrote = {
+                    let lock = sent_bg.lock().unwrap();
+                    if let Some((_, req)) = lock.first() {
+                        if let Some(wt) = &req.working_directory {
+                            std::fs::write(wt.join("leg-out.txt"), "written\n").unwrap();
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if wrote {
+                    complete_fanout_requests(&sent_bg, event_tx_bg);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Some(dmuxai::fanout_worktree::FanoutWriteRunConfig {
+                    run_id: "t2931".into(),
+                    keep_worktrees: false,
+                }),
+            )
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        let after = dmuxai::workspace::git_worktree_fingerprint_sync(&workspace).unwrap();
+        assert_eq!(before, after);
+        dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2931"), false).ok();
+    }
+
+    // TC-2938 / FR-2938
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2938_fallback_keeps_worktree_and_avoids_other_leg_runners() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        app.workspace_root = workspace.clone();
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "cursor".to_owned(),
+                    model: None,
+                }]),
+                stall_timeout_secs: None,
+                stall_api_retries: None,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        let sent2 = Arc::clone(&sent);
+        let event_tx2 = event_tx.clone();
+        let workspace_for_task = workspace.clone();
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let pending = {
+                    let lock = sent2.lock().unwrap();
+                    lock.iter()
+                        .find(|(a, _)| *a == Agent::Agy)
+                        .map(|(agent, req)| {
+                            (
+                                *agent,
+                                req.conversation_id.clone(),
+                                req.turn_id.clone(),
+                                req.working_directory.clone(),
+                            )
+                        })
+                };
+                if let Some((agent, conversation_id, turn_id, wt)) = pending {
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Error(AgentError::provider("model unavailable")),
+                        })
+                        .await;
+                    if let Some(wt) = wt {
+                        assert!(dmuxai::fanout_worktree::path_under_fanout(
+                            &workspace_for_task,
+                            &wt
+                        ));
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let sent_done = Arc::clone(&sent);
+        let event_tx_done = event_tx.clone();
+        tokio::spawn(async move { complete_fanout_requests(&sent_done, event_tx_done) });
+        let _outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "agy".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["agy".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Some(dmuxai::fanout_worktree::FanoutWriteRunConfig {
+                    run_id: "t2938".into(),
+                    keep_worktrees: false,
+                }),
+            )
+            .await;
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .filter(|(a, _)| *a == Agent::Cursor)
+                .count(),
+            1,
+            "fallback must not start the other leg's runner"
+        );
+        dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2938"), false).ok();
+    }
+
+    // TC-2939 / NFR-2930
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2939_no_write_flag_creates_no_worktree() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        app.workspace_root = workspace.clone();
+        complete_fanout_requests(&sent, event_tx);
+        let _ = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        let fanout_root = workspace.join(".dmuxai/fanout");
+        assert!(!fanout_root.exists() || std::fs::read_dir(fanout_root).unwrap().count() == 0);
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|(_, r)| r.working_directory.is_none())
+        );
     }
 
     // TC-1824 / FR-1824 (#212): a headless --read-only turn reaches every runner with

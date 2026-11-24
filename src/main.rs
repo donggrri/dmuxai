@@ -133,6 +133,7 @@ Options:
   runners          List registered runners, admission, installation and model policy
   models           List available models and runner model policy
   runs             List or inspect recorded execution runs
+  fanout           Clean leftover write fan-out git worktrees
   events           Print state-change events from .dmuxai/events.jsonl
   term             Manage persistent named terminal sessions
   mcp              Serve DmuxAI as an MCP server over stdio
@@ -1391,6 +1392,7 @@ mod tests {
     fn tc_2830_subcommand_help_is_local() {
         let subcommands = [
             "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models",
+            "fanout",
         ];
         for sub in subcommands {
             for flag in ["--help", "-h"] {

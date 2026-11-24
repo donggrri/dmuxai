@@ -10,6 +10,7 @@ pub mod custom_agent;
 pub mod docs;
 pub mod events;
 pub mod fanout;
+pub mod fanout_worktree;
 pub mod graph;
 pub mod grok_activity;
 pub mod init;

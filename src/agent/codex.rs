@@ -27,6 +27,7 @@ const CODEX_BINARY_OVERRIDE: &str = "DMUXAI_CODEX_BIN";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const TOOL_SUMMARY_LIMIT: usize = 240;
 
+#[allow(clippy::large_enum_variant)]
 enum CodexCommand {
     Send(AgentRequest),
     Cancel,
@@ -1290,6 +1291,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         }
     }
 

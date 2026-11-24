@@ -70,6 +70,8 @@ pub struct DmuxSettings {
     pub graph_enforce_read_only_roles: bool,
     /// `[fanout] company_workspace` (FR-2916): skip free runners in fan-out legs.
     pub fanout_company_workspace: bool,
+    /// `[fanout] min_free_gb` (FR-2937): minimum free GiB before write fan-out worktrees.
+    pub fanout_min_free_gb: u64,
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
@@ -270,6 +272,7 @@ struct McpToml {
 #[derive(Debug, Default, Deserialize)]
 struct FanoutToml {
     company_workspace: Option<bool>,
+    min_free_gb: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1159,10 +1162,13 @@ impl DmuxSettings {
                 self.graph_allowed_runners = Some(valid);
             }
         }
-        if let Some(fanout) = parsed.fanout
-            && let Some(company_workspace) = fanout.company_workspace
-        {
-            self.fanout_company_workspace = company_workspace;
+        if let Some(fanout) = parsed.fanout {
+            if let Some(company_workspace) = fanout.company_workspace {
+                self.fanout_company_workspace = company_workspace;
+            }
+            if let Some(min_free_gb) = fanout.min_free_gb {
+                self.fanout_min_free_gb = min_free_gb;
+            }
         }
         if let Some(ui) = parsed.ui {
             self.ui = ui;
@@ -1940,6 +1946,7 @@ impl Default for DmuxSettings {
             graph_tasks_file: false,
             graph_enforce_read_only_roles: false,
             fanout_company_workspace: false,
+            fanout_min_free_gb: 5,
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,

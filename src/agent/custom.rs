@@ -29,6 +29,7 @@ fn builtin_probe_agent_error(spec: &CustomAgentSpec, message: String) -> AgentEr
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CustomCommand {
     Send(AgentRequest),
     Cancel,
@@ -520,7 +521,8 @@ fn spawn_turn(
 ) -> ActiveTurn {
     let context = OutputContext::from(&request);
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let settings = dmuxai::settings::DmuxSettings::load(&cwd);
+    let leg_cwd = super::request_cwd(&cwd, &request);
+    let settings = dmuxai::settings::DmuxSettings::load(leg_cwd.as_ref());
     let uses_acp = is_builtin_grok(spec)
         && settings.grok_protocol == dmuxai::runner_protocol::RunnerProtocol::Acp;
     let acp_cancel = uses_acp.then(super::acp::new_cancel_flag);
@@ -537,7 +539,7 @@ fn spawn_turn(
             &request,
             model,
             mode,
-            &cwd,
+            leg_cwd.as_ref(),
             &event_tx,
             &turn_context,
             &turn_pgid,
@@ -1308,6 +1310,7 @@ mod tests {
             policy,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -1960,6 +1963,7 @@ env = { FAKE_AGENT_FINISH_REASON = "omit" }
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -2159,6 +2163,7 @@ env = { FAKE_CFG = "{temp_config}" }
                 policy: TurnPolicy::Agent,
                 require_file_edits: false,
                 system_prompt: None,
+                working_directory: None,
             };
             let context = OutputContext::from(&request);
             let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -2270,6 +2275,7 @@ env = { FAKE_CFG = "{temp_config}" }
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         }
     }
 
@@ -2869,6 +2875,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: Some(sp),
+            working_directory: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -2926,6 +2933,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -2987,6 +2995,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             image_paths: Vec::new(),
             policy: TurnPolicy::Agent,
             require_file_edits: false,
+            working_directory: None,
             system_prompt: Some(sp),
         };
         let context = OutputContext::from(&request);
@@ -3049,6 +3058,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: Some(sp),
+            working_directory: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
@@ -3099,6 +3109,7 @@ system_prompt_arg = ["--system", "{system_prompt}"]
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let context = OutputContext::from(&request);
         let pgid = std::sync::atomic::AtomicU32::new(0);
