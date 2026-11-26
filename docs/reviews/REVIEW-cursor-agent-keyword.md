@@ -54,4 +54,4 @@ Manual review of `rg '"cursor"' src` on parse paths: CLI, settings, graph plan, 
 
 ## Test evidence
 
-To be filled by the gate.
+Full local gate (`fullgate.sh`, 2026-11-26): `GATE: PASS gate=1735/0 web=58/0`; `check-spec --all` 102/102. Smoke: `dmuxai models --agent cursor-agent --json` resolves runner `cursor`; `runners --json` shows `aliases: ["cursor-agent"]`. IDs renumbered to FR/UX/TC-3200..3208 to avoid the decision-board range 3100..3149.
