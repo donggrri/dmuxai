@@ -181,12 +181,11 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
     hub.publish(Vec::new(), None, None);
     hub.set_session(Some(fake.lock().unwrap().view()));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
-    let config = ServerConfig {
-        bind: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        allow_remote: false,
-        token: "test-token-followup".to_owned(),
-        services: DashboardServices {
+    let config = ServerConfig::for_tests(
+        "127.0.0.1".parse().unwrap(),
+        0,
+        "test-token-followup".to_owned(),
+        DashboardServices {
             events_path: None,
             todos: None,
             commands: Some(command_tx),
@@ -197,7 +196,7 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
             jira: None,
             trust_env: None,
         },
-    };
+    );
     let server = start_server(config, hub.clone())
         .await
         .expect("start server");

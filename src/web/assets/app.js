@@ -370,6 +370,17 @@ var token = (function () {
   return storageGet(TOKEN_KEY);
 })();
 
+function apiAuthHeaders(json) {
+  var headers = { 'X-Dmuxai-Client': '1' };
+  if (token) {
+    headers.Authorization = 'Bearer ' + token;
+  }
+  if (json) {
+    headers['Content-Type'] = 'application/json';
+  }
+  return headers;
+}
+
 var snapshot = null;
 var sse = null;
 var sseFailures = 0;
@@ -3322,10 +3333,9 @@ function todoUrl(id) {
 }
 
 function todoApi(method, path, body) {
-  var headers = { Authorization: 'Bearer ' + token };
+  var headers = apiAuthHeaders(body !== undefined);
   var init = { method: method, headers: headers, cache: 'no-store' };
   if (body !== undefined) {
-    headers['Content-Type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
   return fetch(apiUrl(path), init).then(function(res) {
@@ -4626,7 +4636,7 @@ function startSse() {
   sseFailures = 0;
   setConn('connecting', 'connecting');
   try {
-    sse = new EventSource(apiUrl('/api/events?token=' + encodeURIComponent(token)));
+    sse = new EventSource(apiUrl('/api/events' + (token ? '?token=' + encodeURIComponent(token) : '')));
   } catch (err) {
     showMsg('dashboard: SSE unavailable, falling back to polling', true);
     startPolling();
@@ -4692,7 +4702,7 @@ var missingWsRedirected = false;
 
 function poll() {
   fetch(apiUrl('/api/state'), {
-    headers: { Authorization: 'Bearer ' + token },
+    headers: apiAuthHeaders(false),
     cache: 'no-store'
   })
     .then(function(res) {
@@ -4770,15 +4780,6 @@ function init() {
   // Graph controls (toggle, pan/zoom, details) work without a token too.
   bindGraphControls();
   bindCenterViews();
-
-  if (!token) {
-    showMsg(
-      'Missing access token. Start DmuxAI and open the dashboard URL it prints ' +
-      '(for example: dmuxai serve, then open http://127.0.0.1:7420/?token=...).',
-      true
-    );
-    return;
-  }
 
   render(Date.now());
   bindTodoForm();

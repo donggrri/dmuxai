@@ -24,10 +24,14 @@ use crate::mcp::registry::{ImportError, McpRegistry};
 use crate::memory::{MemoryError, MemoryHandle, Proposal, SaveOutcome};
 use crate::todo::{NewTodo, TodoError, TodoPatch, TodoSource, TodoStatus};
 use crate::web::DEFAULT_PORT;
-use crate::web::auth::{BindCheck, check_bind, dashboard_url, token_matches};
+use crate::web::access::{WebAccess, check_guarded_request, host_allowed, is_guarded_path};
+use crate::web::auth::{BindCheck, check_bind, dashboard_url};
 use crate::web::commands::{DashboardCommand, RunMode, RunTodoError, SessionCommand};
 use crate::web::directory::{WorkspaceDirectory, WorkspaceEntry};
 use crate::web::hub::DashboardHub;
+use crate::web::local_peer::{
+    LocalPeerSource, shared_peer_source, windows_host_ipv4, wsl_nat_listen_ipv4,
+};
 
 /// Injectable re-execution hook for `POST /api/workspace/switch` (FR-874, TC-875).
 /// Arguments are `(executable, argv_after_arg0, dashboard_token)`.
@@ -95,20 +99,46 @@ pub struct ServerConfig {
     pub bind: IpAddr,
     pub port: u16,
     pub allow_remote: bool,
+    pub bind_explicit: bool,
     pub token: String,
+    pub token_required: bool,
+    pub trust_wsl_host: bool,
+    pub discovery_mode: String,
+    pub peer_source: Option<Arc<dyn LocalPeerSource>>,
     pub services: DashboardServices,
+}
+
+impl ServerConfig {
+    pub fn for_tests(bind: IpAddr, port: u16, token: String, services: DashboardServices) -> Self {
+        Self {
+            bind,
+            port,
+            allow_remote: false,
+            bind_explicit: false,
+            token,
+            token_required: true,
+            trust_wsl_host: false,
+            discovery_mode: "web".to_owned(),
+            peer_source: None,
+            services,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    token: Arc<String>,
-    allowed_hosts: Option<Arc<Vec<String>>>,
+    pub(crate) access: WebAccess,
     workspaces: Arc<WorkspaceDirectory>,
+}
+
+#[derive(Clone, Default)]
+struct ConnectionAccessState {
+    loopback_peer_checked: bool,
 }
 
 impl AppState {
     pub(crate) fn token(&self) -> &str {
-        self.token.as_str()
+        self.access.token.as_str()
     }
 }
 
@@ -131,6 +161,8 @@ impl FromRequestParts<AppState> for Ws {
 pub struct DashboardServer {
     pub addr: SocketAddr,
     pub url: String,
+    pub windows_url: Option<String>,
+    pub token_required: bool,
     pub warning: Option<String>,
     workspaces: Arc<WorkspaceDirectory>,
     handle: tokio::task::JoinHandle<()>,
@@ -1541,27 +1573,31 @@ fn import_error_response(error: ImportError) -> Response {
 
 async fn security_and_auth_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    // 1. Host header validation
     let host_header = match req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
     {
         Some(h) => h,
         None => return StatusCode::FORBIDDEN.into_response(),
     };
 
-    if let Some(ref allowed) = state.allowed_hosts
-        && !allowed.iter().any(|h| h == host_header)
-    {
+    if !host_allowed(&state.access, host_header.as_str()) {
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // 2. Origin validation (when present)
-    if let Some(origin) = req.headers().get(header::ORIGIN) {
+    let path = req.uri().path().to_owned();
+    let query = req.uri().query().map(str::to_owned);
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+
+    if let Some(origin) = headers.get(header::ORIGIN)
+        && !is_guarded_path(&path)
+    {
         let origin_str = match origin.to_str() {
             Ok(s) => s,
             Err(_) => return StatusCode::FORBIDDEN.into_response(),
@@ -1572,59 +1608,32 @@ async fn security_and_auth_middleware(
         }
     }
 
-    // 3. /api/* auth validation
-    let path = req.uri().path();
-    let is_api_path = path.starts_with("/api/")
-        || path == "/api"
-        || path.starts_with("//api/")
-        || path.contains("/api/");
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let mut conn_state = req
+        .extensions_mut()
+        .get::<ConnectionAccessState>()
+        .cloned()
+        .unwrap_or_default();
 
-    if is_api_path {
-        let mut provided_token: Option<&str> = None;
-
-        if let Some(auth_val) = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        {
-            let mut parts = auth_val.splitn(2, ' ');
-            let scheme = parts.next().unwrap_or_default();
-            let tok = parts.next().unwrap_or_default();
-            if scheme.eq_ignore_ascii_case("bearer") && !tok.trim().is_empty() {
-                provided_token = Some(tok.trim());
-            }
-        }
-
-        if provided_token.is_none()
-            && let Some(query) = req.uri().query()
-        {
-            for pair in query.split('&') {
-                if let Some((k, v)) = pair.split_once('=')
-                    && k == "token"
-                {
-                    if !v.is_empty() {
-                        provided_token = Some(v);
-                    }
-                    break;
-                }
-            }
-        }
-
-        let is_valid = match provided_token {
-            Some(tok) => token_matches(&state.token, tok),
-            None => false,
-        };
-
-        if !is_valid {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::CONTENT_TYPE, "application/json")],
-                r#"{"error":"unauthorized"}"#,
-            )
-                .into_response();
-        }
+    if is_guarded_path(&path)
+        && let Err(resp) = check_guarded_request(
+            &state.access,
+            &method,
+            &path,
+            &headers,
+            &host_header,
+            query.as_deref(),
+            peer,
+            &mut conn_state.loopback_peer_checked,
+        )
+    {
+        return resp;
     }
 
+    req.extensions_mut().insert(conn_state);
     next.run(req).await
 }
 
@@ -1981,7 +1990,7 @@ async fn post_workspace_switch(
     // flag must be committed or cancelled even if the client disconnects and
     // axum drops this handler future.
     tokio::spawn(workspace_switch_task(
-        state.token.clone(),
+        state.access.token.clone(),
         ws.clone(),
         canonical,
     ))
@@ -2230,11 +2239,15 @@ pub fn build_router_with_directory(
     token: String,
     allowed_hosts: Option<Vec<String>>,
 ) -> Router {
-    let state = AppState {
-        token: Arc::new(token),
-        allowed_hosts: allowed_hosts.map(Arc::new),
-        workspaces,
-    };
+    let access = WebAccess::legacy_token_required(token, allowed_hosts);
+    build_router_with_directory_access(workspaces, access)
+}
+
+pub fn build_router_with_directory_access(
+    workspaces: Arc<WorkspaceDirectory>,
+    access: WebAccess,
+) -> Router {
+    let state = AppState { access, workspaces };
 
     Router::new()
         .route("/", get(get_index))
@@ -2336,8 +2349,6 @@ pub async fn start_server(
     };
 
     let bind_addr = SocketAddr::new(config.bind, config.port);
-    // FR-1462: a port held by another process falls back to a free port for
-    // the default and an explicit `--port` alike; an explicit one is reported.
     let mut port_in_use = false;
     let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(l) => l,
@@ -2358,17 +2369,28 @@ pub async fn start_server(
         });
     }
 
-    let allowed_hosts = if config.bind.is_loopback() {
-        Some(vec![
-            format!("127.0.0.1:{port}"),
-            format!("localhost:{port}"),
-            format!("[::1]:{port}"),
-        ])
+    let peer_source = config
+        .peer_source
+        .clone()
+        .unwrap_or_else(shared_peer_source);
+    let bind_ip = if addr.ip().is_unspecified() {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     } else {
-        None
+        addr.ip()
     };
+    let loopback_access = WebAccess::loopback(
+        config.token.clone(),
+        config.token_required,
+        bind_ip,
+        port,
+        peer_source.clone(),
+    );
+    let wsl_access = wsl_extra_listener_access(&config, port, peer_source.clone());
 
-    let url = dashboard_url(addr, &config.token);
+    let url = dashboard_url(addr, &config.token, config.token_required);
+    let mut windows_url = None;
+    let mut wsl_warning = None;
+
     let mut switch_cfg = hub
         .switch_config()
         .unwrap_or_else(|| WorkspaceSwitchConfig {
@@ -2378,19 +2400,84 @@ pub async fn start_server(
     switch_cfg.bound_port = Some(port);
     hub.set_switch_config(switch_cfg);
     let workspaces = Arc::new(WorkspaceDirectory::single(hub, config.services));
-    let router = build_router_with_directory(workspaces.clone(), config.token, allowed_hosts);
+    let loopback_router =
+        build_router_with_directory_access(workspaces.clone(), loopback_access.clone());
+    let loopback_make = loopback_router.into_make_service_with_connect_info::<SocketAddr>();
+
+    let wsl_listener = if let Some((wsl_ip, access)) = wsl_access {
+        let wsl_addr = SocketAddr::new(wsl_ip, port);
+        windows_url = Some(crate::web::auth::dashboard_url_plain(wsl_addr));
+        match tokio::net::TcpListener::bind(wsl_addr).await {
+            Ok(wsl_listener) => {
+                let wsl_router = build_router_with_directory_access(workspaces.clone(), access);
+                let wsl_make = wsl_router.into_make_service_with_connect_info::<SocketAddr>();
+                Some((wsl_listener, wsl_make))
+            }
+            Err(error) => {
+                wsl_warning = Some(format!(
+                    "warning: could not bind WSL interface address {wsl_ip}: {error}"
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(msg) = wsl_warning {
+        warning = Some(match warning {
+            Some(existing) => format!("{existing}\n{msg}"),
+            None => msg,
+        });
+    }
 
     let handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        if let Some((wsl_listener, wsl_make)) = wsl_listener {
+            let wsl_serve = tokio::spawn(async move {
+                let _ = axum::serve(wsl_listener, wsl_make).await;
+            });
+            let _ = tokio::join!(axum::serve(listener, loopback_make), wsl_serve,);
+        } else {
+            let _ = axum::serve(listener, loopback_make).await;
+        }
     });
 
     Ok(DashboardServer {
         addr,
         url,
+        windows_url,
+        token_required: config.token_required,
         warning,
         workspaces,
         handle,
     })
+}
+
+fn wsl_extra_listener_access(
+    config: &ServerConfig,
+    port: u16,
+    peer_source: Arc<dyn LocalPeerSource>,
+) -> Option<(IpAddr, WebAccess)> {
+    if !config.trust_wsl_host
+        || config.bind_explicit
+        || !config.bind.is_loopback()
+        || config.allow_remote
+    {
+        return None;
+    }
+    let wsl_ip = wsl_nat_listen_ipv4(peer_source.as_ref())?;
+    let host_peer = windows_host_ipv4(peer_source.as_ref()).map(IpAddr::V4)?;
+    Some((
+        IpAddr::V4(wsl_ip),
+        WebAccess::wsl_interface(
+            config.token.clone(),
+            config.token_required,
+            IpAddr::V4(wsl_ip),
+            port,
+            Some(host_peer),
+            peer_source,
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -2433,6 +2520,42 @@ mod tests {
         assert!(session_command_needs_web_write(
             &SessionCommand::GraphCancel
         ));
+    }
+
+    // TC-2950 / FR-2950
+    #[tokio::test]
+    async fn tc_2950_loopback_api_without_token_is_accepted_and_wrong_token_rejected() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/test".to_string());
+        let token = "test-token-secret-12345".to_string();
+        let access = WebAccess::loopback(
+            token.clone(),
+            false,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7420,
+            crate::web::local_peer::shared_peer_source(),
+        );
+        let router = build_router_with_directory_access(
+            Arc::new(WorkspaceDirectory::single(hub, Default::default())),
+            access,
+        );
+
+        let req_no_token = axum::http::Request::builder()
+            .uri("/api/state")
+            .header("Host", "localhost:7420")
+            .header("x-dmuxai-client", "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req_no_token).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req_wrong = axum::http::Request::builder()
+            .uri("/api/state")
+            .header("Host", "localhost:7420")
+            .header("Authorization", "Bearer wrong-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req_wrong).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // TC-522: api_requires_token
@@ -2614,13 +2737,12 @@ mod tests {
     async fn tc_527_sse_streams_initial_and_updated_snapshots() {
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         let token = generate_token();
-        let config = ServerConfig {
-            bind: "127.0.0.1".parse().unwrap(),
-            port: 0,
-            allow_remote: false,
-            token: token.clone(),
-            services: DashboardServices::default(),
-        };
+        let config = ServerConfig::for_tests(
+            "127.0.0.1".parse().unwrap(),
+            0,
+            token.clone(),
+            DashboardServices::default(),
+        );
 
         let server = start_server(config, hub.clone()).await.unwrap();
 
@@ -3746,7 +3868,7 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // foreign Origin -> 403
+        // foreign Origin with a valid token is allowed (bearer auth).
         let req = axum::http::Request::builder()
             .method("GET")
             .uri("/api/todos")
@@ -3756,7 +3878,7 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // TC-570 / FR-563: link fields validate on POST/PATCH (400), round-trip in
@@ -4395,7 +4517,7 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 6. 403 foreign Origin
+        // 6. foreign Origin with a valid bearer token is allowed
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/api/prompt")
@@ -4406,7 +4528,7 @@ mod tests {
             .body(axum::body::Body::from(r#"{"text":"hello"}"#))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
         // UX-933: optional `route` (auto | plan | direct), slash wins, empty/unknown → 400
         let (tx, seen) = spawn_prompt_route_capture();
@@ -4647,22 +4769,22 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let config = ServerConfig {
-            bind: "127.0.0.1".parse().unwrap(),
-            port: 0,
-            allow_remote: false,
-            token: token.clone(),
-            services: DashboardServices {
-                mcp: None,
-                todos: None,
-                commands: None,
-                web_attached: false,
-                events_path: Some(events_file.clone()),
-                memory: None,
-                docs: None,
-                jira: None,
-                trust_env: None,
-            },
+        let mut config = ServerConfig::for_tests(
+            "127.0.0.1".parse().unwrap(),
+            0,
+            token.clone(),
+            DashboardServices::default(),
+        );
+        config.services = DashboardServices {
+            mcp: None,
+            todos: None,
+            commands: None,
+            web_attached: false,
+            events_path: Some(events_file.clone()),
+            memory: None,
+            docs: None,
+            jira: None,
+            trust_env: None,
         };
         let server = start_server(config, hub).await.unwrap();
         let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
@@ -5791,13 +5913,12 @@ mod tests {
             jira: None,
             trust_env: None,
         };
-        let config = ServerConfig {
-            bind: "127.0.0.1".parse().unwrap(),
-            port: taken,
-            allow_remote: false,
-            token: "port-in-use-token-0123456789abcdef".to_owned(),
+        let config = ServerConfig::for_tests(
+            "127.0.0.1".parse().unwrap(),
+            taken,
+            "port-in-use-token-0123456789abcdef".to_owned(),
             services,
-        };
+        );
         let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
         let server = start_server(config, hub).await.expect("falls back");
         assert_ne!(server.addr.port(), taken);
@@ -5828,7 +5949,9 @@ mod tests {
                 base_url: "http://127.0.0.1:7421".to_owned(),
                 port: 7421,
                 pid: std::process::id(),
-                token: "abcdefghijklmnopqrstuvwxyz012345".to_owned(),
+                token_required: true,
+                token_required_explicit: false,
+                token: Some("abcdefghijklmnopqrstuvwxyz012345".to_owned()),
             },
         )
         .unwrap();

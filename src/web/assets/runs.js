@@ -156,7 +156,7 @@ function runsStreamRunNeedsRefetch(streamRun, prev) {
 function runsFetchJson(path) {
   var tok = runsToken();
   return fetch(runsApiUrl(path), {
-    headers: tok ? { Authorization: 'Bearer ' + tok } : {},
+    headers: tok ? { Authorization: 'Bearer ' + tok, 'X-Dmuxai-Client': '1' } : { 'X-Dmuxai-Client': '1' },
     cache: 'no-store'
   }).then(function (res) {
     if (!res.ok) {

@@ -172,12 +172,8 @@
   function api(method, path, body) {
     // Re-read per request: the token rotates and app.js removes it on 401.
     var token = currentToken();
-    if (!token) {
-      return Promise.reject(
-        fatalError('missing dashboard token (reopen the ?token= URL)')
-      );
-    }
-    var headers = { Authorization: 'Bearer ' + token };
+    var headers = { 'X-Dmuxai-Client': '1' };
+    if (token) { headers.Authorization = 'Bearer ' + token; }
     var init = { method: method, headers: headers, cache: 'no-store' };
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';

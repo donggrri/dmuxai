@@ -100,16 +100,15 @@ async fn copy_button_copies_raw_markdown_in_headless_chrome() {
     let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_owned());
     hub.publish(Vec::new(), None, None);
     hub.set_session(Some(session("first snapshot")));
-    let config = ServerConfig {
-        bind: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        allow_remote: false,
-        token: "test-token-copy-reply".to_owned(),
-        services: DashboardServices {
+    let config = ServerConfig::for_tests(
+        "127.0.0.1".parse().unwrap(),
+        0,
+        "test-token-copy-reply".to_owned(),
+        DashboardServices {
             web_attached: true,
             ..Default::default()
         },
-    };
+    );
     let server = start_server(config, hub.clone())
         .await
         .expect("start server");

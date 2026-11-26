@@ -5,6 +5,14 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- **Loopback dashboard is tokenless by default (SPEC-web-local-access).** Local
+  agents and curl can call `/api/*` without `?token=`; CSRF guards, Host checks,
+  and optional `[web] require_token` / WSL host trust restore stricter modes.
+  User-level `web.json` discovery under the state directory; `status --json`
+  reports `token_required` and `source`.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

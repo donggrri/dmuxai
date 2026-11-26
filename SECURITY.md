@@ -30,21 +30,25 @@ real credentials, API keys, or private keys to the tree or to commit messages.
 
 ## Dashboard access token
 
-`dmuxai --web` and `dmuxai serve` print a dashboard URL that includes a **per-start access
-token** as the `?token=` query parameter. That token authorizes every `/api/*` request for
-that server instance until it exits. With the default loopback bind, exposure is limited to
-processes and users on the same machine (or anyone who can reach a non-loopback bind when
-`--allow-remote` is used), but the token must still be treated as a **secret**.
+`dmuxai --web` and `dmuxai serve` bind the dashboard to loopback **without** a token
+by default: any local process on the same machine (and, on Linux, other local OS
+users when their peer socket is not visible in `/proc/net/tcp`) can call `/api/*`.
+In WSL2 NAT mode, processes on the Windows host and traffic forwarded from the NAT
+gateway are treated as local on the WSL interface listener; other peers need the
+token.
 
-- The startup line can persist in **terminal scrollback**, session logs, CI output, and
-  screenshots.
-- Opening the URL in a browser can record the full token in **browser history**.
-- **Redact** dashboard URLs and token values before pasting logs into a **bug report**, a
+Opt back into token-required mode with `[web] require_token = true`,
+`DMUXAI_WEB_REQUIRE_TOKEN=1`, `DMUXAI_WEB_TOKEN`, or a non-loopback bind with
+`--allow-remote`. When a token is in use it authorizes `/api/*` until the server
+exits and must be treated as a **secret** (`?token=` in the URL, discovery files).
+
+- Startup lines can persist in **scrollback**, session logs, CI output, and screenshots.
+- **Redact** dashboard URLs and tokens before pasting logs into a **bug report**, a
   public issue, or a chat channel.
-- `DMUXAI_WEB_TOKEN` sets a fixed token instead of a random per-start value. Do not commit
-  it, publish it in configuration repos, or reuse a production token in development logs.
+- `DMUXAI_WEB_TOKEN` sets a fixed token. Do not commit it or reuse production tokens in logs.
+- Set `[web] trust_wsl_host = false` to disable the WSL NAT listener.
 
-See the **Dashboard token** section in [README.md](README.md) for user-facing detail.
+See **Dashboard token** in [README.md](README.md).
 
 ## Workspace configuration trust
 

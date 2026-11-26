@@ -23,13 +23,14 @@ fn tc_2513_readme_documents_dashboard_token() {
     for needle in [
         "dmuxai --web",
         "dmuxai serve",
-        "per-start",
+        "require_token",
         "treat",
         "scrollback",
         "browser history",
         "redact",
         "?token=",
         "DMUXAI_WEB_TOKEN",
+        "DMUXAI_WEB_REQUIRE_TOKEN",
     ] {
         assert!(
             section
@@ -43,16 +44,46 @@ fn tc_2513_readme_documents_dashboard_token() {
 
 // TC-2514 / FR-2514
 #[test]
+fn tc_2965_docs_state_tokenless_default_tradeoff_wsl_and_opt_out() {
+    let readme = read("README.md");
+    let section = section_after_heading(&readme, "### Dashboard token");
+    for needle in [
+        "without",
+        "require_token",
+        "trust_wsl_host",
+        "WSL",
+        "localhost",
+        "tradeoff",
+        "DMUXAI_WEB_REQUIRE_TOKEN",
+    ] {
+        assert!(
+            section
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()),
+            "README dashboard section missing: {needle}"
+        );
+    }
+    let security = read("SECURITY.md");
+    let sec = section_after_heading(&security, "## Dashboard access token");
+    assert!(sec.to_ascii_lowercase().contains("wsl"));
+    assert!(sec.to_ascii_lowercase().contains("require_token"));
+    let api = read("docs/API.md");
+    assert!(api.contains("X-Dmuxai-Client"));
+    assert!(api.contains("token_required"));
+}
+
+// TC-2514 / FR-2514
+#[test]
 fn tc_2514_security_documents_dashboard_token() {
     let security = read("SECURITY.md");
     let section = section_after_heading(&security, "## Dashboard access token");
     for needle in [
-        "per-start",
+        "require_token",
         "dmuxai --web",
         "dmuxai serve",
         "scrollback",
         "redact",
-        "browser history",
+        "trust_wsl_host",
         "DMUXAI_WEB_TOKEN",
         "bug report",
     ] {

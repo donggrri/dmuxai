@@ -3,6 +3,7 @@
 //! API contract shared by `src/main.rs` (CLI/startup) and `src/app.rs`
 //! (in-process publishing). Implementation lives in the submodules.
 
+pub mod access;
 pub mod assets;
 pub mod attachments_api;
 mod auth;
@@ -14,12 +15,17 @@ pub mod docs_api;
 mod file_source;
 mod hub;
 pub mod layout;
+pub mod local_peer;
 pub mod parity;
 pub mod runs_api;
 mod server;
 mod snapshot;
 
-pub use auth::{BindCheck, check_bind, dashboard_url, generate_token};
+pub use access::{WebAccess, build_allowed_hosts};
+pub use auth::{
+    BindCheck, check_bind, dashboard_url, dashboard_url_plain, generate_token,
+    resolve_token_required,
+};
 pub use docs_api::{DocsService, OpenTickets};
 pub use file_source::FileGraphSource;
 pub use hub::DashboardHub;

@@ -156,6 +156,46 @@ pub fn runner_run_admitted(settings: &DmuxSettings, runner: &str) -> bool {
     }
 }
 
+fn resolve_status_dashboard(workspace_root: &Path) -> Value {
+    if let Some(d) = crate::web::discovery::read_discovery(workspace_root)
+        && crate::web::discovery::process_alive(d.pid)
+    {
+        let url = crate::workspace::discovery_dashboard_url(&d);
+        return json!({
+            "url": url,
+            "port": d.port,
+            "pid": d.pid,
+            "process_alive": true,
+            "token_required": d.token_required,
+            "source": "workspace",
+            "token_file": crate::web::discovery::discovery_path(workspace_root).display().to_string(),
+        });
+    }
+    if let Some(d) = crate::web::discovery::read_user_discovery() {
+        let url = d.base_url.trim_end_matches('/').to_string();
+        let mut val = json!({
+            "url": url,
+            "port": d.port,
+            "pid": d.pid,
+            "process_alive": true,
+            "token_required": d.token_required,
+            "source": "user",
+        });
+        if d.token_required
+            && let Some(tok) = d.token
+        {
+            val["token_file"] = json!(
+                crate::web::discovery::user_discovery_path()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            );
+            let _ = tok;
+        }
+        return val;
+    }
+    Value::Null
+}
+
 /// `dmuxai status --json` (FR-763).
 pub fn status_json(workspace_root: &Path) -> Value {
     let settings = DmuxSettings::load(workspace_root);
@@ -280,16 +320,7 @@ pub fn status_json(workspace_root: &Path) -> Value {
     let events_path = crate::events::events_path(workspace_root);
     let last_seq = crate::events::EventLog::open(workspace_root, workspace.clone()).last_seq();
 
-    let dashboard = crate::web::discovery::read_discovery(workspace_root)
-        .map(|d| {
-            json!({
-                "base_url": d.base_url,
-                "port": d.port,
-                "pid": d.pid,
-                "token_file": crate::web::discovery::discovery_path(workspace_root).display().to_string(),
-            })
-        })
-        .unwrap_or(Value::Null);
+    let dashboard = resolve_status_dashboard(workspace_root);
 
     json!({
         "workspace": workspace,
@@ -1333,6 +1364,38 @@ mod tests {
                     Some("Claude Sonnet 5.5 (High)".to_owned())
                 ),
             ]
+        );
+    }
+
+    // TC-2958 / FR-2958
+    #[test]
+    fn tc_2958_status_reports_one_dashboard_schema_from_workspace_or_user_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let d = crate::web::discovery::Discovery {
+            base_url: "http://127.0.0.1:7420".to_owned(),
+            port: 7420,
+            pid: std::process::id(),
+            token_required: false,
+            token_required_explicit: false,
+            token: None,
+        };
+        crate::web::discovery::write_discovery(workspace.path(), &d).unwrap();
+        let val = status_json(workspace.path());
+        let dash = val.get("dashboard").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(
+            dash.get("source").and_then(|s| s.as_str()),
+            Some("workspace")
+        );
+        assert_eq!(
+            dash.get("token_required").and_then(|t| t.as_bool()),
+            Some(false)
+        );
+        assert!(
+            !dash
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .contains("token=")
         );
     }
 }

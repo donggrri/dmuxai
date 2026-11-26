@@ -12,9 +12,24 @@ pub fn generate_token() -> String {
     format!("{u1}{u2}").to_ascii_lowercase()
 }
 
-pub fn dashboard_url(addr: SocketAddr, token: &str) -> String {
+pub fn dashboard_url(addr: SocketAddr, token: &str, token_required: bool) -> String {
     let port = addr.port();
-    let host = match addr.ip() {
+    let host = dashboard_host(addr);
+    if token_required {
+        format!("http://{host}:{port}/?token={token}")
+    } else {
+        format!("http://{host}:{port}/")
+    }
+}
+
+pub fn dashboard_url_plain(addr: SocketAddr) -> String {
+    let port = addr.port();
+    let host = dashboard_host(addr);
+    format!("http://{host}:{port}/")
+}
+
+fn dashboard_host(addr: SocketAddr) -> String {
+    match addr.ip() {
         ip if ip.is_unspecified() => {
             if addr.is_ipv4() {
                 "127.0.0.1".to_string()
@@ -24,8 +39,50 @@ pub fn dashboard_url(addr: SocketAddr, token: &str) -> String {
         }
         IpAddr::V4(ip) => ip.to_string(),
         IpAddr::V6(ip) => format!("[{ip}]"),
-    };
-    format!("http://{host}:{port}/?token={token}")
+    }
+}
+
+/// Whether the dashboard must reject unauthenticated `/api/*` requests (FR-2951).
+pub fn resolve_token_required(
+    config_require_token: bool,
+    bind: IpAddr,
+    allow_remote: bool,
+    explicit_env_token: bool,
+) -> bool {
+    if let Ok(value) = std::env::var("DMUXAI_WEB_TOKEN_REQUIRED") {
+        if value == "0" {
+            if !config_require_token
+                && !env_require_token_flag()
+                && !explicit_env_token
+                && bind_is_loopback_for_policy(bind, allow_remote)
+            {
+                return false;
+            }
+        } else if value == "1" {
+            return true;
+        }
+    }
+    if config_require_token || env_require_token_flag() || explicit_env_token {
+        return true;
+    }
+    !bind_is_loopback_for_policy(bind, allow_remote)
+}
+
+fn env_require_token_flag() -> bool {
+    matches!(
+        std::env::var("DMUXAI_WEB_REQUIRE_TOKEN").ok().as_deref(),
+        Some("1")
+    )
+}
+
+pub fn bind_is_loopback_for_policy(bind: IpAddr, allow_remote: bool) -> bool {
+    if bind.is_loopback() {
+        return true;
+    }
+    if bind.is_unspecified() && !allow_remote {
+        return true;
+    }
+    false
 }
 
 pub fn check_bind(ip: IpAddr, allow_remote: bool) -> Result<BindCheck, String> {
@@ -87,20 +144,89 @@ mod tests {
         );
 
         let addr_v4: SocketAddr = "127.0.0.1:7420".parse().unwrap();
-        let url_v4 = dashboard_url(addr_v4, &t1);
+        let url_v4 = dashboard_url(addr_v4, &t1, true);
         assert_eq!(url_v4, format!("http://127.0.0.1:7420/?token={t1}"));
+        let url_v4_plain = dashboard_url(addr_v4, &t1, false);
+        assert_eq!(url_v4_plain, "http://127.0.0.1:7420/");
 
         let addr_v6: SocketAddr = "[::1]:7420".parse().unwrap();
-        let url_v6 = dashboard_url(addr_v6, &t1);
+        let url_v6 = dashboard_url(addr_v6, &t1, true);
         assert_eq!(url_v6, format!("http://[::1]:7420/?token={t1}"));
 
         let addr_unspec_v4: SocketAddr = "0.0.0.0:7420".parse().unwrap();
-        let url_unspec_v4 = dashboard_url(addr_unspec_v4, &t1);
+        let url_unspec_v4 = dashboard_url(addr_unspec_v4, &t1, true);
         assert_eq!(url_unspec_v4, format!("http://127.0.0.1:7420/?token={t1}"));
 
         let addr_unspec_v6: SocketAddr = "[::]:7420".parse().unwrap();
-        let url_unspec_v6 = dashboard_url(addr_unspec_v6, &t1);
+        let url_unspec_v6 = dashboard_url(addr_unspec_v6, &t1, true);
         assert_eq!(url_unspec_v6, format!("http://[::1]:7420/?token={t1}"));
+    }
+
+    // TC-2956 / FR-2956
+    #[test]
+    fn tc_2956_printed_url_has_no_token_when_not_required() {
+        let addr: SocketAddr = "127.0.0.1:7420".parse().unwrap();
+        let token = "a".repeat(64);
+        assert_eq!(dashboard_url(addr, &token, false), "http://127.0.0.1:7420/");
+        assert!(dashboard_url(addr, &token, true).contains("?token="));
+    }
+
+    // TC-2951 partial / FR-2951
+    #[test]
+    fn tc_2951_require_token_config_env_token_remote_bind_and_reexec_enforce_token() {
+        let prev_req = std::env::var_os("DMUXAI_WEB_REQUIRE_TOKEN");
+        let prev_state = std::env::var_os("DMUXAI_WEB_TOKEN_REQUIRED");
+        unsafe { std::env::remove_var("DMUXAI_WEB_REQUIRE_TOKEN") };
+        unsafe { std::env::remove_var("DMUXAI_WEB_TOKEN_REQUIRED") };
+
+        assert!(!resolve_token_required(
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            false
+        ));
+        assert!(resolve_token_required(
+            true,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            false
+        ));
+
+        unsafe { std::env::set_var("DMUXAI_WEB_REQUIRE_TOKEN", "1") };
+        assert!(resolve_token_required(
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            false
+        ));
+        unsafe { std::env::remove_var("DMUXAI_WEB_REQUIRE_TOKEN") };
+
+        let remote: IpAddr = "192.168.1.1".parse().unwrap();
+        assert!(resolve_token_required(false, remote, true, false));
+
+        unsafe { std::env::set_var("DMUXAI_WEB_TOKEN_REQUIRED", "0") };
+        assert!(!resolve_token_required(
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            false
+        ));
+        unsafe { std::env::set_var("DMUXAI_WEB_TOKEN_REQUIRED", "1") };
+        assert!(resolve_token_required(
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            false
+        ));
+
+        match prev_req {
+            Some(v) => unsafe { std::env::set_var("DMUXAI_WEB_REQUIRE_TOKEN", v) },
+            None => unsafe { std::env::remove_var("DMUXAI_WEB_REQUIRE_TOKEN") },
+        }
+        match prev_state {
+            Some(v) => unsafe { std::env::set_var("DMUXAI_WEB_TOKEN_REQUIRED", v) },
+            None => unsafe { std::env::remove_var("DMUXAI_WEB_TOKEN_REQUIRED") },
+        }
     }
 
     // TC-524: bind_policy_requires_opt_in_for_non_loopback
