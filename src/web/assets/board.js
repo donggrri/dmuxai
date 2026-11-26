@@ -145,24 +145,9 @@ function boardRenderMyDecisions(container, items) {
     ].filter(Boolean).join(' · ');
     card.appendChild(boardEl('div', 'board-decision-meta', meta));
     if (item.recommendation) {
-      card.appendChild(boardEl('div', 'board-decision-meta', item.recommendation));
+      card.appendChild(boardEl('div', 'board-decision-recommendation', item.recommendation));
     }
     var actions = boardEl('div', 'board-decision-actions');
-    var approve = boardEl('button', 'btn btn-small', 'Approve');
-    approve.type = 'button';
-    approve.setAttribute('data-board-action', 'approve');
-    approve.setAttribute('data-item-id', item.id);
-    actions.appendChild(approve);
-    var changes = boardEl('button', 'btn btn-small', 'Request changes');
-    changes.type = 'button';
-    changes.setAttribute('data-board-action', 'request_changes');
-    changes.setAttribute('data-item-id', item.id);
-    actions.appendChild(changes);
-    var reject = boardEl('button', 'btn btn-small', 'Reject');
-    reject.type = 'button';
-    reject.setAttribute('data-board-action', 'reject');
-    reject.setAttribute('data-item-id', item.id);
-    actions.appendChild(reject);
     if (item.options && item.options.length) {
       for (var oi = 0; oi < item.options.length; oi++) {
         var optBtn = boardEl('button', 'btn btn-small', item.options[oi]);
@@ -173,6 +158,21 @@ function boardRenderMyDecisions(container, items) {
         actions.appendChild(optBtn);
       }
     }
+    var approve = boardEl('button', 'btn btn-small btn-primary', 'Approve');
+    approve.type = 'button';
+    approve.setAttribute('data-board-action', 'approve');
+    approve.setAttribute('data-item-id', item.id);
+    actions.appendChild(approve);
+    var changes = boardEl('button', 'btn btn-small', 'Request changes');
+    changes.type = 'button';
+    changes.setAttribute('data-board-action', 'request_changes');
+    changes.setAttribute('data-item-id', item.id);
+    actions.appendChild(changes);
+    var reject = boardEl('button', 'btn btn-small btn-danger', 'Reject');
+    reject.type = 'button';
+    reject.setAttribute('data-board-action', 'reject');
+    reject.setAttribute('data-item-id', item.id);
+    actions.appendChild(reject);
     card.appendChild(actions);
     card.addEventListener('click', function (e) {
       if (e.target && e.target.getAttribute && e.target.getAttribute('data-board-action')) {
@@ -305,6 +305,31 @@ function boardCloseDrawer() {
   boardSelectedItem = null;
 }
 
+function boardPlanFieldInput(field, val) {
+  if (field === 'job') {
+    var area = document.createElement('textarea');
+    area.className = 'board-plan-job';
+    area.rows = 2;
+    area.value = val == null ? '' : String(val);
+    area.setAttribute('data-field', field);
+    return area;
+  }
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.value = val == null ? '' : String(val);
+  input.setAttribute('data-field', field);
+  return input;
+}
+
+function boardFormatChatTime(ms) {
+  if (!ms) { return ''; }
+  try {
+    return new Date(ms).toLocaleString();
+  } catch (err) {
+    return '';
+  }
+}
+
 function boardRenderPlanTable(tbody, plan) {
   tbody.textContent = '';
   if (!plan || !plan.steps) { return; }
@@ -315,15 +340,11 @@ function boardRenderPlanTable(tbody, plan) {
     var fields = ['id', 'role', 'runner', 'model', 'depends_on', 'job'];
     for (var fi = 0; fi < fields.length; fi++) {
       var td = document.createElement('td');
-      var input = document.createElement('input');
-      input.type = 'text';
       var val = step[fields[fi]];
       if (fields[fi] === 'depends_on' && Array.isArray(val)) {
         val = val.join(',');
       }
-      input.value = val == null ? '' : String(val);
-      input.setAttribute('data-field', fields[fi]);
-      td.appendChild(input);
+      td.appendChild(boardPlanFieldInput(fields[fi], val));
       tr.appendChild(td);
     }
     var delTd = document.createElement('td');
@@ -347,7 +368,7 @@ function boardRenderDrawer(item) {
   drawer.appendChild(boardEl('p', 'board-drawer-summary', item.summary || ''));
   if (item.plan) {
     drawer.appendChild(boardEl('p', 'board-plan-meta',
-      'Plan rev ' + item.plan.revision + ' · ' + (item.plan.hash || '')));
+      (item.plan.hash || '—') + ' · revision ' + item.plan.revision));
     if (boardPlanConflict) {
       drawer.appendChild(boardEl('p', 'board-plan-notice', 'Plan changed — reload'));
     }
@@ -410,8 +431,13 @@ function boardRenderDrawer(item) {
   if (item.thread) {
     for (var ti = 0; ti < item.thread.length; ti++) {
       var msg = item.thread[ti];
-      var line = boardEl('div', 'board-chat-msg',
-        msg.from + ' · ' + boardAgeMs(msg.at_ms) + '\n' + msg.text);
+      var line = boardEl('div', 'board-chat-msg');
+      if (msg.from === 'owner') {
+        line.classList.add('board-chat-msg-owner');
+      }
+      line.appendChild(boardEl('div', 'board-chat-sender', msg.from || 'unknown'));
+      line.appendChild(boardEl('div', 'board-chat-time', boardFormatChatTime(msg.at_ms)));
+      line.appendChild(boardEl('div', 'board-chat-bubble', msg.text || ''));
       thread.appendChild(line);
     }
   }
@@ -452,7 +478,7 @@ function boardCollectSteps() {
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
     var step = { id: '', role: '', runner: '', model: null, depends_on: [], job: '', task: null };
-    var inputs = row.querySelectorAll('input');
+    var inputs = row.querySelectorAll('input, textarea');
     for (var j = 0; j < inputs.length; j++) {
       var field = inputs[j].getAttribute('data-field');
       var val = inputs[j].value.trim();
@@ -492,10 +518,7 @@ function boardAddPlanStep() {
   var tr = document.createElement('tr');
   ['id', 'role', 'runner', 'model', 'depends_on', 'job'].forEach(function (field) {
     var td = document.createElement('td');
-    var input = document.createElement('input');
-    input.type = 'text';
-    input.setAttribute('data-field', field);
-    td.appendChild(input);
+    td.appendChild(boardPlanFieldInput(field, ''));
     tr.appendChild(td);
   });
   tr.appendChild(document.createElement('td'));
@@ -617,6 +640,31 @@ function boardSaveRules(panel) {
   }
 }
 
+function boardEnsureRequestChangesForm(card, id) {
+  if (!card || card.querySelector('.board-request-changes-form')) { return; }
+  var form = boardEl('div', 'board-request-changes-form');
+  var ta = document.createElement('textarea');
+  ta.className = 'board-request-changes-input';
+  ta.rows = 3;
+  ta.setAttribute('aria-label', 'Direction for changes');
+  ta.setAttribute('data-item-id', id);
+  form.appendChild(ta);
+  var row = boardEl('div', 'board-decision-actions');
+  var send = boardEl('button', 'btn btn-small btn-primary', 'Send');
+  send.type = 'button';
+  send.setAttribute('data-board-action', 'submit_changes');
+  send.setAttribute('data-item-id', id);
+  row.appendChild(send);
+  var cancel = boardEl('button', 'btn btn-small', 'Cancel');
+  cancel.type = 'button';
+  cancel.setAttribute('data-board-action', 'cancel_changes');
+  cancel.setAttribute('data-item-id', id);
+  row.appendChild(cancel);
+  form.appendChild(row);
+  card.appendChild(form);
+  ta.focus();
+}
+
 function boardOnActionClick(e) {
   var btn = e.target;
   if (!btn || !btn.getAttribute) { return; }
@@ -625,14 +673,28 @@ function boardOnActionClick(e) {
   var id = btn.getAttribute('data-item-id');
   if (!id) { return; }
   e.stopPropagation();
+  var card = btn.closest('.board-decision-card');
+  if (action === 'request_changes') {
+    boardEnsureRequestChangesForm(card, id);
+    return;
+  }
+  if (action === 'cancel_changes') {
+    var form = card && card.querySelector('.board-request-changes-form');
+    if (form) { form.remove(); }
+    return;
+  }
+  if (action === 'submit_changes') {
+    var area = card && card.querySelector('.board-request-changes-input');
+    if (area && area.value.trim()) {
+      boardDecide(id, 'request_changes', { text: area.value.trim() });
+    }
+    return;
+  }
   boardOpenDrawer(id);
   if (action === 'approve') {
     boardDecide(id, 'approve');
   } else if (action === 'reject') {
     boardDecide(id, 'reject');
-  } else if (action === 'request_changes') {
-    var text = window.prompt('Direction for changes');
-    if (text) { boardDecide(id, 'request_changes', { text: text }); }
   } else if (action === 'answer') {
     var opt = parseInt(btn.getAttribute('data-option'), 10);
     boardDecide(id, 'answer', { option: opt, text: btn.textContent });
@@ -649,6 +711,13 @@ function boardInit() {
   if (backdrop) {
     backdrop.addEventListener('click', boardCloseDrawer);
   }
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') { return; }
+    var wrap = document.getElementById('board-drawer-wrap');
+    if (wrap && !wrap.hidden && wrap.classList.contains('open')) {
+      boardCloseDrawer();
+    }
+  });
   document.addEventListener('dmuxai:center-view', function () {
     boardSyncViewState();
   });

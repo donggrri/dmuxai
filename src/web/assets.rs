@@ -2504,6 +2504,18 @@ mod tests {
         assert!(!BOARD_JS.contains("token="));
         assert!(BOARD_JS.contains("textContent"));
         assert!(BOARD_JS.contains("Authorization"));
+        let mut pos = 0usize;
+        while let Some(rel) = BOARD_CSS[pos..].find("var(--") {
+            let start = pos + rel + 6;
+            let rest = &BOARD_CSS[start..];
+            let name_end = rest.find([')', ',', ' ']).unwrap_or(rest.len());
+            let name = &rest[..name_end];
+            assert!(
+                APP_CSS.contains(&format!("--{name}:")),
+                "board.css uses var(--{name}) but app.css has no --{name}: definition"
+            );
+            pos = start + name_end;
+        }
     }
 
     #[tokio::test]
