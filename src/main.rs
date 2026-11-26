@@ -1330,6 +1330,7 @@ mod tests {
             parse_cli(["serve", "--bind", "127.0.0.1"]),
             CliAction::Serve(WebOptions {
                 bind: "127.0.0.1".parse().unwrap(),
+                bind_explicit: true,
                 ..web_default()
             })
         );
@@ -1337,6 +1338,7 @@ mod tests {
             parse_cli(["serve", "--bind", "[::1]"]),
             CliAction::Serve(WebOptions {
                 bind: "::1".parse().unwrap(),
+                bind_explicit: true,
                 ..web_default()
             })
         );
@@ -1344,6 +1346,7 @@ mod tests {
             parse_cli(["serve", "--bind", "::1"]),
             CliAction::Serve(WebOptions {
                 bind: "::1".parse().unwrap(),
+                bind_explicit: true,
                 ..web_default()
             })
         );
@@ -1352,6 +1355,7 @@ mod tests {
             CliAction::Serve(WebOptions {
                 bind: "0.0.0.0".parse().unwrap(),
                 allow_remote: true,
+                bind_explicit: true,
                 ..web_default()
             })
         );

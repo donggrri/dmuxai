@@ -524,7 +524,7 @@
     ui.quit = button('Quit', 'quit', function () {
       var cachedFolders = (openFolders || []).slice();
       fetch(apiUrl('/api/workspaces'), {
-        headers: authHeaders() },
+        headers: authHeaders(),
         cache: 'no-store'
       }).then(function (resp) {
         if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
@@ -2296,7 +2296,8 @@
               img.src = imageUrlCache[name];
             } else {
               fetch(apiUrl('/api/attachments/' + encodeURIComponent(name)), {
-                headers: authHeaders() }
+                headers: authHeaders(),
+                cache: 'no-store'
               }).then(function (resp) {
                 if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
                 return resp.blob();
@@ -2441,7 +2442,7 @@
   function refreshOpenFolders() {
     var previous = JSON.stringify(openFolders);
     fetch(apiUrl('/api/workspaces'), {
-      headers: authHeaders() },
+      headers: authHeaders(),
       cache: 'no-store'
     }).then(function (resp) {
       if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
