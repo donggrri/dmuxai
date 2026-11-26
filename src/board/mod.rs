@@ -642,6 +642,7 @@ mod tests {
                 }],
                 revision: 1,
                 history: vec![],
+                previous_steps: None,
             }),
             decision: Some(Decision {
                 verdict: Verdict::RequestChanges,

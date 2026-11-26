@@ -21,7 +21,7 @@ use crate::board::BoardStore;
 use crate::board::{
     BoardCaller, BoardError, BoardItem, BoardRules, DecideRequest, Lane, ListFilter, RulesStore,
     SayRequest, Verdict, default_actor_by, default_rules, edit_plan_from_json, resolve_actor,
-    valid_item_id,
+    unmasked_prompt_from_item_plan, valid_item_id,
 };
 use crate::graph::{PlanStep, PlanTask};
 use crate::web::server::{error_json, json_ok};
@@ -256,6 +256,7 @@ async fn board_plan(
     if !valid_item_id(&id) {
         return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
     }
+    let by = default_actor_by(BoardCaller::Dashboard);
     let state_root = state.state_root.clone();
     let board_base = state.board_base.clone();
     let item_id = id.clone();
@@ -268,11 +269,18 @@ async fn board_plan(
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            let prompt = item
-                .plan
-                .as_ref()
-                .map(|p| p.prompt.clone())
-                .unwrap_or_default();
+            let stored_prompt =
+                match unmasked_prompt_from_item_plan(&state_root, item.plan.as_ref()) {
+                    Ok(Some(prompt)) => prompt,
+                    Ok(None) => String::new(),
+                    Err(error) => return board_error_response(error),
+                };
+            if stored_prompt.trim().is_empty() {
+                return board_error_response(BoardError::Usage(
+                    "plan edit requires an existing plan or prompt".to_owned(),
+                ));
+            }
+            let inherit = item.plan.as_ref().map(|p| p.tasks.clone());
             let mut doc = serde_json::json!({ "steps": body.steps });
             if let Some(tasks) = body.tasks {
                 doc["tasks"] = serde_json::to_value(tasks).unwrap_or(serde_json::json!([]));
@@ -283,12 +291,14 @@ async fn board_plan(
                     return board_error_response(BoardError::Internal(error.to_string()));
                 }
             };
-            let edit = edit_plan_from_json(&workspace, &state_root, &prompt, &json_text);
+            let edit =
+                edit_plan_from_json(&workspace, &state_root, &stored_prompt, &json_text, inherit);
             match edit {
                 Ok((_pending, hash)) => {
                     let edit_id = id.clone();
+                    let by = by.clone();
                     match with_store(board_base, move |store| {
-                        store.edit_plan(&edit_id, &hash, &workspace, &state_root)
+                        store.edit_plan(&edit_id, &hash, &workspace, &state_root, &by)
                     })
                     .await
                     {
@@ -322,7 +332,7 @@ async fn board_lane(
     };
     let by = default_actor_by(BoardCaller::Dashboard);
     match with_store(state.board_base.clone(), move |store| {
-        store.move_lane(&id, lane, &by)
+        store.move_lane(&id, lane, &by, None)
     })
     .await
     {
@@ -585,6 +595,7 @@ mod tests {
                 recommendation: Some("ship".to_owned()),
                 options: vec!["A".to_owned()],
                 plan_hash: None,
+                key: None,
                 by: "bot:coord".to_owned(),
                 state_root: state.to_path_buf(),
             })
@@ -765,6 +776,7 @@ mod tests {
                     recommendation: None,
                     options: vec![],
                     plan_hash: None,
+                    key: None,
                     by: "bot:test".to_owned(),
                     state_root: state.clone(),
                 })
