@@ -741,11 +741,13 @@ with sync_playwright() as p:
     probe = b.new_page()
     probe.goto(sys.argv[2])
     probe.wait_for_function("() => document.querySelector('#graph-phase').textContent === 'completed'", timeout=15000)
-    from urllib.parse import urlparse, parse_qs
-    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
-    real = probe.evaluate("""async (t) => {
-        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
-        return await r.json(); }""", tok)
+    real = probe.evaluate("""async () => {
+        const params = new URLSearchParams(location.search);
+        const tok = params.get('token') || sessionStorage.getItem('dmuxai.token');
+        const h = {'X-Dmuxai-Client': '1'};
+        if (tok) { h.Authorization = 'Bearer ' + tok; }
+        const r = await fetch('/api/state', {headers: h});
+        return await r.json(); }""")
     probe.close()
 
     OLD_STEPS = [{"id": "a", "role": "plan", "runner": "cursor", "status": "completed", "started_at_ms": 1000, "finished_at_ms": 31000}]
@@ -928,11 +930,13 @@ with sync_playwright() as p:
     probe = b.new_page()
     probe.goto(sys.argv[2])
     probe.wait_for_function("() => document.querySelector('#graph-phase').textContent === 'completed'", timeout=15000)
-    from urllib.parse import urlparse, parse_qs
-    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
-    real = probe.evaluate("""async (t) => {
-        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
-        return await r.json(); }""", tok)
+    real = probe.evaluate("""async () => {
+        const params = new URLSearchParams(location.search);
+        const tok = params.get('token') || sessionStorage.getItem('dmuxai.token');
+        const h = {'X-Dmuxai-Client': '1'};
+        if (tok) { h.Authorization = 'Bearer ' + tok; }
+        const r = await fetch('/api/state', {headers: h});
+        return await r.json(); }""")
     probe.close()
 
     snap = copy.deepcopy(real)
@@ -1130,11 +1134,13 @@ with sync_playwright() as p:
     probe = b.new_page()
     probe.goto(sys.argv[2])
     probe.wait_for_timeout(500)
-    from urllib.parse import urlparse, parse_qs
-    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
-    real = probe.evaluate("""async (t) => {
-        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
-        return await r.json(); }""", tok)
+    real = probe.evaluate("""async () => {
+        const params = new URLSearchParams(location.search);
+        const tok = params.get('token') || sessionStorage.getItem('dmuxai.token');
+        const h = {'X-Dmuxai-Client': '1'};
+        if (tok) { h.Authorization = 'Bearer ' + tok; }
+        const r = await fetch('/api/state', {headers: h});
+        return await r.json(); }""")
     probe.close()
 
     now = int(time.time() * 1000)
@@ -1243,11 +1249,13 @@ with sync_playwright() as p:
     probe = b.new_page()
     probe.goto(sys.argv[2])
     probe.wait_for_timeout(500)
-    from urllib.parse import urlparse, parse_qs
-    tok = parse_qs(urlparse(sys.argv[2]).query)["token"][0]
-    real = probe.evaluate("""async (t) => {
-        const r = await fetch('/api/state', {headers: {Authorization: 'Bearer ' + t}});
-        return await r.json(); }""", tok)
+    real = probe.evaluate("""async () => {
+        const params = new URLSearchParams(location.search);
+        const tok = params.get('token') || sessionStorage.getItem('dmuxai.token');
+        const h = {'X-Dmuxai-Client': '1'};
+        if (tok) { h.Authorization = 'Bearer ' + tok; }
+        const r = await fetch('/api/state', {headers: h});
+        return await r.json(); }""")
     probe.close()
 
     now = int(time.time() * 1000)

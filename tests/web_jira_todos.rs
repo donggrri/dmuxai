@@ -181,13 +181,17 @@ with sync_playwright() as p:
     pg.locator("#jira-list .jira-item").first.locator("button", has_text="Copy to to-do").click()
     pg.wait_for_function("""async () => {
       const token = sessionStorage.getItem('dmuxai.token');
-      const res = await fetch('/api/todos', { headers: { Authorization: 'Bearer ' + token } });
+      const h = {'X-Dmuxai-Client': '1'};
+      if (token) { h.Authorization = 'Bearer ' + token; }
+      const res = await fetch('/api/todos', { headers: h });
       const todos = await res.json();
       return Array.isArray(todos) && todos.some(t => typeof t.title === 'string' && t.title.indexOf('DEMO-1') === 0);
     }""", timeout=15000)
     out["todos"] = pg.evaluate("""async () => {
       const token = sessionStorage.getItem('dmuxai.token');
-      const res = await fetch('/api/todos', { headers: { Authorization: 'Bearer ' + token } });
+      const h = {'X-Dmuxai-Client': '1'};
+      if (token) { h.Authorization = 'Bearer ' + token; }
+      const res = await fetch('/api/todos', { headers: h });
       return await res.json();
     }""")
     out["html"] = pg.content()
