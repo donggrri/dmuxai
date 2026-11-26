@@ -115,6 +115,7 @@ pub(crate) fn build_web_workspace(
         events_path: Some(dmuxai::events::events_path(workspace_root)),
         docs,
         trust_env: None,
+        board_base: None,
     };
 
     let sink = cli::build_event_sink(workspace_root, settings);

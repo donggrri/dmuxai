@@ -331,6 +331,7 @@ async fn tc_824_running_indicator_renders_in_headless_chrome() {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         },
     };
 

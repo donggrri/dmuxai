@@ -7,6 +7,8 @@ pub const AGENT_PROMPTS_JS: &str = include_str!("assets/agent-prompts.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
+pub const BOARD_JS: &str = include_str!("assets/board.js");
+pub const BOARD_CSS: &str = include_str!("assets/board.css");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
@@ -2452,5 +2454,76 @@ mod tests {
             .nth(1)
             .expect("runs css section");
         assert!(!runs_css.contains("text-transform: lowercase;"));
+    }
+
+    // TC-3122 / FR-3122: board markup, toggle, lanes, decision cards.
+    #[test]
+    fn tc_3122_board_view_markup_toggle_lanes_and_decision_cards() {
+        assert!(INDEX_HTML.contains("id=\"board-toggle\""));
+        assert!(INDEX_HTML.contains("data-view=\"board\""));
+        assert!(INDEX_HTML.contains("id=\"board\""));
+        assert!(INDEX_HTML.contains("board-my-decisions"));
+        assert!(INDEX_HTML.contains("id=\"board-kanban\""));
+        assert!(BOARD_JS.contains("'board-lane-' + laneId"));
+        assert!(BOARD_JS.contains("Approve"));
+        assert!(BOARD_JS.contains("Request changes"));
+        assert!(BOARD_JS.contains("Reject"));
+        assert!(INDEX_HTML.contains("/assets/board.js"));
+        assert!(INDEX_HTML.contains("/assets/board.css"));
+    }
+
+    // TC-3123 / FR-3123: drawer plan edit, chat, stale approve notice.
+    #[test]
+    fn tc_3123_board_drawer_plan_edit_chat_and_stale_approve_conflict() {
+        assert!(INDEX_HTML.contains("id=\"board-drawer\""));
+        assert!(BOARD_JS.contains("board-plan-steps"));
+        assert!(BOARD_JS.contains("board-save-plan"));
+        assert!(BOARD_JS.contains("board-add-step"));
+        assert!(BOARD_JS.contains("/plan"));
+        assert!(BOARD_JS.contains("board-chat-input"));
+        assert!(BOARD_JS.contains("board-chat-send"));
+        assert!(BOARD_JS.contains("plan_hash"));
+        assert!(BOARD_JS.contains("Plan changed"));
+        assert!(BOARD_JS.contains("previous_steps"));
+    }
+
+    // TC-3124 / FR-3124: board SSE only while the view is visible.
+    #[test]
+    fn tc_3124_board_stream_only_while_visible() {
+        assert!(BOARD_JS.contains("dmuxai:center-view"));
+        assert!(BOARD_JS.contains("boardOpenStream"));
+        assert!(BOARD_JS.contains("boardCloseStream"));
+        assert!(BOARD_JS.contains("boardUiOpen"));
+        assert!(BOARD_JS.contains("dmuxaiOpenEventSource"));
+    }
+
+    // TC-3125 / FR-3125: no innerHTML, no token literal, no-store assets.
+    #[test]
+    fn tc_3125_board_assets_no_innerhtml_no_token() {
+        assert!(!BOARD_JS.contains("innerHTML"));
+        assert!(!BOARD_JS.contains("token="));
+        assert!(BOARD_JS.contains("textContent"));
+        assert!(BOARD_JS.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn tc_3125_board_assets_served_no_store() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        for path in ["/assets/board.js", "/assets/board.css"] {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .header("Host", "localhost:7420")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .unwrap(),
+                "no-store"
+            );
+        }
     }
 }

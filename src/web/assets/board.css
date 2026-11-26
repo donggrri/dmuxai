@@ -1,0 +1,227 @@
+/* Decision board view (SPEC-decision-board FR-3122..FR-3126) */
+
+#board.board-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem 1.25rem;
+  min-height: 0;
+  flex: 1;
+}
+
+.board-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.board-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: var(--text-muted, #8b949e);
+}
+
+.board-my-decisions {
+  border: 1px solid var(--border, #30363d);
+  border-radius: 8px;
+  padding: 0.75rem;
+  background: var(--panel-bg, rgba(255, 255, 255, 0.02));
+}
+
+.board-my-decisions h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.board-my-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.board-decision-card {
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  padding: 0.5rem 0.65rem;
+  min-width: 12rem;
+  max-width: 18rem;
+  background: var(--surface, #161b22);
+  cursor: pointer;
+}
+
+.board-decision-card:focus-visible {
+  outline: 2px solid var(--accent, #4aa8ff);
+  outline-offset: 2px;
+}
+
+.board-decision-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 0.25rem;
+}
+
+.board-decision-meta {
+  font-size: 0.75rem;
+  color: var(--text-muted, #8b949e);
+}
+
+.board-decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.board-kanban {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(8rem, 1fr));
+  gap: 0.5rem;
+  overflow-x: auto;
+  min-height: 12rem;
+}
+
+.board-lane {
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  min-width: 8rem;
+  background: var(--surface, #161b22);
+}
+
+.board-lane-head {
+  font-size: 0.75rem;
+  text-transform: capitalize;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border, #30363d);
+  color: var(--text-muted, #8b949e);
+}
+
+.board-lane-cards {
+  flex: 1;
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.board-card {
+  border: 1px solid var(--border, #30363d);
+  border-radius: 4px;
+  padding: 0.35rem 0.45rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  background: var(--panel-bg, #0d1117);
+}
+
+.board-card-title {
+  font-weight: 500;
+}
+
+.board-card-menu {
+  margin-top: 0.25rem;
+  font-size: 0.7rem;
+}
+
+.board-drawer-wrap {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+  z-index: 40;
+}
+
+.board-drawer-wrap.open {
+  pointer-events: auto;
+}
+
+.board-drawer-backdrop {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.board-drawer {
+  width: min(32rem, 95vw);
+  max-width: 100%;
+  height: 100%;
+  overflow: auto;
+  background: var(--surface, #161b22);
+  border-left: 1px solid var(--border, #30363d);
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.board-plan-notice {
+  color: var(--warning, #d29922);
+  font-size: 0.85rem;
+}
+
+.board-plan-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+}
+
+.board-plan-table th,
+.board-plan-table td {
+  border: 1px solid var(--border, #30363d);
+  padding: 0.2rem 0.35rem;
+  vertical-align: top;
+}
+
+.board-plan-table input {
+  width: 100%;
+  font: inherit;
+  background: transparent;
+  color: inherit;
+  border: none;
+}
+
+.board-chat {
+  border-top: 1px solid var(--border, #30363d);
+  padding-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-height: 8rem;
+}
+
+.board-chat-thread {
+  flex: 1;
+  overflow: auto;
+  max-height: 12rem;
+  font-size: 0.8rem;
+}
+
+.board-chat-msg {
+  margin-bottom: 0.35rem;
+}
+
+.board-rules-panel {
+  border: 1px solid var(--border, #30363d);
+  border-radius: 6px;
+  padding: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.board-rules-panel[hidden] {
+  display: none;
+}
+
+.board-badge {
+  display: inline-flex;
+  min-width: 1.1rem;
+  justify-content: center;
+  padding: 0 0.25rem;
+  border-radius: 999px;
+  background: var(--accent, #4aa8ff);
+  color: #fff;
+  font-size: 0.7rem;
+  margin-left: 0.25rem;
+}
