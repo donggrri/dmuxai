@@ -703,7 +703,7 @@ fn triage_view(triage: &Triage) -> TriageView {
         source: triage.source,
         cause: triage.cause,
         override_kind: triage.override_kind,
-        runner: triage.runner.clone(),
+        runner: crate::runner_id::canonical_runner_id(&triage.runner),
         model: triage.model.clone(),
         line: judge_line_text(triage),
     }
@@ -1473,7 +1473,7 @@ mod tests {
         let view = snapshot_from_run(&run);
         let triage_view = view.triage.as_ref().expect("triage");
         assert_eq!(triage_view.line, judge_line_text(&triage));
-        assert_eq!(triage_view.runner, "cursor");
+        assert_eq!(triage_view.runner, crate::runner_id::CURSOR_RUNNER_ID);
 
         let json = serde_json::to_string(&view).unwrap();
         assert!(json.contains("\"triage\""));
@@ -2085,5 +2085,26 @@ mod tests {
         assert_eq!(json, "\"app\"");
         let round: SnapshotSource = serde_json::from_str(&json).unwrap();
         assert_eq!(round, SnapshotSource::App);
+    }
+
+    // TC-3212 / FR-3207
+    #[test]
+    fn tc_3212_web_snapshot_uses_cursor_agent_id() {
+        let triage = crate::graph::Triage {
+            route: crate::graph::Route::Complex,
+            reason: "r".to_owned(),
+            source: crate::graph::TriageSource::Judge,
+            cause: None,
+            override_kind: None,
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 1,
+        };
+        let view = triage_view(&triage);
+        assert_eq!(view.runner, crate::runner_id::CURSOR_RUNNER_ID);
+        assert_eq!(
+            crate::web::server::normalize_request_agent_id("cursor"),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

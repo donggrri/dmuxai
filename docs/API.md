@@ -163,7 +163,7 @@ dmuxai events --follow --json
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
 
 In `agents[]`:
-- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `id`: runner id (`cursor-agent`, `agy`, `codex`, or custom agent name)
 - `label`: display name
 - `allowed`: headless `run` admission under `[graph] allowed_runners` (true when unset)
 - `graph_allowed`: graph admission (built-in presets excluded when unset)
@@ -172,7 +172,7 @@ In `agents[]`:
 ### `runners` and `models` (SPEC-cli-runners-models)
 
 `dmuxai runners [--json]` lists registered runners in `status` order with:
-- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `id`: runner id (`cursor-agent`, `agy`, `codex`, or custom agent name; `cursor-agent` also reports `"aliases": ["cursor"]`)
 - `label`: display name
 - `kind`: `"builtin"`, `"preset"`, or `"custom"`
 - `allowed`: headless admission under `[graph] allowed_runners` (true when unset)
@@ -347,7 +347,7 @@ defaults to the selected agent:
 | `cancel` | `agent?` | Ctrl+C |
 | `new_conversation` | `title?` | `/new` |
 | `load_conversation` | `id` | `/resume`, F3 |
-| `share` | `target` (`codex`/`cursor`/`agy`) | `/share` |
+| `share` | `target` (`codex`/`cursor-agent`/`agy`; `cursor` alias) | `/share` |
 | `status`, `toggle_details`, `quit` | — | `/status`, `/details`, `/quit` |
 
 Busy agents refuse mode/model/effort changes (409); runners outside
@@ -615,8 +615,8 @@ Resolution order for a turn's prompt (first match wins; built-ins only on write 
 
 1. `[runners.<runner>.models."<model>"]`
 2. `[runners.<runner>]`
-3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor` + `grok-4.7*` → Cursor Grok)
-4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor` → Cursor, `grok` → Grok Build)
+3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor-agent` + `grok-4.7*` → Cursor Grok)
+4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor-agent` → Cursor, `grok` → Grok Build)
 5. `[runners.default]`
 6. None
 
@@ -632,10 +632,10 @@ prompt_roles = ["chat", "worker"]
 [runners.codex]
 system_prompt_file = "prompts/codex.md"
 
-[runners.cursor]
+[runners.cursor-agent]
 builtin_prompt = false
 
-[runners.cursor.models."composer-2.5"]
+[runners.cursor-agent.models."composer-2.5"]
 system_prompt_file = "prompts/composer.md"
 prompt_inject = "session"
 ```

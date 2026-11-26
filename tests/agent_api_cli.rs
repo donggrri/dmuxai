@@ -694,7 +694,10 @@ fn tc_764_1812_status_json_has_contract_keys() {
     let agents = json["agents"].as_array().unwrap();
     let fake = agents.iter().find(|a| a["id"] == "fake").unwrap();
     assert_eq!(fake["allowed"], true);
-    let cursor = agents.iter().find(|a| a["id"] == "cursor").unwrap();
+    let cursor = agents
+        .iter()
+        .find(|a| a["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
+        .unwrap();
     assert_eq!(cursor["allowed"], false);
     assert_eq!(json["events"]["last_seq"], 0);
     assert!(json["dashboard"].is_null());
@@ -760,7 +763,10 @@ fn tc_811_fresh_install_lists_opencode() {
         .unwrap_or_else(|| panic!("opencode missing: {json}"));
     assert_eq!(opencode["allowed"], true, "{json}");
     assert_eq!(opencode["graph_allowed"], false, "{json}");
-    let cursor = agents.iter().find(|agent| agent["id"] == "cursor").unwrap();
+    let cursor = agents
+        .iter()
+        .find(|agent| agent["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
+        .unwrap();
     assert_eq!(cursor["allowed"], true);
 
     let empty_path = [("PATH", OsString::new())];
@@ -830,7 +836,10 @@ fn tc_891_fresh_install_lists_grok() {
         .unwrap_or_else(|| panic!("grok missing: {json}"));
     assert_eq!(grok["allowed"], true, "{json}");
     assert_eq!(grok["graph_allowed"], false, "{json}");
-    let cursor = agents.iter().find(|agent| agent["id"] == "cursor").unwrap();
+    let cursor = agents
+        .iter()
+        .find(|agent| agent["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
+        .unwrap();
     assert_eq!(cursor["allowed"], true);
 
     let empty_path = [("PATH", OsString::new())];
@@ -854,7 +863,10 @@ fn tc_2839_status_allowed_matches_headless_run_cli() {
             "all runners allowed when unset: {agent}"
         );
     }
-    let cursor = agents.iter().find(|a| a["id"] == "cursor").unwrap();
+    let cursor = agents
+        .iter()
+        .find(|a| a["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
+        .unwrap();
     assert_eq!(cursor["allowed"], true);
     assert_eq!(cursor["graph_allowed"], true);
     let agy = agents.iter().find(|a| a["id"] == "agy").unwrap();
@@ -870,7 +882,10 @@ fn tc_2839_status_allowed_matches_headless_run_cli() {
     .unwrap();
     let json_agy = stdout_json(&sandbox_agy.run(&["status", "--json"]));
     let agents_agy = json_agy["agents"].as_array().unwrap();
-    let cursor_agy = agents_agy.iter().find(|a| a["id"] == "cursor").unwrap();
+    let cursor_agy = agents_agy
+        .iter()
+        .find(|a| a["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
+        .unwrap();
     assert_eq!(cursor_agy["allowed"], false);
     assert_eq!(cursor_agy["graph_allowed"], false);
     let agy_agy = agents_agy.iter().find(|a| a["id"] == "agy").unwrap();
@@ -890,7 +905,10 @@ fn tc_2839_status_allowed_matches_headless_run_cli() {
         assert_eq!(agent["allowed"], false);
         assert_eq!(agent["graph_allowed"], false);
     }
-    let cursor_empty = agents_empty.iter().find(|a| a["id"] == "cursor").unwrap();
+    let cursor_empty = agents_empty
+        .iter()
+        .find(|a| a["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
+        .unwrap();
     assert_eq!(cursor_empty["allowed"], false);
     assert_eq!(cursor_empty["graph_allowed"], false);
     let agy_empty = agents_empty.iter().find(|a| a["id"] == "agy").unwrap();

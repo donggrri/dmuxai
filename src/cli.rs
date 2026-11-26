@@ -2926,7 +2926,10 @@ fn start_headless_journal(
         created_at_ms: now_ms,
         completed_at_ms: None,
         duration_ms: None,
-        requested_runner: options.agent.clone(),
+        requested_runner: options
+            .agent
+            .as_deref()
+            .map(dmuxai::runner_id::canonical_runner_id),
         resolved_runner: None,
         requested_model: options.model.clone(),
         resolved_model: None,
@@ -3722,7 +3725,7 @@ fn trust_workspace(
 mod tests {
     fn resolve_cli_builtin_runner(agent: &str) -> Option<&'static str> {
         match dmuxai::runner_id::canonical_runner_id(agent).as_str() {
-            "cursor" => Some("cursor"),
+            dmuxai::runner_id::CURSOR_RUNNER_ID => Some(dmuxai::runner_id::CURSOR_RUNNER_ID),
             "agy" => Some("agy"),
             "codex" => Some("codex"),
             _ => None,
@@ -4892,6 +4895,11 @@ mod tests {
             AgentCommand::Run(opts) => assert_eq!(opts.agent.as_deref(), Some("cursor-agent")),
             other => panic!("unexpected {other:?}"),
         }
+        let run_legacy = parse(&args(&["run", "hi", "--agent", "cursor"])).unwrap();
+        match run_legacy {
+            AgentCommand::Run(opts) => assert_eq!(opts.agent.as_deref(), Some("cursor")),
+            other => panic!("unexpected {other:?}"),
+        }
         let models = parse(&args(&["models", "--agent", "cursor-agent"])).unwrap();
         match models {
             AgentCommand::Models { agent, .. } => {
@@ -4901,10 +4909,26 @@ mod tests {
         }
         assert_eq!(
             parse_cli_agents_csv("cursor-agent,agy"),
-            vec!["cursor".to_owned(), "agy".to_owned()]
+            vec![
+                dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
+                "agy".to_owned()
+            ]
         );
-        assert_eq!(resolve_cli_builtin_runner("cursor-agent"), Some("cursor"));
-        assert_eq!(resolve_cli_builtin_runner("cursor"), Some("cursor"));
+        assert_eq!(
+            parse_cli_agents_csv("cursor,agy"),
+            vec![
+                dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
+                "agy".to_owned()
+            ]
+        );
+        assert_eq!(
+            resolve_cli_builtin_runner("cursor-agent"),
+            Some(dmuxai::runner_id::CURSOR_RUNNER_ID)
+        );
+        assert_eq!(
+            resolve_cli_builtin_runner("cursor"),
+            Some(dmuxai::runner_id::CURSOR_RUNNER_ID)
+        );
         let msg = dmuxai::runner_id::format_unknown_agent_message("nope");
         assert!(msg.contains("cursor-agent"));
         assert!(msg.contains("nope"));

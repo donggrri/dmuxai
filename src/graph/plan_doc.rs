@@ -472,7 +472,7 @@ pub fn pin_graph_plan_runners(
     let pinned_runner = crate::runner_id::canonical_runner_id(pinned_runner);
     let mut notes = Vec::new();
     for node in &mut plan.nodes {
-        let prior = node.runner.trim().to_ascii_lowercase();
+        let prior = crate::runner_id::canonical_runner_id(&node.runner);
         if prior != pinned_runner || !runner_allowed(&prior) {
             notes.push(format!(
                 "step {}: runner {} -> {} (pinned)",
@@ -921,7 +921,7 @@ fn check_runner(step: &PlanStep, ctx: &PlanContext<'_>, errors: &mut Vec<PlanErr
     let registered = ctx
         .available_runners
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&key));
+        .any(|candidate| crate::runner_id::canonical_runner_id(candidate) == key);
     if !registered {
         errors.push(PlanError::new(step.id.clone(), "runner is not registered"));
         return;
@@ -1158,7 +1158,7 @@ mod tests {
                         .any(|denied| denied.eq_ignore_ascii_case(runner))
                 }),
                 effective_model: Box::new(move |runner: &str| {
-                    if runner.eq_ignore_ascii_case("cursor") {
+                    if runner.eq_ignore_ascii_case(crate::runner_id::CURSOR_RUNNER_ID) {
                         Some(if fast_cursor {
                             "composer-2.5-fast".to_owned()
                         } else {
@@ -1214,7 +1214,7 @@ mod tests {
         assert_eq!(plan.nodes[2].role, NodeRole::Test);
         assert_eq!(plan.nodes[0].model_id, "composer-2.5");
         assert_eq!(plan.nodes[1].model_id, "gemini-3.8-flash-medium");
-        assert_eq!(plan.nodes[2].runner, "cursor");
+        assert_eq!(plan.nodes[2].runner, crate::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(plan.nodes[2].model_id, "composer-2.5");
         assert!(plan.nodes[0].requires_gate, "sensitive true gates the step");
         assert!(
@@ -1640,10 +1640,11 @@ DATA-nonce1>>>>
             let node = &fallback.plan.nodes[0];
             assert_eq!(node.id, "step-1");
             assert_eq!(node.role, NodeRole::Implement);
-            assert_eq!(node.runner, runner);
+            assert_eq!(node.runner, crate::runner_id::canonical_runner_id(runner));
             assert_eq!(node.job, prompt, "job is the user prompt verbatim");
+            let canon_runner = crate::runner_id::canonical_runner_id(runner);
             assert!(fallback.note.ends_with(&format!(
-                "one step on {runner} {}. Edit to ask for a real plan.",
+                "one step on {canon_runner} {}. Edit to ask for a real plan.",
                 node.model_id
             )));
             assert!(
@@ -1984,10 +1985,22 @@ DATA-nonce1>>>>
     fn tc_3204_plan_runner_accepts_cursor_agent() {
         let json = r#"{"tasks":[{"id":"task-1","title":"one","done_check":"d","size":"small"}],"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor-agent","depends_on":[],"task":"task-1"}]}"#;
         let doc = parse_plan(json).unwrap();
-        let context = PlanCtx::new(&["cursor"], &[], false);
+        let context = PlanCtx::new(&[crate::runner_id::CURSOR_RUNNER_ID], &[], false);
         let plan = validate_plan(&doc, &context.context("ship")).unwrap();
-        assert_eq!(plan.nodes[0].runner, "cursor");
+        assert_eq!(plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
+
+        let legacy_json = r#"{"tasks":[{"id":"task-1","title":"one","done_check":"d","size":"small"}],"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let legacy_doc = parse_plan(legacy_json).unwrap();
+        let legacy_plan = validate_plan(&legacy_doc, &context.context("ship")).unwrap();
+        assert_eq!(
+            legacy_plan.nodes[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+
         let pinned = fallback_plan("ship it", "cursor-agent", None, "timeout").unwrap();
-        assert_eq!(pinned.plan.nodes[0].runner, "cursor");
+        assert_eq!(
+            pinned.plan.nodes[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

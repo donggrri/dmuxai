@@ -111,7 +111,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "description": "Optional runner id (e.g. agy, cursor, codex, or a custom agent name)"
+                        "description": "Optional runner id (e.g. agy, cursor-agent, codex, or a custom agent name)"
                     }
                 }
             }
@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(calls.as_slice(), &[Some("cursor-agent".to_owned())]);
         assert_eq!(
             crate::runner_id::canonical_runner_id(" cursor-agent "),
-            "cursor"
+            crate::runner_id::CURSOR_RUNNER_ID
         );
     }
 }

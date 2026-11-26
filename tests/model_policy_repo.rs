@@ -76,6 +76,10 @@ fn tc_3208_docs_name_cursor_agent_keyword() {
     assert!(api.contains("alias"));
     let changelog = fs::read_to_string("CHANGELOG.md").expect("CHANGELOG.md");
     assert!(changelog.contains("cursor-agent"));
+    assert!(
+        changelog.contains("Breaking-ish"),
+        "CHANGELOG should note the breaking-ish output id change"
+    );
     let cli_rs = fs::read_to_string("src/cli.rs").expect("src/cli.rs");
     for usage in ["RUN_USAGE", "MODELS_USAGE", "RUNNERS_USAGE"] {
         let marker = format!("pub const {usage}");

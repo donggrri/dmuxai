@@ -1506,7 +1506,7 @@ pub fn install_registry(specs: Vec<CustomAgentSpec>) -> Vec<String> {
         }
         if matches!(
             crate::runner_id::canonical_runner_id(&spec.name).as_str(),
-            "cursor" | "agy" | "codex"
+            crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex"
         ) || accepted.iter().any(|other| other.name == spec.name)
         {
             warnings.push(format!("custom agent name '{}' is already used", spec.name));

@@ -456,8 +456,11 @@ async fn runtime_loop(
                     let (models, _advertised_default) = list_models(&cwd).await;
                     let selected = match &selected_model {
                         Some(model)
-                            if dmuxai::model_policy::validate_model_for_runner("cursor", model)
-                                .is_ok() =>
+                            if dmuxai::model_policy::validate_model_for_runner(
+                                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                                model,
+                            )
+                            .is_ok() =>
                         {
                             selected_model.clone()
                         }
@@ -943,7 +946,13 @@ fn configure_command(
         ])
         .arg(cwd);
     let model = match selected_model {
-        Some(model) if dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok() => {
+        Some(model)
+            if dmuxai::model_policy::validate_model_for_runner(
+                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                model,
+            )
+            .is_ok() =>
+        {
             model
         }
         _ => dmuxai::model_policy::ALLOWED_MODEL,

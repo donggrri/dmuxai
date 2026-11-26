@@ -733,7 +733,10 @@ impl DmuxSettings {
             let custom_agents = &settings.custom_agents;
             let validate = |target: &crate::runner_fallback::FallbackTarget| -> Result<(), String> {
                 let runner = target.runner.as_str();
-                let is_builtin = matches!(runner, "cursor" | "agy" | "codex" | "opencode" | "grok");
+                let is_builtin = matches!(
+                    runner,
+                    crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex" | "opencode" | "grok"
+                );
                 let custom_spec = custom_agents
                     .iter()
                     .find(|spec| spec.name.eq_ignore_ascii_case(runner));
@@ -789,7 +792,7 @@ impl DmuxSettings {
             }
             let is_builtin = matches!(
                 id.as_str(),
-                "cursor" | "agy" | "codex" | "opencode" | "grok"
+                crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex" | "opencode" | "grok"
             );
             let custom_spec = settings
                 .custom_agents
@@ -837,7 +840,7 @@ impl DmuxSettings {
             }
         }
 
-        let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
+        let mut known: Vec<&str> = vec![crate::runner_id::CURSOR_RUNNER_ID, "agy", "codex"];
         known.extend(known_custom.iter().map(String::as_str));
         let unknown = settings.theme.unknown_agent_ids(&known);
         drop(known);
@@ -1200,10 +1203,12 @@ impl DmuxSettings {
                     if lower.is_empty() {
                         continue;
                     }
-                    if matches!(lower.as_str(), "agy" | "codex" | "cursor")
-                        || pending_presets
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(&lower))
+                    if matches!(
+                        lower.as_str(),
+                        "agy" | "codex" | crate::runner_id::CURSOR_RUNNER_ID
+                    ) || pending_presets
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&lower))
                         || self
                             .custom_agents
                             .iter()
@@ -2964,7 +2969,10 @@ allowed_runners = ["AGY", "bogus_agent", "cursor"]
         let settings = DmuxSettings::load_with_user_config(&dir, None);
         assert_eq!(
             settings.graph_allowed_runners,
-            Some(vec!["agy".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "agy".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             settings.config_warnings.iter().any(
@@ -3707,7 +3715,10 @@ mod builtin_opencode_tests {
         let listed = load(Some(bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
-            Some(vec!["opencode".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "opencode".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             listed.config_warnings.is_empty(),
@@ -4044,7 +4055,10 @@ mod builtin_grok_tests {
         let listed = load(Some(path_bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
-            Some(vec!["grok".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "grok".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             listed.config_warnings.is_empty(),
@@ -4784,7 +4798,10 @@ system_prompt = "ignored"
         .unwrap();
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
 
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         let model = cursor
             .models
             .as_ref()
@@ -4794,7 +4811,7 @@ system_prompt = "ignored"
         assert_eq!(prompt.text, "Model file prompt");
         assert_eq!(
             prompt.source,
-            "workspace:[runners.cursor.models.\"Composer-2.5\"] (model.txt)"
+            "workspace:[runners.cursor-agent.models.\"Composer-2.5\"] (model.txt)"
         );
         assert_eq!(model.inject, Some(PromptInject::Session));
 
@@ -4807,7 +4824,7 @@ system_prompt = "ignored"
         assert_eq!(inline.text, "Inline model prompt");
         assert_eq!(
             inline.source,
-            "workspace:[runners.cursor.models.\"inline-model\"]"
+            "workspace:[runners.cursor-agent.models.\"inline-model\"]"
         );
 
         let default = settings
@@ -4870,15 +4887,15 @@ prompt_inject = "immediately"
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
 
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"composer-2.5\"]")
+            w.contains("[runners.cursor-agent.models.\"composer-2.5\"]")
                 && w.contains("both system_prompt and system_prompt_file")
         }));
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"big\"]")
+            w.contains("[runners.cursor-agent.models.\"big\"]")
                 && w.contains("exceeds 32 KiB (32768 bytes)")
         }));
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"bad-inject\"]")
+            w.contains("[runners.cursor-agent.models.\"bad-inject\"]")
                 && w.contains("unknown prompt_inject 'immediately'")
         }));
     }
@@ -4922,7 +4939,10 @@ system_prompt = "workspace model"
         .unwrap();
 
         let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         assert_eq!(cursor.builtin_prompt, Some(true));
 
         let models = cursor.models.as_ref().expect("models");
@@ -4931,7 +4951,7 @@ system_prompt = "workspace model"
         assert_eq!(prompt.text, "workspace model");
         assert_eq!(
             prompt.source,
-            "workspace:[runners.cursor.models.\"composer-2.5\"]"
+            "workspace:[runners.cursor-agent.models.\"composer-2.5\"]"
         );
         // The workspace entry did not set prompt_inject, so the user value stays.
         assert_eq!(composer.inject, Some(PromptInject::Always));
@@ -6222,10 +6242,16 @@ fallback = ["agy"]
             settings
                 .graph_allowed_runners
                 .as_ref()
-                .is_some_and(|r| r.contains(&"cursor".to_owned()))
+                .is_some_and(|r| r.contains(&crate::runner_id::CURSOR_RUNNER_ID.to_owned()))
         );
-        assert_eq!(settings.routing_default_agent.as_deref(), Some("cursor"));
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        assert_eq!(
+            settings.routing_default_agent.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         assert_eq!(cursor.model.as_deref(), Some("composer-2.5"));
         assert!(
             !settings
@@ -6253,7 +6279,10 @@ model = "grok-4.7-high"
         .unwrap();
         let settings = DmuxSettings::load(ws);
         assert_eq!(
-            settings.runner_models.get("cursor").map(String::as_str),
+            settings
+                .runner_models
+                .get(crate::runner_id::CURSOR_RUNNER_ID)
+                .map(String::as_str),
             Some("grok-4.7-high")
         );
         assert!(
@@ -6264,5 +6293,77 @@ model = "grok-4.7-high"
             "warnings: {:?}",
             settings.config_warnings
         );
+    }
+
+    // TC-3213 / FR-3208, FR-3209
+    #[test]
+    fn tc_3213_legacy_cursor_config_and_graph_store_normalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor", "agy"]
+
+[routing]
+default_agent = "cursor"
+
+[runners.cursor]
+model = "composer-2.5"
+fallback = ["agy:composer-2.5"]
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert!(settings.graph_runner_allowed(crate::runner_id::CURSOR_RUNNER_ID));
+        assert_eq!(
+            settings.routing_default_agent.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        assert!(
+            settings
+                .runner_prompts
+                .get(crate::runner_id::CURSOR_RUNNER_ID)
+                .and_then(|c| c.model.as_deref())
+                == Some("composer-2.5")
+        );
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("cursor") && w.contains("legacy"))
+        );
+        let mut run = crate::graph::GraphRun {
+            plan: crate::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "p1".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "p".to_owned(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: Default::default(),
+                tasks: Vec::new(),
+            },
+            conversation_id: "c".to_owned(),
+            phase: crate::graph::GraphRunPhase::Active,
+            ..Default::default()
+        };
+        run.plan.nodes.push(crate::graph::GraphNode {
+            id: "n1".to_owned(),
+            role: crate::graph::NodeRole::Implement,
+            job: "j".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+            skill: None,
+            requires_gate: false,
+            status: crate::graph::GraphNodeStatus::Pending,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        });
+        run.normalize_legacy_runners();
+        assert_eq!(run.plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
     }
 }

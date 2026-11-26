@@ -503,7 +503,8 @@ fn tail_text_lines(path: &Path, offset: &mut u64, max_lines: usize) -> Vec<Strin
         let line = String::from_utf8_lossy(&bytes[line_start..line_end]);
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            lines.push(mask_sensitive_tokens(trimmed));
+            let normalized = crate::run_journal::normalize_progress_line(trimmed);
+            lines.push(mask_sensitive_tokens(&normalized));
         }
         line_start = line_end + 1;
         consumed = line_start as u64;

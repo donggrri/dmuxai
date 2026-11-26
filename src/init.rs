@@ -19,8 +19,8 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # border = "dark-gray"
 # accent = "#ffa500"
 # [theme.agents]
-# Per-runner chat colors: cursor, agy, codex or a custom agent name.
-# cursor = "yellow"
+# Per-runner chat colors: cursor-agent, agy, codex or a custom agent name.
+# cursor-agent = "yellow"
 
 # [routing]
 # Runner used when no runner is named explicitly.

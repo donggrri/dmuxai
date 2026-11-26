@@ -154,21 +154,36 @@ impl Theme {
         if let Some(color) = self.agents.get(&key) {
             return *color;
         }
+        let canon = crate::runner_id::canonical_runner_id(agent_id);
+        if let Some(color) = self.agents.get(&canon) {
+            return *color;
+        }
+        if canon == crate::runner_id::CURSOR_RUNNER_ID
+            && let Some(color) = self.agents.get("cursor")
+        {
+            return *color;
+        }
         if let Some(color) = fallback {
             return color;
         }
-        match key.as_str() {
-            "cursor" => self.cursor,
+        match canon.as_str() {
+            crate::runner_id::CURSOR_RUNNER_ID => self.cursor,
             "agy" => self.agy,
             _ => self.other,
         }
     }
 
-    /// Return the `[theme.agents]` ids that are not in `known` (case-insensitive).
+    /// Return the `[theme.agents]` ids that are not in `known` (case-insensitive,
+    /// matching canonical runner ids).
     pub fn unknown_agent_ids(&self, known: &[&str]) -> Vec<String> {
         self.agents
             .keys()
-            .filter(|id| !known.iter().any(|k| k.eq_ignore_ascii_case(id)))
+            .filter(|id| {
+                let canon_id = crate::runner_id::canonical_runner_id(id);
+                !known
+                    .iter()
+                    .any(|k| crate::runner_id::canonical_runner_id(k) == canon_id)
+            })
             .cloned()
             .collect()
     }

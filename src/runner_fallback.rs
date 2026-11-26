@@ -190,7 +190,7 @@ impl FallbackSettings {
     }
 
     pub fn config_for(&self, runner: &str) -> Option<&RunnerFallbackConfig> {
-        let id = runner.trim().to_ascii_lowercase();
+        let id = crate::runner_id::canonical_runner_id(runner);
         if let Some(c) = self.runners.get(&id) {
             return Some(c);
         }
@@ -201,7 +201,7 @@ impl FallbackSettings {
         let Some(cfg) = self.config_for(runner) else {
             return Vec::new();
         };
-        let runner_lc = runner.trim().to_ascii_lowercase();
+        let runner_lc = crate::runner_id::canonical_runner_id(runner);
         let cur = current_model.map(str::to_owned);
         cfg.chain()
             .iter()

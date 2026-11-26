@@ -58,7 +58,11 @@ pub fn validate_model_for_runner_with(
     let trimmed = model_id.trim();
     let runner_key = crate::runner_id::canonical_runner_id(runner);
     if trimmed.to_ascii_lowercase().contains("fast") {
-        let skip_fast = allow_fast && matches!(runner_key.as_str(), "cursor" | "agy");
+        let skip_fast = allow_fast
+            && matches!(
+                runner_key.as_str(),
+                crate::runner_id::CURSOR_RUNNER_ID | "agy"
+            );
         if !skip_fast {
             return Err(format!("fast models are blocked by policy: {trimmed}"));
         }
@@ -75,7 +79,7 @@ pub fn validate_model_for_runner_with(
         };
     }
     if crate::custom_agent::is_grok_model_id(trimmed) {
-        return if runner_key == "grok" || runner_key == "cursor" {
+        return if runner_key == "grok" || runner_key == crate::runner_id::CURSOR_RUNNER_ID {
             Ok(())
         } else {
             Err(format!(
@@ -85,7 +89,7 @@ pub fn validate_model_for_runner_with(
     }
     let lower = trimmed.to_ascii_lowercase();
     match runner_key.as_str() {
-        "cursor" => {
+        crate::runner_id::CURSOR_RUNNER_ID => {
             if trimmed.is_empty() {
                 Err("model id must not be empty".to_owned())
             } else {
@@ -135,7 +139,7 @@ pub const PROVIDER_DEFAULT: &str = "provider default";
 /// the pinned non-fast `composer-2.5`; every other runner gets `None`
 /// (provider default). Never another runner's model, never a fast model.
 pub fn default_model_for_runner(runner: &str) -> Option<&'static str> {
-    if crate::runner_id::canonical_runner_id(runner) == "cursor" {
+    if crate::runner_id::canonical_runner_id(runner) == crate::runner_id::CURSOR_RUNNER_ID {
         Some(ALLOWED_MODEL)
     } else {
         None
@@ -511,7 +515,7 @@ mod tests {
         let cursor_default = validate_model_for_runner("cursor", PROVIDER_DEFAULT).unwrap_err();
         assert_eq!(
             cursor_default,
-            "model provider default is not allowed for cursor; only composer-2.5 is permitted"
+            "model provider default is not allowed for cursor-agent; only composer-2.5 is permitted"
         );
     }
 

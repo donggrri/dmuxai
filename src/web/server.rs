@@ -334,8 +334,11 @@ async fn get_agent_prompts(Ws(ws): Ws) -> Response {
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
-    let mut runner_ids: Vec<String> =
-        vec!["cursor".to_owned(), "agy".to_owned(), "codex".to_owned()];
+    let mut runner_ids: Vec<String> = vec![
+        crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
+        "agy".to_owned(),
+        "codex".to_owned(),
+    ];
     for spec in &settings.custom_agents {
         let id = spec.name.trim().to_ascii_lowercase();
         if !runner_ids.iter().any(|existing| existing == &id) {
@@ -431,7 +434,7 @@ async fn post_agent_prompts(Ws(ws): Ws, ApiJson(body): ApiJson<AgentPromptsPostB
 
     let runner = normalize_request_agent_id(&body.runner);
     let mut known: Vec<String> = vec![
-        "cursor".to_owned(),
+        crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
         "agy".to_owned(),
         "codex".to_owned(),
         "default".to_owned(),
@@ -6702,7 +6705,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["runner"] == "cursor")
+            .find(|r| r["runner"] == crate::runner_id::CURSOR_RUNNER_ID)
             .unwrap();
         assert_eq!(cursor["delivery"], "prepend");
         let agy = v2["runners"]
