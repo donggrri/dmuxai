@@ -139,7 +139,10 @@ impl BoardSettings {
         self.notify_command
             .as_ref()
             .is_some_and(|cmd| !cmd.is_empty())
-            || self.notify_webhook_url.is_some()
+            || self.notify_webhook_url.as_deref().is_some_and(|url| {
+                let lower = url.trim().to_ascii_lowercase();
+                lower.starts_with("http://") || lower.starts_with("https://")
+            })
     }
 
     pub fn allows_event(&self, event: &str) -> bool {
@@ -6178,5 +6181,17 @@ notify_webhook_url = "ftp://bad"
         };
         let warnings = bad_board.validate();
         assert_eq!(warnings.len(), 4, "warnings: {warnings:?}");
+        assert!(!bad_board.has_notify_target());
+
+        let env = RuntimeEnv {
+            xdg_config_home: Some(user_dir.clone()),
+            ..Default::default()
+        };
+        let user_cfg_dmuxai = user_dir.join("dmuxai");
+        std::fs::create_dir_all(&user_cfg_dmuxai).unwrap();
+        std::fs::copy(&user_cfg, user_cfg_dmuxai.join("dmuxai.toml")).unwrap();
+        let loaded = BoardSettings::load_user_only_with_env(&env);
+        assert_eq!(loaded.planner.as_deref(), Some("codex:gpt-5.4"));
+        assert!(loaded.has_notify_target());
     }
 }

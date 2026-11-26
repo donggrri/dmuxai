@@ -281,12 +281,15 @@ async fn board_plan(
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            let stored_prompt =
-                match unmasked_prompt_from_item_plan(&state_root, item.plan.as_ref()) {
-                    Ok(Some(prompt)) => prompt,
-                    Ok(None) => String::new(),
-                    Err(error) => return board_error_response(error),
-                };
+            let stored_prompt = match unmasked_prompt_from_item_plan(
+                &state_root,
+                &board_base,
+                item.plan.as_ref(),
+            ) {
+                Ok(Some(prompt)) => prompt,
+                Ok(None) => String::new(),
+                Err(error) => return board_error_response(error),
+            };
             if stored_prompt.trim().is_empty() {
                 return board_error_response(BoardError::Usage(
                     "plan edit requires an existing plan or prompt".to_owned(),
@@ -1008,7 +1011,7 @@ mod tests {
         let fake_bin = dir.path().join("fake.sh");
         std::fs::write(
             &fake_bin,
-            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"run-web1\",\"text\":\"ok\"}\\n'\nexit 0\n",
+            "#!/bin/sh\ncat > /dev/null\nsleep 0.1\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"fedcba9876543210\",\"text\":\"ok\"}\\n'\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -1053,7 +1056,21 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
+        let ask_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let current = store.get(&item.id).unwrap();
+            if current.thread.iter().any(|m| m.from == "planner") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ask_deadline,
+                "timed out waiting for background ask"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
         let resp = web_router
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
@@ -1069,6 +1086,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Second concurrent run while in_progress -> 409 Conflict.
+        let resp_conflict = web_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/{}/run", item.id))
+                    .header("Host", "localhost:7420")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"plan_hash":"{hash}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_conflict.status(), StatusCode::CONFLICT);
+
+        let run_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let current = store.get(&item.id).unwrap();
+            if current.lane == Lane::Done {
+                assert_eq!(current.run_ids, vec!["fedcba9876543210".to_owned()]);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < run_deadline,
+                "timed out waiting for background run"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
     }
 }

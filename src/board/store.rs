@@ -379,11 +379,11 @@ impl BoardStore {
                 "plan hash must be 16 lowercase hex characters".to_owned(),
             ));
         }
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             if let Some(key) = &req.key
                 && let Some(existing) = store.find_item_by_key(key, req.source_bot.as_deref())?
             {
-                return Ok(existing);
+                return Ok((existing, false));
             }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
@@ -434,11 +434,13 @@ impl BoardStore {
             mask_item_fields(&mut item);
             store.save_item_inner(&item)?;
             store.append_event(&item.id, EventKind::Created, item.version, &req.by)?;
-            if item.lane == Lane::NeedsDecision {
-                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", &req.by);
-            }
-            Ok(item)
-        })
+            let notify = item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", &req.by);
+        }
+        Ok(item)
     }
 
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<BoardItem>, BoardError> {
@@ -541,7 +543,7 @@ impl BoardStore {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
         enforce_sensitive_lane_move(by, lane)?;
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if let Some(expected) = if_version
                 && item.version != expected
@@ -557,11 +559,13 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Lane, item.version, by)?;
-            if prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision {
-                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", by);
-            }
-            Ok(item)
-        })
+            let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
+        }
+        Ok(item)
     }
 
     pub fn attach_plan(
@@ -574,7 +578,7 @@ impl BoardStore {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             let pending = read_pending_plan(state_root, hash)?;
             let computed = pending_hash_for_plan(&pending)?;
@@ -590,11 +594,13 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
-            if prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision {
-                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", by);
-            }
-            Ok(item)
-        })
+            let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
+        }
+        Ok(item)
     }
 
     pub fn edit_plan(
@@ -608,7 +614,7 @@ impl BoardStore {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             let pending = read_pending_plan(_state_root, hash)?;
             let computed = pending_hash_for_plan(&pending)?;
@@ -624,11 +630,13 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
-            if prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision {
-                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", by);
-            }
-            Ok(item)
-        })
+            let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
+        }
+        Ok(item)
     }
 
     pub fn unmasked_prompt(&self, id: &str, hash: Option<&str>) -> Result<String, BoardError> {
@@ -664,7 +672,7 @@ impl BoardStore {
             .base
             .parent()
             .ok_or_else(|| BoardError::Internal("board store has no state parent".to_owned()))?;
-        let pending = read_pending_plan(state_root, &plan_hash)?;
+        let pending = super::plan::read_pending_or_board_copy(state_root, &self.base, &plan_hash)?;
         Ok(pending.prompt)
     }
 
@@ -813,7 +821,7 @@ impl BoardStore {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
-        self.with_lock(|store| {
+        let item = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if req.by == "planner" {
                 return Err(BoardError::Forbidden(
@@ -895,9 +903,10 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Decision, item.version, &req.by)?;
-            super::notify::dispatch_board_event(&store.base, &item, "decision", &req.by);
             Ok(item)
-        })
+        })?;
+        super::notify::dispatch_board_event(&self.base, &item, "decision", &req.by);
+        Ok(item)
     }
 
     pub fn say(&self, id: &str, req: SayRequest) -> Result<BoardItem, BoardError> {
@@ -905,7 +914,7 @@ impl BoardStore {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
         validate_message(&req.text)?;
-        self.with_lock(|store| {
+        let (item, from) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if item.thread.len() >= THREAD_MAX {
                 return Err(BoardError::Usage(format!(
@@ -922,11 +931,12 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Message, item.version, &from)?;
-            if from == "owner" {
-                super::notify::dispatch_board_event(&store.base, &item, "message", &from);
-            }
-            Ok(item)
-        })
+            Ok((item, from))
+        })?;
+        if from == "owner" {
+            super::notify::dispatch_board_event(&self.base, &item, "message", &from);
+        }
+        Ok(item)
     }
 
     /// Record the outcome of `board run` (FR-3133, FR-3135).
@@ -941,7 +951,7 @@ impl BoardStore {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
-        self.with_lock(|store| {
+        let item = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if let Some(rid) = run_id.map(str::trim).filter(|s| !s.is_empty())
                 && !item.run_ids.iter().any(|existing| existing == rid)
@@ -984,9 +994,10 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Lane, item.version, by)?;
-            super::notify::dispatch_board_event(&store.base, &item, "run_finished", by);
             Ok(item)
-        })
+        })?;
+        super::notify::dispatch_board_event(&self.base, &item, "run_finished", by);
+        Ok(item)
     }
 
     pub fn wait(&self, id: &str, filter: WaitFilter) -> Result<WaitOutcome, BoardError> {
@@ -1137,7 +1148,7 @@ fn wait_trigger_for_event_any(event: &BoardEvent, filter: &WaitFilter) -> Option
 }
 
 fn enforce_sensitive_lane_move(by: &str, lane: Lane) -> Result<(), BoardError> {
-    if by == "owner" || by == "planner" {
+    if by == "owner" {
         return Ok(());
     }
     if matches!(lane, Lane::Auto | Lane::Approved) {

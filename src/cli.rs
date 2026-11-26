@@ -179,6 +179,8 @@ pub enum BoardOp {
         id: String,
         detach: bool,
         by: Option<String>,
+        exec_prepared: bool,
+        plan_hash: Option<String>,
     },
 }
 
@@ -1936,6 +1938,16 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     hidden: false,
                 },
                 FlagSpec {
+                    names: &["--exec-prepared"],
+                    takes_value: false,
+                    hidden: true,
+                },
+                FlagSpec {
+                    names: &["--plan-hash"],
+                    takes_value: true,
+                    hidden: true,
+                },
+                FlagSpec {
                     names: &["--json"],
                     takes_value: false,
                     hidden: false,
@@ -1953,6 +1965,8 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     id,
                     detach: parsed.flags.contains_key("--detach"),
                     by: parsed.flags.get("--by").cloned().flatten(),
+                    exec_prepared: parsed.flags.contains_key("--exec-prepared"),
+                    plan_hash: parsed.flags.get("--plan-hash").cloned().flatten(),
                 },
             })
         }
@@ -2905,8 +2919,11 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
                 validate_message(text).map_err(ApiError::from)?;
             }
         }
-        BoardOp::Run { id, .. } => {
+        BoardOp::Run { id, plan_hash, .. } => {
             check_id(id)?;
+            if let Some(hash) = plan_hash {
+                check_hash(hash)?;
+            }
         }
     }
     Ok(())
@@ -3158,6 +3175,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                         } else {
                             dmuxai::board::unmasked_prompt_from_item_plan(
                                 &state_root,
+                                store.base(),
                                 item.plan.as_ref(),
                             )
                             .map_err(ApiError::from)?
@@ -3416,30 +3434,47 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 }
                 Ok(())
             }
-            BoardOp::Run { id, detach, by } => {
+            BoardOp::Run {
+                id,
+                detach,
+                by,
+                exec_prepared,
+                plan_hash,
+            } => {
                 let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
-                let prepared = dmuxai::board::runner::run_item_prepare(
-                    &store,
-                    dmuxai::board::runner::RunParams {
-                        id,
-                        expected_plan_hash: None,
-                        by,
-                        state_root,
-                    },
-                )
-                .map_err(ApiError::from)?;
-                let item = if detach {
-                    let out_item = prepared.item.clone();
-                    let board_base = store.base().to_path_buf();
-                    std::thread::spawn(move || {
-                        if let Ok(bg_store) = dmuxai::board::BoardStore::open(board_base) {
-                            let _ = dmuxai::board::runner::run_item_execute(&bg_store, prepared);
-                        }
-                    });
-                    out_item
+                let item = if exec_prepared {
+                    let hash = plan_hash.ok_or_else(|| {
+                        ApiError::new(
+                            exit::USAGE,
+                            "--exec-prepared requires --plan-hash".to_owned(),
+                        )
+                    })?;
+                    dmuxai::board::runner::run_item_execute_prepared(
+                        &store,
+                        &id,
+                        &hash,
+                        &by,
+                        &state_root,
+                    )
+                    .map_err(ApiError::from)?
                 } else {
-                    dmuxai::board::runner::run_item_execute(&store, prepared)
-                        .map_err(ApiError::from)?
+                    let prepared = dmuxai::board::runner::run_item_prepare(
+                        &store,
+                        dmuxai::board::runner::RunParams {
+                            id,
+                            expected_plan_hash: None,
+                            by,
+                            state_root,
+                        },
+                    )
+                    .map_err(ApiError::from)?;
+                    if detach {
+                        dmuxai::board::runner::launch_detached_board_run(&store, prepared)
+                            .map_err(ApiError::from)?
+                    } else {
+                        dmuxai::board::runner::run_item_execute(&store, prepared)
+                            .map_err(ApiError::from)?
+                    }
                 };
                 if json_out {
                     print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
@@ -3451,6 +3486,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
         }
     })();
 
+    dmuxai::board::notify::wait_for_pending(std::time::Duration::from_secs(10));
     match result {
         Ok(()) => exit::OK,
         Err(error) => fail(error, json_out),

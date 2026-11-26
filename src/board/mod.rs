@@ -352,12 +352,22 @@ pub fn resolve_actor(by: Option<&str>, caller: BoardCaller) -> Result<String, Bo
             BoardCaller::Dashboard => {}
         }
     }
-    if actor != "owner" && actor != "planner" && !actor.starts_with("bot:") {
+    if actor == "planner" {
+        return Err(BoardError::Forbidden(
+            "planner actor is reserved for internal board runner actions".to_owned(),
+        ));
+    }
+    if actor != "owner" && !actor.starts_with("bot:") {
         return Err(BoardError::Usage(format!(
-            "invalid --by '{actor}' (expected owner, planner, or bot:NAME)"
+            "invalid --by '{actor}' (expected owner or bot:NAME)"
         )));
     }
     Ok(actor)
+}
+
+/// Strip trailing CR/LF so stored plan prompts match `dmuxai run -` (`read_prompt`).
+pub fn normalize_plan_prompt(prompt: &str) -> String {
+    prompt.trim_end_matches(['\r', '\n']).to_owned()
 }
 
 /// Read a local file path or stdin when `path` is `-`.
@@ -551,6 +561,14 @@ mod tests {
         assert!(validate_message(&"m".repeat(TEXT_MAX + 1)).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::Mcp).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
+        assert!(matches!(
+            resolve_actor(Some("planner"), BoardCaller::Mcp),
+            Err(BoardError::Forbidden(_))
+        ));
+        assert!(matches!(
+            resolve_actor(Some("planner"), BoardCaller::CliNonTty),
+            Err(BoardError::Forbidden(_))
+        ));
         match resolve_actor(None, BoardCaller::CliTty) {
             Ok(actor) => assert_eq!(actor, "owner"),
             Err(BoardError::Forbidden(_)) => {}

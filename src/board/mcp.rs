@@ -334,9 +334,13 @@ fn board_plan(workspace_root: &std::path::Path, args: &Value) -> Result<Value, A
         let prompt = if let Some(prompt) = str_arg(args, "prompt") {
             super::read_path_or_stdin(prompt).map_err(ApiError::from)?
         } else {
-            super::plan::unmasked_prompt_from_item_plan(&state_root, item.plan.as_ref())
-                .map_err(ApiError::from)?
-                .unwrap_or_default()
+            super::plan::unmasked_prompt_from_item_plan(
+                &state_root,
+                store.base(),
+                item.plan.as_ref(),
+            )
+            .map_err(ApiError::from)?
+            .unwrap_or_default()
         };
         if prompt.trim().is_empty() {
             return Err(ApiError::new(
@@ -578,12 +582,7 @@ fn board_run(args: &Value) -> Result<Value, ApiError> {
         },
     )
     .map_err(ApiError::from)?;
-    let item = prepared.item.clone();
-    let board_base = store.base().to_path_buf();
-    std::thread::spawn(move || {
-        if let Ok(bg_store) = super::BoardStore::open(board_base) {
-            let _ = super::runner::run_item_execute(&bg_store, prepared);
-        }
-    });
+    let item =
+        super::runner::launch_detached_board_run(&store, prepared).map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }

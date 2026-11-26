@@ -27,8 +27,25 @@ pub fn board_plan_copy_path(board_base: &Path, hash: &str) -> PathBuf {
     board_base.join("plans").join(format!("{hash}.json"))
 }
 
-/// Write `<state base>/board/plans/<hash>.json` (0600, same bytes as the
-/// pending plan file) so failed runs can retry with the same hash (FR-3130).
+fn read_checked_bytes(path: &Path, not_found_msg: String) -> Result<Vec<u8>, BoardError> {
+    crate::run_journal::verify_no_symlinks(path).map_err(|e| BoardError::Usage(e.to_string()))?;
+    if crate::run_journal::is_symlink(path).unwrap_or(false) {
+        return Err(BoardError::Usage(format!(
+            "refusing symlinked plan file at {}",
+            path.display()
+        )));
+    }
+    std::fs::read(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            BoardError::NotFound(not_found_msg)
+        } else {
+            BoardError::Internal(e.to_string())
+        }
+    })
+}
+
+/// Write `<state base>/board/plans/<hash>.json` (0600, canonical hash-verified
+/// bytes) so failed runs can retry with the same hash (FR-3130).
 pub fn write_board_plan_copy(
     state_root: &Path,
     board_base: &Path,
@@ -40,17 +57,45 @@ pub fn write_board_plan_copy(
         ));
     }
     let pending_path = pending_plan_path(state_root, hash);
-    let bytes = std::fs::read(&pending_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            BoardError::NotFound(format!("No pending plan found for '{hash}'"))
-        } else {
-            BoardError::Internal(e.to_string())
-        }
-    })?;
+    let bytes = read_checked_bytes(&pending_path, format!("No pending plan found for '{hash}'"))?;
+    let pending: PendingPlanFile = serde_json::from_slice(&bytes)
+        .map_err(|e| BoardError::Failed(format!("Pending plan '{hash}' is invalid: {e}")))?;
+    if pending_hash_for_plan(&pending)? != hash {
+        return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
+    }
+    let raw_prefix: String = sha256_hex(&bytes).chars().take(16).collect();
+    let canonical_bytes;
+    let out_bytes = if raw_prefix == hash {
+        bytes.as_slice()
+    } else {
+        canonical_bytes =
+            serde_json::to_vec(&pending).map_err(|e| BoardError::Internal(e.to_string()))?;
+        canonical_bytes.as_slice()
+    };
     let plans_dir = board_base.join("plans");
     crate::board::store::ensure_dir(&plans_dir)?;
     let copy_path = board_plan_copy_path(board_base, hash);
-    crate::board::store::atomic_write(&copy_path, &bytes)
+    crate::board::store::atomic_write(&copy_path, out_bytes)
+}
+
+fn read_board_plan_copy_bytes(
+    board_base: &Path,
+    hash: &str,
+) -> Result<(PendingPlanFile, Vec<u8>), BoardError> {
+    let copy_path = board_plan_copy_path(board_base, hash);
+    let bytes = read_checked_bytes(
+        &copy_path,
+        format!("No pending plan or board copy found for '{hash}'"),
+    )?;
+    let actual_prefix: String = sha256_hex(&bytes).chars().take(16).collect();
+    if actual_prefix != hash {
+        return Err(BoardError::Failed(format!(
+            "Board plan copy '{hash}' failed sha256 verification"
+        )));
+    }
+    let plan: PendingPlanFile = serde_json::from_slice(&bytes)
+        .map_err(|e| BoardError::Failed(format!("Board plan copy '{hash}' is invalid: {e}")))?;
+    Ok((plan, bytes))
 }
 
 /// Ensure `graph-pending/<hash>.json` exists; if missing, restore it from
@@ -65,26 +110,27 @@ pub fn ensure_pending_plan_from_copy(
         Err(BoardError::NotFound(_)) => {}
         Err(other) => return Err(other),
     }
-    let copy_path = board_plan_copy_path(board_base, hash);
-    let bytes = std::fs::read(&copy_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            BoardError::NotFound(format!("No pending plan or board copy found for '{hash}'"))
-        } else {
-            BoardError::Internal(e.to_string())
-        }
-    })?;
-    let actual_prefix: String = sha256_hex(&bytes).chars().take(16).collect();
-    if actual_prefix != hash {
-        return Err(BoardError::Failed(format!(
-            "Board plan copy '{hash}' failed sha256 verification"
-        )));
-    }
-    let plan: PendingPlanFile = serde_json::from_slice(&bytes)
-        .map_err(|e| BoardError::Failed(format!("Board plan copy '{hash}' is invalid: {e}")))?;
+    let (plan, bytes) = read_board_plan_copy_bytes(board_base, hash)?;
     let dir = state_root.join("graph-pending");
     crate::board::store::ensure_dir(&dir)?;
     crate::board::store::atomic_write(&pending_plan_path(state_root, hash), &bytes)?;
     Ok(plan)
+}
+
+/// Read `graph-pending/<hash>.json` or fall back to `<board_base>/plans/<hash>.json`
+/// without mutating `graph-pending` (FR-3130).
+pub fn read_pending_or_board_copy(
+    state_root: &Path,
+    board_base: &Path,
+    hash: &str,
+) -> Result<PendingPlanFile, BoardError> {
+    match read_pending_plan(state_root, hash) {
+        Ok(plan) => Ok(plan),
+        Err(BoardError::NotFound(_)) => {
+            read_board_plan_copy_bytes(board_base, hash).map(|(p, _)| p)
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Prune `<board_base>/plans/<hash>.json` copies that belong only to
@@ -137,13 +183,7 @@ pub fn read_pending_plan(state: &Path, hash: &str) -> Result<PendingPlanFile, Bo
         ));
     }
     let path = pending_plan_path(state, hash);
-    let bytes = std::fs::read(&path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            BoardError::NotFound(format!("No pending plan found for '{hash}'"))
-        } else {
-            BoardError::Internal(e.to_string())
-        }
-    })?;
+    let bytes = read_checked_bytes(&path, format!("No pending plan found for '{hash}'"))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| BoardError::Failed(format!("Pending plan '{hash}' is invalid: {e}")))
 }
@@ -168,12 +208,13 @@ pub fn write_pending_plan(state: &Path, plan: &PendingPlanFile) -> Result<String
 
 pub fn unmasked_prompt_from_item_plan(
     state_root: &Path,
+    board_base: &Path,
     plan: Option<&super::BoardPlan>,
 ) -> Result<Option<String>, BoardError> {
     let Some(plan) = plan else {
         return Ok(None);
     };
-    let pending = read_pending_plan(state_root, &plan.hash)?;
+    let pending = read_pending_or_board_copy(state_root, board_base, &plan.hash)?;
     Ok(Some(pending.prompt))
 }
 
@@ -247,9 +288,10 @@ pub fn edit_plan_from_json(
     }
     let settings = DmuxSettings::load(workspace_root);
     let holder = PlanValidationCtx::from_settings(&settings);
+    let normalized_prompt = super::normalize_plan_prompt(stored_prompt);
     let cap = settings.graph_max_nodes.clamp(1, 8) as usize;
     let ctx = PlanContext {
-        user_prompt: stored_prompt,
+        user_prompt: &normalized_prompt,
         available_runners: &holder.runners,
         runner_allowed: &|runner: &str| settings.graph_runner_allowed(runner),
         effective_model: &|runner: &str| holder.effective_model(runner),
@@ -264,14 +306,14 @@ pub fn edit_plan_from_json(
                 .join("\n"),
         )
     })?;
-    let plan = pending_from_doc(stored_prompt, &doc);
+    let plan = pending_from_doc(&normalized_prompt, &doc);
     let hash = write_pending_plan(state_root, &plan)?;
     Ok((plan, hash))
 }
 
 pub fn pending_from_doc(prompt: &str, doc: &PlanDoc) -> PendingPlanFile {
     PendingPlanFile {
-        prompt: prompt.to_owned(),
+        prompt: super::normalize_plan_prompt(prompt),
         tasks: doc.tasks.clone(),
         steps: doc.steps.clone(),
     }
@@ -496,10 +538,18 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
 
-        // Remove graph-pending/<hash>.json and verify restore.
+        // Remove graph-pending/<hash>.json and verify fallback + restore.
         let pending_path = pending_plan_path(&state, &hash);
         std::fs::remove_file(&pending_path).unwrap();
         assert!(!pending_path.exists());
+
+        let item_with_plan = store.get(&item.id).unwrap();
+        assert_eq!(
+            unmasked_prompt_from_item_plan(&state, &board_base, item_with_plan.plan.as_ref())
+                .unwrap()
+                .as_deref(),
+            Some("keep me")
+        );
 
         let restored = ensure_pending_plan_from_copy(&state, &board_base, &hash).unwrap();
         assert_eq!(restored.prompt, "keep me");
@@ -510,5 +560,19 @@ mod tests {
         std::fs::write(&copy_path, b"{\"prompt\":\"tampered\"}").unwrap();
         let err = ensure_pending_plan_from_copy(&state, &board_base, &hash).unwrap_err();
         assert!(matches!(err, BoardError::Failed(_)));
+
+        // Prune removes copies whose done/rejected items and files are > 30 days old,
+        // while keeping active/recent copies.
+        let old_copy = board_plan_copy_path(&board_base, "0123456789abcdef");
+        std::fs::write(&old_copy, b"{}").unwrap();
+        let old_time = filetime::FileTime::from_unix_time(1, 0);
+        filetime::set_file_mtime(&old_copy, old_time).unwrap();
+        let now_ms = 60 * 86_400 * 1000u64;
+        prune_old_plan_copies(&board_base, &[item_with_plan], now_ms);
+        assert!(
+            !old_copy.exists(),
+            "old orphan/closed copy should be pruned"
+        );
+        assert!(copy_path.exists(), "active item plan copy should be kept");
     }
 }

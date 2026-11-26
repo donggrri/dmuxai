@@ -394,16 +394,22 @@ pub(crate) async fn deliver_command_json(
 /// Append one line to `<workspace>/.dmuxai/notify.log`, creating the
 /// directory if needed. Failures are swallowed: logging never panics.
 pub(crate) fn append_log(log_path: &Path, line: &str) {
-    if let Some(parent) = log_path.parent() {
+    if let Some(parent) = log_path.parent()
+        && !parent.exists()
+    {
         let _ = crate::workspace::ensure_state_dir(parent);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut file) = opts.open(log_path) {
         use std::io::Write;
-        let _ = writeln!(file, "{line}");
+        let masked = crate::run_journal::mask_sensitive_tokens(line);
+        let _ = writeln!(file, "{masked}");
     }
 }
 
