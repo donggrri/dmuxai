@@ -23,7 +23,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 
 ### Out of scope / non-goals
 
-- Altering AGY, Codex, or custom agent model policies (AGY continues to allow `gemini-*-flash-*`, opencode allows `opencode/*-free`, Codex uses its catalog).
+- Altering AGY, Codex, or custom agent model policies (AGY policy is governed by SPEC-open-model-lists; opencode allows `opencode/*-free`, Codex uses its catalog).
 - Redesigning the F2 model picker UI layout.
 - Network calls or live provider smoke testing during unit tests.
 
