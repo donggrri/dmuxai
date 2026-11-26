@@ -88,7 +88,7 @@ pub struct AcpTurnResult {
 pub fn acp_model_arg(runner: &str, model: Option<&str>) -> Result<Option<String>, String> {
     match model.map(str::trim).filter(|m| !m.is_empty()) {
         None => Ok(None),
-        Some(model) => dmuxai::model_policy::validate_model_for_runner(runner, model)
+        Some(model) => dmuxai::model_policy::validate_model_for_runner_with(runner, model, false)
             .map(|()| Some(model.to_owned()))
             .map_err(|error| format!("{runner} ACP refused model `{model}`: {error}")),
     }

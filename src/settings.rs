@@ -119,6 +119,8 @@ pub struct DmuxSettings {
     /// Trusted `[terminal.serial] usbipd_attach` (FR-2614), parsed for
     /// compatibility. dmuxai never runs usbipd from WSL, so it has no effect.
     pub terminal_serial_usbipd_attach: Option<bool>,
+    /// User-level `[models] allow_fast` (FR-3003); workspace values are ignored.
+    pub models_allow_fast: bool,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,
 }
@@ -170,6 +172,19 @@ struct DmuxToml {
     /// `[terminal]` sessions config (SPEC-terminal-sessions FR-2614, FR-2630).
     /// A restricted key: dropped from a workspace config unless it is trusted.
     terminal: Option<TerminalToml>,
+    /// `[models]` (FR-3003): user config only.
+    models: Option<ModelsToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelsToml {
+    allow_fast: Option<bool>,
+}
+
+/// Applies the user-level fast-model opt-in once per process (FR-3003); value
+/// comes only from the user config, not workspace `dmuxai.toml`.
+pub fn wire_model_policy_switch(settings: &DmuxSettings) {
+    crate::model_policy::set_allow_fast(settings.models_allow_fast);
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -451,6 +466,11 @@ impl DmuxSettings {
                     if let Some(ws) = parsed.workspace.take() {
                         settings.workspace = ws;
                     }
+                    if let Some(models) = parsed.models.take()
+                        && let Some(allow_fast) = models.allow_fast
+                    {
+                        settings.models_allow_fast = allow_fast;
+                    }
                     if let Some(runners) = parsed.runners.take() {
                         let base_dir = match user_path.parent() {
                             Some(p) if !p.as_os_str().is_empty() => p,
@@ -497,6 +517,12 @@ impl DmuxSettings {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(mut parsed) => {
+                    if parsed.models.is_some() {
+                        settings
+                            .config_warnings
+                            .push("[models] is only valid in the user config; ignored".to_owned());
+                        parsed.models = None;
+                    }
                     let sha256 = content_hash(contents.as_bytes());
                     let restricted = restricted_workspace_keys_with_user(
                         &parsed,
@@ -1933,6 +1959,7 @@ impl Default for DmuxSettings {
             runs: crate::run_journal::JournalConfig::default(),
             terminal: crate::term::policy::TerminalSettings::default(),
             terminal_serial_usbipd_attach: None,
+            models_allow_fast: false,
             workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
         }
     }
@@ -4452,7 +4479,7 @@ model = "gemini-3.8-flash-high"
             ws3.path().join("dmuxai.toml"),
             r#"
 [runners.agy]
-model = "gemini-4-argon"
+model = "gemini-4-argon-fast"
 "#,
         )
         .unwrap();
@@ -4462,8 +4489,54 @@ model = "gemini-4-argon"
             settings3
                 .config_warnings
                 .iter()
-                .any(|w| w.contains("gemini-4-argon") && w.contains("not allowed"))
+                .any(|w| w.contains("gemini-4-argon-fast") && w.contains("not allowed"))
         );
+    }
+
+    // TC-3008 / FR-3003: `[models] allow_fast` is user-config only
+    #[test]
+    fn tc_3008_allow_fast_is_user_config_only() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[models]
+allow_fast = true
+"#,
+        )
+        .unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let settings_user = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+        assert!(settings_user.models_allow_fast);
+        assert!(
+            !settings_user
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown") && w.contains("allow_fast"))
+        );
+
+        let ws_only = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws_only.path().join("dmuxai.toml"),
+            r#"
+[models]
+allow_fast = true
+"#,
+        )
+        .unwrap();
+        let settings_ws = DmuxSettings::load_with_user_config(ws_only.path(), None);
+        assert!(!settings_ws.models_allow_fast);
+        assert!(
+            settings_ws
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[models]") && w.contains("user config"))
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        let settings_default = DmuxSettings::load_with_user_config(empty.path(), None);
+        assert!(!settings_default.models_allow_fast);
     }
 
     // TC-1754 / FR-1731: default ignored, custom accepted, unknown dropped

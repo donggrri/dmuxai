@@ -1840,6 +1840,7 @@ impl App {
         settings: DmuxSettings,
         prewarm: bool,
     ) -> Result<Self, ConversationError> {
+        dmuxai::settings::wire_model_policy_switch(&settings);
         let (mcp_servers, mcp_warnings) =
             dmuxai::mcp::config::resolve_servers(&settings.mcp_servers, |k| std::env::var(k).ok());
         let (event_tx, event_rx) = event_channel();
@@ -3567,22 +3568,15 @@ impl App {
                     models_loading: catalog.is_some_and(|catalog| catalog.loading),
                     models: catalog
                         .map(|catalog| {
-                            catalog
-                                .models
-                                .iter()
-                                .filter(|model| {
-                                    dmuxai::model_policy::validate_model_for_runner(&id, &model.id)
-                                        .is_ok()
-                                })
+                            picker_offered_models(&id, catalog)
+                                .into_iter()
                                 .map(|model| session_model(agent, model))
                                 .collect()
                         })
                         .unwrap_or_default(),
                     default_model: catalog
                         .and_then(|catalog| catalog.default_model.clone())
-                        .filter(|model| {
-                            dmuxai::model_policy::validate_model_for_runner(&id, model).is_ok()
-                        }),
+                        .filter(|model| model_offered_in_picker(&id, model)),
                     id,
                     run: Some(self.run_state_view_for_dashboard(agent)),
                 }
@@ -3838,20 +3832,26 @@ impl App {
                 };
                 let index = adapter_index(target);
                 self.quiet_model_echo.remove(&target);
-                // Same Cursor model pin as the TUI picker (SPEC-cursor-model-pin).
-                if target == Agent::Cursor
-                    && let Err(error) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &info.id)
+                let runner = self.agent_runner_name(target);
+                if let Err(error) =
+                    dmuxai::model_policy::validate_model_for_runner(&runner, &info.id)
                 {
-                    self.push_system(format!(
-                        "Model {} rejected for Cursor ({error}); replaced with {}",
-                        info.label,
-                        dmuxai::model_policy::ALLOWED_MODEL
-                    ));
-                    let _ = self.adapters[index]
-                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
-                    if let Some(catalog) = self.model_catalogs.get_mut(&target) {
-                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    if target == Agent::Cursor {
+                        self.push_system(format!(
+                            "Model {} rejected for Cursor ({error}); replaced with {}",
+                            info.label,
+                            dmuxai::model_policy::ALLOWED_MODEL
+                        ));
+                        let _ = self.adapters[index]
+                            .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        if let Some(catalog) = self.model_catalogs.get_mut(&target) {
+                            catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        }
+                    } else {
+                        return Err(RunTodoError::Invalid(format!(
+                            "Model {} rejected for {target} ({error})",
+                            info.label
+                        )));
                     }
                 } else {
                     self.adapters[index]
@@ -5454,20 +5454,12 @@ impl App {
             return;
         }
 
+        let runner = self.agent_runner_name(agent);
         let catalog = self
             .model_catalogs
             .get_mut(&agent)
             .expect("every agent has a model catalog");
-        let cursor = catalog
-            .selected
-            .as_ref()
-            .and_then(|selected| {
-                catalog
-                    .models
-                    .iter()
-                    .position(|model| &model.id == selected)
-            })
-            .unwrap_or(0);
+        let cursor = picker_selected_index(&runner, catalog);
         let should_load = catalog.models.is_empty() && !catalog.loading;
         if should_load {
             catalog.loading = true;
@@ -5487,6 +5479,12 @@ impl App {
         let Some(mut picker) = self.model_picker.take() else {
             return;
         };
+        let runner = self.agent_runner_name(picker.agent);
+        let model_count = self
+            .model_catalogs
+            .get(&picker.agent)
+            .map(|catalog| picker_offered_models(&runner, catalog).len())
+            .unwrap_or(0);
 
         match key.code {
             KeyCode::Esc => {}
@@ -5495,12 +5493,6 @@ impl App {
                 self.model_picker = Some(picker);
             }
             KeyCode::Down => {
-                let model_count = self
-                    .model_catalogs
-                    .get(&picker.agent)
-                    .expect("every agent has a model catalog")
-                    .models
-                    .len();
                 if model_count > 0 {
                     picker.cursor = (picker.cursor + 1).min(model_count - 1);
                 }
@@ -5508,12 +5500,12 @@ impl App {
             }
             KeyCode::Tab if picker.agent != Agent::Codex => self.model_picker = Some(picker),
             KeyCode::Enter | KeyCode::Tab => {
-                let Some(model) = self
-                    .model_catalogs
-                    .get(&picker.agent)
-                    .and_then(|catalog| catalog.models.get(picker.cursor))
-                    .cloned()
-                else {
+                let Some(model) = self.model_catalogs.get(&picker.agent).and_then(|catalog| {
+                    picker_offered_models(&runner, catalog)
+                        .into_iter()
+                        .nth(picker.cursor)
+                        .cloned()
+                }) else {
                     self.model_picker = Some(picker);
                     return;
                 };
@@ -5523,22 +5515,29 @@ impl App {
                     .position(|candidate| *candidate == agent)
                     .expect("picker agent belongs to Agent::all()");
                 self.quiet_model_echo.remove(&agent);
-                if agent == Agent::Cursor
-                    && let Err(error) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &model.id)
+                if let Err(error) =
+                    dmuxai::model_policy::validate_model_for_runner(&runner, &model.id)
                 {
-                    self.push_system(format!(
-                        "Model {} rejected for Cursor ({error}); replaced with {}",
-                        model.label,
-                        dmuxai::model_policy::ALLOWED_MODEL
-                    ));
-                    let _ = self.adapters[adapter_index]
-                        .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
-                    let catalog = self
-                        .model_catalogs
-                        .get_mut(&agent)
-                        .expect("every agent has a model catalog");
-                    catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    if agent == Agent::Cursor {
+                        self.push_system(format!(
+                            "Model {} rejected for Cursor ({error}); replaced with {}",
+                            model.label,
+                            dmuxai::model_policy::ALLOWED_MODEL
+                        ));
+                        let _ = self.adapters[adapter_index]
+                            .select_model(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                        let catalog = self
+                            .model_catalogs
+                            .get_mut(&agent)
+                            .expect("every agent has a model catalog");
+                        catalog.selected = Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned());
+                    } else {
+                        self.messages.push(Message::new(
+                            Role::System,
+                            format!("Model {} rejected for {agent} ({error})", model.label),
+                        ));
+                        self.model_picker = Some(picker);
+                    }
                     self.persist_task_settings();
                     return;
                 }
@@ -11586,6 +11585,7 @@ impl App {
                 selected,
                 selected_effort,
             } => {
+                let runner = self.agent_runner_name(agent);
                 let catalog = self
                     .model_catalogs
                     .get_mut(&agent)
@@ -11601,6 +11601,16 @@ impl App {
                         }
                         _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
                     }
+                } else if agent == Agent::Agy {
+                    match selected {
+                        Some(ref m)
+                            if dmuxai::model_policy::validate_model_for_runner("agy", m)
+                                .is_ok() =>
+                        {
+                            selected
+                        }
+                        _ => None,
+                    }
                 } else {
                     selected
                 };
@@ -11612,19 +11622,11 @@ impl App {
                 if let Some(picker) = self.model_picker.as_mut()
                     && picker.agent == agent
                 {
-                    picker.cursor = catalog
-                        .selected
-                        .as_ref()
-                        .and_then(|selected| {
-                            catalog
-                                .models
-                                .iter()
-                                .position(|model| &model.id == selected)
-                        })
-                        .unwrap_or(0);
+                    picker.cursor = picker_selected_index(&runner, catalog);
                 }
             }
             AgentEvent::ModelSelected(model) => {
+                let runner = self.agent_runner_name(agent);
                 let model = if agent == Agent::Cursor
                     && dmuxai::model_policy::validate_model_for_runner("cursor", &model).is_err()
                 {
@@ -11633,6 +11635,15 @@ impl App {
                         dmuxai::model_policy::ALLOWED_MODEL
                     ));
                     dmuxai::model_policy::ALLOWED_MODEL.to_owned()
+                } else if agent == Agent::Agy
+                    && dmuxai::model_policy::validate_model_for_runner("agy", &model).is_err()
+                {
+                    self.push_system(format!(
+                        "Disallowed model '{model}' for AGY ({})",
+                        dmuxai::model_policy::validate_model_for_runner(&runner, &model)
+                            .unwrap_err()
+                    ));
+                    return;
                 } else {
                     model
                 };
@@ -16445,6 +16456,8 @@ impl App {
             .model_catalogs
             .get(&picker.agent)
             .expect("every agent has a model catalog");
+        let runner = self.agent_runner_name(picker.agent);
+        let offered = picker_offered_models(&runner, catalog);
         let title = format!(" {} models ", picker.agent);
         if catalog.loading {
             let mut block = Block::default().borders(Borders::ALL).title(title);
@@ -16462,8 +16475,7 @@ impl App {
             return;
         }
 
-        let items = catalog
-            .models
+        let items = offered
             .iter()
             .map(|model| {
                 let marker = if catalog.selected.as_deref() == Some(model.id.as_str()) {
@@ -16502,7 +16514,7 @@ impl App {
             list = list.style(Style::default().fg(fg));
         }
         let mut state = ListState::default().with_selected(
-            (!catalog.models.is_empty()).then_some(picker.cursor.min(catalog.models.len() - 1)),
+            (!offered.is_empty()).then_some(picker.cursor.min(offered.len().saturating_sub(1))),
         );
         frame.render_stateful_widget(list, area, &mut state);
     }
@@ -17780,6 +17792,27 @@ fn bounded_activity_detail(value: &str) -> String {
     } else {
         prefix
     }
+}
+
+/// F2 and dashboard pickers hide fast ids even when `[models] allow_fast` is set (FR-3008).
+fn model_offered_in_picker(runner: &str, model_id: &str) -> bool {
+    dmuxai::model_policy::validate_model_for_runner_with(runner, model_id, false).is_ok()
+}
+
+fn picker_offered_models<'a>(runner: &str, catalog: &'a ModelCatalog) -> Vec<&'a ModelInfo> {
+    catalog
+        .models
+        .iter()
+        .filter(|model| model_offered_in_picker(runner, &model.id))
+        .collect()
+}
+
+fn picker_selected_index(runner: &str, catalog: &ModelCatalog) -> usize {
+    let selected = catalog.selected.as_deref();
+    picker_offered_models(runner, catalog)
+        .iter()
+        .position(|model| selected == Some(model.id.as_str()))
+        .unwrap_or(0)
 }
 
 /// Resolve a requested model id against a runner's catalog (SPEC-agy-bare-model).
@@ -26334,7 +26367,7 @@ out3
     // TC-1751 / FR-1730: disallowed headless model is policy-rejected before any request
     #[tokio::test]
     async fn tc_1751_headless_disallowed_model_policy() {
-        // agy + gemini-4-argon
+        // agy + fast model
         {
             let (mut app, sent) = test_app();
             app.selected = adapter_index(Agent::Agy);
@@ -26348,7 +26381,7 @@ out3
                 approve_plan_id: None,
                 allow_sensitive: false,
                 todo_id: None,
-                model: Some("gemini-4-argon".to_owned()),
+                model: Some("gemini-4-argon-fast".to_owned()),
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28111,6 +28144,70 @@ out3
             default_model: None,
             loading: false,
         }
+    }
+
+    // TC-3010 / FR-3008
+    #[test]
+    fn tc_3010_pickers_offer_open_models_without_fast() {
+        let (mut app, _) = test_app();
+        app.apply_agent_event(
+            Agent::Cursor,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::new("claude-sonnet-5-5-high", "Claude Sonnet 5.5 High"),
+                    ModelInfo::new("grok-4.7-high", "Grok 4.7 High"),
+                    ModelInfo::new("composer-2.5-fast", "Composer 2.5 Fast"),
+                ],
+                selected: Some("claude-sonnet-5-5-high".to_owned()),
+                selected_effort: None,
+            },
+        );
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::new("gemini-4-carbon-high", "Gemini 4 Carbon High"),
+                    ModelInfo::new("claude-sonnet-5-5-high", "Claude Sonnet 5.5 High"),
+                    ModelInfo::new("gemini-4-carbon-fast", "Gemini 4 Carbon Fast"),
+                ],
+                selected: Some("gemini-4-carbon-high".to_owned()),
+                selected_effort: None,
+            },
+        );
+
+        let session = app.session_view();
+        let cursor = session.agents.iter().find(|a| a.id == "cursor").unwrap();
+        let cursor_ids: Vec<&str> = cursor.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(cursor_ids.contains(&"claude-sonnet-5-5-high"));
+        assert!(cursor_ids.contains(&"grok-4.7-high"));
+        assert!(!cursor_ids.iter().any(|id| id.contains("fast")));
+
+        let agy = session.agents.iter().find(|a| a.id == "agy").unwrap();
+        let agy_ids: Vec<&str> = agy.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(agy_ids.contains(&"gemini-4-carbon-high"));
+        assert!(agy_ids.contains(&"claude-sonnet-5-5-high"));
+        assert!(!agy_ids.iter().any(|id| id.contains("fast")));
+
+        app.selected = adapter_index(Agent::Cursor);
+        app.open_model_picker();
+        let rendered = render_text_at(&mut app, 80, 30);
+        assert!(rendered.contains("grok-4.7-high"));
+        assert!(!rendered.contains("composer-2.5-fast"));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_catalogs[&Agent::Cursor].selected.as_deref(),
+            Some("grok-4.7-high")
+        );
+
+        app.selected = adapter_index(Agent::Agy);
+        app.open_model_picker();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_catalogs[&Agent::Agy].selected.as_deref(),
+            Some("claude-sonnet-5-5-high")
+        );
     }
 
     // Composer model menu: the session view carries the runner default model,
@@ -34496,7 +34593,9 @@ out3
         assert!(
             dmuxai::model_policy::validate_model_for_runner("agy", "gemini-3.8-flash-high").is_ok()
         );
-        assert!(dmuxai::model_policy::validate_model_for_runner("agy", "gemini-4-argon").is_err());
+        assert!(
+            dmuxai::model_policy::validate_model_for_runner("agy", "gemini-4-argon-fast").is_err()
+        );
     }
 
     fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {

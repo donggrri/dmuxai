@@ -3,7 +3,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -450,39 +450,28 @@ async fn runtime_loop(
                     }
                 }
                 CursorCommand::Cancel => {}
-                CursorCommand::ListModels => match list_models(&cwd).await {
-                    Ok((models, _advertised_default)) => {
-                        let selected = match &selected_model {
-                            Some(model)
-                                if dmuxai::model_policy::validate_model_for_runner(
-                                    "cursor", model,
-                                )
+                CursorCommand::ListModels => {
+                    let (models, _advertised_default) = list_models(&cwd).await;
+                    let selected = match &selected_model {
+                        Some(model)
+                            if dmuxai::model_policy::validate_model_for_runner("cursor", model)
                                 .is_ok() =>
-                            {
-                                selected_model.clone()
-                            }
-                            _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
-                        };
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::ModelsListed {
-                                models,
-                                selected,
-                                selected_effort: None,
-                            },
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::Error(AgentError::model_unavailable(error.to_string())),
-                        )
-                        .await;
-                    }
-                },
+                        {
+                            selected_model.clone()
+                        }
+                        _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
+                    };
+                    send_event(
+                        &event_tx,
+                        None,
+                        AgentEvent::ModelsListed {
+                            models,
+                            selected,
+                            selected_effort: None,
+                        },
+                    )
+                    .await;
+                }
                 CursorCommand::SelectModel(model) => {
                     let changed = selected_model.as_ref() != Some(&model);
                     selected_model = Some(model.clone());
@@ -1267,21 +1256,50 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
     events
 }
 
-async fn list_models(cwd: &Path) -> io::Result<(Vec<ModelInfo>, Option<String>)> {
-    let mut command = cursor_command()?;
+const CURSOR_LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn resolve_cursor_list_program() -> PathBuf {
+    std::env::var_os("DMUXAI_CURSOR_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cursor-agent"))
+}
+
+fn static_cursor_catalog_models() -> (Vec<ModelInfo>, Option<String>) {
+    let models = dmuxai::agent_api::static_cursor_model_listing()
+        .models
+        .into_iter()
+        .map(|(id, label)| ModelInfo::new(id.clone(), label.unwrap_or(id)))
+        .collect();
+    (models, Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()))
+}
+
+async fn list_models(cwd: &Path) -> (Vec<ModelInfo>, Option<String>) {
+    let program = resolve_cursor_list_program();
+    list_models_with(&program, cwd, CURSOR_LIST_MODELS_TIMEOUT).await
+}
+
+pub(crate) async fn list_models_with(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> (Vec<ModelInfo>, Option<String>) {
+    let mut command = dmuxai::process::headless_command(program.to_path_buf());
     apply_child_cwd_tokio(&mut command, cwd);
     command
         .arg("--list-models")
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let output = command.output().await?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Cursor model discovery failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let parsed = parse_model_list(&String::from_utf8_lossy(&output.stdout));
+            if parsed.0.is_empty() {
+                static_cursor_catalog_models()
+            } else {
+                parsed
+            }
+        }
+        _ => static_cursor_catalog_models(),
     }
-    Ok(parse_model_list(&String::from_utf8_lossy(&output.stdout)))
 }
 
 fn parse_model_list(output: &str) -> (Vec<ModelInfo>, Option<String>) {
@@ -2090,6 +2108,85 @@ pub(crate) mod tests {
         assert!(
             !grok_args.iter().any(|arg| arg == "composer-2.5"),
             "grok-4.7 should not be replaced with composer-2.5: {grok_args:?}"
+        );
+    }
+
+    // TC-3013 / FR-3011, FR-3008
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3013_cursor_list_models_bounded_with_static_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let write_script = |name: &str, body: &str| -> PathBuf {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let hang = write_script("hang", "#!/bin/sh\nsleep 30\n");
+        let fail = write_script("fail", "#!/bin/sh\nexit 1\n");
+        let timeout = Duration::from_millis(300);
+
+        let (hang_models, _) = list_models_with(&hang, dir.path(), timeout).await;
+        assert!(!hang_models.is_empty());
+        assert!(hang_models.iter().any(|m| m.id == "claude-sonnet-5-5-high"));
+
+        let (fail_models, _) = list_models_with(&fail, dir.path(), timeout).await;
+        assert!(!fail_models.is_empty());
+        assert!(fail_models.iter().any(|m| m.id == "grok-4.7-high"));
+    }
+
+    // TC-3011 / FR-3008, FR-3009
+    #[test]
+    fn tc_3011_cursor_argv_passes_open_models_and_pins_default() {
+        let cwd = Path::new("workspace");
+        for model in ["claude-sonnet-5-5-high", "grok-4.7-high"] {
+            let mut cmd = tokio::process::Command::new("cursor-agent");
+            configure_command(&mut cmd, None, Some(model), TurnPolicy::ReadOnly, cwd);
+            let args = cmd
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                args.windows(2).any(|w| w == ["--model", model]),
+                "open model {model} should reach argv: {args:?}"
+            );
+        }
+
+        let mut default_cmd = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut default_cmd, None, None, TurnPolicy::ReadOnly, cwd);
+        let default_args = default_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            default_args
+                .windows(2)
+                .any(|w| w == ["--model", "composer-2.5"]),
+            "unset model should pin composer-2.5: {default_args:?}"
+        );
+
+        let mut fast_cmd = tokio::process::Command::new("cursor-agent");
+        configure_command(
+            &mut fast_cmd,
+            None,
+            Some("composer-2.5-fast"),
+            TurnPolicy::ReadOnly,
+            cwd,
+        );
+        let fast_args = fast_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            fast_args
+                .windows(2)
+                .any(|w| w == ["--model", "composer-2.5"]),
+            "fast model should fall back to composer-2.5: {fast_args:?}"
         );
     }
 
