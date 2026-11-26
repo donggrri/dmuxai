@@ -152,9 +152,10 @@ function boardRenderMyDecisions(container, items) {
       for (var oi = 0; oi < item.options.length; oi++) {
         var optBtn = boardEl('button', 'btn btn-small', item.options[oi]);
         optBtn.type = 'button';
-        optBtn.setAttribute('data-board-action', 'answer');
+        optBtn.setAttribute('data-board-action', 'select_option');
         optBtn.setAttribute('data-option', String(oi));
         optBtn.setAttribute('data-item-id', item.id);
+        optBtn.setAttribute('aria-pressed', 'false');
         actions.appendChild(optBtn);
       }
     }
@@ -174,12 +175,6 @@ function boardRenderMyDecisions(container, items) {
     reject.setAttribute('data-item-id', item.id);
     actions.appendChild(reject);
     card.appendChild(actions);
-    card.addEventListener('click', function (e) {
-      if (e.target && e.target.getAttribute && e.target.getAttribute('data-board-action')) {
-        return;
-      }
-      boardOpenDrawer(item.id);
-    });
     row.appendChild(card);
   }
   if (!any) {
@@ -225,10 +220,6 @@ function boardRenderKanban(root, items) {
           .catch(function () { /* ignore */ });
       });
       card.appendChild(menu);
-      card.addEventListener('click', function (e) {
-        if (e.target && e.target.tagName === 'SELECT') { return; }
-        boardOpenDrawer(item.id);
-      });
       cards.appendChild(card);
     }
     lane.appendChild(cards);
@@ -372,9 +363,26 @@ function boardRenderDrawer(item) {
     if (boardPlanConflict) {
       drawer.appendChild(boardEl('p', 'board-plan-notice', 'Plan changed — reload'));
     }
+    var planScroll = boardEl('div', 'board-plan-table-wrap');
     var table = document.createElement('table');
     table.className = 'board-plan-table';
     table.setAttribute('id', 'board-plan-steps');
+    var colgroup = document.createElement('colgroup');
+    [
+      { w: '90px', cls: 'board-plan-col-id' },
+      { w: '110px', cls: 'board-plan-col-role' },
+      { w: '110px', cls: 'board-plan-col-runner' },
+      { w: '150px', cls: 'board-plan-col-model' },
+      { w: '120px', cls: 'board-plan-col-deps' },
+      { w: 'auto', cls: 'board-plan-col-job' },
+      { w: '80px', cls: 'board-plan-col-actions' }
+    ].forEach(function (col) {
+      var cg = document.createElement('col');
+      cg.className = col.cls;
+      if (col.w !== 'auto') { cg.style.width = col.w; }
+      colgroup.appendChild(cg);
+    });
+    table.appendChild(colgroup);
     var thead = document.createElement('thead');
     var hrow = document.createElement('tr');
     ['id', 'role', 'runner', 'model', 'depends_on', 'job', ''].forEach(function (h) {
@@ -387,7 +395,8 @@ function boardRenderDrawer(item) {
     var tbody = document.createElement('tbody');
     boardRenderPlanTable(tbody, item.plan);
     table.appendChild(tbody);
-    drawer.appendChild(table);
+    planScroll.appendChild(table);
+    drawer.appendChild(planScroll);
     var planActions = boardEl('div', 'board-plan-actions');
     var addStep = boardEl('button', 'btn btn-small', 'Add step');
     addStep.type = 'button';
@@ -398,6 +407,8 @@ function boardRenderDrawer(item) {
     savePlan.id = 'board-save-plan';
     planActions.appendChild(savePlan);
     drawer.appendChild(planActions);
+    savePlan.addEventListener('click', function () { boardSavePlan(item.id); });
+    addStep.addEventListener('click', function () { boardAddPlanStep(); });
     var errBox = boardEl('div', 'board-plan-errors');
     errBox.id = 'board-plan-errors';
     drawer.appendChild(errBox);
@@ -420,10 +431,22 @@ function boardRenderDrawer(item) {
       drawer.appendChild(diff);
     }
   }
+  var decisionLine = 'No decision yet';
   if (item.decision) {
-    drawer.appendChild(boardEl('p', 'board-decision-record',
-      'Last decision: ' + item.decision.verdict + ' by ' + item.decision.by));
+    var dParts = [item.decision.verdict, item.decision.by ? 'by ' + item.decision.by : ''];
+    if (item.decision.text) {
+      dParts.push(item.decision.text);
+    } else if (
+      item.decision.option !== undefined &&
+      item.decision.option !== null &&
+      item.options &&
+      item.options[item.decision.option]
+    ) {
+      dParts.push(item.options[item.decision.option]);
+    }
+    decisionLine = dParts.filter(Boolean).join(' · ');
   }
+  drawer.appendChild(boardEl('p', 'board-decision-record', decisionLine));
   var chat = boardEl('section', 'board-chat');
   chat.setAttribute('aria-label', 'Side chat');
   var thread = boardEl('div', 'board-chat-thread');
@@ -453,19 +476,11 @@ function boardRenderDrawer(item) {
   chat.appendChild(send);
   drawer.appendChild(chat);
 
-  savePlan.addEventListener('click', function () { boardSavePlan(item.id); });
-  addStep.addEventListener('click', function () { boardAddPlanStep(); });
   send.addEventListener('click', function () { boardSendChat(item.id); });
   ta.addEventListener('keydown', function (e) {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       boardSendChat(item.id);
-    }
-  });
-  drawer.addEventListener('click', function (e) {
-    var btn = e.target;
-    if (btn && btn.getAttribute && btn.getAttribute('data-board-remove-step') !== null) {
-      boardRemovePlanStep(btn.getAttribute('data-board-remove-step'));
     }
   });
 }
@@ -521,7 +536,12 @@ function boardAddPlanStep() {
     td.appendChild(boardPlanFieldInput(field, ''));
     tr.appendChild(td);
   });
-  tr.appendChild(document.createElement('td'));
+  var delTd = document.createElement('td');
+  var delBtn = boardEl('button', 'btn btn-small', 'Remove');
+  delBtn.type = 'button';
+  delBtn.setAttribute('data-board-remove-step', 'new');
+  delTd.appendChild(delBtn);
+  tr.appendChild(delTd);
   tbody.appendChild(tr);
 }
 
@@ -546,11 +566,28 @@ function boardSendChat(id) {
 
 function boardOpenDrawer(id, skipPush) {
   boardSelectedId = id;
+  var wrap = document.getElementById('board-drawer-wrap');
+  if (wrap) {
+    wrap.hidden = false;
+    wrap.classList.add('open');
+  }
+  var cached = !skipPush ? boardFindItem(id) : null;
+  if (cached) {
+    boardRenderDrawer(cached);
+  } else if (!skipPush) {
+    var drawer = document.getElementById('board-drawer');
+    if (drawer) { drawer.textContent = ''; }
+  }
   boardFetchJson('GET', '/api/board/' + encodeURIComponent(id)).then(function (item) {
+    if (boardSelectedId !== id) { return; }
     boardSelectedItem = item;
     boardPlanConflict = false;
     boardRenderDrawer(item);
-  }).catch(function () { boardCloseDrawer(); });
+  }).catch(function () {
+    if (boardSelectedId === id) {
+      boardCloseDrawer();
+    }
+  });
 }
 
 function boardFindItem(id) {
@@ -640,6 +677,38 @@ function boardSaveRules(panel) {
   }
 }
 
+function boardEnsureAnswerSendForm(card, id) {
+  if (!card) { return; }
+  var form = card.querySelector('.board-answer-send-form');
+  if (!form) {
+    form = boardEl('div', 'board-answer-send-form');
+    var ta = document.createElement('textarea');
+    ta.className = 'board-answer-note-input';
+    ta.rows = 2;
+    ta.setAttribute('aria-label', 'Optional note with answer');
+    ta.setAttribute('data-item-id', id);
+    ta.placeholder = 'Optional note';
+    form.appendChild(ta);
+    var send = boardEl('button', 'btn btn-small btn-primary', 'Send answer');
+    send.type = 'button';
+    send.setAttribute('data-board-action', 'submit_answer');
+    send.setAttribute('data-item-id', id);
+    form.appendChild(send);
+    card.appendChild(form);
+  }
+  form.hidden = false;
+}
+
+function boardClearAnswerSendForm(card) {
+  if (!card) { return; }
+  var form = card.querySelector('.board-answer-send-form');
+  if (form) {
+    form.hidden = true;
+    var ta = form.querySelector('.board-answer-note-input');
+    if (ta) { ta.value = ''; }
+  }
+}
+
 function boardEnsureRequestChangesForm(card, id) {
   if (!card || card.querySelector('.board-request-changes-form')) { return; }
   var form = boardEl('div', 'board-request-changes-form');
@@ -666,51 +735,104 @@ function boardEnsureRequestChangesForm(card, id) {
 }
 
 function boardOnActionClick(e) {
-  var btn = e.target;
-  if (!btn || !btn.getAttribute) { return; }
+  var btn = e.target && e.target.closest ? e.target.closest('[data-board-action]') : null;
+  if (!btn) { return false; }
   var action = btn.getAttribute('data-board-action');
-  if (!action) { return; }
   var id = btn.getAttribute('data-item-id');
-  if (!id) { return; }
+  if (!action || !id) { return false; }
   e.stopPropagation();
   var card = btn.closest('.board-decision-card');
   if (action === 'request_changes') {
     boardEnsureRequestChangesForm(card, id);
-    return;
+    return true;
   }
   if (action === 'cancel_changes') {
     var form = card && card.querySelector('.board-request-changes-form');
     if (form) { form.remove(); }
-    return;
+    return true;
   }
   if (action === 'submit_changes') {
     var area = card && card.querySelector('.board-request-changes-input');
     if (area && area.value.trim()) {
       boardDecide(id, 'request_changes', { text: area.value.trim() });
     }
-    return;
+    return true;
   }
-  boardOpenDrawer(id);
+  if (action === 'select_option') {
+    var optBtns = card ? card.querySelectorAll('[data-board-action="select_option"]') : [];
+    for (var si = 0; si < optBtns.length; si++) {
+      var selected = optBtns[si] === btn;
+      optBtns[si].setAttribute('aria-pressed', selected ? 'true' : 'false');
+      optBtns[si].classList.toggle('board-option-selected', selected);
+    }
+    boardEnsureAnswerSendForm(card, id);
+    return true;
+  }
+  if (action === 'submit_answer') {
+    var picked = card && card.querySelector('[data-board-action="select_option"][aria-pressed="true"]');
+    if (!picked) { return true; }
+    var answerOpt = parseInt(picked.getAttribute('data-option'), 10);
+    var noteArea = card && card.querySelector('.board-answer-note-input');
+    var answerText = noteArea && noteArea.value.trim()
+      ? noteArea.value.trim()
+      : picked.textContent;
+    boardDecide(id, 'answer', { option: answerOpt, text: answerText });
+    boardClearAnswerSendForm(card);
+    return true;
+  }
   if (action === 'approve') {
     boardDecide(id, 'approve');
-  } else if (action === 'reject') {
+    return true;
+  }
+  if (action === 'reject') {
+    if (!window.confirm('Reject this item?')) { return true; }
     boardDecide(id, 'reject');
-  } else if (action === 'answer') {
-    var opt = parseInt(btn.getAttribute('data-option'), 10);
-    boardDecide(id, 'answer', { option: opt, text: btn.textContent });
+    return true;
+  }
+  return false;
+}
+
+function boardOnBodyClick(e) {
+  if (boardOnActionClick(e)) { return; }
+  var target = e.target;
+  if (!target || !target.closest) { return; }
+  if (target.closest('select, input, textarea, button, a')) { return; }
+  var card = target.closest('.board-card, .board-decision-card');
+  if (!card) { return; }
+  var id = card.getAttribute('data-item-id');
+  if (id) {
+    boardOpenDrawer(id);
   }
 }
 
 function boardInit() {
   boardBindToolbar();
-  var my = document.getElementById('board-my-decisions');
-  if (my) {
-    my.addEventListener('click', boardOnActionClick);
+  var body = document.getElementById('board-body');
+  if (body) {
+    body.addEventListener('click', boardOnBodyClick);
+  }
+  var drawer = document.getElementById('board-drawer');
+  if (drawer) {
+    drawer.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('[data-board-remove-step]') : null;
+      if (btn) {
+        boardRemovePlanStep(btn.getAttribute('data-board-remove-step'));
+      }
+    });
   }
   var backdrop = document.getElementById('board-drawer-backdrop');
   if (backdrop) {
     backdrop.addEventListener('click', boardCloseDrawer);
   }
+  document.addEventListener('click', function (e) {
+    var wrap = document.getElementById('board-drawer-wrap');
+    if (!wrap || wrap.hidden || !wrap.classList.contains('open')) { return; }
+    var target = e.target;
+    if (target && target.closest && target.closest('.board-card, .board-decision-card, #board-drawer')) {
+      return;
+    }
+    boardCloseDrawer();
+  });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') { return; }
     var wrap = document.getElementById('board-drawer-wrap');

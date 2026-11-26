@@ -2468,6 +2468,8 @@ mod tests {
         assert!(BOARD_JS.contains("Approve"));
         assert!(BOARD_JS.contains("Request changes"));
         assert!(BOARD_JS.contains("Reject"));
+        assert!(BOARD_JS.contains("boardUpdateBadge"));
+        assert!(BOARD_JS.contains("badge.textContent"));
         assert!(INDEX_HTML.contains("/assets/board.js"));
         assert!(INDEX_HTML.contains("/assets/board.css"));
     }
@@ -2485,6 +2487,12 @@ mod tests {
         assert!(BOARD_JS.contains("plan_hash"));
         assert!(BOARD_JS.contains("Plan changed"));
         assert!(BOARD_JS.contains("previous_steps"));
+        assert!(BOARD_JS.contains("Send answer"));
+        assert!(BOARD_JS.contains("window.confirm"));
+        assert!(BOARD_JS.contains("No decision yet"));
+        assert!(BOARD_JS.contains("board-plan-table-wrap"));
+        assert!(BOARD_JS.contains("boardOnBodyClick"));
+        assert!(BOARD_JS.contains(".board-card, .board-decision-card, #board-drawer"));
     }
 
     // TC-3124 / FR-3124: board SSE only while the view is visible.
