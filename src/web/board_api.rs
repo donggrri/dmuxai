@@ -140,6 +140,7 @@ fn parse_all_flag(raw: Option<&String>) -> bool {
 #[derive(Serialize)]
 struct BoardListResponse {
     items: Vec<BoardItem>,
+    launch_allowed: bool,
 }
 
 async fn board_list(
@@ -157,8 +158,15 @@ async fn board_list(
         workspace,
         include_all,
     };
+    let launch_allowed = state.launch_allowed;
     match with_store(state.board_base.clone(), move |store| store.list(&filter)).await {
-        Ok(items) => json_ok(StatusCode::OK, &BoardListResponse { items }),
+        Ok(items) => json_ok(
+            StatusCode::OK,
+            &BoardListResponse {
+                items,
+                launch_allowed,
+            },
+        ),
         Err(error) => board_error_response(error),
     }
 }

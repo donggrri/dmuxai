@@ -10,6 +10,7 @@ All notable changes to dmuxai are listed here. Versions follow
 - **Decision board (v0.4.1, PR 1):** User-level coordinator board under `<state base>/board/` with lanes, rules, graph plan attach/edit, decisions, thread messages, blocking `board wait`, `dmuxai board` CLI, and MCP `board_*` tools (SPEC-decision-board FR-3100..FR-3115).
 - **Decision board dashboard (v0.4.1, PR 2):** Board center view (My decisions cards, kanban lanes, item drawer with plan editor, diff, chat, rules panel), HTTP `/api/board*` routes and live `GET /api/board/events` SSE on `dmuxai serve` and `dmuxai --web` (SPEC-decision-board FR-3120..FR-3126).
 - **Decision board runner & notifications (v0.4.1, PR 3 part A):** `board ask` / `board_ask`, `board run` / `board_run`, HTTP `POST /api/board/{id}/ask` and `/run` (`--web` only), board plan copies under `<state base>/board/plans/<hash>.json`, user-only `[board]` config, and background board notifications (`dmuxai.board.event.v1`) (SPEC-decision-board FR-3130..FR-3133, FR-3135, NFR-3130).
+- **Decision board drawer Ask planner & Run controls (v0.4.1, PR 3 part B):** Added Ask planner (`#board-ask-text`, `#board-ask`, `#board-ask-revise`, `#board-ask-busy`) and `#board-run` drawer controls in `--web`, hidden in view-only `serve` via `GET /api/board` `launch_allowed` (SPEC-decision-board FR-3134).
 
 ## [0.4.0] - 2026-11-24
 

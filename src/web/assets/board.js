@@ -26,6 +26,8 @@ var boardShowClosed = false;
 var boardWorkspaceFilter = '';
 var boardRulesOpen = false;
 var boardPlanConflict = false;
+var boardLaunchAllowed = false;
+var boardAskPending = {};
 
 function boardToken() {
   try { return window.sessionStorage.getItem(BOARD_TOKEN_KEY); } catch (err) { return null; }
@@ -240,6 +242,9 @@ function boardRenderList() {
 function boardRefreshList() {
   var qs = boardShowClosed ? '?all=1' : '';
   return boardFetchJson('GET', '/api/board' + qs).then(function (data) {
+    if (data && typeof data.launch_allowed === 'boolean') {
+      boardLaunchAllowed = data.launch_allowed;
+    }
     boardItems = data && data.items ? data.items : [];
     boardRenderList();
     if (boardSelectedId) {
@@ -348,12 +353,41 @@ function boardRenderPlanTable(tbody, plan) {
   }
 }
 
+function boardCountPlannerMessages(item) {
+  if (!item || !item.thread) { return 0; }
+  var count = 0;
+  for (var i = 0; i < item.thread.length; i++) {
+    if (item.thread[i] && item.thread[i].from === 'planner') {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function boardIsItemRunnable(item) {
+  if (!boardLaunchAllowed || !item || !item.plan || !item.plan.hash) {
+    return false;
+  }
+  if (item.lane === 'auto') {
+    return true;
+  }
+  if (item.lane === 'approved' && item.decision && item.decision.plan_hash === item.plan.hash) {
+    return true;
+  }
+  return false;
+}
+
 function boardRenderDrawer(item) {
   var wrap = document.getElementById('board-drawer-wrap');
   var drawer = document.getElementById('board-drawer');
   if (!wrap || !drawer) { return; }
   wrap.hidden = false;
   wrap.classList.add('open');
+  var pendingAsk = boardAskPending[item.id];
+  if (pendingAsk && !pendingAsk.error && boardCountPlannerMessages(item) > pendingAsk.baselineCount) {
+    delete boardAskPending[item.id];
+    pendingAsk = null;
+  }
   drawer.textContent = '';
   drawer.appendChild(boardEl('h3', 'board-drawer-title', item.title));
   drawer.appendChild(boardEl('p', 'board-drawer-summary', item.summary || ''));
@@ -447,6 +481,21 @@ function boardRenderDrawer(item) {
     decisionLine = dParts.filter(Boolean).join(' · ');
   }
   drawer.appendChild(boardEl('p', 'board-decision-record', decisionLine));
+  var runWrap = boardEl('div', 'board-run-actions');
+  var runnable = boardIsItemRunnable(item);
+  runWrap.hidden = !runnable;
+  var runBtn = boardEl('button', 'btn btn-small btn-primary', 'Run');
+  runBtn.type = 'button';
+  runBtn.id = 'board-run';
+  runBtn.hidden = !runnable;
+  runWrap.appendChild(runBtn);
+  var runErr = boardEl('div', 'board-run-error');
+  runErr.id = 'board-run-error';
+  runErr.setAttribute('aria-live', 'polite');
+  runWrap.appendChild(runErr);
+  drawer.appendChild(runWrap);
+  runBtn.addEventListener('click', function () { boardRunItem(item); });
+
   var chat = boardEl('section', 'board-chat');
   chat.setAttribute('aria-label', 'Side chat');
   var thread = boardEl('div', 'board-chat-thread');
@@ -483,6 +532,114 @@ function boardRenderDrawer(item) {
       boardSendChat(item.id);
     }
   });
+
+  var askSec = boardEl('section', 'board-ask');
+  askSec.id = 'board-ask-section';
+  askSec.setAttribute('aria-label', 'Ask planner');
+  askSec.hidden = !boardLaunchAllowed;
+  var askLabel = boardEl('label', 'board-ask-label', 'Ask planner');
+  askLabel.setAttribute('for', 'board-ask-text');
+  askSec.appendChild(askLabel);
+  var askTa = document.createElement('textarea');
+  askTa.id = 'board-ask-text';
+  askTa.className = 'board-ask-text';
+  askTa.rows = 2;
+  askTa.setAttribute('aria-label', 'Ask planner');
+  askSec.appendChild(askTa);
+  var askActions = boardEl('div', 'board-ask-actions');
+  var askBtn = boardEl('button', 'btn btn-small', 'Ask');
+  askBtn.type = 'button';
+  askBtn.id = 'board-ask';
+  var reviseBtn = boardEl('button', 'btn btn-small btn-primary', 'Ask & revise plan');
+  reviseBtn.type = 'button';
+  reviseBtn.id = 'board-ask-revise';
+  if (!item.plan) { reviseBtn.disabled = true; }
+  var isBusy = !!(pendingAsk && !pendingAsk.error);
+  if (isBusy) {
+    askBtn.disabled = true;
+    reviseBtn.disabled = true;
+  }
+  askActions.appendChild(askBtn);
+  askActions.appendChild(reviseBtn);
+  askSec.appendChild(askActions);
+  var askBusy = boardEl('div', 'board-ask-busy');
+  askBusy.id = 'board-ask-busy';
+  askBusy.setAttribute('aria-live', 'polite');
+  askBusy.setAttribute('role', 'status');
+  if (pendingAsk && pendingAsk.error) {
+    askBusy.hidden = false;
+    askBusy.classList.add('board-ask-error');
+    askBusy.textContent = pendingAsk.error;
+  } else if (isBusy) {
+    askBusy.hidden = false;
+    askBusy.textContent = 'Asking planner\u2026';
+  } else {
+    askBusy.hidden = true;
+  }
+  askSec.appendChild(askBusy);
+  drawer.appendChild(askSec);
+  askBtn.addEventListener('click', function () { boardAskPlanner(item.id, false); });
+  reviseBtn.addEventListener('click', function () { boardAskPlanner(item.id, true); });
+}
+
+function boardAskPlanner(id, revise) {
+  if (!boardLaunchAllowed) { return; }
+  var ta = document.getElementById('board-ask-text');
+  if (!ta || !ta.value.trim()) { return; }
+  var text = ta.value.trim();
+  var item = boardFindItem(id);
+  var baselineCount = boardCountPlannerMessages(item);
+  boardAskPending[id] = { baselineCount: baselineCount, error: null };
+  var busy = document.getElementById('board-ask-busy');
+  var askBtn = document.getElementById('board-ask');
+  var reviseBtn = document.getElementById('board-ask-revise');
+  if (askBtn) { askBtn.disabled = true; }
+  if (reviseBtn) { reviseBtn.disabled = true; }
+  if (busy) {
+    busy.classList.remove('board-ask-error');
+    busy.hidden = false;
+    busy.textContent = 'Asking planner\u2026';
+  }
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', {
+    text: text,
+    revise: !!revise
+  }).then(function () {
+    var curTa = document.getElementById('board-ask-text');
+    if (curTa) { curTa.value = ''; }
+  }).catch(function (err) {
+    var msg = (err && err.message) ? err.message : 'Ask failed';
+    boardAskPending[id] = { baselineCount: baselineCount, error: msg };
+    var curBusy = document.getElementById('board-ask-busy');
+    var curAsk = document.getElementById('board-ask');
+    var curRevise = document.getElementById('board-ask-revise');
+    if (curAsk) { curAsk.disabled = false; }
+    if (curRevise) {
+      var curItem = boardFindItem(id);
+      curRevise.disabled = !(curItem && curItem.plan);
+    }
+    if (curBusy) {
+      curBusy.classList.add('board-ask-error');
+      curBusy.hidden = false;
+      curBusy.textContent = msg;
+    }
+  });
+}
+
+function boardRunItem(item) {
+  if (!boardLaunchAllowed || !boardIsItemRunnable(item)) { return; }
+  if (!window.confirm('Run this plan now?')) { return; }
+  var errEl = document.getElementById('board-run-error');
+  if (errEl) { errEl.textContent = ''; }
+  var body = item.plan && item.plan.hash ? { plan_hash: item.plan.hash } : {};
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(item.id) + '/run', body)
+    .then(function () {
+      boardRefreshList();
+    })
+    .catch(function (err) {
+      if (errEl) {
+        errEl.textContent = (err && err.message) ? err.message : 'Run failed';
+      }
+    });
 }
 
 function boardCollectSteps() {

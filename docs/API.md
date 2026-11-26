@@ -496,7 +496,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 
 | Method | Path | Body / query | Success | Errors |
 | --- | --- | --- | --- | --- |
-| GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items}` | 400, 401, 403 |
+| GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` | `200` item | 400, 401, 403, 404, 409, 422 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |

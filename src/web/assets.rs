@@ -2546,4 +2546,25 @@ mod tests {
             );
         }
     }
+
+    // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
+    #[test]
+    fn tc_3134_drawer_ask_and_run_controls_hidden_in_serve() {
+        assert!(BOARD_JS.contains("board-ask-text"));
+        assert!(BOARD_JS.contains("board-ask"));
+        assert!(BOARD_JS.contains("board-ask-revise"));
+        assert!(BOARD_JS.contains("board-ask-busy"));
+        assert!(BOARD_JS.contains("aria-live"));
+        assert!(BOARD_JS.contains("Ask planner"));
+        assert!(BOARD_JS.contains("Ask & revise plan"));
+        assert!(BOARD_JS.contains("board-run"));
+        assert!(BOARD_JS.contains("boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("askSec.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("boardIsItemRunnable"));
+        assert!(BOARD_JS.contains("item.lane === 'auto'"));
+        assert!(BOARD_JS.contains("item.lane === 'approved'"));
+        assert!(BOARD_JS.contains("item.decision.plan_hash === item.plan.hash"));
+        assert!(BOARD_JS.contains("/ask"));
+        assert!(BOARD_JS.contains("/run"));
+    }
 }
