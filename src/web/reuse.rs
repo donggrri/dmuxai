@@ -10,7 +10,7 @@ use crate::web::snapshot::SNAPSHOT_SCHEMA;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(65);
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Outcome of probing for and attaching to a live web dashboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,9 +88,9 @@ where
         return AttachOutcome::NoLiveDashboard;
     }
 
-    if !probe_live_state(addr, &host_header, token, &mut connect) {
+    let Some(reused_stream) = probe_live_ping(addr, &host_header, token, &mut connect) else {
         return AttachOutcome::NoLiveDashboard;
-    }
+    };
 
     post_attach(
         addr,
@@ -98,6 +98,7 @@ where
         discovery,
         token,
         workspace_root,
+        reused_stream,
         &mut connect,
     )
 }
@@ -129,32 +130,47 @@ fn parse_loopback_target(base_url: &str, fallback_port: u16) -> Option<(SocketAd
     Some((addr, host_port.to_owned()))
 }
 
-fn probe_live_state<F>(
+/// Probes `GET /api/ping` with `Connection: keep-alive` and a 2 s / 64 KiB cap.
+///
+/// Returns `Some(Some(stream))` when the server is a live `web` dashboard and kept the
+/// connection open, `Some(None)` when it is live but sent `Connection: close`, or `None`
+/// when no live `web` dashboard responded.
+fn probe_live_ping<F>(
     addr: SocketAddr,
     host_header: &str,
     token: Option<&str>,
     connect: &mut F,
-) -> bool
+) -> Option<Option<TcpStream>>
 where
     F: FnMut(SocketAddr, Duration) -> std::io::Result<TcpStream>,
 {
     let mut req =
-        format!("GET /api/state HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n");
+        format!("GET /api/ping HTTP/1.1\r\nHost: {host_header}\r\nConnection: keep-alive\r\n");
     if let Some(tok) = token {
         req.push_str(&format!("Authorization: Bearer {tok}\r\n"));
     }
     req.push_str("\r\n");
 
-    let Ok((status, body)) = send_http_request(addr, req.as_bytes(), PROBE_TIMEOUT, connect) else {
-        return false;
-    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut stream = connect_with_deadline(addr, deadline, connect).ok()?;
+    let (status, body, keep_alive) = send_on_stream(
+        &mut stream,
+        req.as_bytes(),
+        deadline,
+        MAX_CONTROL_RESPONSE_BYTES,
+    )
+    .ok()?;
     if status != 200 {
-        return false;
+        return None;
     }
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return false;
-    };
-    json.get("schema").and_then(|v| v.as_str()) == Some(SNAPSHOT_SCHEMA)
+    let json = serde_json::from_slice::<serde_json::Value>(&body).ok()?;
+    if json.get("schema").and_then(|v| v.as_str()) != Some(SNAPSHOT_SCHEMA) {
+        return None;
+    }
+    if json.get("mode").and_then(|v| v.as_str()) != Some("web") {
+        return None;
+    }
+    Some(if keep_alive { Some(stream) } else { None })
 }
 
 fn post_attach<F>(
@@ -163,6 +179,7 @@ fn post_attach<F>(
     discovery: &UserDiscovery,
     token: Option<&str>,
     workspace_root: &Path,
+    reused_stream: Option<TcpStream>,
     connect: &mut F,
 ) -> AttachOutcome
 where
@@ -185,8 +202,31 @@ where
     req.push_str("\r\n");
     req.push_str(&payload);
 
-    let Ok((status, body)) = send_http_request(addr, req.as_bytes(), ATTACH_TIMEOUT, connect)
-    else {
+    let deadline = Instant::now() + ATTACH_TIMEOUT;
+    let response = if let Some(mut stream) = reused_stream {
+        match send_on_stream(
+            &mut stream,
+            req.as_bytes(),
+            deadline,
+            MAX_CONTROL_RESPONSE_BYTES,
+        ) {
+            Ok((status, body, _)) => Ok((status, body)),
+            Err(_) => {
+                // Keep-alive socket may have been closed by the server between requests; reconnect once.
+                connect_with_deadline(addr, deadline, connect).and_then(|mut s| {
+                    send_on_stream(&mut s, req.as_bytes(), deadline, MAX_CONTROL_RESPONSE_BYTES)
+                        .map(|(status, body, _)| (status, body))
+                })
+            }
+        }
+    } else {
+        connect_with_deadline(addr, deadline, connect).and_then(|mut s| {
+            send_on_stream(&mut s, req.as_bytes(), deadline, MAX_CONTROL_RESPONSE_BYTES)
+                .map(|(status, body, _)| (status, body))
+        })
+    };
+
+    let Ok((status, body)) = response else {
         return AttachOutcome::NoLiveDashboard;
     };
     let json = serde_json::from_slice::<serde_json::Value>(&body).ok();
@@ -226,16 +266,14 @@ where
     AttachOutcome::NoLiveDashboard
 }
 
-fn send_http_request<F>(
+fn connect_with_deadline<F>(
     addr: SocketAddr,
-    request_bytes: &[u8],
-    timeout: Duration,
+    deadline: Instant,
     connect: &mut F,
-) -> std::io::Result<(u16, Vec<u8>)>
+) -> std::io::Result<TcpStream>
 where
     F: FnMut(SocketAddr, Duration) -> std::io::Result<TcpStream>,
 {
-    let deadline = Instant::now() + timeout;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(std::io::Error::new(
@@ -243,7 +281,15 @@ where
             "request timed out",
         ));
     }
-    let mut stream = connect(addr, remaining.min(PROBE_TIMEOUT))?;
+    connect(addr, remaining.min(PROBE_TIMEOUT))
+}
+
+fn send_on_stream(
+    stream: &mut TcpStream,
+    request_bytes: &[u8],
+    deadline: Instant,
+    max_response_bytes: usize,
+) -> std::io::Result<(u16, Vec<u8>, bool)> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(std::io::Error::new(
@@ -258,6 +304,12 @@ where
 
     let mut raw = Vec::new();
     let mut buf = [0u8; 8192];
+    let mut header_end = None;
+    let mut parsed_status = 0u16;
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut server_close = false;
+
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -268,50 +320,125 @@ where
         }
         stream.set_read_timeout(Some(remaining))?;
         match stream.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                let Some(split) = header_end else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "missing headers",
+                    ));
+                };
+                let body_slice = &raw[split + 4..];
+                let body = if is_chunked {
+                    decode_chunked(body_slice)
+                } else if let Some(len) = content_length {
+                    if body_slice.len() < len {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "truncated body",
+                        ));
+                    }
+                    body_slice[..len].to_vec()
+                } else {
+                    body_slice.to_vec()
+                };
+                return Ok((parsed_status, body, false));
+            }
             Ok(n) => {
-                if raw.len().saturating_add(n) > MAX_RESPONSE_BYTES {
+                if raw.len().saturating_add(n) > max_response_bytes {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "response too large",
                     ));
                 }
                 raw.extend_from_slice(&buf[..n]);
+
+                if header_end.is_none()
+                    && let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let head = std::str::from_utf8(&raw[..split]).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid headers")
+                    })?;
+                    let mut lines = head.lines();
+                    let status_line = lines.next().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "empty status")
+                    })?;
+                    parsed_status = status_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status")
+                        })?;
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':') {
+                            let key = k.trim();
+                            let val = v.trim();
+                            if key.eq_ignore_ascii_case("content-length") {
+                                if let Ok(len) = val.parse::<usize>() {
+                                    content_length = Some(len);
+                                }
+                            } else if key.eq_ignore_ascii_case("transfer-encoding")
+                                && val.to_ascii_lowercase().contains("chunked")
+                            {
+                                is_chunked = true;
+                            } else if key.eq_ignore_ascii_case("connection")
+                                && val.to_ascii_lowercase().contains("close")
+                            {
+                                server_close = true;
+                            }
+                        }
+                    }
+                    if let Some(len) = content_length
+                        && split + 4 + len > max_response_bytes
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "response too large",
+                        ));
+                    }
+                    header_end = Some(split);
+                }
+
+                if let Some(split) = header_end {
+                    let body_slice = &raw[split + 4..];
+                    if let Some(len) = content_length {
+                        if body_slice.len() >= len {
+                            return Ok((parsed_status, body_slice[..len].to_vec(), !server_close));
+                        }
+                    } else if is_chunked && let Some(decoded) = decode_chunked_complete(body_slice)
+                    {
+                        return Ok((parsed_status, decoded, !server_close));
+                    }
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
+}
 
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing headers"))?;
-    let head = std::str::from_utf8(&raw[..split])
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid headers"))?;
-    let mut lines = head.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty status"))?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad status"))?;
-
-    let is_chunked = lines.any(|line| {
-        line.split_once(':').is_some_and(|(k, v)| {
-            k.trim().eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-        })
-    });
-    let body_slice = &raw[split + 4..];
-    let body = if is_chunked {
-        decode_chunked(body_slice)
-    } else {
-        body_slice.to_vec()
-    };
-    Ok((status, body))
+fn decode_chunked_complete(mut input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let pos = input.windows(2).position(|w| w == b"\r\n")?;
+        let size_str = std::str::from_utf8(&input[..pos]).ok()?;
+        let size_hex = size_str.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16).ok()?;
+        let data_start = pos + 2;
+        if size == 0 {
+            if input.len() >= data_start + 2 {
+                return Some(out);
+            }
+            return None;
+        }
+        let data_end = data_start.checked_add(size)?;
+        let next = data_end.checked_add(2)?;
+        if next > input.len() {
+            return None;
+        }
+        out.extend_from_slice(&input[data_start..data_end]);
+        input = &input[next..];
+    }
 }
 
 fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
@@ -411,7 +538,10 @@ mod tests {
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf);
                 let (status, body) = if idx == 0 {
-                    ("200 OK", format!(r#"{{"schema":"{SNAPSHOT_SCHEMA}"}}"#))
+                    (
+                        "200 OK",
+                        format!(r#"{{"schema":"{SNAPSHOT_SCHEMA}","mode":"web","pid":123}}"#),
+                    )
                 } else {
                     (second_status, second_body.to_owned())
                 };
@@ -562,7 +692,7 @@ mod tests {
         );
         slow_handle.join().unwrap();
 
-        // 9. Oversized response (> 1 MiB) is rejected -> NoLiveDashboard.
+        // 9. Oversized response (> 64 KiB) is rejected -> NoLiveDashboard.
         let big_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let big_port = big_listener.local_addr().unwrap().port();
         let big_handle = std::thread::spawn(move || {
@@ -570,7 +700,7 @@ mod tests {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 512];
                 let _ = stream.read(&mut buf);
-                let body_len = MAX_RESPONSE_BYTES + 1024;
+                let body_len = MAX_CONTROL_RESPONSE_BYTES + 1024;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
                 );
@@ -588,5 +718,70 @@ mod tests {
             AttachOutcome::NoLiveDashboard
         );
         big_handle.join().unwrap();
+    }
+
+    // TC-2972 / FR-2972: Probe uses GET /api/ping (not /api/state) so >1 MiB state snapshots
+    // never break reuse, and reuses one keep-alive TCP connection for ping + attach.
+    #[test]
+    fn tc_2972_ping_probe_ignores_huge_state_and_reuses_keepalive_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 4096];
+
+            // Request 1: must be GET /api/ping, never GET /api/state.
+            let n1 = stream.read(&mut buf).unwrap();
+            let req1 = String::from_utf8_lossy(&buf[..n1]);
+            assert!(
+                req1.starts_with("GET /api/ping "),
+                "expected GET /api/ping, got: {req1}"
+            );
+            let ping_body = format!(r#"{{"schema":"{SNAPSHOT_SCHEMA}","mode":"web","pid":42}}"#);
+            let resp1 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{ping_body}",
+                ping_body.len()
+            );
+            stream.write_all(resp1.as_bytes()).unwrap();
+            stream.flush().unwrap();
+
+            // Request 2 on the SAME keep-alive connection: POST /api/workspace/attach.
+            let n2 = stream.read(&mut buf).unwrap();
+            let req2 = String::from_utf8_lossy(&buf[..n2]);
+            assert!(
+                req2.starts_with("POST /api/workspace/attach "),
+                "expected POST /api/workspace/attach on same connection, got: {req2}"
+            );
+            let attach_body = r#"{"ok":true,"id":"ws-2","in_process":true,"opened":true}"#;
+            let resp2 = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{attach_body}",
+                attach_body.len()
+            );
+            stream.write_all(resp2.as_bytes()).unwrap();
+        });
+
+        let connect_calls = AtomicUsize::new(0);
+        let outcome = try_attach_with_discovery_and_connector(
+            &test_discovery(port),
+            tmp.path(),
+            |addr, timeout| {
+                connect_calls.fetch_add(1, Ordering::SeqCst);
+                TcpStream::connect_timeout(&addr, timeout)
+            },
+        );
+        assert_eq!(
+            outcome,
+            AttachOutcome::Attached {
+                url: format!("http://127.0.0.1:{port}/?ws=ws-2")
+            }
+        );
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "probe + attach should reuse a single keep-alive TCP connection"
+        );
+        handle.join().unwrap();
     }
 }

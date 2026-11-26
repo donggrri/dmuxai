@@ -902,6 +902,23 @@ async fn get_favicon_failed() -> impl IntoResponse {
     )
 }
 
+/// Lightweight side-effect-free liveness/mode probe used by `dmuxai` reuse (FR-2972).
+async fn get_ping(State(state): State<AppState>) -> Response {
+    let mode = if state.workspaces.opener().is_some() {
+        "web"
+    } else {
+        "serve"
+    };
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({
+            "schema": crate::web::snapshot::SNAPSHOT_SCHEMA,
+            "mode": mode,
+            "pid": std::process::id(),
+        }),
+    )
+}
+
 async fn get_state(Ws(ws): Ws) -> Response {
     let mut snapshot = ws.hub.snapshot();
     snapshot.sent_at_ms = crate::web::snapshot::now_ms();
@@ -2313,6 +2330,7 @@ pub fn build_router_with_directory_access(
         .route("/assets/favicon-running.svg", get(get_favicon_running))
         .route("/assets/favicon-done.svg", get(get_favicon_done))
         .route("/assets/favicon-failed.svg", get(get_favicon_failed))
+        .route("/api/ping", get(get_ping))
         .route("/api/state", get(get_state))
         .route("/api/workspaces", get(get_workspaces))
         .route("/api/workspaces/{id}/close", post(post_workspace_close))
@@ -7697,8 +7715,52 @@ mod tests {
             token,
             &serde_json::json!({ "path": canonical_str }).to_string(),
         );
-        let resp_serve = serve_router.oneshot(req_serve).await.unwrap();
+        let resp_serve = serve_router.clone().oneshot(req_serve).await.unwrap();
         assert_eq!(resp_serve.status(), StatusCode::FORBIDDEN);
+
+        // 6. GET /api/ping requires auth/guards and reports "web" vs "serve".
+        let ping_unauth = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/ping")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            serve_router
+                .clone()
+                .oneshot(ping_unauth)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let ping_serve = serve_router
+            .oneshot(json_request("GET", "/api/ping", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(ping_serve.status(), StatusCode::OK);
+        let ping_serve_bytes = axum::body::to_bytes(ping_serve.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let ping_serve_json: serde_json::Value = serde_json::from_slice(&ping_serve_bytes).unwrap();
+        assert_eq!(ping_serve_json["mode"], "serve");
+        assert_eq!(
+            ping_serve_json["schema"],
+            crate::web::snapshot::SNAPSHOT_SCHEMA
+        );
+
+        let web_router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+        let ping_web = web_router
+            .oneshot(json_request("GET", "/api/ping", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(ping_web.status(), StatusCode::OK);
+        let ping_web_bytes = axum::body::to_bytes(ping_web.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let ping_web_json: serde_json::Value = serde_json::from_slice(&ping_web_bytes).unwrap();
+        assert_eq!(ping_web_json["mode"], "web");
     }
 
     // Concurrent race on POST /api/workspace/attach returns 200 with existing id (FR-2972).

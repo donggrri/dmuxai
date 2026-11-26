@@ -19,7 +19,7 @@ Out of scope: the all-projects list (SPEC-web-all-projects), auto-opening a brow
 | OQ-2973 | Repo custom agents on reuse | Custom agents are a process-wide registry, so the in-process open refuses a workspace whose repo config defines `[[agents.custom]]` (today's behavior). Then `dmuxai` does not reuse: it starts its own dashboard as with `--new` and says why (FR-2978). Workspace trust is handled by the host's existing in-process open path. |
 
 ## 3. Terms
-- Live web dashboard: the user-level discovery file exists, `mode = "web"`, its `uid` is ours, its pid is alive, and `GET <base_url>/api/state` (with the secret from the file when `token_required`) answers 200 within 2 s with the `dmuxai.dashboard/v1` schema.
+- Live web dashboard: the user-level discovery file exists, `mode = "web"`, its `uid` is ours, its pid is alive, and `GET <base_url>/api/ping` (with the secret from the file when `token_required`) answers 200 within 2 s with the `dmuxai.dashboard/v1` schema and its `mode`. `/api/ping` is a small side-effect-free endpoint so the probe does not depend on the snapshot size.
 - Web mode: the existing headless `--web` host.
 
 ## 4. Requirements

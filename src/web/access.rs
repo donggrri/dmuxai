@@ -446,6 +446,7 @@ pub fn get_api_routes_with_possible_side_effects() -> Vec<&'static str> {
 /// Every `GET` route registered under `/api/*` on the dashboard router (for FR-2954 tests).
 pub fn all_api_get_routes() -> Vec<&'static str> {
     vec![
+        "/api/ping",
         "/api/state",
         "/api/workspaces",
         "/api/workspace",

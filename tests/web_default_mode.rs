@@ -137,6 +137,12 @@ fn tc_2972_second_start_opens_workspace_in_live_dashboard() {
     );
 
     // Focus must still be on default (ws1), not ws2.
+    let ping_body = http_get_json(&format!("{base1}/api/ping"));
+    let ping: serde_json::Value = serde_json::from_str(&ping_body).unwrap();
+    assert_eq!(ping["schema"], "dmuxai.dashboard/v1");
+    assert_eq!(ping["mode"], "web");
+    assert!(ping["pid"].as_u64().is_some());
+
     let body = http_get_json(&format!("{base1}/api/workspaces"));
     let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
     let list = resp["workspaces"].as_array().unwrap();
