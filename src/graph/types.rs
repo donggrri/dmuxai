@@ -243,6 +243,13 @@ impl GraphRun {
                 node.runner = crate::runner_id::canonical_runner_id(&node.runner);
             }
         }
+        if let Some(approval) = &mut self.approval {
+            for revision in &mut approval.revisions {
+                for step in &mut revision.steps {
+                    step.runner = crate::runner_id::canonical_runner_id(&step.runner);
+                }
+            }
+        }
     }
 
     /// Keeps at most [`PLAN_HISTORY_MAX`] entries, dropping the oldest.

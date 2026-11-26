@@ -336,7 +336,8 @@ fn load_graph_view(workspace_root: &Path, graph_id: &str) -> Option<serde_json::
     {
         return None;
     }
-    let run: GraphRun = serde_json::from_slice(&bytes).ok()?;
+    let mut run: GraphRun = serde_json::from_slice(&bytes).ok()?;
+    run.normalize_legacy_runners();
     let mut value = serde_json::to_value(snapshot::snapshot_from_run(&run)).ok()?;
     mask_json_value(&mut value);
     Some(value)

@@ -731,8 +731,8 @@ fn approval_fallback_note(run: &GraphRun, revision: &PlanRevision) -> Option<Str
     let runner = run
         .triage
         .as_ref()
-        .map(|triage| triage.runner.as_str())
-        .unwrap_or("agent");
+        .map(|triage| crate::runner_id::canonical_runner_id(&triage.runner))
+        .unwrap_or_else(|| "agent".to_owned());
     Some(format!(
         "Fallback plan (heuristic, {cause}), not written by {runner}"
     ))
@@ -743,7 +743,7 @@ fn approval_step_view(revision: &PlanRevision, step: &PlanStep) -> ApprovalStepV
     ApprovalStepView {
         id: step.id.clone(),
         role: step.role.clone(),
-        runner: step.runner.clone(),
+        runner: crate::runner_id::canonical_runner_id(&step.runner),
         model,
         job: truncate_with_ellipsis(&step.job, SNAPSHOT_STEP_JOB_LIMIT),
         depends_on: step.depends_on.clone(),
@@ -932,7 +932,7 @@ fn build_graph_view(
             id: node.id.clone(),
             role: node.role,
             job: truncate_with_ellipsis(&node.job, SNAPSHOT_NODE_JOB_LIMIT),
-            runner: node.runner.clone(),
+            runner: crate::runner_id::canonical_runner_id(&node.runner),
             model_id: node.model_id.clone(),
             status: node.status,
             attempt: node.attempt,
@@ -1031,7 +1031,7 @@ fn conversation_turn_fields(
                 .map(|node| TurnStepView {
                     id: node.id.clone(),
                     role: node.role,
-                    runner: node.runner.clone(),
+                    runner: crate::runner_id::canonical_runner_id(&node.runner),
                     status: node.status,
                     started_at_ms: node.started_at_ms,
                     finished_at_ms: node.finished_at_ms,
@@ -2104,6 +2104,45 @@ mod tests {
         assert_eq!(view.runner, crate::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(
             crate::web::server::normalize_request_agent_id("cursor"),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+
+        let run = GraphRun {
+            plan: GraphPlan {
+                schema: "dmuxai.graph/v1".to_string(),
+                id: "run-legacy".to_string(),
+                orchestrator_model: "composer-2.5".to_string(),
+                user_prompt: "go".to_string(),
+                limits: GraphLimits::default(),
+                tasks: Vec::new(),
+                nodes: vec![GraphNode {
+                    id: "n1".to_string(),
+                    role: NodeRole::Implement,
+                    job: "work".to_string(),
+                    runner: "cursor".to_string(),
+                    model_id: "composer-2.5".to_string(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Completed,
+                    attempt: 1,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                }],
+                edges: Vec::new(),
+            },
+            conversation_id: "conv".to_string(),
+            phase: GraphRunPhase::Completed,
+            ..Default::default()
+        };
+        let graph_view =
+            snapshot_from_run_with_conversation(&run, std::slice::from_ref(&run), None);
+        assert_eq!(
+            graph_view.nodes[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+        assert_eq!(
+            graph_view.turns[0].steps[0].runner,
             crate::runner_id::CURSOR_RUNNER_ID
         );
     }

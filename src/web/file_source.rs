@@ -55,7 +55,11 @@ impl FileGraphSource {
         let (newest_path, _) = &json_files[0];
         let newest_run = std::fs::read_to_string(newest_path)
             .ok()
-            .and_then(|c| serde_json::from_str::<GraphRun>(&c).ok());
+            .and_then(|c| serde_json::from_str::<GraphRun>(&c).ok())
+            .map(|mut run| {
+                run.normalize_legacy_runners();
+                run
+            });
 
         if let Some(run) = newest_run {
             self.last = Some(snapshot_from_run(&run));
@@ -70,8 +74,9 @@ impl FileGraphSource {
         // Only when self.last is None, fall back to the newest older file that parses
         for (path, _) in &json_files[1..] {
             if let Ok(contents) = std::fs::read_to_string(path)
-                && let Ok(run) = serde_json::from_str::<GraphRun>(&contents)
+                && let Ok(mut run) = serde_json::from_str::<GraphRun>(&contents)
             {
+                run.normalize_legacy_runners();
                 self.last = Some(snapshot_from_run(&run));
                 return self.last.clone();
             }
@@ -166,5 +171,46 @@ mod tests {
         fs::remove_dir_all(&graphs_dir).unwrap();
         assert_eq!(source.poll(), None);
         assert_eq!(fresh_source.poll(), None);
+    }
+
+    // FR-3208: legacy `"cursor"` runner in a graph file normalizes to `cursor-agent` on read.
+    #[test]
+    fn fr_3208_file_source_normalizes_legacy_cursor_runner() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let graphs_dir = temp_dir.path().join(".dmuxai").join("graphs");
+        fs::create_dir_all(&graphs_dir).unwrap();
+        let legacy_json = serde_json::json!({
+            "plan": {
+                "schema": "dmuxai.graph/v1",
+                "id": "legacy-run",
+                "orchestrator_model": "composer-2.5",
+                "user_prompt": "p",
+                "limits": { "max_parallel": 2, "max_retries": 2 },
+                "nodes": [{
+                    "id": "n1",
+                    "role": "implement",
+                    "job": "work",
+                    "runner": "cursor",
+                    "model_id": "composer-2.5",
+                    "skill": null,
+                    "requires_gate": false,
+                    "status": "completed",
+                    "attempt": 1
+                }],
+                "edges": []
+            },
+            "conversation_id": "conv-legacy",
+            "phase": "completed",
+            "waiting_gate_node": null
+        });
+        fs::write(
+            graphs_dir.join("legacy.json"),
+            serde_json::to_vec(&legacy_json).unwrap(),
+        )
+        .unwrap();
+
+        let mut source = FileGraphSource::new(temp_dir.path());
+        let view = source.poll().expect("expected legacy graph view");
+        assert_eq!(view.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
     }
 }
