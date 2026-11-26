@@ -130,7 +130,7 @@ impl ServerConfig {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) access: WebAccess,
-    workspaces: Arc<WorkspaceDirectory>,
+    pub(crate) workspaces: Arc<WorkspaceDirectory>,
 }
 
 impl AppState {
@@ -819,6 +819,22 @@ async fn get_runs_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::RUNS_JS,
+    )
+}
+
+async fn get_all_projects_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::ALL_PROJECTS_JS,
     )
 }
 
@@ -2240,6 +2256,7 @@ async fn workspace_switch_task(
     }
 
     let _ = crate::workspace::record_recent_workspace(&canonical);
+    crate::state_path::warn_write_workspace_metadata(&canonical);
 
     let cfg = ws.hub.switch_config().unwrap_or_default();
     match preflight_workspace_switch(cfg.current_exe.as_deref(), &canonical) {
@@ -2323,6 +2340,7 @@ pub fn build_router_with_directory_access(
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/runs.js", get(get_runs_js))
+        .route("/assets/all-projects.js", get(get_all_projects_js))
         .route("/assets/sidebar-resize.js", get(get_sidebar_resize_js))
         .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))
@@ -2361,6 +2379,30 @@ pub fn build_router_with_directory_access(
         .route("/api/runs", get(crate::web::runs_api::list))
         .route("/api/runs/{id}", get(crate::web::runs_api::detail))
         .route("/api/runs/{id}/stream", get(crate::web::runs_api::stream))
+        .route(
+            "/api/global/projects",
+            get(crate::web::global_api::list_projects),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/conversations",
+            get(crate::web::global_api::list_conversations),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/conversations/{id}",
+            get(crate::web::global_api::conversation_detail),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/runs",
+            get(crate::web::global_api::list_runs),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/runs/{run_id}",
+            get(crate::web::global_api::run_detail),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/runs/{run_id}/stream",
+            get(crate::web::global_api::run_stream),
+        )
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))

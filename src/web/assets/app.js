@@ -1916,7 +1916,8 @@ var CENTER_VIEW_KEY = 'dmuxai.centerView';
 var CENTER_VIEWS = {
   diff: { panel: 'docs', toggle: 'diff-toggle' },
   graph: { panel: 'graph', toggle: 'graph-toggle' },
-  runs: { panel: 'runs', toggle: 'runs-toggle' }
+  runs: { panel: 'runs', toggle: 'runs-toggle' },
+  'all-projects': { panel: 'all-projects', toggle: 'all-projects-toggle' }
 };
 var centerView = null;
 var graphViewOverride = null;

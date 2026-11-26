@@ -13,6 +13,7 @@ pub mod directory;
 pub mod discovery;
 pub mod docs_api;
 mod file_source;
+pub mod global_api;
 mod hub;
 pub mod layout;
 pub mod local_peer;

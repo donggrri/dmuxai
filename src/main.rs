@@ -655,6 +655,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         }
     };
     let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
+    dmuxai::state_path::warn_write_workspace_metadata(&workspace_root);
     let workspace = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .unwrap_or_else(|_| workspace_root.display().to_string());
 
@@ -999,6 +1000,7 @@ async fn run_entry(
             require_tty_or_exit();
             dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
             let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
+            dmuxai::state_path::warn_write_workspace_metadata(&workspace_root);
             None
         }
         DefaultUiMode::Web => {
@@ -1012,6 +1014,7 @@ async fn run_entry(
             }
             dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
             let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
+            dmuxai::state_path::warn_write_workspace_metadata(&workspace_root);
             if !options.has_explicit_web_flags() {
                 match dmuxai::web::reuse::try_attach_to_live_dashboard(&workspace_root) {
                     AttachOutcome::Attached { url } => {

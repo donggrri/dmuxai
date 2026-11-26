@@ -587,7 +587,7 @@ pub enum AgentKey {
 pub const UNKNOWN_CUSTOM_AGENT: u8 = u8::MAX;
 
 impl AgentKey {
-    fn as_db(self) -> &'static str {
+    pub fn as_db(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
@@ -2113,101 +2113,7 @@ impl ConversationEngine {
                 ))
             },
         )?;
-
-        let mut turn_statement = self.connection.prepare(
-            "SELECT id, seq, requested_agent, model_id, status, error_text
-               FROM turns WHERE conversation_id = ?1 ORDER BY seq",
-        )?;
-        let turns = turn_statement
-            .query_map([conversation_id.as_str()], |row| {
-                Ok(TurnSnapshot {
-                    id: TurnId::new(row.get::<_, String>(0)?),
-                    seq: row.get(1)?,
-                    agent: AgentKey::from_db(&row.get::<_, String>(2)?)?,
-                    model_id: row.get(3)?,
-                    status: TurnStatus::from_db(&row.get::<_, String>(4)?)?,
-                    error_text: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut message_statement = self.connection.prepare(
-            "SELECT m.id, m.turn_id, t.seq, t.requested_agent,
-                    m.role, m.text, m.state, m.display_text
-               FROM messages m
-               JOIN turns t ON t.id = m.turn_id
-              WHERE t.conversation_id = ?1
-              ORDER BY t.seq, m.ordinal",
-        )?;
-        let messages = message_statement
-            .query_map([conversation_id.as_str()], |row| {
-                let role = MessageRole::from_db(&row.get::<_, String>(4)?)?;
-                let display_text: Option<String> = if role == MessageRole::Assistant {
-                    None
-                } else {
-                    row.get(7)?
-                };
-                Ok(TranscriptMessage {
-                    id: row.get(0)?,
-                    turn_id: TurnId::new(row.get::<_, String>(1)?),
-                    turn_seq: row.get(2)?,
-                    agent: AgentKey::from_db(&row.get::<_, String>(3)?)?,
-                    role,
-                    text: row.get(5)?,
-                    display_text,
-                    state: MessageState::from_db(&row.get::<_, String>(6)?)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut binding_statement = self.connection.prepare(
-            "SELECT agent, provider_session_id, status, known_through_seq
-               FROM provider_bindings
-              WHERE conversation_id = ?1
-              ORDER BY agent",
-        )?;
-        let bindings = binding_statement
-            .query_map([conversation_id.as_str()], |row| {
-                Ok(ProviderBinding {
-                    agent: AgentKey::from_db(&row.get::<_, String>(0)?)?,
-                    provider_session_id: row.get(1)?,
-                    status: BindingStatus::from_db(&row.get::<_, String>(2)?)?,
-                    known_through_seq: row.get(3)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut activity_statement = self.connection.prepare(
-            "SELECT a.turn_id, a.ordinal, a.payload_json
-               FROM activities a
-               JOIN turns t ON t.id = a.turn_id
-              WHERE t.conversation_id = ?1
-              ORDER BY t.seq, a.ordinal",
-        )?;
-        let mut activities = Vec::new();
-        let mut rows = activity_statement.query([conversation_id.as_str()])?;
-        while let Some(row) = rows.next()? {
-            let turn_id = TurnId::new(row.get::<_, String>(0)?);
-            let ordinal: i64 = row.get(1)?;
-            let payload_json: String = row.get(2)?;
-            if let Ok(item) = serde_json::from_str::<ActivityItem>(&payload_json) {
-                activities.push(TurnActivity {
-                    turn_id,
-                    ordinal,
-                    item,
-                });
-            }
-        }
-
-        Ok(ConversationSnapshot {
-            id: conversation_id.clone(),
-            title,
-            settings,
-            turns,
-            messages,
-            bindings,
-            activities,
-        })
+        load_snapshot_parts(&self.connection, conversation_id, title, settings)
     }
 
     pub fn record_activity(
@@ -2803,6 +2709,228 @@ fn read_conversation_cards(
         card.spoken_agents = spoken.remove(card.id.as_str()).unwrap_or_default();
     }
     Ok(cards)
+}
+
+fn load_snapshot_parts(
+    connection: &Connection,
+    conversation_id: &ConversationId,
+    title: String,
+    settings: TaskSettings,
+) -> Result<ConversationSnapshot, ConversationError> {
+    let mut turn_statement = connection.prepare(
+        "SELECT id, seq, requested_agent, model_id, status, error_text
+           FROM turns WHERE conversation_id = ?1 ORDER BY seq",
+    )?;
+    let turns = turn_statement
+        .query_map([conversation_id.as_str()], |row| {
+            Ok(TurnSnapshot {
+                id: TurnId::new(row.get::<_, String>(0)?),
+                seq: row.get(1)?,
+                agent: AgentKey::from_db(&row.get::<_, String>(2)?)?,
+                model_id: row.get(3)?,
+                status: TurnStatus::from_db(&row.get::<_, String>(4)?)?,
+                error_text: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut message_statement = connection.prepare(
+        "SELECT m.id, m.turn_id, t.seq, t.requested_agent,
+                m.role, m.text, m.state, m.display_text
+           FROM messages m
+           JOIN turns t ON t.id = m.turn_id
+          WHERE t.conversation_id = ?1
+          ORDER BY t.seq, m.ordinal",
+    )?;
+    let messages = message_statement
+        .query_map([conversation_id.as_str()], |row| {
+            let role = MessageRole::from_db(&row.get::<_, String>(4)?)?;
+            let display_text: Option<String> = if role == MessageRole::Assistant {
+                None
+            } else {
+                row.get(7)?
+            };
+            Ok(TranscriptMessage {
+                id: row.get(0)?,
+                turn_id: TurnId::new(row.get::<_, String>(1)?),
+                turn_seq: row.get(2)?,
+                agent: AgentKey::from_db(&row.get::<_, String>(3)?)?,
+                role,
+                text: row.get(5)?,
+                display_text,
+                state: MessageState::from_db(&row.get::<_, String>(6)?)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut binding_statement = connection.prepare(
+        "SELECT agent, provider_session_id, status, known_through_seq
+           FROM provider_bindings
+          WHERE conversation_id = ?1
+          ORDER BY agent",
+    )?;
+    let bindings = binding_statement
+        .query_map([conversation_id.as_str()], |row| {
+            Ok(ProviderBinding {
+                agent: AgentKey::from_db(&row.get::<_, String>(0)?)?,
+                provider_session_id: row.get(1)?,
+                status: BindingStatus::from_db(&row.get::<_, String>(2)?)?,
+                known_through_seq: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut activity_statement = connection.prepare(
+        "SELECT a.turn_id, a.ordinal, a.payload_json
+           FROM activities a
+           JOIN turns t ON t.id = a.turn_id
+          WHERE t.conversation_id = ?1
+          ORDER BY t.seq, a.ordinal",
+    )?;
+    let mut activities = Vec::new();
+    let mut rows = activity_statement.query([conversation_id.as_str()])?;
+    while let Some(row) = rows.next()? {
+        let turn_id = TurnId::new(row.get::<_, String>(0)?);
+        let ordinal: i64 = row.get(1)?;
+        let payload_json: String = row.get(2)?;
+        if let Ok(item) = serde_json::from_str::<ActivityItem>(&payload_json) {
+            activities.push(TurnActivity {
+                turn_id,
+                ordinal,
+                item,
+            });
+        }
+    }
+
+    Ok(ConversationSnapshot {
+        id: conversation_id.clone(),
+        title,
+        settings,
+        turns,
+        messages,
+        bindings,
+        activities,
+    })
+}
+
+/// Bounded summary of a per-repo conversation database (NFR-2980).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoConversationSummary {
+    pub count: usize,
+    pub latest_updated_at_ms: Option<u64>,
+    pub workspace_root: Option<String>,
+}
+
+/// Opens `db_path` read-only (never migrating or writing) and returns bounded
+/// conversation counts and latest timestamp for `repo_key` (FR-2981, NFR-2980).
+pub fn summarize_repo_db(db_path: &Path, repo_key: &str) -> Option<RepoConversationSummary> {
+    if !db_path.is_file() {
+        return None;
+    }
+    let connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = connection.busy_timeout(std::time::Duration::from_millis(250));
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .ok()?;
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        return None;
+    }
+    let mut stmt = connection
+        .prepare(
+            "SELECT c.workspace_root, COUNT(*), MAX(c.updated_at_ms)
+               FROM conversations c
+              WHERE c.archived_at_ms IS NULL
+              GROUP BY c.workspace_root",
+        )
+        .ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    while let Some(row) = rows.next().ok()? {
+        let workspace_root: String = row.get(0).ok()?;
+        if crate::state_path::repo_key_for_canonical(&workspace_root) == repo_key {
+            let count_raw: i64 = row.get(1).ok()?;
+            let count = usize::try_from(count_raw.max(0)).unwrap_or(0);
+            let latest_raw: Option<i64> = row.get(2).ok()?;
+            let latest_updated_at_ms = latest_raw.map(|v| v.max(0) as u64);
+            return Some(RepoConversationSummary {
+                count,
+                latest_updated_at_ms,
+                workspace_root: Some(workspace_root),
+            });
+        }
+    }
+    Some(RepoConversationSummary {
+        count: 0,
+        latest_updated_at_ms: None,
+        workspace_root: None,
+    })
+}
+
+/// Read-only listing of conversations in a single repo's database (FR-2982).
+/// Reuses [`read_conversation_cards`] and filters to rows hashing to `repo_key`.
+pub fn list_repo_db_conversations(
+    db_path: &Path,
+    repo_key: &str,
+    limit: usize,
+) -> Vec<(String, ConversationCard)> {
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let Ok(rows) = read_conversation_cards(db_path, "", limit) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter(|(workspace, _)| crate::state_path::repo_key_for_canonical(workspace) == repo_key)
+        .collect()
+}
+
+/// Read-only transcript loader for a single conversation in a repo database (FR-2982).
+/// Opens SQLite read-only and never runs migrations.
+pub fn read_repo_conversation_snapshot(
+    db_path: &Path,
+    repo_key: &str,
+    conversation_id: &str,
+) -> Result<Option<ConversationSnapshot>, ConversationError> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_millis(250))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        return Ok(None);
+    }
+    let settings_columns = if version >= 4 {
+        "last_agent, last_model_id, last_reasoning_effort"
+    } else {
+        "NULL, NULL, NULL"
+    };
+    let sql = format!(
+        "SELECT workspace_root, title, {settings_columns}
+           FROM conversations
+          WHERE id = ?1 AND archived_at_ms IS NULL"
+    );
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = stmt.query([conversation_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let workspace_root: String = row.get(0)?;
+    if crate::state_path::repo_key_for_canonical(&workspace_root) != repo_key {
+        return Ok(None);
+    }
+    let title: String = row.get(1)?;
+    let settings = task_settings_from_values(row.get(2)?, row.get(3)?, row.get(4)?);
+    drop(rows);
+    drop(stmt);
+    let conv_id = ConversationId::new(conversation_id.to_owned());
+    load_snapshot_parts(&connection, &conv_id, title, settings).map(Some)
 }
 
 #[cfg(test)]

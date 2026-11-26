@@ -7,6 +7,7 @@ pub const AGENT_PROMPTS_JS: &str = include_str!("assets/agent-prompts.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
+pub const ALL_PROJECTS_JS: &str = include_str!("assets/all-projects.js");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
