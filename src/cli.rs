@@ -2471,14 +2471,20 @@ fn print_json(value: &Value) {
 
 fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
     use dmuxai::board::{
-        AddItemRequest, DecideRequest, Grade, Kind, Lane, SayRequest, UpdateItemRequest, Verdict,
-        WaitFilter, WaitFor, WaitOutcome, default_actor_by, resolve_actor,
+        AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
+        UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, default_actor_by,
+        resolve_actor, wait_ready_json,
     };
     use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
     use std::io::IsTerminal;
 
     let json_out = command.json;
     let is_tty = std::io::stdin().is_terminal();
+    let caller = if is_tty {
+        BoardCaller::CliTty
+    } else {
+        BoardCaller::CliNonTty
+    };
     let store = match agent_api::open_board_store() {
         Ok(store) => store,
         Err(error) => return fail(error, json_out),
@@ -2537,7 +2543,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     recommendation,
                     options,
                     plan_hash,
-                    by: default_actor_by(is_tty, false),
+                    by: default_actor_by(caller),
                     state_root: state_root.clone(),
                 })
                 .map_err(ApiError::from)?;
@@ -2607,7 +2613,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
             run_id,
             if_version,
         } => {
-            let by = default_actor_by(is_tty, false);
+            let by = default_actor_by(caller);
             let summary = summary.map(|s| read_prompt(&s)).transpose()?;
             let grade = grade
                 .map(|g| {
@@ -2650,7 +2656,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
         BoardOp::Move { id, lane } => {
             let lane = Lane::parse(&lane)
                 .ok_or_else(|| ApiError::new(exit::USAGE, "invalid lane".to_owned()))?;
-            let by = default_actor_by(is_tty, false);
+            let by = default_actor_by(caller);
             let item = store.move_lane(&id, lane, &by).map_err(ApiError::from)?;
             if json_out {
                 print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
@@ -2700,7 +2706,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
         } => {
             let verdict = Verdict::parse(&verdict)
                 .ok_or_else(|| ApiError::new(exit::USAGE, "invalid verdict".to_owned()))?;
-            let by = resolve_actor(by.as_deref(), is_tty, false).map_err(ApiError::from)?;
+            let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
             let item = store
                 .decide(
                     &id,
@@ -2720,7 +2726,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
         }
         BoardOp::Say { id, text, from } => {
             let text = read_prompt(&text)?;
-            let from = from.unwrap_or_else(|| default_actor_by(is_tty, false));
+            let from = resolve_actor(from.as_deref(), caller).map_err(ApiError::from)?;
             let item = store
                 .say(
                     &id,
@@ -2768,15 +2774,8 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 )
                 .map_err(ApiError::from)?;
             match outcome {
-                WaitOutcome::Ready(item) => {
-                    if json_out {
-                        print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-                    } else {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&item).unwrap_or_default()
-                        );
-                    }
+                WaitOutcome::Ready { item, event } => {
+                    print_json(&wait_ready_json(&event, &item));
                 }
                 WaitOutcome::TimedOut { version } => {
                     let val = json!({ "timed_out": true, "version": version });

@@ -101,11 +101,7 @@ impl BoardRules {
             if rule.kind.as_ref().is_some_and(|k| k != kind_str) {
                 continue;
             }
-            if rule
-                .grade
-                .as_deref()
-                .is_some_and(|g| grade_str != Some(g))
-            {
+            if rule.grade.as_deref().is_some_and(|g| grade_str != Some(g)) {
                 continue;
             }
             if let Some(re) = &rule.title_regex {

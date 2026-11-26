@@ -11,8 +11,17 @@ pub use plan::{PendingPlanFile, edit_plan_from_json, pending_plan_path, read_pen
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{
     AddItemRequest, BoardStore, DecideRequest, ListFilter, SayRequest, UpdateItemRequest,
-    WaitFilter, WaitFor, WaitOutcome,
+    WaitEvent, WaitFilter, WaitFor, WaitOutcome,
 };
+
+/// Who is invoking a board write (FR-3108 owner identity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardCaller {
+    CliTty,
+    CliNonTty,
+    Mcp,
+    Dashboard,
+}
 
 use crate::agent_api::exit;
 use serde::{Deserialize, Serialize};
@@ -286,25 +295,23 @@ impl From<BoardError> for crate::agent_api::ApiError {
     }
 }
 
-pub fn default_actor_by(is_tty: bool, is_mcp: bool) -> String {
-    if is_tty {
-        "owner".to_owned()
-    } else if is_mcp {
-        "bot:mcp".to_owned()
-    } else {
-        "bot:coordinator".to_owned()
+pub fn default_actor_by(caller: BoardCaller) -> String {
+    match caller {
+        BoardCaller::CliTty | BoardCaller::Dashboard => "owner".to_owned(),
+        BoardCaller::Mcp => "bot:mcp".to_owned(),
+        BoardCaller::CliNonTty => "bot:coordinator".to_owned(),
     }
 }
 
-pub fn resolve_actor(by: Option<&str>, is_tty: bool, is_mcp: bool) -> Result<String, BoardError> {
+pub fn resolve_actor(by: Option<&str>, caller: BoardCaller) -> Result<String, BoardError> {
     let actor = by
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| default_actor_by(is_tty, is_mcp));
-    if is_mcp && actor == "owner" {
+        .unwrap_or_else(|| default_actor_by(caller));
+    if actor == "owner" && matches!(caller, BoardCaller::Mcp | BoardCaller::CliNonTty) {
         return Err(BoardError::Forbidden(
-            "MCP callers cannot act as owner".to_owned(),
+            "owner actions need an interactive terminal or the dashboard".to_owned(),
         ));
     }
     if actor != "owner" && actor != "planner" && !actor.starts_with("bot:") {
@@ -313,6 +320,15 @@ pub fn resolve_actor(by: Option<&str>, is_tty: bool, is_mcp: bool) -> Result<Str
         )));
     }
     Ok(actor)
+}
+
+/// JSON body for a successful `board wait` (FR-3112).
+pub fn wait_ready_json(event: &WaitEvent, item: &BoardItem) -> serde_json::Value {
+    serde_json::json!({
+        "timed_out": false,
+        "event": event,
+        "item": item,
+    })
 }
 
 pub fn mask_board_plan(plan: &mut BoardPlan) {
@@ -437,9 +453,12 @@ mod tests {
             "too many options"
         );
         assert!(validate_message(&"m".repeat(TEXT_MAX + 1)).is_err());
-        assert!(resolve_actor(Some("owner"), false, true).is_err());
-        assert!(resolve_actor(None, true, false).unwrap() == "owner");
-        assert!(resolve_actor(None, false, true).unwrap() == "bot:mcp");
+        assert!(resolve_actor(Some("owner"), BoardCaller::Mcp).is_err());
+        assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
+        assert!(resolve_actor(None, BoardCaller::CliTty).unwrap() == "owner");
+        assert!(resolve_actor(None, BoardCaller::CliNonTty).unwrap() == "bot:coordinator");
+        assert!(resolve_actor(None, BoardCaller::Mcp).unwrap() == "bot:mcp");
+        assert!(resolve_actor(None, BoardCaller::Dashboard).unwrap() == "owner");
     }
 
     #[test]

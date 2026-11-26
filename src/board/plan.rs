@@ -61,20 +61,45 @@ pub fn write_pending_plan(state: &Path, plan: &PendingPlanFile) -> Result<String
     Ok(hash)
 }
 
+/// Runner list and model hints for board plan edits. This is a pre-check only;
+/// `run --graph --approve-plan-id` re-validates authoritatively at execution.
 pub struct PlanValidationCtx {
     runners: Vec<String>,
+    settings: DmuxSettings,
 }
 
 impl PlanValidationCtx {
     pub fn from_settings(settings: &DmuxSettings) -> Self {
-        let mut runners = vec!["cursor", "agy", "codex"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        for spec in &settings.custom_agents {
-            runners.push(spec.name.clone());
+        let mut runners = Vec::new();
+        for name in ["cursor", "agy", "codex"] {
+            if settings.graph_runner_allowed(name) {
+                runners.push(name.to_owned());
+            }
         }
-        Self { runners }
+        for spec in &settings.custom_agents {
+            if settings.graph_runner_allowed(&spec.name) {
+                runners.push(spec.name.clone());
+            }
+        }
+        Self {
+            runners,
+            settings: settings.clone(),
+        }
+    }
+
+    fn effective_model(&self, runner: &str) -> Option<String> {
+        let key = runner.trim().to_ascii_lowercase();
+        if let Some(spec) = self
+            .settings
+            .custom_agents
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&key))
+        {
+            return spec.default_model.clone().or_else(|| {
+                crate::model_policy::default_model_for_runner(&key).map(str::to_owned)
+            });
+        }
+        crate::model_policy::default_model_for_runner(&key).map(str::to_owned)
     }
 }
 
@@ -100,9 +125,7 @@ pub fn edit_plan_from_json(
         user_prompt: stored_prompt,
         available_runners: &holder.runners,
         runner_allowed: &|runner: &str| settings.graph_runner_allowed(runner),
-        effective_model: &|runner: &str| {
-            crate::model_policy::default_model_for_runner(runner).map(str::to_owned)
-        },
+        effective_model: &|runner: &str| holder.effective_model(runner),
         validate_model: &crate::model_policy::validate_model_for_runner,
     };
     let _graph = validate_plan_with_limit(&doc, &ctx, cap).map_err(|errors| {
@@ -214,5 +237,28 @@ mod tests {
             .unwrap();
         assert_eq!(edited.plan.as_ref().unwrap().revision, 2);
         assert_ne!(hash, hash2);
+    }
+
+    #[test]
+    fn custom_runner_default_model_satisfies_plan_validation() {
+        use crate::custom_agent::CustomAgentSpec;
+        let mut settings = DmuxSettings::default();
+        settings.custom_agents.push(CustomAgentSpec {
+            name: "mybot".to_owned(),
+            default_model: Some("composer-2.5".to_owned()),
+            ..Default::default()
+        });
+        let holder = PlanValidationCtx::from_settings(&settings);
+        assert!(holder.runners.iter().any(|r| r == "mybot"));
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"mybot","depends_on":[],"task":"task-1"}]}"#;
+        let doc = parse_plan(plan_json).unwrap();
+        let ctx = PlanContext {
+            user_prompt: "prompt",
+            available_runners: &holder.runners,
+            runner_allowed: &|runner: &str| settings.graph_runner_allowed(runner),
+            effective_model: &|runner: &str| holder.effective_model(runner),
+            validate_model: &crate::model_policy::validate_model_for_runner,
+        };
+        validate_plan_with_limit(&doc, &ctx, 8).expect("custom default_model should validate");
     }
 }

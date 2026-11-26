@@ -89,10 +89,22 @@ pub struct WaitFilter {
     pub waiter: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitEvent {
+    pub kind: String,
+    pub by: String,
+    pub version: u32,
+}
+
 #[derive(Debug, Clone)]
 pub enum WaitOutcome {
-    Ready(Box<BoardItem>),
-    TimedOut { version: u32 },
+    Ready {
+        item: Box<BoardItem>,
+        event: WaitEvent,
+    },
+    TimedOut {
+        version: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,52 +649,17 @@ impl BoardStore {
         }
         let deadline = Instant::now() + Duration::from_secs(filter.timeout_secs);
         let mut file_offset = 0u64;
-        if self.events_path.exists() {
-            file_offset = fs::metadata(&self.events_path)
-                .map_err(|e| BoardError::Internal(e.to_string()))?
-                .len();
-        }
+        let mut history_scanned = false;
         loop {
-            if self.events_path.exists() {
-                let len = fs::metadata(&self.events_path)
-                    .map_err(|e| BoardError::Internal(e.to_string()))?
-                    .len();
-                if len > file_offset {
-                    let mut file = File::open(&self.events_path)
-                        .map_err(|e| BoardError::Internal(e.to_string()))?;
-                    file.seek(SeekFrom::Start(file_offset))
-                        .map_err(|e| BoardError::Internal(e.to_string()))?;
-                    let mut buf = String::new();
-                    file.read_to_string(&mut buf)
-                        .map_err(|e| BoardError::Internal(e.to_string()))?;
-                    file_offset = len;
-                    for line in buf.lines() {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
-                        let Ok(event) = serde_json::from_str::<BoardEvent>(line) else {
-                            continue;
-                        };
-                        if event.item_id != id || event.version <= filter.since_version {
-                            continue;
-                        }
-                        if event.by == filter.waiter {
-                            continue;
-                        }
-                        let matches = match filter.wait_for {
-                            WaitFor::Decision => matches!(event.kind, EventKind::Decision),
-                            WaitFor::Message => matches!(event.kind, EventKind::Message),
-                            WaitFor::Any => matches!(
-                                event.kind,
-                                EventKind::Decision | EventKind::Message | EventKind::Plan
-                            ),
-                        };
-                        if matches {
-                            return Ok(WaitOutcome::Ready(Box::new(self.get(id)?)));
-                        }
-                    }
-                }
+            let read_from = if history_scanned { file_offset } else { 0 };
+            if let Some(event) = self.poll_events(id, &filter, read_from, &mut file_offset)? {
+                let item = self.get(id)?;
+                return Ok(WaitOutcome::Ready {
+                    item: Box::new(item),
+                    event,
+                });
             }
+            history_scanned = true;
             if Instant::now() >= deadline {
                 let version = self
                     .get(id)
@@ -693,6 +670,78 @@ impl BoardStore {
             thread::sleep(Duration::from_millis(500));
         }
     }
+
+    fn poll_events(
+        &self,
+        id: &str,
+        filter: &WaitFilter,
+        read_from: u64,
+        file_offset: &mut u64,
+    ) -> Result<Option<WaitEvent>, BoardError> {
+        if !self.events_path.exists() {
+            return Ok(None);
+        }
+        let len = fs::metadata(&self.events_path)
+            .map_err(|e| BoardError::Internal(e.to_string()))?
+            .len();
+        if len <= read_from {
+            return Ok(None);
+        }
+        let mut file =
+            File::open(&self.events_path).map_err(|e| BoardError::Internal(e.to_string()))?;
+        file.seek(SeekFrom::Start(read_from))
+            .map_err(|e| BoardError::Internal(e.to_string()))?;
+        let byte_count = (len - read_from) as usize;
+        let mut buf = vec![0u8; byte_count];
+        file.read_exact(&mut buf)
+            .map_err(|e| BoardError::Internal(e.to_string()))?;
+        let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+            return Ok(None);
+        };
+        *file_offset = read_from + (last_nl as u64) + 1;
+        let text = String::from_utf8_lossy(&buf[..=last_nl]);
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<BoardEvent>(line) else {
+                continue;
+            };
+            if let Some(trigger) = wait_trigger_for_event(&event, id, filter) {
+                return Ok(Some(trigger));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn wait_trigger_for_event(event: &BoardEvent, id: &str, filter: &WaitFilter) -> Option<WaitEvent> {
+    if event.item_id != id || event.version <= filter.since_version {
+        return None;
+    }
+    if event.by == filter.waiter {
+        return None;
+    }
+    let matches = match filter.wait_for {
+        WaitFor::Decision => matches!(event.kind, EventKind::Decision),
+        WaitFor::Message => matches!(event.kind, EventKind::Message),
+        WaitFor::Any => matches!(
+            event.kind,
+            EventKind::Decision | EventKind::Message | EventKind::Plan
+        ),
+    };
+    if !matches {
+        return None;
+    }
+    let kind = serde_json::to_value(&event.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    Some(WaitEvent {
+        kind,
+        by: event.by.clone(),
+        version: event.version,
+    })
 }
 
 fn workspace_from_path(path: Option<&Path>) -> Result<WorkspaceRef, BoardError> {
@@ -918,6 +967,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(approved.lane, Lane::Approved);
+        use crate::board::{BoardCaller, resolve_actor};
+        assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
+        assert!(resolve_actor(Some("owner"), BoardCaller::Dashboard).is_ok());
     }
 
     #[test]
@@ -1084,8 +1136,90 @@ mod tests {
             )
             .unwrap();
         match handle.join().unwrap() {
-            WaitOutcome::Ready(got) => assert_eq!(got.lane, Lane::Rejected),
+            WaitOutcome::Ready { item: got, event } => {
+                assert_eq!(got.lane, Lane::Rejected);
+                assert_eq!(event.kind, "decision");
+                assert_eq!(event.by, "owner");
+            }
             WaitOutcome::TimedOut { .. } => panic!("expected ready"),
+        }
+        store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Answer,
+                    text: Some("done".to_owned()),
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let immediate = store
+            .wait(
+                &item.id,
+                WaitFilter {
+                    since_version: 1,
+                    timeout_secs: 2,
+                    wait_for: WaitFor::Decision,
+                    waiter: "bot:coordinator".to_owned(),
+                },
+            )
+            .unwrap();
+        match immediate {
+            WaitOutcome::Ready { event, .. } => {
+                assert_eq!(event.kind, "decision");
+                assert_eq!(event.by, "owner");
+            }
+            WaitOutcome::TimedOut { .. } => panic!("expected immediate ready from history scan"),
+        }
+        let events_path = store.events_path.clone();
+        let partial = format!(
+            r#"{{"seq":90001,"item_id":"{}","kind":"message","version":9001,"at_ms":1,"by":"planner""#,
+            item.id
+        );
+        let mut append = OpenOptions::new();
+        append.append(true);
+        append
+            .open(&events_path)
+            .unwrap()
+            .write_all(partial.as_bytes())
+            .unwrap();
+        let stuck = store
+            .wait(
+                &item.id,
+                WaitFilter {
+                    since_version: 9000,
+                    timeout_secs: 1,
+                    wait_for: WaitFor::Message,
+                    waiter: "bot:coordinator".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(stuck, WaitOutcome::TimedOut { .. }));
+        append
+            .open(&events_path)
+            .unwrap()
+            .write_all(b"}\n")
+            .unwrap();
+        match store
+            .wait(
+                &item.id,
+                WaitFilter {
+                    since_version: 9000,
+                    timeout_secs: 2,
+                    wait_for: WaitFor::Message,
+                    waiter: "bot:coordinator".to_owned(),
+                },
+            )
+            .unwrap()
+        {
+            WaitOutcome::Ready { event, .. } => {
+                assert_eq!(event.kind, "message");
+                assert_eq!(event.by, "planner");
+                assert_eq!(event.version, 9001);
+            }
+            WaitOutcome::TimedOut { .. } => panic!("expected ready after partial line completed"),
         }
         let timeout = store
             .wait(

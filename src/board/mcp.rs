@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 
 use super::edit_plan_from_json;
 use super::{
-    AddItemRequest, DecideRequest, Grade, Kind, Lane, ListFilter, SayRequest, UpdateItemRequest,
-    Verdict, WaitFilter, WaitFor, WaitOutcome, default_actor_by, resolve_actor,
+    AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, ListFilter, SayRequest,
+    UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, resolve_actor, wait_ready_json,
 };
 use crate::agent_api::{ApiError, exit, open_board_store};
 
@@ -105,7 +105,7 @@ fn board_add(workspace_root: &std::path::Path, args: &Value) -> Result<Value, Ap
         .unwrap_or_else(|| workspace_root.to_path_buf());
     let state_root = crate::state_path::state_base()
         .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
-    let by = resolve_actor(str_arg(args, "by"), false, true).map_err(ApiError::from)?;
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
     let item = store
         .add(AddItemRequest {
@@ -164,7 +164,7 @@ fn board_show(args: &Value) -> Result<Value, ApiError> {
 fn board_update(_workspace_root: &std::path::Path, args: &Value) -> Result<Value, ApiError> {
     let id = str_arg(args, "id")
         .ok_or_else(|| ApiError::new(exit::USAGE, "id is required".to_owned()))?;
-    let by = resolve_actor(str_arg(args, "by"), false, true).map_err(ApiError::from)?;
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
     let item = store
         .update(
@@ -202,7 +202,7 @@ fn board_move(args: &Value) -> Result<Value, ApiError> {
     let lane = str_arg(args, "lane")
         .and_then(Lane::parse)
         .ok_or_else(|| ApiError::new(exit::USAGE, "lane is required".to_owned()))?;
-    let by = resolve_actor(str_arg(args, "by"), false, true).map_err(ApiError::from)?;
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
     let item = store.move_lane(id, lane, &by).map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
@@ -255,7 +255,7 @@ fn board_decide(args: &Value) -> Result<Value, ApiError> {
     let verdict = str_arg(args, "verdict")
         .and_then(Verdict::parse)
         .ok_or_else(|| ApiError::new(exit::USAGE, "verdict is required".to_owned()))?;
-    let by = resolve_actor(str_arg(args, "by"), false, true).map_err(ApiError::from)?;
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
     let item = store
         .decide(
@@ -281,9 +281,7 @@ fn board_say(args: &Value) -> Result<Value, ApiError> {
     let text = str_arg(args, "text")
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| ApiError::new(exit::USAGE, "text is required".to_owned()))?;
-    let from = str_arg(args, "from")
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_actor_by(false, true));
+    let from = resolve_actor(str_arg(args, "from"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
     let item = store
         .say(
@@ -337,7 +335,7 @@ fn board_wait(args: &Value) -> Result<Value, ApiError> {
         )
         .map_err(ApiError::from)?;
     Ok(match outcome {
-        WaitOutcome::Ready(item) => serde_json::to_value(item).unwrap_or(Value::Null),
+        WaitOutcome::Ready { item, event } => wait_ready_json(&event, &item),
         WaitOutcome::TimedOut { version } => json!({ "timed_out": true, "version": version }),
     })
 }
