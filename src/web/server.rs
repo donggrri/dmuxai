@@ -104,6 +104,7 @@ pub struct ServerConfig {
     pub token_required: bool,
     pub trust_wsl_host: bool,
     pub discovery_mode: String,
+    pub max_workspaces: usize,
     pub peer_source: Option<Arc<dyn LocalPeerSource>>,
     pub services: DashboardServices,
 }
@@ -119,6 +120,7 @@ impl ServerConfig {
             token_required: true,
             trust_wsl_host: false,
             discovery_mode: "web".to_owned(),
+            max_workspaces: crate::web::directory::DEFAULT_MAX_WORKSPACES,
             peer_source: None,
             services,
         }
@@ -1726,7 +1728,7 @@ async fn get_workspaces(axum::extract::State(state): axum::extract::State<AppSta
     json_ok(
         StatusCode::OK,
         &WorkspacesListResponse {
-            max: crate::web::directory::MAX_WORKSPACES,
+            max: state.workspaces.max_workspaces(),
             workspaces,
         },
     )
@@ -1956,10 +1958,11 @@ async fn post_workspace_switch(
     };
 
     if let Some(opener) = state.workspaces.opener() {
-        return tokio::spawn(workspace_switch_in_process_task(
+        return tokio::spawn(workspace_in_process_open_task(
             state.workspaces.clone(),
             opener,
             canonical,
+            true,
         ))
         .await
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
@@ -1979,6 +1982,33 @@ async fn post_workspace_switch(
         state.access.token.clone(),
         ws.clone(),
         canonical,
+    ))
+    .await
+    .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// Attach a workspace in-process without changing the active browser focus (FR-2972).
+async fn post_workspace_attach(
+    State(state): State<AppState>,
+    Ws(ws): Ws,
+    ApiJson(body): ApiJson<WorkspacePathBody>,
+) -> Response {
+    if !ws.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
+    {
+        Ok(path) => path,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
+    };
+    let Some(opener) = state.workspaces.opener() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+    tokio::spawn(workspace_in_process_open_task(
+        state.workspaces.clone(),
+        opener,
+        canonical,
+        false,
     ))
     .await
     .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
@@ -2057,15 +2087,18 @@ async fn workspace_close_task(
     }
 }
 
-async fn workspace_switch_in_process_task(
+async fn workspace_in_process_open_task(
     workspaces: Arc<WorkspaceDirectory>,
     opener: tokio::sync::mpsc::Sender<crate::web::directory::OpenRequest>,
     canonical: std::path::PathBuf,
+    focus: bool,
 ) -> Response {
     let key = crate::workspace::normalize_workspace_path(&canonical)
         .unwrap_or_else(|_| canonical.display().to_string());
     if let Some(entry) = workspaces.find_by_path(&key) {
-        workspaces.set_focused(&entry.id);
+        if focus {
+            workspaces.set_focused(&entry.id);
+        }
         return json_ok(
             StatusCode::OK,
             &serde_json::json!({
@@ -2092,7 +2125,9 @@ async fn workspace_switch_in_process_task(
 
     match tokio::time::timeout(Duration::from_secs(60), rx).await {
         Ok(Ok(Ok(entry))) => {
-            workspaces.set_focused(&entry.id);
+            if focus {
+                workspaces.set_focused(&entry.id);
+            }
             json_ok(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -2107,7 +2142,14 @@ async fn workspace_switch_in_process_task(
         Ok(Ok(Err(e))) => {
             let status =
                 StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            error_json(status, &e.message)
+            if let Some(code) = e.code {
+                json_ok(
+                    status,
+                    &serde_json::json!({ "error": e.message, "code": code }),
+                )
+            } else {
+                error_json(status, &e.message)
+            }
         }
         Ok(Err(_)) => error_json(StatusCode::CONFLICT, "requires dmuxai --web"),
         Err(_) => error_json(
@@ -2259,6 +2301,7 @@ pub fn build_router_with_directory_access(
         .route("/api/workspace/dirs", get(get_workspace_dirs))
         .route("/api/workspace/validate", post(post_workspace_validate))
         .route("/api/workspace/switch", post(post_workspace_switch))
+        .route("/api/workspace/attach", post(post_workspace_attach))
         .route("/api/workspace/open", post(post_workspace_open))
         .route("/api/skills", get(get_skills).post(post_skills))
         .route("/api/skills/approve", post(post_skills_approve))
@@ -2391,7 +2434,11 @@ pub async fn start_server(
         });
     switch_cfg.bound_port = Some(port);
     hub.set_switch_config(switch_cfg);
-    let workspaces = Arc::new(WorkspaceDirectory::single(hub, config.services));
+    let workspaces = Arc::new(WorkspaceDirectory::single_with_max(
+        hub,
+        config.services,
+        config.max_workspaces,
+    ));
     let loopback_router =
         build_router_with_directory_access(workspaces.clone(), primary_access.clone());
     let loopback_make = loopback_router
@@ -2576,6 +2623,7 @@ mod tests {
             token_required: false,
             trust_wsl_host: true,
             discovery_mode: "web".to_owned(),
+            max_workspaces: crate::web::directory::DEFAULT_MAX_WORKSPACES,
             peer_source: Some(mock.clone()),
             services: DashboardServices::default(),
         };
@@ -7514,10 +7562,10 @@ mod tests {
 
         tokio::spawn(async move {
             if let Some(req) = opener_rx.recv().await {
-                let _ = req.reply.send(Err(crate::web::directory::OpenError {
-                    status: 409,
-                    message: "too many open folders (max 4)".to_string(),
-                }));
+                let _ = req.reply.send(Err(crate::web::directory::OpenError::new(
+                    409,
+                    "too many open folders (max 8)",
+                )));
             }
         });
 
@@ -7534,7 +7582,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body_str = read_body(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-        assert_eq!(v["error"], "too many open folders (max 4)");
+        assert_eq!(v["error"], "too many open folders (max 8)");
     }
 
     #[tokio::test]

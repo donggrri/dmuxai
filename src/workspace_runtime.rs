@@ -15,8 +15,7 @@ use dmuxai::settings::DmuxSettings;
 use dmuxai::todo::TodoStore;
 use dmuxai::web::commands::DashboardCommand;
 use dmuxai::web::directory::{
-    CloseRequest, DirectoryError, MAX_WORKSPACES, OpenError, OpenRequest, WorkspaceDirectory,
-    WorkspaceEntry,
+    CloseRequest, DirectoryError, OpenError, OpenRequest, WorkspaceDirectory, WorkspaceEntry,
 };
 use dmuxai::web::{DashboardHub, DashboardServices, SnapshotSource};
 use tokio::sync::mpsc::Receiver;
@@ -312,18 +311,15 @@ pub(crate) async fn run_headless_host(
                 match received_close {
                     Some(CloseRequest { id, reply }) => {
                         if id == "default" {
-                            let _ = reply.send(Err(OpenError {
-                                status: 409,
-                                message: "the first folder closes with Quit".to_owned(),
-                            }));
+                            let _ = reply.send(Err(OpenError::new(
+                                409,
+                                "the first folder closes with Quit",
+                            )));
                         } else if let Some(stop) = stop_flags.get(&id) {
                             closing.insert(id, reply);
                             stop.store(true, Ordering::Relaxed);
                         } else {
-                            let _ = reply.send(Err(OpenError {
-                                status: 404,
-                                message: "no such open folder".to_owned(),
-                            }));
+                            let _ = reply.send(Err(OpenError::new(404, "no such open folder")));
                         }
                     }
                     None => {
@@ -335,10 +331,7 @@ pub(crate) async fn run_headless_host(
     }
 
     for (_, reply) in closing.drain() {
-        let _ = reply.send(Err(OpenError {
-            status: 503,
-            message: "dmuxai is shutting down".to_owned(),
-        }));
+        let _ = reply.send(Err(OpenError::new(503, "dmuxai is shutting down")));
     }
 
     for stop in stop_flags.values() {
@@ -399,36 +392,31 @@ async fn open_hosted_workspace(
     let key = dmuxai::workspace::normalize_workspace_path(&path)
         .unwrap_or_else(|_| path.display().to_string());
     if ctx.directory.find_by_path(&key).is_some() {
-        return Err(OpenError {
-            status: 409,
-            message: "folder is already open".to_owned(),
-        });
+        return Err(OpenError::new(409, "folder is already open"));
     }
-    if ctx.directory.len() >= MAX_WORKSPACES {
-        return Err(OpenError {
-            status: 409,
-            message: "too many open folders (max 4); close one first".to_owned(),
-        });
+    let max_workspaces = ctx.directory.max_workspaces();
+    if ctx.directory.len() >= max_workspaces {
+        return Err(OpenError::with_code(
+            409,
+            "full",
+            format!("too many open folders (max {max_workspaces}); close one first"),
+        ));
     }
     if let Err(error) = dmuxai::workspace::ensure_directory_writable(&path) {
-        return Err(OpenError {
-            status: 400,
-            message: error.to_string(),
-        });
+        return Err(OpenError::new(400, error.to_string()));
     }
 
     let settings = DmuxSettings::load(&path);
-    let restricted = folder_is_restricted(&settings);
-    let (mut app, migration_notice) =
-        open_workspace_app(&path, &settings).map_err(|error| OpenError {
-            status: 500,
-            message: error.to_string(),
-        })?;
-    if !settings.custom_agents.is_empty() {
-        app.push_startup_notice(
-            "Custom agents from this folder's dmuxai.toml are not loaded when it is opened in a dashboard that already serves another folder; start a separate `dmuxai --web` here to use them.".to_owned(),
-        );
+    if settings.workspace_defines_custom_agents {
+        return Err(OpenError::with_code(
+            422,
+            "custom_agents_not_supported",
+            "Custom agents from this folder's dmuxai.toml cannot be hosted in a shared dashboard; start a separate dashboard to use them.",
+        ));
     }
+    let restricted = folder_is_restricted(&settings);
+    let (mut app, migration_notice) = open_workspace_app(&path, &settings)
+        .map_err(|error| OpenError::new(500, error.to_string()))?;
     for warning in &settings.config_warnings {
         app.push_startup_notice(warning.clone());
     }
@@ -468,9 +456,10 @@ async fn open_hosted_workspace(
                 DirectoryError::Full | DirectoryError::Duplicate => 409,
                 _ => 500,
             };
-            OpenError {
-                status,
-                message: error.to_string(),
+            if error == DirectoryError::Full {
+                OpenError::with_code(status, "full", error.to_string())
+            } else {
+                OpenError::new(status, error.to_string())
             }
         })?;
 

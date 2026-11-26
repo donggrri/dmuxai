@@ -202,10 +202,10 @@ fn tc_1602_plain_dmuxai_needs_tty_and_help_mentions_no_tui() {
         cmd
     };
 
-    let out = base(&["-C", "."]).output().expect("run plain dmuxai");
+    let out = base(&["--tui"]).output().expect("run dmuxai --tui");
     assert!(
         !out.status.success(),
-        "plain dmuxai must fail without a TTY"
+        "dmuxai --tui must fail without a TTY"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -217,7 +217,7 @@ fn tc_1602_plain_dmuxai_needs_tty_and_help_mentions_no_tui() {
     assert!(out.status.success(), "--help must exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Run the local dashboard with agents (no TUI)"),
+        stdout.contains("no TUI"),
         "--help must describe --web as no-TUI, got: {stdout:?}"
     );
 }

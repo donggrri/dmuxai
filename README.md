@@ -31,11 +31,27 @@ The graph in this shot is demo data and the token is redacted:
 
 ```bash
 cd /path/to/project
-dmuxai                          # TUI
+dmuxai                          # web dashboard (default mode; attaches to a live dashboard if one is running)
+dmuxai --new                    # start a separate web dashboard instead of reusing a running one
+dmuxai --tui                    # interactive terminal UI
 dmuxai -C /path/to/project      # run in /path/to/project from any directory (also --workspace-dir DIR)
-dmuxai --web                    # dashboard only (no TUI); the URL with its access token is printed
-dmuxai serve                    # dashboard only (no TTY needed); prints: dmuxai dashboard: http://127.0.0.1:7420/?token=...
+dmuxai --web                    # explicit web mode (same as plain `dmuxai` when default mode is web)
+dmuxai serve                    # view-only dashboard (no TTY needed)
 dmuxai serve --port 0           # pick a free port
+```
+
+### Default web mode
+
+Plain `dmuxai` starts in **web mode** by default (headless `--web` host, no TTY required). If a live web dashboard owned by your user is already running, running `dmuxai` in another project attaches that project in-process and prints its `?ws=<id>` URL without changing the active browser focus; pass `--new` to start a separate server instead.
+
+Default mode resolution order: `--tui` / `--web` CLI flag > `DMUXAI_UI` (`web` or `tui`) > `[ui] default_mode` in `dmuxai.toml` > `web`:
+
+```toml
+[ui]
+default_mode = "web"   # "web" (default) or "tui"
+
+[web]
+max_workspaces = 8     # workspaces hosted per dashboard (1..32, default 8)
 ```
 
 You can also set a default workspace and extra dashboard browse roots in your

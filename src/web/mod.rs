@@ -18,6 +18,7 @@ pub mod layout;
 pub mod local_peer;
 pub mod parity;
 mod peer_connect;
+pub mod reuse;
 pub mod runs_api;
 mod server;
 mod snapshot;

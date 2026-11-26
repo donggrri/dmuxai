@@ -98,18 +98,19 @@ fn tc_382_unknown_flag_exits_with_code_2() {
     );
 }
 
-/// TC-382 / FR-382: starting without a TTY prints a clear error message to stderr and exits 1 without "Os code 6".
+/// TC-382 / FR-382 / FR-2976: starting `--tui` without a TTY prints a clear error message to stderr and exits 1 without "Os code 6".
 #[test]
 fn non_tty_start_fails_with_clear_message() {
     let output = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+        .arg("--tui")
         .stdin(Stdio::null())
         .output()
-        .expect("execute dmuxai");
+        .expect("execute dmuxai --tui");
 
     assert_eq!(
         output.status.code(),
         Some(1),
-        "expected exit code 1 for non-TTY start, got: {:?}",
+        "expected exit code 1 for non-TTY --tui start, got: {:?}",
         output.status
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -121,6 +122,55 @@ fn non_tty_start_fails_with_clear_message() {
         !stderr.contains("Os { code: 6"),
         "stderr should not mention Os code 6, got: {stderr}"
     );
+}
+
+/// TC-2976 / FR-2976: non-TTY plain `dmuxai` runs in web mode and prints its dashboard URL.
+#[test]
+fn tc_2976_non_tty_plain_run_uses_web_mode() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let workspace = tmp.path().join("ws");
+    let state = tmp.path().join("state");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
+        .args(["--port", "0"])
+        .current_dir(&workspace)
+        .env("DMUXAI_STATE_DIR", &state)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_CONFIG_HOME", tmp.path().join("cfg"))
+        .env_remove("DMUXAI_UI")
+        .env_remove("DMUXAI_WEB_TOKEN")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn plain dmuxai");
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if line.starts_with("dmuxai dashboard:") {
+                let _ = tx.send(line);
+                break;
+            }
+            line.clear();
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let line = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let url_line = line.expect("plain non-TTY dmuxai must print dashboard URL in web mode");
+    assert!(url_line.contains("http://"), "got: {url_line}");
 }
 
 /// TC-871 / FR-870: `dmuxai -C <a> status --json` from cwd `<b>` reports `<a>`;

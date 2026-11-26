@@ -23,8 +23,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use dmuxai::settings::DmuxSettings;
+use dmuxai::settings::{DefaultUiMode, DmuxSettings};
 use dmuxai::todo::TodoStore;
+use dmuxai::web::reuse::AttachOutcome;
 use dmuxai::web::{
     DEFAULT_PORT, DashboardHub, DashboardServer, DashboardServices, FileGraphSource, ServerConfig,
     SnapshotSource, check_bind, generate_token, start_server,
@@ -36,13 +37,14 @@ use tokio::signal::unix::SignalKind;
 
 type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-/// CLI options for the dashboard server (FR-520, FR-521, FR-524).
+/// CLI options for the dashboard server (FR-520, FR-521, FR-524, FR-2971).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebOptions {
     port: u16,
     bind: IpAddr,
     allow_remote: bool,
     bind_explicit: bool,
+    new: bool,
 }
 
 impl Default for WebOptions {
@@ -52,6 +54,7 @@ impl Default for WebOptions {
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             allow_remote: false,
             bind_explicit: false,
+            new: false,
         }
     }
 }
@@ -62,7 +65,8 @@ enum CliAction {
     /// Subcommand-local help text printed instead of the root usage (FR-2617).
     HelpTopic(&'static str),
     Version,
-    Run,
+    Run(WebOptions),
+    RunTui,
     Serve(WebOptions),
     RunWeb(WebOptions),
     McpMemory(MemoryOptions),
@@ -88,9 +92,11 @@ DmuxAI - One terminal. Multiple AI coding agents.
 
 Usage:
   dmuxai [--help|--version]
+  dmuxai [--port N] [--bind ADDR] [--allow-remote] [--new]
+  dmuxai --tui
   dmuxai [-C DIR | --workspace-dir DIR] [--config PATH] [subcommand...]
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
-  dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
+  dmuxai --web [--port N] [--bind ADDR] [--allow-remote] [--new]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
   dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
   dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json] [--trust-workspace-config]
@@ -116,7 +122,9 @@ Options:
   -C, --workspace-dir DIR  Run in DIR instead of the current directory
   --config PATH          Use PATH as the dmuxai.toml config file
   serve            Run the local dashboard server without the TUI
-  --web            Run the local dashboard with agents (no TUI)
+  --web            Run the local dashboard with agents (no TUI; default mode)
+  --tui            Run the interactive terminal UI instead of the web dashboard
+  --new            Start a separate web dashboard instead of reusing a running one
   --port N         Dashboard port (default 7420)
   --bind ADDR      Dashboard bind address (default 127.0.0.1)
   --allow-remote   Allow binding to a non-loopback address
@@ -147,6 +155,7 @@ Configuration:
   dmuxai.toml      Optional configuration file in the workspace root or parent directories
 
 Environment variables:
+  DMUXAI_UI           Default mode for plain `dmuxai` (`web` or `tui`; overrides [ui] default_mode)
   DMUXAI_FORCE_COLOR  Force color output on (1) or off (0)
   NO_COLOR            Disable color output unless forced
   XDG_STATE_HOME      Directory for application state and conversation history
@@ -206,29 +215,36 @@ where
 
     let serve = args.first().map(String::as_str) == Some("serve");
     let web = args.iter().any(|arg| arg == "--web");
+    let tui = args.iter().any(|arg| arg == "--tui");
     let mcp = args.first().map(String::as_str) == Some("mcp-memory");
+    let has_web_option = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--port" | "--bind" | "--allow-remote" | "--new"
+        )
+    });
 
-    if !serve && !web && !mcp {
+    if !serve && !web && !tui && !mcp && !has_web_option {
         // Preserve the original single-action semantics exactly: `--help`
         // returns immediately, `--version` is honored only while the action is
         // still `Run`, and any other argument returns `Unknown` at that point.
-        let mut action = CliAction::Run;
+        let mut help_or_version: Option<CliAction> = None;
         for arg in &args {
             match arg.as_str() {
                 "-h" | "--help" => return CliAction::Help,
                 "-V" | "--version" => {
-                    if action == CliAction::Run {
-                        action = CliAction::Version;
+                    if help_or_version.is_none() {
+                        help_or_version = Some(CliAction::Version);
                     }
                 }
                 other => return CliAction::Unknown(other.to_owned()),
             }
         }
-        return action;
+        return help_or_version.unwrap_or_else(|| CliAction::Run(WebOptions::default()));
     }
 
-    // With `serve`/`--web`/`mcp-memory` present, `--help` and `--version` win
-    // from any position (FR-520).
+    // With `serve`/`--web`/`--tui`/`mcp-memory`/web flags present, `--help` and
+    // `--version` win from any position (FR-520).
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return CliAction::Help;
     }
@@ -240,10 +256,28 @@ where
         return parse_mcp_memory_cli(&args);
     }
 
-    // `serve` and `--web` are mutually exclusive, and `serve` is only valid as
-    // the first argument; anything else is an unknown argument.
+    // `serve` and `--web` are mutually exclusive; `--tui` conflicts with `serve`, `--web`,
+    // and web-only flags (FR-2971).
     if serve && web {
         return CliAction::Unknown("--web".to_owned());
+    }
+    if tui && (serve || web) {
+        return CliAction::Usage("--tui cannot be used with --web or serve".to_owned());
+    }
+    if tui {
+        for arg in &args {
+            match arg.as_str() {
+                "--tui" => {}
+                "serve" => {
+                    return CliAction::Usage("--tui cannot be used with --web or serve".to_owned());
+                }
+                "--port" | "--bind" | "--allow-remote" | "--new" => {
+                    return CliAction::Usage(format!("{arg} cannot be used with --tui"));
+                }
+                other => return CliAction::Unknown(other.to_owned()),
+            }
+        }
+        return CliAction::RunTui;
     }
 
     let mut options = WebOptions::default();
@@ -256,6 +290,12 @@ where
                 }
             }
             "--web" => {}
+            "--new" => {
+                if serve {
+                    return CliAction::Usage("--new cannot be used with serve".to_owned());
+                }
+                options.new = true;
+            }
             "--port" => {
                 index += 1;
                 match args.get(index).and_then(|value| value.parse::<u16>().ok()) {
@@ -291,8 +331,10 @@ where
 
     if serve {
         CliAction::Serve(options)
-    } else {
+    } else if web {
         CliAction::RunWeb(options)
+    } else {
+        CliAction::Run(options)
     }
 }
 
@@ -448,9 +490,10 @@ async fn async_main(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             std::process::exit(code);
         }
         CliAction::Serve(options) => run_serve(options).await,
-        CliAction::RunWeb(options) => run_tui(Some(options)).await,
+        CliAction::RunWeb(options) => run_entry(Some(DefaultUiMode::Web), options).await,
+        CliAction::RunTui => run_entry(Some(DefaultUiMode::Tui), WebOptions::default()).await,
         CliAction::McpMemory(options) => run_mcp_memory(options),
-        CliAction::Run => run_tui(None).await,
+        CliAction::Run(options) => run_entry(None, options).await,
     }
 }
 
@@ -702,6 +745,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         token_required,
         trust_wsl_host: settings.web_theme.trust_wsl_host,
         discovery_mode: "serve".to_owned(),
+        max_workspaces: settings.web_theme.max_workspaces,
         peer_source: None,
         services,
     };
@@ -864,17 +908,47 @@ fn publish_user_discovery(
         .map(|error| format!("could not write the user-level dashboard discovery file: {error}"))
 }
 
-/// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
+/// Resolve the default UI mode for plain `dmuxai` (FR-2970).
 ///
-/// FR-1600: `--web` runs headless on its own — the terminal UI is never
-/// started, so no TTY is required. Only plain `dmuxai` keeps the TTY check.
-async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
-    let headless = web.is_some();
-    if !headless && (!io::stdin().is_terminal() || !io::stdout().is_terminal()) {
+/// Order: CLI flag (`--tui` / `--web`) > `DMUXAI_UI` > `[ui] default_mode` > built-in `web`.
+fn resolve_default_mode(
+    flag: Option<DefaultUiMode>,
+    env_ui: Option<&str>,
+    settings_mode: Option<DefaultUiMode>,
+) -> Result<DefaultUiMode, String> {
+    if let Some(mode) = flag {
+        return Ok(mode);
+    }
+    if let Some(raw) = env_ui.map(str::trim).filter(|s| !s.is_empty()) {
+        if raw.eq_ignore_ascii_case("web") {
+            return Ok(DefaultUiMode::Web);
+        }
+        if raw.eq_ignore_ascii_case("tui") {
+            return Ok(DefaultUiMode::Tui);
+        }
+        return Err(format!(
+            "DMUXAI_UI = \"{raw}\" is not valid; expected \"web\" or \"tui\""
+        ));
+    }
+    Ok(settings_mode.unwrap_or(DefaultUiMode::Web))
+}
+
+fn require_tty_or_exit() {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         eprintln!(
             "dmuxai needs an interactive terminal (TTY); run it in a terminal, or see dmuxai --help"
         );
         std::process::exit(1);
+    }
+}
+
+/// Entry point for plain `dmuxai`, `dmuxai --web`, and `dmuxai --tui` (FR-2970..FR-2978).
+async fn run_entry(
+    flag_mode: Option<DefaultUiMode>,
+    options: WebOptions,
+) -> Result<(), Box<dyn Error>> {
+    if flag_mode == Some(DefaultUiMode::Tui) {
+        require_tty_or_exit();
     }
     let workspace_root = match dmuxai::workspace::resolve_workspace_root() {
         Ok(root) => root,
@@ -886,6 +960,55 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
     let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
     let settings = load_settings_with_trust_prompt(&workspace_root);
+    let env_ui = std::env::var("DMUXAI_UI").ok();
+    let mode = match resolve_default_mode(flag_mode, env_ui.as_deref(), settings.ui_default_mode) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    };
+
+    let web = match mode {
+        DefaultUiMode::Tui => {
+            require_tty_or_exit();
+            None
+        }
+        DefaultUiMode::Web => {
+            if !options.new {
+                match dmuxai::web::reuse::try_attach_to_live_dashboard(&workspace_root) {
+                    AttachOutcome::Attached { url } => {
+                        println!("dmuxai dashboard: {url}");
+                        io::stdout().flush()?;
+                        return Ok(());
+                    }
+                    AttachOutcome::Full { message } => {
+                        eprintln!("error: {message}");
+                        std::process::exit(4);
+                    }
+                    AttachOutcome::CustomAgentsNotSupported => {
+                        eprintln!(
+                            "note: running dashboard cannot host this workspace (repo defines custom agents); starting a separate dashboard"
+                        );
+                    }
+                    AttachOutcome::NoLiveDashboard => {}
+                }
+            }
+            Some(options)
+        }
+    };
+    run_tui(workspace_root, settings, web).await
+}
+
+/// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
+///
+/// FR-1600 / FR-2976: web mode runs headless on its own — no TTY is required.
+async fn run_tui(
+    workspace_root: PathBuf,
+    settings: DmuxSettings,
+    web: Option<WebOptions>,
+) -> Result<(), Box<dyn Error>> {
+    let headless = web.is_some();
     let startup_warning = dmuxai::workspace::normalize_workspace_path(&workspace_root)
         .ok()
         .and_then(|normalized| dmuxai::workspace::wsl_mnt_warning(&normalized));
@@ -1141,6 +1264,7 @@ async fn attach_web_dashboard(
         token_required,
         trust_wsl_host: settings.web_theme.trust_wsl_host,
         discovery_mode: "web".to_owned(),
+        max_workspaces: settings.web_theme.max_workspaces,
         peer_source: None,
         services: parts.services,
     };
@@ -1277,7 +1401,10 @@ mod tests {
 
     #[test]
     fn parse_cli_empty_args_defaults_to_run() {
-        assert_eq!(parse_cli(std::iter::empty::<&str>()), CliAction::Run);
+        assert_eq!(
+            parse_cli(std::iter::empty::<&str>()),
+            CliAction::Run(WebOptions::default())
+        );
     }
 
     #[test]
@@ -1378,10 +1505,20 @@ mod tests {
             parse_cli(["serve", "--nope"]),
             CliAction::Unknown(_)
         ));
-        assert!(matches!(
+        assert_eq!(
             parse_cli(["--port", "9000"]),
-            CliAction::Unknown(_)
-        ));
+            CliAction::Run(WebOptions {
+                port: 9000,
+                ..web_default()
+            })
+        );
+        assert_eq!(
+            parse_cli(["--new"]),
+            CliAction::Run(WebOptions {
+                new: true,
+                ..web_default()
+            })
+        );
         // `serve` is only valid as the first argument; `--web` excludes `serve`.
         assert!(matches!(
             parse_cli(["--web", "serve"]),
@@ -1666,5 +1803,77 @@ mod tests {
             parse_cli(["__mock-mcp", "unexpected"]),
             CliAction::Unknown(_)
         ));
+    }
+
+    // TC-2970 / FR-2970: Default mode resolution order: flag > DMUXAI_UI > [ui] default_mode > web.
+    #[test]
+    fn tc_2970_default_mode_resolution_order() {
+        assert_eq!(
+            resolve_default_mode(None, None, None),
+            Ok(DefaultUiMode::Web)
+        );
+        assert_eq!(
+            resolve_default_mode(None, None, Some(DefaultUiMode::Tui)),
+            Ok(DefaultUiMode::Tui)
+        );
+        assert_eq!(
+            resolve_default_mode(None, Some("web"), Some(DefaultUiMode::Tui)),
+            Ok(DefaultUiMode::Web)
+        );
+        assert_eq!(
+            resolve_default_mode(None, Some("TUI"), Some(DefaultUiMode::Web)),
+            Ok(DefaultUiMode::Tui)
+        );
+        assert_eq!(
+            resolve_default_mode(
+                Some(DefaultUiMode::Tui),
+                Some("web"),
+                Some(DefaultUiMode::Web)
+            ),
+            Ok(DefaultUiMode::Tui)
+        );
+        assert_eq!(
+            resolve_default_mode(
+                Some(DefaultUiMode::Web),
+                Some("tui"),
+                Some(DefaultUiMode::Tui)
+            ),
+            Ok(DefaultUiMode::Web)
+        );
+        let err = resolve_default_mode(None, Some("bogus"), None).unwrap_err();
+        assert!(err.contains("DMUXAI_UI"), "got: {err}");
+    }
+
+    // TC-2971 / FR-2971: --tui flag and conflicts with --web, serve, and web-only flags.
+    #[test]
+    fn tc_2971_tui_flag_and_conflicts() {
+        assert_eq!(parse_cli(["--tui"]), CliAction::RunTui);
+        assert!(matches!(parse_cli(["--tui", "--web"]), CliAction::Usage(_)));
+        assert!(matches!(parse_cli(["--web", "--tui"]), CliAction::Usage(_)));
+        assert!(matches!(parse_cli(["--tui", "serve"]), CliAction::Usage(_)));
+        assert!(matches!(parse_cli(["serve", "--tui"]), CliAction::Usage(_)));
+        assert!(matches!(
+            parse_cli(["--tui", "--port", "9000"]),
+            CliAction::Usage(_)
+        ));
+        assert!(matches!(
+            parse_cli(["--tui", "--bind", "127.0.0.1"]),
+            CliAction::Usage(_)
+        ));
+        assert!(matches!(
+            parse_cli(["--tui", "--allow-remote"]),
+            CliAction::Usage(_)
+        ));
+        assert!(matches!(parse_cli(["--tui", "--new"]), CliAction::Usage(_)));
+        assert!(matches!(parse_cli(["serve", "--new"]), CliAction::Usage(_)));
+    }
+
+    // TC-2977 / FR-2977: `dmuxai --help` documents default mode, --tui, --new, DMUXAI_UI.
+    #[test]
+    fn tc_2977_help_documents_default_mode_flags() {
+        assert!(USAGE.contains("--tui"));
+        assert!(USAGE.contains("--new"));
+        assert!(USAGE.contains("default mode"));
+        assert!(USAGE.contains("DMUXAI_UI"));
     }
 }

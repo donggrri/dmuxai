@@ -586,6 +586,7 @@ pub fn process_alive(pid: u32) -> bool {
 pub fn open_dashboard_args(workspace: &Path) -> Vec<String> {
     vec![
         "--web".to_owned(),
+        "--new".to_owned(),
         "-C".to_owned(),
         workspace.display().to_string(),
         "--port".to_owned(),
@@ -812,12 +813,12 @@ pub fn live_dashboard_url(workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
 
-    // TC-1470 (FR-1470): "Open in new window" asks for a headless dashboard.
+    // TC-1470 (FR-1470, FR-2974): "Open in new window" asks for a headless dashboard with `--new`.
     #[test]
     fn tc_1470_spawn_dashboard_sets_headless_env() {
         assert_eq!(super::HEADLESS_DASHBOARD_ENV, "DMUXAI_HEADLESS_DASHBOARD");
         let args = super::open_dashboard_args(std::path::Path::new("/w"));
-        assert_eq!(args, ["--web", "-C", "/w", "--port", "0"]);
+        assert_eq!(args, ["--web", "--new", "-C", "/w", "--port", "0"]);
     }
 
     // TC-873 (FR-872): listing recents (every GET /api/workspace) must not
