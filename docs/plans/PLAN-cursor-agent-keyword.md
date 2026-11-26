@@ -3,10 +3,10 @@
 Status: in progress  
 Spec: [SPEC-cursor-agent-keyword.md](../specs/SPEC-cursor-agent-keyword.md)
 
-1. Add `src/runner_id.rs` with `canonical_runner_id` (FR-3100, TC-3100).
-2. Apply it at every parse boundary: CLI, settings (all keys), graph plan/override, TUI, MCP, web, custom-agent reserved names (FR-3101..FR-3105).
-3. `runners --json` `aliases` (FR-3106).
-4. Help text, README, docs, CHANGELOG (UX-3100).
+1. Add `src/runner_id.rs` with `canonical_runner_id` (FR-3200, TC-3200).
+2. Apply it at every parse boundary: CLI, settings (all keys), graph plan/override, TUI, MCP, web, custom-agent reserved names (FR-3201..FR-3205).
+3. `runners --json` `aliases` (FR-3206).
+4. Help text, README, docs, CHANGELOG (UX-3200).
 
 ## Risks and rollback
 

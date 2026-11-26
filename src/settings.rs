@@ -16,6 +16,54 @@ use crate::workspace_trust::{
 #[doc(hidden)]
 pub use crate::state_path::test_env_lock;
 
+const CURSOR_RUNNER_TABLE_CONFLICT: &str =
+    "[runners.cursor] and [runners.cursor-agent] both define settings; [runners.cursor-agent] wins";
+
+fn runners_define_cursor_and_alias(
+    runners: &BTreeMap<String, crate::agent_prompt::RunnerPromptToml>,
+) -> bool {
+    runners
+        .keys()
+        .any(|k| k.trim().eq_ignore_ascii_case("cursor"))
+        && runners
+            .keys()
+            .any(|k| k.trim().eq_ignore_ascii_case("cursor-agent"))
+}
+
+fn parse_runners_tables(
+    runners: BTreeMap<String, crate::agent_prompt::RunnerPromptToml>,
+    scope: &str,
+    base_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> (
+    BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
+    BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
+) {
+    let cursor_conflict = runners_define_cursor_and_alias(&runners);
+    let mut parsed_map = BTreeMap::new();
+    let mut fallback_map = BTreeMap::new();
+    for (id, raw) in runners {
+        let raw_norm = id.trim().to_ascii_lowercase();
+        let canon_id = crate::runner_id::canonical_runner_id(&raw_norm);
+        if cursor_conflict && raw_norm == "cursor-agent" {
+            warnings.push(CURSOR_RUNNER_TABLE_CONFLICT.to_owned());
+        }
+        let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
+            &canon_id, &raw, scope, base_dir, warnings,
+        );
+        parsed_map.insert(canon_id.clone(), cfg);
+        fallback_map.insert(
+            canon_id,
+            crate::runner_fallback::RunnerFallbackToml {
+                fallback: raw.fallback.clone(),
+                stall_timeout_secs: raw.stall_timeout_secs,
+                stall_api_retries: raw.stall_api_retries,
+            },
+        );
+    }
+    (parsed_map, fallback_map)
+}
+
 /// Web dashboard theme settings loaded from `[web]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebThemeSettings {
@@ -497,27 +545,12 @@ impl DmuxSettings {
                             Some(p) if !p.as_os_str().is_empty() => p,
                             _ => Path::new("."),
                         };
-                        let mut parsed_map = BTreeMap::new();
-                        let mut fallback_map = BTreeMap::new();
-                        for (id, raw) in runners {
-                            let norm_id = id.trim().to_ascii_lowercase();
-                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
-                                &norm_id,
-                                &raw,
-                                "user",
-                                base_dir,
-                                &mut settings.config_warnings,
-                            );
-                            parsed_map.insert(norm_id.clone(), cfg);
-                            fallback_map.insert(
-                                norm_id,
-                                crate::runner_fallback::RunnerFallbackToml {
-                                    fallback: raw.fallback.clone(),
-                                    stall_timeout_secs: raw.stall_timeout_secs,
-                                    stall_api_retries: raw.stall_api_retries,
-                                },
-                            );
-                        }
+                        let (parsed_map, fallback_map) = parse_runners_tables(
+                            runners,
+                            "user",
+                            base_dir,
+                            &mut settings.config_warnings,
+                        );
                         user_runners = Some(parsed_map);
                         user_fallback_tables = Some(fallback_map);
                     }
@@ -595,27 +628,12 @@ impl DmuxSettings {
                     }
 
                     if let Some(runners) = parsed.runners.take() {
-                        let mut parsed_map = BTreeMap::new();
-                        let mut fallback_map = BTreeMap::new();
-                        for (id, raw) in runners {
-                            let norm_id = id.trim().to_ascii_lowercase();
-                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
-                                &norm_id,
-                                &raw,
-                                "workspace",
-                                workspace,
-                                &mut settings.config_warnings,
-                            );
-                            parsed_map.insert(norm_id.clone(), cfg);
-                            fallback_map.insert(
-                                norm_id,
-                                crate::runner_fallback::RunnerFallbackToml {
-                                    fallback: raw.fallback.clone(),
-                                    stall_timeout_secs: raw.stall_timeout_secs,
-                                    stall_api_retries: raw.stall_api_retries,
-                                },
-                            );
-                        }
+                        let (parsed_map, fallback_map) = parse_runners_tables(
+                            runners,
+                            "workspace",
+                            workspace,
+                            &mut settings.config_warnings,
+                        );
                         workspace_runners = Some(parsed_map);
                         workspace_fallback_tables = Some(fallback_map);
                     }
@@ -1105,7 +1123,10 @@ impl DmuxSettings {
         }
         if let Some(routing) = parsed.routing {
             if let Some(default_agent) = routing.default_agent {
-                self.routing_default_agent = Some(default_agent);
+                let canon = crate::runner_id::canonical_runner_id(&default_agent);
+                if !canon.is_empty() {
+                    self.routing_default_agent = Some(canon);
+                }
             }
             if let Some(cursor_models) = routing.cursor_models {
                 self.routing_cursor_models = cursor_models;
@@ -1175,7 +1196,7 @@ impl DmuxSettings {
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
                 for runner in runners {
-                    let lower = runner.trim().to_ascii_lowercase();
+                    let lower = crate::runner_id::canonical_runner_id(&runner);
                     if lower.is_empty() {
                         continue;
                     }
@@ -1322,15 +1343,18 @@ impl DmuxSettings {
     /// SPEC-grok-runner FR-899). An unset `allowed_runners` admits every runner
     /// except built-in presets; a listed runner, including a preset, is admitted.
     pub fn graph_runner_allowed(&self, runner: &str) -> bool {
-        let runner = runner.trim();
+        let runner = crate::runner_id::canonical_runner_id(runner);
+        if runner.is_empty() {
+            return false;
+        }
         match &self.graph_allowed_runners {
             Some(allowed) => allowed
                 .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner)),
+                .any(|r| crate::runner_id::canonical_runner_id(r) == runner),
             None => !self
                 .custom_agents
                 .iter()
-                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(runner)),
+                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(&runner)),
         }
     }
 
@@ -6170,5 +6194,75 @@ usbipd_attach = false
             "workspace wins"
         );
         assert_eq!(settings.terminal_serial_usbipd_attach, Some(false));
+    }
+
+    // TC-3202 / FR-3202
+    #[test]
+    fn tc_3202_config_accepts_cursor_agent_keyword() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor-agent", "agy"]
+
+[routing]
+default_agent = "cursor-agent"
+
+[runners.cursor-agent]
+model = "composer-2.5"
+fallback = ["agy"]
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert!(settings.graph_runner_allowed("cursor"));
+        assert!(
+            settings
+                .graph_allowed_runners
+                .as_ref()
+                .is_some_and(|r| r.contains(&"cursor".to_owned()))
+        );
+        assert_eq!(settings.routing_default_agent.as_deref(), Some("cursor"));
+        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        assert_eq!(cursor.model.as_deref(), Some("composer-2.5"));
+        assert!(
+            !settings
+                .runner_fallback
+                .chain_for("cursor", None)
+                .is_empty()
+        );
+    }
+
+    // TC-3203 / FR-3202
+    #[test]
+    fn tc_3203_cursor_and_cursor_agent_tables_conflict_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[runners.cursor]
+model = "composer-2.5"
+
+[runners.cursor-agent]
+model = "grok-4.7-high"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert_eq!(
+            settings.runner_models.get("cursor").map(String::as_str),
+            Some("grok-4.7-high")
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains(CURSOR_RUNNER_TABLE_CONFLICT)),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
     }
 }

@@ -469,7 +469,7 @@ pub fn pin_graph_plan_runners(
     pinned_model: &str,
     runner_allowed: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
-    let pinned_runner = pinned_runner.trim().to_ascii_lowercase();
+    let pinned_runner = crate::runner_id::canonical_runner_id(pinned_runner);
     let mut notes = Vec::new();
     for node in &mut plan.nodes {
         let prior = node.runner.trim().to_ascii_lowercase();
@@ -580,7 +580,7 @@ pub fn validate_plan_with_limit(
     let mut edges = Vec::new();
     for step in &doc.steps {
         let role = parse_role(&step.role).expect("role checked");
-        let runner = step.runner.trim().to_ascii_lowercase();
+        let runner = crate::runner_id::canonical_runner_id(&step.runner);
         let model_id = resolved_model(step, &runner, ctx).expect("model checked");
         let keyword =
             sensitive_keyword_match(ctx.user_prompt) || sensitive_keyword_match(&step.job);
@@ -917,7 +917,7 @@ fn check_runner(step: &PlanStep, ctx: &PlanContext<'_>, errors: &mut Vec<PlanErr
         errors.push(PlanError::new(step.id.clone(), "runner is not registered"));
         return;
     }
-    let key = runner.to_ascii_lowercase();
+    let key = crate::runner_id::canonical_runner_id(runner);
     let registered = ctx
         .available_runners
         .iter()
@@ -986,7 +986,7 @@ pub fn fallback_plan(
     effective_model: Option<&str>,
     cause: &str,
 ) -> Result<FallbackPlan, String> {
-    let runner = runner.trim().to_ascii_lowercase();
+    let runner = crate::runner_id::canonical_runner_id(runner);
     let model = match effective_model {
         Some(model) if crate::model_policy::validate_model_for_runner(&runner, model).is_ok() => {
             model.trim().to_owned()
@@ -1010,7 +1010,7 @@ pub fn fallback_plan(
 /// direct 1-node run when the selected agent has no explicit model and runs on
 /// its provider default (FR-937).
 pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) -> FallbackPlan {
-    let runner = runner.trim().to_ascii_lowercase();
+    let runner = crate::runner_id::canonical_runner_id(runner);
     let model = model.to_owned();
     let task = implicit_task(prompt);
     FallbackPlan {
@@ -1977,5 +1977,17 @@ DATA-nonce1>>>>
         let doc = parse_plan(&json).unwrap();
         let context = PlanCtx::new(&["cursor"], &[], false);
         validate_plan_with_limit(&doc, &context.context("build it"), 12).expect("12 tasks");
+    }
+
+    // TC-3204 / FR-3203
+    #[test]
+    fn tc_3204_plan_runner_accepts_cursor_agent() {
+        let json = r#"{"tasks":[{"id":"task-1","title":"one","done_check":"d","size":"small"}],"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor-agent","depends_on":[],"task":"task-1"}]}"#;
+        let doc = parse_plan(json).unwrap();
+        let context = PlanCtx::new(&["cursor"], &[], false);
+        let plan = validate_plan(&doc, &context.context("ship")).unwrap();
+        assert_eq!(plan.nodes[0].runner, "cursor");
+        let pinned = fallback_plan("ship it", "cursor-agent", None, "timeout").unwrap();
+        assert_eq!(pinned.plan.nodes[0].runner, "cursor");
     }
 }

@@ -58,7 +58,7 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
             return String::new();
         }
         if let Some(default) = settings.routing_default_agent.as_deref() {
-            let lower = default.trim().to_ascii_lowercase();
+            let lower = crate::runner_id::canonical_runner_id(default);
             if allowed.contains(&lower) {
                 return lower;
             }
@@ -70,7 +70,7 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
     }
 
     if let Some(default) = settings.routing_default_agent.as_deref() {
-        let lower = default.trim().to_ascii_lowercase();
+        let lower = crate::runner_id::canonical_runner_id(default);
         let known = matches!(lower.as_str(), "agy" | "codex" | "cursor")
             || crate::custom_agent::index_of(&lower).is_some()
             || settings

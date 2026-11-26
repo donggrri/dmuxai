@@ -24,7 +24,7 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 
 # [routing]
 # Runner used when no runner is named explicitly.
-# default_agent = "cursor"
+# default_agent = "cursor-agent"
 
 # [graph]
 # Graph orchestration splits multi-step prompts across runners (always on).
@@ -36,7 +36,7 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # tasks_file = false
 # Unset: every runner may take graph nodes, except built-in presets (opencode
 # and grok). A built-in preset is never graph-routed unless it is listed here.
-# allowed_runners = ["cursor", "agy", "codex"]
+# allowed_runners = ["cursor-agent", "agy", "codex"]
 
 # [cursor]
 # Pre-warm the next cursor-agent process in the background (TUI / web only).

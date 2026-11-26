@@ -116,7 +116,7 @@ impl Theme {
         self.accent = apply_optional_color(self.accent, "[theme] accent", &t.accent, warnings);
         if let Some(agents) = &t.agents {
             for (id, value) in agents {
-                let key = id.trim().to_ascii_lowercase();
+                let key = crate::runner_id::canonical_runner_id(id);
                 if key.is_empty() {
                     warnings.push(format!(
                         "[theme.agents] \"{id}\" = \"{value}\" has an empty agent id; ignoring"

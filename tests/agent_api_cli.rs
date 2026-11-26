@@ -1297,7 +1297,11 @@ fn tc_2832_models_unknown_agent_exits_3() {
     let json = stdout_json(&output);
     assert_eq!(json["ok"], false);
     assert_eq!(json["exit_code"], 3);
-    assert_eq!(json["error"], "unknown agent 'nope'");
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("unknown agent 'nope'") && e.contains("cursor-agent"))
+    );
     assert_eq!(json["error_kind"], Value::Null);
 }
 

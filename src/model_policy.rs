@@ -56,7 +56,7 @@ pub fn validate_model_for_runner_with(
     allow_fast: bool,
 ) -> Result<(), String> {
     let trimmed = model_id.trim();
-    let runner_key = runner.trim().to_ascii_lowercase();
+    let runner_key = crate::runner_id::canonical_runner_id(runner);
     if trimmed.to_ascii_lowercase().contains("fast") {
         let skip_fast = allow_fast && matches!(runner_key.as_str(), "cursor" | "agy");
         if !skip_fast {
@@ -135,7 +135,7 @@ pub const PROVIDER_DEFAULT: &str = "provider default";
 /// the pinned non-fast `composer-2.5`; every other runner gets `None`
 /// (provider default). Never another runner's model, never a fast model.
 pub fn default_model_for_runner(runner: &str) -> Option<&'static str> {
-    if runner.trim().eq_ignore_ascii_case("cursor") {
+    if crate::runner_id::canonical_runner_id(runner) == "cursor" {
         Some(ALLOWED_MODEL)
     } else {
         None

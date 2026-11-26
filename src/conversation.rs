@@ -599,15 +599,18 @@ impl AgentKey {
     }
 
     fn from_db(value: &str) -> rusqlite::Result<Self> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "cursor" => Ok(Self::Cursor),
-            "agy" => Ok(Self::Agy),
-            "" => Err(rusqlite::Error::FromSqlConversionFailure(
+        if value.trim().is_empty() {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 Type::Text,
                 "empty agent name".into(),
-            )),
+            ));
+        }
+        let canon = crate::runner_id::canonical_runner_id(value);
+        match canon.as_str() {
+            "codex" => Ok(Self::Codex),
+            "cursor" => Ok(Self::Cursor),
+            "agy" => Ok(Self::Agy),
             other => Ok(Self::Custom(
                 crate::custom_agent::index_of(other).unwrap_or(UNKNOWN_CUSTOM_AGENT),
             )),

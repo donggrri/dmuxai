@@ -196,7 +196,7 @@ Arguments:
   <prompt|->               Prompt text to run, or - to read from stdin
 
 Options:
-  --agent ID               Runner id (e.g. cursor, agy, codex, or a custom agent)
+  --agent ID               Runner id (cursor-agent, agy, codex, or a custom agent; `cursor` is an alias)
   --agents RUNNERS         Comma-separated runners for fan-out (a,b[:model],...)
   --write                  Write fan-out: each leg runs in its own git worktree (needs --agents)
   --keep-worktrees         Keep leg worktrees after a write fan-out (needs --write)
@@ -310,7 +310,7 @@ Options:
 pub const RUNNERS_USAGE: &str = "\
 Usage: dmuxai runners [options]
 
-List registered runners, admission, installation and model policy.
+List registered runners (primary Cursor keyword: cursor-agent; `cursor` is an alias), admission, installation and model policy.
 
 Options:
   --json                   Print machine-readable JSON on stdout
@@ -342,7 +342,7 @@ Usage: dmuxai models [options]
 List available models and runner model policy.
 
 Options:
-  --agent ID               Only list models for the given runner id
+  --agent ID               Only list models for the given runner id (cursor-agent; `cursor` is an alias)
   --json                   Print machine-readable JSON on stdout
   -h, --help               Print help information
 ";
@@ -3720,6 +3720,21 @@ fn trust_workspace(
 
 #[cfg(test)]
 mod tests {
+    fn resolve_cli_builtin_runner(agent: &str) -> Option<&'static str> {
+        match dmuxai::runner_id::canonical_runner_id(agent).as_str() {
+            "cursor" => Some("cursor"),
+            "agy" => Some("agy"),
+            "codex" => Some("codex"),
+            _ => None,
+        }
+    }
+
+    fn parse_cli_agents_csv(raw: &str) -> Vec<String> {
+        raw.split(',')
+            .map(dmuxai::runner_id::canonical_runner_id)
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
     use super::*;
 
     fn args(list: &[&str]) -> Vec<String> {
@@ -4867,5 +4882,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    // TC-3201 / FR-3201
+    #[test]
+    fn tc_3201_cli_accepts_cursor_agent_keyword() {
+        let run = parse(&args(&["run", "hi", "--agent", "cursor-agent"])).unwrap();
+        match run {
+            AgentCommand::Run(opts) => assert_eq!(opts.agent.as_deref(), Some("cursor-agent")),
+            other => panic!("unexpected {other:?}"),
+        }
+        let models = parse(&args(&["models", "--agent", "cursor-agent"])).unwrap();
+        match models {
+            AgentCommand::Models { agent, .. } => {
+                assert_eq!(agent.as_deref(), Some("cursor-agent"))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            parse_cli_agents_csv("cursor-agent,agy"),
+            vec!["cursor".to_owned(), "agy".to_owned()]
+        );
+        assert_eq!(resolve_cli_builtin_runner("cursor-agent"), Some("cursor"));
+        assert_eq!(resolve_cli_builtin_runner("cursor"), Some("cursor"));
+        let msg = dmuxai::runner_id::format_unknown_agent_message("nope");
+        assert!(msg.contains("cursor-agent"));
+        assert!(msg.contains("nope"));
     }
 }

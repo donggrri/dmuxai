@@ -150,11 +150,12 @@ pub fn runner_allowed(settings: &DmuxSettings, runner: &str) -> bool {
 /// (FR-2838). With the list unset, every registered runner is admitted (true).
 /// With the list set, membership decides admission (empty list = false).
 pub fn runner_run_admitted(settings: &DmuxSettings, runner: &str) -> bool {
+    let runner = crate::runner_id::canonical_runner_id(runner);
     match &settings.graph_allowed_runners {
         None => true,
         Some(allowed) => allowed
             .iter()
-            .any(|r| r.trim().eq_ignore_ascii_case(runner.trim())),
+            .any(|r| crate::runner_id::canonical_runner_id(r) == runner),
     }
 }
 
@@ -415,6 +416,9 @@ pub fn runners_json(settings: &DmuxSettings) -> Value {
 
             let mut entry = serde_json::Map::new();
             entry.insert("id".to_owned(), json!(id));
+            if id == "cursor" {
+                entry.insert("aliases".to_owned(), json!(["cursor-agent"]));
+            }
             entry.insert("label".to_owned(), json!(label));
             entry.insert("kind".to_owned(), json!(kind));
             entry.insert("allowed".to_owned(), json!(allowed));
@@ -723,7 +727,8 @@ pub async fn collect_model_listing_with(
     program: Option<&Path>,
     timeout: Duration,
 ) -> ModelListing {
-    if runner.eq_ignore_ascii_case("cursor") {
+    let runner = crate::runner_id::canonical_runner_id(runner);
+    if runner == "cursor" {
         let program_path = program
             .map(Path::to_path_buf)
             .unwrap_or_else(resolve_cursor_program_path);
@@ -733,7 +738,7 @@ pub async fn collect_model_listing_with(
         let listing = run_cursor_list_models(program, timeout, workspace_root).await;
         store_model_listing_cache("cursor", &program_path, workspace_root, listing.clone());
         listing
-    } else if runner.eq_ignore_ascii_case("agy") {
+    } else if runner == "agy" {
         let program_path = program
             .map(Path::to_path_buf)
             .unwrap_or_else(resolve_agy_program_path);
@@ -743,7 +748,7 @@ pub async fn collect_model_listing_with(
         let listing = run_agy_list_models(program, timeout, workspace_root).await;
         store_model_listing_cache("agy", &program_path, workspace_root, listing.clone());
         listing
-    } else if runner.eq_ignore_ascii_case("codex") {
+    } else if runner == "codex" {
         ModelListing {
             source: "static".to_owned(),
             models: vec![("composer-2.5".to_owned(), None)],
@@ -753,7 +758,7 @@ pub async fn collect_model_listing_with(
     } else if let Some(spec) = settings
         .custom_agents
         .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(runner))
+        .find(|s| s.name.eq_ignore_ascii_case(&runner))
     {
         if !spec.models_command.is_empty() {
             match crate::custom_agent::list_listed_model_ids(spec, workspace_root, Some(timeout))
@@ -897,13 +902,14 @@ pub async fn collect_models_json(
 ) -> Result<Value, ApiError> {
     let known_runners = runner_ids(settings);
     if let Some(target) = target_agent {
+        let target_canon = crate::runner_id::canonical_runner_id(target);
         let matching = known_runners
             .iter()
-            .find(|(id, _)| id.eq_ignore_ascii_case(target.trim()));
+            .find(|(id, _)| crate::runner_id::canonical_runner_id(id) == target_canon);
         let Some((canonical_id, _)) = matching else {
             return Err(ApiError::new(
                 exit::NOT_FOUND,
-                format!("unknown agent '{target}'"),
+                crate::runner_id::format_unknown_agent_message(target),
             ));
         };
         let listing = collect_model_listing(workspace_root, canonical_id, settings).await;
@@ -1208,6 +1214,15 @@ mod tests {
         }
 
         // 4. status_json on temp workspace with no config, set config, and empty config
+        let _guard = crate::state_path::test_env_lock();
+        let isolated_xdg = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_config = std::env::var_os("DMUXAI_CONFIG");
+        // SAFETY: test_env_lock() serializes env mutation across tests.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", isolated_xdg.path());
+            std::env::remove_var("DMUXAI_CONFIG");
+        }
         let dir_none = tempfile::tempdir().unwrap();
         let val_none = status_json(dir_none.path());
         let agents_none = val_none["agents"].as_array().expect("agents array");
@@ -1257,6 +1272,25 @@ mod tests {
         let agy_empty = agents_empty.iter().find(|a| a["id"] == "agy").unwrap();
         assert_eq!(agy_empty["allowed"], false);
         assert_eq!(agy_empty["graph_allowed"], false);
+        if let Some(path) = prev_config {
+            // SAFETY: test_env_lock() serializes env mutation across tests.
+            unsafe {
+                std::env::set_var("DMUXAI_CONFIG", path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("DMUXAI_CONFIG");
+            }
+        }
+        if let Some(path) = prev_xdg {
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
     }
 
     // TC-2831 / FR-2831: runners_json fields and admission with unset/set allowed_runners
@@ -1900,5 +1934,18 @@ mod tests {
             "2",
             "repeat with same program path should hit cache"
         );
+    }
+
+    // TC-3207 / FR-3206
+    #[test]
+    fn tc_3207_runners_json_lists_cursor_agent_alias() {
+        let settings = DmuxSettings::default();
+        let val = runners_json(&settings);
+        let runners = val["runners"].as_array().expect("runners array");
+        let cursor = runners
+            .iter()
+            .find(|r| r["id"] == "cursor")
+            .expect("cursor entry");
+        assert_eq!(cursor["aliases"], json!(["cursor-agent"]));
     }
 }

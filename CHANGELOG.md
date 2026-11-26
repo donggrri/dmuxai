@@ -5,6 +5,15 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Cursor runner keyword `cursor-agent` (SPEC-cursor-agent-keyword, FR-3200..FR-3206).** The documented
+  keyword for the Cursor runner is `cursor-agent` (`cursor` remains a permanent alias). Every agent/runner
+  parse boundary normalizes the keyword to the internal id `cursor`; JSON and stored ids stay `cursor`.
+  `dmuxai runners --json` adds `"aliases": ["cursor-agent"]` on the cursor entry. Config may use
+  `[runners.cursor-agent]` and `allowed_runners = ["cursor-agent"]`; when both `[runners.cursor]` and
+  `[runners.cursor-agent]` are present, the `cursor-agent` table wins with one warning.
+
 ### Changed
 
 - **Open model lists for Cursor and AGY (SPEC-open-model-lists, FR-3000..FR-3011).** Cursor and AGY now accept

@@ -28,7 +28,7 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
@@ -71,7 +71,8 @@ Notes:
   model is rejected before any turn starts with exit `5` (usage errors such as a
   missing value exit `2`); the accepted model is echoed in `triage.model`.
 - `dmuxai run -` reads the prompt from stdin:
-  `echo "summarize the repo" | dmuxai run - --agent agy --json`.
+  `echo "summarize the repo" | dmuxai run - --agent agy --json`. For Cursor use
+  `--agent cursor-agent` (or the alias `cursor`).
 - With `--json`, stdout carries only the JSON document(s); warnings/diagnostics go
   to stderr.
 
@@ -600,7 +601,7 @@ Per-runner and per-model system prompts. User config sets defaults; workspace `d
 | `stall_timeout_secs` | `240` | No-progress seconds that trigger a stall when the runner has a non-empty chain; `0` disables. |
 | `stall_api_retries` | `3` | Consecutive `API error (attempt N)` retry lines that trigger a stall; `0` disables. |
 
-Model policy (SPEC-open-model-lists): `cursor` and `agy` accept any non-fast model id their CLI reports (`dmuxai models --agent cursor|agy`). Ids containing `fast` are blocked for every runner unless the **user** config sets:
+Model policy (SPEC-open-model-lists): `cursor-agent` (`cursor`) and `agy` accept any non-fast model id their CLI reports (`dmuxai models --agent cursor-agent|agy`). Ids containing `fast` are blocked for every runner unless the **user** config sets:
 
 ```toml
 [models]

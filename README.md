@@ -307,7 +307,7 @@ Full reference: [docs/API.md](docs/API.md) — CLI, HTTP, MCP, events and `[noti
 
 ## Attach any agent CLI
 
-Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless
+Built-in runners are Cursor (keyword `cursor-agent`; id `cursor` is still accepted), AGY and Codex. **Any other headless
 agent CLI** (opencode, hermes, pi, Claude Code, ...) is attached with an
 `[[agents.custom]]` block in `dmuxai.toml` (repo) or `~/.config/dmuxai/dmuxai.toml`
 (user) — no Rust code. In a repo `dmuxai.toml`, custom agents require `dmuxai trust`
@@ -644,7 +644,7 @@ stall_api_retries = 3      # 0 disables
 ```
 
 `[runners.<id>]` and `[runners.default]` accept `fallback = ["<runner>", "<runner>:<model>", ...]`
-(runner ids like `agy`, `cursor`, `codex`, `opencode`, `grok`, or a custom agent name; model optional;
+(runner ids like `cursor-agent` (`cursor` alias), `agy`, `codex`, `opencode`, `grok`, or a custom agent name; model optional;
 another model of the same runner is allowed). An empty `fallback = []` disables the default chain
 for that runner; missing/empty means old behaviour. Workspace `dmuxai.toml` replaces the user entry
 per runner id. Invalid targets (unknown runner, disallowed model, duplicates) are dropped with a
@@ -761,7 +761,7 @@ A machine or workspace can constrain which runners are permitted to execute grap
 allowed_runners = ["agy", "opencode"]
 ```
 
-A machine can exclude `cursor` from the graph globally across all workspaces by setting `[graph] allowed_runners = ["agy", "opencode"]` in the user-level configuration:
+A machine can exclude Cursor from the graph globally across all workspaces by setting `[graph] allowed_runners = ["agy", "opencode"]` in the user-level configuration (`cursor-agent` in the list is the same runner):
 - `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`)
 
 Exception: when `allowed_runners` is unset, every runner may take graph nodes

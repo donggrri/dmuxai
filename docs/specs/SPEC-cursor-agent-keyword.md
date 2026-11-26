@@ -29,7 +29,7 @@ The Cursor runner is the `cursor-agent` binary, but every agent-id parse boundar
 
 | ID | Assumption or question | Owner | Needed by |
 | --- | --- | --- | --- |
-| OQ-3100 | Output ids stay `cursor` for wire compatibility; flipping output ids to `cursor-agent` would be a breaking change and needs an owner decision. | Owner | follow-up |
+| OQ-3200 | Output ids stay `cursor` for wire compatibility; flipping output ids to `cursor-agent` would be a breaking change and needs an owner decision. | Owner | follow-up |
 
 ## 3. Terms and state model
 
@@ -43,37 +43,37 @@ The Cursor runner is the `cursor-agent` binary, but every agent-id parse boundar
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-3100 | Must | Given `canonical_runner_id(s)` | `cursor-agent`, `CURSOR-AGENT` and ` cursor-agent ` return `cursor`; `cursor` returns `cursor`; any other input returns its trimmed lowercase form unchanged (`agy`, `opencode-glm`, `cursor-agentx`) | Empty input returns an empty string | TC-3100 |
-| FR-3101 | Must | Given the CLI flags that take an agent id (`run --agent`, `models --agent`, `--agents a,b`, `status`/`runners` filters) | `cursor-agent` behaves exactly like `cursor`; outcome JSON still reports `agent: "cursor"` | An unknown id still exits 3 and its message lists `cursor-agent` (not `cursor`) among the built-in ids | TC-3101 |
-| FR-3102 | Must | Given config keys `[runners.cursor-agent]`, `[runners.cursor-agent.models."<m>"]`, `[graph] allowed_runners = ["cursor-agent"]`, fallback targets `cursor-agent` / `cursor-agent:<model>`, routing default agent `cursor-agent` | Each is read as `cursor` | If both `[runners.cursor]` and `[runners.cursor-agent]` define a key, `cursor-agent` wins and one config warning names both tables | TC-3102, TC-3103 |
-| FR-3103 | Must | Given graph plan JSON with `"runner": "cursor-agent"`, `/graph override`, and TUI `/agent`-style commands | Accepted and stored as `cursor` | Unknown runners are rejected as before | TC-3104 |
-| FR-3104 | Must | Given an MCP `run`/`models` call with `agent: "cursor-agent"` and a web API request naming that agent | Accepted; responses use the canonical id `cursor` | Unknown ids keep their existing error | TC-3105 |
-| FR-3105 | Must | Given a custom agent named `cursor-agent` (any case) in `[[agents.custom]]` | Rejected with the existing `already used` warning | Custom agents named `cursor` behave as before | TC-3106 |
-| FR-3106 | Must | Given `dmuxai runners --json` | Each runner entry may carry `aliases`; the cursor entry has `"aliases": ["cursor-agent"]`, `id` stays `cursor`; other entries have no alias or an empty array | Consumers that ignore the field are unaffected | TC-3107 |
-| UX-3100 | Must | Given `--help` for `run`, `models`, `runners`, README, `docs/API.md`, other usage docs and the CHANGELOG | They name `cursor-agent` as the keyword for the Cursor runner and state that `cursor` still works | A doc test fails when README or `--help` lose the keyword | TC-3108 |
+| FR-3200 | Must | Given `canonical_runner_id(s)` | `cursor-agent`, `CURSOR-AGENT` and ` cursor-agent ` return `cursor`; `cursor` returns `cursor`; any other input returns its trimmed lowercase form unchanged (`agy`, `opencode-glm`, `cursor-agentx`) | Empty input returns an empty string | TC-3200 |
+| FR-3201 | Must | Given the CLI flags that take an agent id (`run --agent`, `models --agent`, `--agents a,b`, `status`/`runners` filters) | `cursor-agent` behaves exactly like `cursor`; outcome JSON still reports `agent: "cursor"` | An unknown id still exits 3 and its message lists `cursor-agent` (not `cursor`) among the built-in ids | TC-3201 |
+| FR-3202 | Must | Given config keys `[runners.cursor-agent]`, `[runners.cursor-agent.models."<m>"]`, `[graph] allowed_runners = ["cursor-agent"]`, fallback targets `cursor-agent` / `cursor-agent:<model>`, routing default agent `cursor-agent` | Each is read as `cursor` | If both `[runners.cursor]` and `[runners.cursor-agent]` define a key, `cursor-agent` wins and one config warning names both tables | TC-3202, TC-3203 |
+| FR-3203 | Must | Given graph plan JSON with `"runner": "cursor-agent"`, `/graph override`, and TUI `/agent`-style commands | Accepted and stored as `cursor` | Unknown runners are rejected as before | TC-3204 |
+| FR-3204 | Must | Given an MCP `run`/`models` call with `agent: "cursor-agent"` and a web API request naming that agent | Accepted; responses use the canonical id `cursor` | Unknown ids keep their existing error | TC-3205 |
+| FR-3205 | Must | Given a custom agent named `cursor-agent` (any case) in `[[agents.custom]]` | Rejected with the existing `already used` warning | Custom agents named `cursor` behave as before | TC-3206 |
+| FR-3206 | Must | Given `dmuxai runners --json` | Each runner entry may carry `aliases`; the cursor entry has `"aliases": ["cursor-agent"]`, `id` stays `cursor`; other entries have no alias or an empty array | Consumers that ignore the field are unaffected | TC-3207 |
+| UX-3200 | Must | Given `--help` for `run`, `models`, `runners`, README, `docs/API.md`, other usage docs and the CHANGELOG | They name `cursor-agent` as the keyword for the Cursor runner and state that `cursor` still works | A doc test fails when README or `--help` lose the keyword | TC-3208 |
 
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-3100 | FR-3100 | unit | the inputs listed in FR-3100 | call `canonical_runner_id` | outputs as specified | `src/runner_id.rs` `tc_3100_canonical_runner_id_maps_cursor_agent` |
-| TC-3101 | FR-3101 | unit | CLI argv with `--agent cursor-agent` for `run`, `models`, and `--agents cursor-agent,agy`; an unknown id | parse and resolve | parsed agent equals the one for `cursor`; the unknown-id message lists `cursor-agent` | `src/cli.rs` `tc_3101_cli_accepts_cursor_agent_keyword` |
-| TC-3102 | FR-3102 | unit | user and workspace config using `[runners.cursor-agent]`, `allowed_runners`, `fallback` entries and routing default with `cursor-agent` | load settings | runner models, prompts, graph admission and fallback chain are those of `cursor` | `src/settings.rs` `tc_3102_config_accepts_cursor_agent_keyword` |
-| TC-3103 | FR-3102 | unit | config with both `[runners.cursor]` and `[runners.cursor-agent]` setting `model` | load settings | `cursor-agent` value wins; one warning names both tables | `src/settings.rs` `tc_3103_cursor_and_cursor_agent_tables_conflict_warns` |
-| TC-3104 | FR-3103 | unit | plan JSON with `runner: cursor-agent`, `/graph override cursor-agent`, TUI parse of `cursor-agent` | validate/parse | accepted, stored runner is `cursor` | `src/graph/plan_doc.rs` `tc_3104_plan_runner_accepts_cursor_agent` |
-| TC-3105 | FR-3104 | unit | MCP `models` call with `agent: cursor-agent` through the backend, and the web agent-id parser | handle | same result as `cursor`, canonical id in the response | `src/mcp_server.rs` `tc_3105_mcp_accepts_cursor_agent_keyword` |
-| TC-3106 | FR-3105 | unit | settings with `[[agents.custom]] name = "Cursor-Agent"` | load settings | rejected with an `already used` warning | `src/custom_agent.rs` `tc_3106_custom_agent_cannot_take_cursor_agent_name` |
-| TC-3107 | FR-3106 | unit | `runners_json` | read the cursor entry | `id == "cursor"` and `aliases == ["cursor-agent"]` | `src/agent_api.rs` `tc_3107_runners_json_lists_cursor_agent_alias` |
-| TC-3108 | UX-3100 | unit | `--help` text of `run`, `models`, `runners` and the files README.md, docs/API.md, CHANGELOG.md | read | each contains `cursor-agent` and the README/API mention that `cursor` is still accepted | `tests/model_policy_repo.rs` `tc_3108_docs_name_cursor_agent_keyword` |
+| TC-3200 | FR-3200 | unit | the inputs listed in FR-3200 | call `canonical_runner_id` | outputs as specified | `src/runner_id.rs` `tc_3200_canonical_runner_id_maps_cursor_agent` |
+| TC-3201 | FR-3201 | unit | CLI argv with `--agent cursor-agent` for `run`, `models`, and `--agents cursor-agent,agy`; an unknown id | parse and resolve | parsed agent equals the one for `cursor`; the unknown-id message lists `cursor-agent` | `src/cli.rs` `tc_3201_cli_accepts_cursor_agent_keyword` |
+| TC-3202 | FR-3202 | unit | user and workspace config using `[runners.cursor-agent]`, `allowed_runners`, `fallback` entries and routing default with `cursor-agent` | load settings | runner models, prompts, graph admission and fallback chain are those of `cursor` | `src/settings.rs` `tc_3202_config_accepts_cursor_agent_keyword` |
+| TC-3203 | FR-3202 | unit | config with both `[runners.cursor]` and `[runners.cursor-agent]` setting `model` | load settings | `cursor-agent` value wins; one warning names both tables | `src/settings.rs` `tc_3203_cursor_and_cursor_agent_tables_conflict_warns` |
+| TC-3204 | FR-3203 | unit | plan JSON with `runner: cursor-agent`, `/graph override cursor-agent`, TUI parse of `cursor-agent` | validate/parse | accepted, stored runner is `cursor` | `src/graph/plan_doc.rs` `tc_3204_plan_runner_accepts_cursor_agent` |
+| TC-3205 | FR-3204 | unit | MCP `models` call with `agent: cursor-agent` through the backend, and the web agent-id parser | handle | same result as `cursor`, canonical id in the response | `src/mcp_server.rs` `tc_3205_mcp_accepts_cursor_agent_keyword` |
+| TC-3206 | FR-3205 | unit | settings with `[[agents.custom]] name = "Cursor-Agent"` | load settings | rejected with an `already used` warning | `src/custom_agent.rs` `tc_3206_custom_agent_cannot_take_cursor_agent_name` |
+| TC-3207 | FR-3206 | unit | `runners_json` | read the cursor entry | `id == "cursor"` and `aliases == ["cursor-agent"]` | `src/agent_api.rs` `tc_3207_runners_json_lists_cursor_agent_alias` |
+| TC-3208 | UX-3200 | unit | `--help` text of `run`, `models`, `runners` and the files README.md, docs/API.md, CHANGELOG.md | read | each contains `cursor-agent` and the README/API mention that `cursor` is still accepted | `tests/model_policy_repo.rs` `tc_3208_docs_name_cursor_agent_keyword` |
 
 ## 6. Data, integration, and safety contracts
 
 | Area | Contract / change | Compatibility and rollback | Evidence |
 | --- | --- | --- | --- |
-| Persistence | Unchanged: agent ids stored and journaled are `cursor` | No migration; rollback is code-only | TC-3101 |
-| JSON / MCP / web | Responses keep `cursor`; `runners --json` adds `aliases` | Additive | TC-3107 |
-| Config | `cursor-agent` accepted wherever `cursor` is; conflicts resolved in favour of `cursor-agent` with a warning | Existing configs unchanged | TC-3102, TC-3103 |
-| Safety | The alias reaches the same policy, admission, sensitive-gate and model validation as `cursor`; no new execution path | A missed boundary only rejects the alias, never bypasses a policy | TC-3101, TC-3105 |
+| Persistence | Unchanged: agent ids stored and journaled are `cursor` | No migration; rollback is code-only | TC-3201 |
+| JSON / MCP / web | Responses keep `cursor`; `runners --json` adds `aliases` | Additive | TC-3207 |
+| Config | `cursor-agent` accepted wherever `cursor` is; conflicts resolved in favour of `cursor-agent` with a warning | Existing configs unchanged | TC-3202, TC-3203 |
+| Safety | The alias reaches the same policy, admission, sensitive-gate and model validation as `cursor`; no new execution path | A missed boundary only rejects the alias, never bypasses a policy | TC-3201, TC-3205 |
 
 ## 7. Implementation plan
 
@@ -81,6 +81,6 @@ See [PLAN-cursor-agent-keyword.md](../plans/PLAN-cursor-agent-keyword.md) and [T
 
 ## 8. Review and test exit criteria
 
-- [ ] TC-3100..TC-3108 pass.
+- [ ] TC-3200..TC-3208 pass.
 - [ ] A scan of `"cursor"` literals in parse paths shows no boundary that skips `canonical_runner_id` (recorded in the review).
 - [ ] Full local gates pass: fmt, clippy `-D warnings`, `cargo test`, `check-spec`, `check-tc-links`, web ignored tests.

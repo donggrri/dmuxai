@@ -61,3 +61,32 @@ fn mission_doc_states_composer_policy() {
     assert!(mission.contains(ALLOWED_MODEL));
     assert!(mission.contains("cursor-agent"));
 }
+
+// TC-3208 / UX-3200
+#[test]
+fn tc_3208_docs_name_cursor_agent_keyword() {
+    let readme = fs::read_to_string("README.md").expect("README.md");
+    assert!(readme.contains("cursor-agent"));
+    assert!(
+        readme.contains("still accepted") || readme.contains("alias"),
+        "README should note that cursor is still accepted"
+    );
+    let api = fs::read_to_string("docs/API.md").expect("docs/API.md");
+    assert!(api.contains("cursor-agent"));
+    assert!(api.contains("alias"));
+    let changelog = fs::read_to_string("CHANGELOG.md").expect("CHANGELOG.md");
+    assert!(changelog.contains("cursor-agent"));
+    let cli_rs = fs::read_to_string("src/cli.rs").expect("src/cli.rs");
+    for usage in ["RUN_USAGE", "MODELS_USAGE", "RUNNERS_USAGE"] {
+        let marker = format!("pub const {usage}");
+        let block = cli_rs
+            .split(&marker)
+            .nth(1)
+            .and_then(|rest| rest.split("\");").next())
+            .unwrap_or_else(|| panic!("{usage} not found"));
+        assert!(
+            block.contains("cursor-agent"),
+            "{usage} must name cursor-agent"
+        );
+    }
+}

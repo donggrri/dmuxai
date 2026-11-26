@@ -2,7 +2,7 @@
 
 Spec: [SPEC-cursor-agent-keyword.md](../specs/SPEC-cursor-agent-keyword.md)
 
-- [ ] T1 - `canonical_runner_id`. Requirements: FR-3100. Verify: `cargo test tc_3100`.
-- [ ] T2 - CLI, settings, graph, TUI, MCP, web boundaries and reserved name. Requirements: FR-3101..FR-3105. Verify: `cargo test tc_3101 tc_3102 tc_3103 tc_3104 tc_3105 tc_3106`.
-- [ ] T3 - `aliases` in `runners --json`. Requirements: FR-3106. Verify: `cargo test tc_3107`.
-- [ ] T4 - Help, README, docs, CHANGELOG, review. Requirements: UX-3100. Verify: `cargo test tc_3108`, `python3 scripts/check-spec.py --all`, `scripts/gate.sh`.
+- [ ] T1 - `canonical_runner_id`. Requirements: FR-3200. Verify: `cargo test tc_3200`.
+- [ ] T2 - CLI, settings, graph, TUI, MCP, web boundaries and reserved name. Requirements: FR-3201..FR-3205. Verify: `cargo test tc_3201 tc_3202 tc_3203 tc_3204 tc_3205 tc_3206`.
+- [ ] T3 - `aliases` in `runners --json`. Requirements: FR-3206. Verify: `cargo test tc_3207`.
+- [ ] T4 - Help, README, docs, CHANGELOG, review. Requirements: UX-3200. Verify: `cargo test tc_3208`, `python3 scripts/check-spec.py --all`, `scripts/gate.sh`.

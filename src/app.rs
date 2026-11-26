@@ -3317,10 +3317,11 @@ impl App {
         let Some(raw) = agent.map(str::trim).filter(|raw| !raw.is_empty()) else {
             return Ok(self.adapters[self.selected].agent());
         };
+        let canon = dmuxai::runner_id::canonical_runner_id(raw);
         self.adapters
             .iter()
             .map(|adapter| adapter.agent())
-            .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
+            .find(|candidate| self.agent_runner_name(*candidate) == canon)
             .ok_or_else(|| {
                 if raw.eq_ignore_ascii_case("opencode")
                     && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
@@ -15905,17 +15906,17 @@ impl App {
         }
         let start_fallbacks_len = self.fallback_history.len();
         if let Some(ref agent_str) = req.agent {
-            let runner_clean = agent_str.trim().to_ascii_lowercase();
+            let runner_clean = dmuxai::runner_id::canonical_runner_id(agent_str);
             let adapter = self
                 .adapters
                 .iter()
-                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+                .find(|a| runner_name(a.agent()) == runner_clean);
             let Some(adapter) = adapter else {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::NOT_FOUND,
                     self.conversation_id.as_str().to_owned(),
                     Some(agent_str.clone()),
-                    format!("unknown agent '{agent_str}'"),
+                    dmuxai::runner_id::format_unknown_agent_message(agent_str),
                 );
             };
             let target_agent = adapter.agent();
@@ -18693,10 +18694,11 @@ fn runner_name(agent: Agent) -> &'static str {
 }
 
 fn runner_from_str(runner: &str) -> Option<Agent> {
-    match runner.trim().to_ascii_lowercase().as_str() {
+    match dmuxai::runner_id::canonical_runner_id(runner).as_str() {
         "cursor" => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
         "codex" => Some(Agent::Codex),
+        "" => None,
         other => dmuxai::custom_agent::index_of(other).map(Agent::Custom),
     }
 }
@@ -18952,7 +18954,7 @@ fn terminal_snapshot_notice(turn: &TurnSnapshot) -> Option<String> {
 }
 
 fn parse_agent(value: &str) -> Option<Agent> {
-    match value.to_ascii_lowercase().as_str() {
+    match dmuxai::runner_id::canonical_runner_id(value).as_str() {
         "codex" => Some(Agent::Codex),
         "cursor" => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
