@@ -640,9 +640,11 @@ impl BoardStore {
                 .map(|p| p.hash.clone())
                 .ok_or_else(|| BoardError::NotFound("item has no plan".to_owned()))?
         };
-        let state_root =
-            crate::state_path::state_base().map_err(|e| BoardError::Internal(e.to_string()))?;
-        let pending = read_pending_plan(&state_root, &plan_hash)?;
+        let state_root = self
+            .base
+            .parent()
+            .ok_or_else(|| BoardError::Internal("board store has no state parent".to_owned()))?;
+        let pending = read_pending_plan(state_root, &plan_hash)?;
         Ok(pending.prompt)
     }
 
@@ -1099,6 +1101,7 @@ mod tests {
     #[test]
     fn tc_3100_item_roundtrip_atomic_write_and_permissions() {
         let (_dir, store, state) = test_store();
+        let ref_url = "https://example.com/issues/1";
         let item = store
             .add(AddItemRequest {
                 title: "hello".to_owned(),
@@ -1108,7 +1111,7 @@ mod tests {
                 lane: None,
                 source_bot: Some("coord".to_owned()),
                 source_channel: None,
-                source_ref: None,
+                source_ref: Some(ref_url.to_owned()),
                 workspace: None,
                 recommendation: None,
                 options: vec![],
@@ -1128,7 +1131,28 @@ mod tests {
             assert_eq!(mode, 0o600);
             let dir_mode = fs::metadata(store.base()).unwrap().permissions().mode() & 0o777;
             assert_eq!(dir_mode, 0o700);
+            let items_mode = fs::metadata(store.base().join("items"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(items_mode, 0o700);
+            let events_mode = fs::metadata(&store.events_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(events_mode, 0o600);
         }
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["source"]["ref"], ref_url);
+        assert!(json["source"].get("ref_url").is_none());
+        let mut with_unknown = json.clone();
+        with_unknown["future_field"] = serde_json::json!({"new": true});
+        atomic_write(&path, &serde_json::to_vec_pretty(&with_unknown).unwrap()).unwrap();
+        let reloaded = store.get(&item.id).unwrap();
+        assert_eq!(reloaded.title, item.title);
+        assert_eq!(reloaded.source.ref_url.as_deref(), Some(ref_url));
         let names: Vec<_> = fs::read_dir(store.base().join("items"))
             .unwrap()
             .filter_map(|e| e.ok())
@@ -1251,34 +1275,32 @@ mod tests {
         let item = store
             .attach_plan(&item.id, &hash, &state, "bot:test")
             .unwrap();
-        assert!(
-            store
-                .decide(
-                    &item.id,
-                    DecideRequest {
-                        verdict: Verdict::Approve,
-                        text: None,
-                        option: None,
-                        plan_hash: Some("0000000000000000".to_owned()),
-                        by: "owner".to_owned(),
-                    }
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .decide(
-                    &item.id,
-                    DecideRequest {
-                        verdict: Verdict::Approve,
-                        text: None,
-                        option: None,
-                        plan_hash: None,
-                        by: "bot:x".to_owned(),
-                    }
-                )
-                .is_err()
-        );
+        let stale = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some("0000000000000000".to_owned()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(stale.exit_code(), crate::agent_api::exit::CONFLICT);
+        let bot_forbidden = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "bot:x".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(bot_forbidden.exit_code(), crate::agent_api::exit::FORBIDDEN);
         let approved = store
             .decide(
                 &item.id,
@@ -1292,6 +1314,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(approved.lane, Lane::Approved);
+        assert_eq!(
+            approved.decision.as_ref().unwrap().verdict,
+            Verdict::Approve
+        );
+
+        let rejected = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Reject,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(rejected.lane, Lane::Rejected);
+        assert_eq!(rejected.decision.as_ref().unwrap().verdict, Verdict::Reject);
+
+        let changes = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::RequestChanges,
+                    text: Some("please fix".to_owned()),
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(changes.lane, Lane::NeedsDecision);
+        assert_eq!(
+            changes.decision.as_ref().unwrap().verdict,
+            Verdict::RequestChanges
+        );
+        assert_eq!(
+            changes.decision.as_ref().unwrap().text.as_deref(),
+            Some("please fix")
+        );
+
+        let answer = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Answer,
+                    text: None,
+                    option: Some(0),
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(answer.lane, Lane::NeedsDecision);
+        assert_eq!(answer.decision.as_ref().unwrap().verdict, Verdict::Answer);
+        assert_eq!(answer.decision.as_ref().unwrap().option, Some(0));
+
+        let planner = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Reject,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "planner".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(planner.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        let bot_move = store
+            .move_lane(&item.id, Lane::Approved, "bot:x", None)
+            .unwrap_err();
+        assert_eq!(bot_move.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        let auto = store
+            .add(AddItemRequest {
+                title: "dbg".to_owned(),
+                summary: String::new(),
+                kind: Kind::Debug,
+                grade: None,
+                lane: None,
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: None,
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state,
+            })
+            .unwrap();
+        assert_eq!(auto.lane, Lane::Auto);
+        let auto_approved = store
+            .decide(
+                &auto.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "bot:x".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(auto_approved.lane, Lane::Approved);
+
         use crate::board::{BoardCaller, resolve_actor};
         assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::Dashboard).is_ok());
@@ -1433,7 +1566,7 @@ mod tests {
                 plan_hash: None,
                 key: None,
                 by: "bot:test".to_owned(),
-                state_root: state,
+                state_root: state.clone(),
             })
             .unwrap();
         let store2 = BoardStore::open(store.base().to_path_buf()).unwrap();
@@ -1562,6 +1695,128 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(timeout, WaitOutcome::TimedOut { .. }));
+
+        // Events from the waiter itself are ignored.
+        let base_version = store.get(&item.id).unwrap().version;
+        let id = item.id.clone();
+        let store2 = BoardStore::open(store.base().to_path_buf()).unwrap();
+        let handle = thread::spawn(move || {
+            store2
+                .wait(
+                    &id,
+                    WaitFilter {
+                        since_version: base_version,
+                        timeout_secs: 3,
+                        wait_for: WaitFor::Message,
+                        waiter: "planner".to_owned(),
+                    },
+                )
+                .unwrap()
+        });
+        thread::sleep(Duration::from_millis(300));
+        store
+            .say(
+                &item.id,
+                SayRequest {
+                    text: "self message".to_owned(),
+                    from: "planner".to_owned(),
+                },
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        store
+            .say(
+                &item.id,
+                SayRequest {
+                    text: "owner message".to_owned(),
+                    from: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        match handle.join().unwrap() {
+            WaitOutcome::Ready { item: got, event } => {
+                assert_eq!(event.kind, "message");
+                assert_eq!(event.by, "owner");
+                assert!(got.thread.iter().any(|m| m.text == "owner message"));
+            }
+            WaitOutcome::TimedOut { .. } => panic!("self events must not wake the waiter"),
+        }
+
+        // A missing item fails with not-found immediately, without waiting.
+        let started = Instant::now();
+        let missing = store
+            .wait(
+                "b000000000000",
+                WaitFilter {
+                    since_version: 0,
+                    timeout_secs: 5,
+                    wait_for: WaitFor::Any,
+                    waiter: "bot:coordinator".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(missing.exit_code(), crate::agent_api::exit::NOT_FOUND);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // `wait --any` returns the next owner event on another item.
+        let other = store
+            .add(AddItemRequest {
+                title: "other".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: None,
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state,
+            })
+            .unwrap();
+        let since_seq = store
+            .list_events(0)
+            .unwrap()
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or(0);
+        let store2 = BoardStore::open(store.base().to_path_buf()).unwrap();
+        let handle = thread::spawn(move || {
+            store2
+                .wait_any(
+                    since_seq,
+                    WaitFilter {
+                        since_version: 0,
+                        timeout_secs: 3,
+                        wait_for: WaitFor::Any,
+                        waiter: "bot:coordinator".to_owned(),
+                    },
+                )
+                .unwrap()
+        });
+        thread::sleep(Duration::from_millis(300));
+        store
+            .say(
+                &other.id,
+                SayRequest {
+                    text: "any event".to_owned(),
+                    from: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        match handle.join().unwrap() {
+            Some((event, got)) => {
+                assert_eq!(event.item_id, other.id);
+                assert_eq!(event.kind, "message");
+                assert_eq!(event.by, "owner");
+                assert_eq!(got.id, other.id);
+            }
+            None => panic!("wait_any should return the owner event on another item"),
+        }
     }
 
     #[test]

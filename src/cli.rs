@@ -2601,6 +2601,194 @@ fn print_json(value: &Value) {
     let _ = stdout.flush();
 }
 
+/// FR-3102: reject malformed ids, enums, text and option indexes before the
+/// board store is opened (which creates `<state base>/board/`).
+fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
+    use dmuxai::board::{
+        Grade, Kind, Lane, OPTIONS_MAX, TEXT_MAX, Verdict, valid_item_id, validate_message,
+        validate_new_text, validate_options, validate_ref_url, validate_text_limit,
+    };
+
+    fn usage(message: impl Into<String>) -> ApiError {
+        ApiError::new(exit::USAGE, message.into())
+    }
+    fn check_id(id: &str) -> Result<(), ApiError> {
+        if valid_item_id(id) {
+            Ok(())
+        } else {
+            Err(usage("invalid board item id"))
+        }
+    }
+    fn check_hash(hash: &str) -> Result<(), ApiError> {
+        if dmuxai::state_path::valid_pending_plan_hash(hash) {
+            Ok(())
+        } else {
+            Err(usage("plan hash must be 16 lowercase hex characters"))
+        }
+    }
+
+    match &command.op {
+        BoardOp::Add {
+            title,
+            summary,
+            kind,
+            grade,
+            lane,
+            ref_url,
+            recommendation,
+            options,
+            plan_hash,
+            ..
+        } => {
+            if Kind::parse(kind).is_none() {
+                return Err(usage("invalid --kind"));
+            }
+            if let Some(grade) = grade
+                && Grade::parse(grade).is_none()
+            {
+                return Err(usage("invalid --grade"));
+            }
+            if let Some(lane) = lane
+                && Lane::parse(lane).is_none()
+            {
+                return Err(usage("invalid --lane"));
+            }
+            let summary = if summary.trim() == "-" { "" } else { summary };
+            validate_new_text(title, summary, recommendation.as_deref()).map_err(ApiError::from)?;
+            validate_options(options).map_err(ApiError::from)?;
+            validate_ref_url(ref_url.as_deref()).map_err(ApiError::from)?;
+            if let Some(hash) = plan_hash {
+                check_hash(hash)?;
+            }
+        }
+        BoardOp::List { lanes, .. } => {
+            for lane in lanes {
+                if Lane::parse(lane).is_none() {
+                    return Err(usage(format!("invalid lane '{lane}'")));
+                }
+            }
+        }
+        BoardOp::Show { id } => check_id(id)?,
+        BoardOp::Update {
+            id,
+            title,
+            summary,
+            recommendation,
+            options,
+            replace_options,
+            grade,
+            kind,
+            ..
+        } => {
+            check_id(id)?;
+            if let Some(title) = title {
+                validate_new_text(title, "", None).map_err(ApiError::from)?;
+            }
+            if let Some(summary) = summary
+                && summary.trim() != "-"
+            {
+                validate_text_limit("summary", summary, TEXT_MAX).map_err(ApiError::from)?;
+            }
+            if let Some(recommendation) = recommendation {
+                validate_text_limit("recommendation", recommendation, TEXT_MAX)
+                    .map_err(ApiError::from)?;
+            }
+            if *replace_options {
+                validate_options(options).map_err(ApiError::from)?;
+            }
+            if let Some(grade) = grade
+                && !grade.is_empty()
+                && Grade::parse(grade).is_none()
+            {
+                return Err(usage("invalid --grade"));
+            }
+            if let Some(kind) = kind
+                && Kind::parse(kind).is_none()
+            {
+                return Err(usage("invalid --kind"));
+            }
+        }
+        BoardOp::Move { id, lane, .. } => {
+            check_id(id)?;
+            if Lane::parse(lane).is_none() {
+                return Err(usage("invalid lane"));
+            }
+        }
+        BoardOp::Plan { id, hash, .. } => {
+            check_id(id)?;
+            if let Some(hash) = hash {
+                check_hash(hash)?;
+            }
+        }
+        BoardOp::Decide {
+            id,
+            verdict,
+            text,
+            option,
+            plan_hash,
+            ..
+        } => {
+            check_id(id)?;
+            let verdict = Verdict::parse(verdict).ok_or_else(|| usage("invalid verdict"))?;
+            match verdict {
+                Verdict::RequestChanges => {
+                    let text = text
+                        .as_deref()
+                        .filter(|t| !t.trim().is_empty())
+                        .ok_or_else(|| usage("request_changes needs --text"))?;
+                    validate_message(text).map_err(ApiError::from)?;
+                }
+                Verdict::Answer => {
+                    if text.as_deref().is_none_or(|t| t.trim().is_empty()) && option.is_none() {
+                        return Err(usage("answer needs --text or --option"));
+                    }
+                    if let Some(text) = text.as_deref() {
+                        validate_message(text).map_err(ApiError::from)?;
+                    }
+                    if let Some(index) = option
+                        && *index >= OPTIONS_MAX
+                    {
+                        return Err(usage("option index out of range"));
+                    }
+                }
+                Verdict::Approve | Verdict::Reject => {}
+            }
+            if let Some(hash) = plan_hash {
+                check_hash(hash)?;
+            }
+        }
+        BoardOp::Say { id, text, .. } => {
+            check_id(id)?;
+            if text.trim() != "-" {
+                validate_message(text).map_err(ApiError::from)?;
+            }
+        }
+        BoardOp::Events { .. } => {}
+        BoardOp::Prompt { id, hash } => {
+            check_id(id)?;
+            if let Some(hash) = hash {
+                check_hash(hash)?;
+            }
+        }
+        BoardOp::Wait {
+            id, any, wait_for, ..
+        } => {
+            match wait_for.as_str() {
+                "decision" | "message" | "any" => {}
+                other => return Err(usage(format!("invalid --for '{other}'"))),
+            }
+            if !any {
+                let id = id
+                    .as_deref()
+                    .ok_or_else(|| usage("board wait needs an id"))?;
+                check_id(id)?;
+            }
+        }
+        BoardOp::Rules { .. } => {}
+    }
+    Ok(())
+}
+
 fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
     use dmuxai::board::{
         AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
@@ -2625,6 +2813,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
     };
 
     let result: Result<(), ApiError> = (|| {
+        prevalidate_board_command(&command)?;
         let store = agent_api::open_board_store()?;
         match command.op {
             BoardOp::Add {
@@ -5473,6 +5662,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    // TC-3102 / FR-3102: the CLI executor validates ids and enums before it
+    // opens (and creates) the board store.
+    #[test]
+    fn tc_3102_invalid_ids_and_limits_rejected_before_fs_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let _guard = dmuxai::state_path::test_env_lock();
+        // SAFETY: test-only mutation of the process environment.
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+        let bad_id = execute_board(
+            Path::new("/tmp"),
+            BoardCommand {
+                op: BoardOp::Show {
+                    id: "../items/x".to_owned(),
+                },
+                json: true,
+            },
+        );
+        let bad_lane = execute_board(
+            Path::new("/tmp"),
+            BoardCommand {
+                op: BoardOp::Move {
+                    id: "b000000000000".to_owned(),
+                    lane: "not-a-lane".to_owned(),
+                    if_version: None,
+                },
+                json: true,
+            },
+        );
+        let bad_add_lane = execute_board(
+            Path::new("/tmp"),
+            BoardCommand {
+                op: BoardOp::Add {
+                    title: "t".to_owned(),
+                    summary: String::new(),
+                    kind: "debug".to_owned(),
+                    grade: None,
+                    lane: Some("not-a-lane".to_owned()),
+                    bot: None,
+                    channel: None,
+                    ref_url: None,
+                    workspace: None,
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                },
+                json: true,
+            },
+        );
+        unsafe { std::env::remove_var("DMUXAI_STATE_DIR") };
+        assert_eq!(bad_id, 2);
+        assert_eq!(bad_lane, 2);
+        assert_eq!(bad_add_lane, 2);
+        assert!(
+            !state.join("board").exists(),
+            "invalid input must not create the board directory"
+        );
     }
 
     // TC-3105 / FR-3105: board add parses workspace flag.

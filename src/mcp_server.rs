@@ -124,12 +124,18 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string" },
-                    "kind": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["debug", "feature", "question", "review", "other"] },
                     "summary": { "type": "string" },
-                    "grade": { "type": "string" },
-                    "lane": { "type": "string" },
-                    "plan_hash": { "type": "string" },
+                    "grade": { "type": "string", "enum": ["A", "B", "C", "D"] },
+                    "lane": { "type": "string", "enum": ["auto", "needs_decision", "approved", "in_progress", "done", "rejected", "unknown"] },
+                    "bot": { "type": "string" },
+                    "channel": { "type": "string" },
+                    "ref": { "type": "string" },
                     "workspace": { "type": "string" },
+                    "recommendation": { "type": "string" },
+                    "options": { "type": "array", "items": { "type": "string" } },
+                    "plan_hash": { "type": "string" },
+                    "key": { "type": "string" },
                     "by": { "type": "string" }
                 },
                 "required": ["title", "kind"]
@@ -138,7 +144,14 @@ fn tool_definitions() -> Value {
         {
             "name": "board_list",
             "description": "List decision board items.",
-            "inputSchema": { "type": "object", "properties": { "all": { "type": "boolean" } } }
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lane": { "type": "array", "items": { "type": "string", "enum": ["auto", "needs_decision", "approved", "in_progress", "done", "rejected", "unknown"] } },
+                    "workspace": { "type": "string" },
+                    "all": { "type": "boolean" }
+                }
+            }
         },
         {
             "name": "board_show",
@@ -154,7 +167,18 @@ fn tool_definitions() -> Value {
             "description": "Update decision board item fields.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "id": { "type": "string" } },
+                "properties": {
+                    "id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "recommendation": { "type": "string" },
+                    "options": { "type": "array", "items": { "type": "string" } },
+                    "grade": { "type": "string", "enum": ["A", "B", "C", "D", ""] },
+                    "kind": { "type": "string", "enum": ["debug", "feature", "question", "review", "other"] },
+                    "run_id": { "type": "string" },
+                    "if_version": { "type": "integer", "minimum": 1 },
+                    "by": { "type": "string" }
+                },
                 "required": ["id"]
             }
         },
@@ -165,7 +189,9 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
-                    "lane": { "type": "string" }
+                    "lane": { "type": "string", "enum": ["auto", "needs_decision", "approved", "in_progress", "done", "rejected", "unknown"] },
+                    "if_version": { "type": "integer", "minimum": 1 },
+                    "by": { "type": "string" }
                 },
                 "required": ["id", "lane"]
             }
@@ -175,7 +201,14 @@ fn tool_definitions() -> Value {
             "description": "Attach or edit a graph plan on a board item.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "id": { "type": "string" } },
+                "properties": {
+                    "id": { "type": "string" },
+                    "hash": { "type": "string" },
+                    "steps": { "type": "array", "items": { "type": "object" } },
+                    "tasks": { "type": "array", "items": { "type": "object" } },
+                    "prompt": { "type": "string" },
+                    "by": { "type": "string" }
+                },
                 "required": ["id"]
             }
         },
@@ -186,7 +219,11 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
-                    "verdict": { "type": "string" }
+                    "verdict": { "type": "string", "enum": ["approve", "reject", "request_changes", "answer"] },
+                    "text": { "type": "string" },
+                    "option": { "type": "integer", "minimum": 0 },
+                    "plan_hash": { "type": "string" },
+                    "by": { "type": "string" }
                 },
                 "required": ["id", "verdict"]
             }
@@ -198,7 +235,8 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
-                    "text": { "type": "string" }
+                    "text": { "type": "string" },
+                    "from": { "type": "string" }
                 },
                 "required": ["id", "text"]
             }
@@ -210,13 +248,13 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
+                    "any": { "type": "boolean" },
                     "since_version": { "type": "integer", "minimum": 0 },
                     "since_seq": { "type": "integer", "minimum": 0 },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
                     "wait_for": { "type": "string", "enum": ["decision", "message", "any"] },
                     "waiter": { "type": "string" }
-                },
-                "required": ["id"]
+                }
             }
         },
         {
@@ -229,6 +267,16 @@ fn tool_definitions() -> Value {
                     "hash": { "type": "string" }
                 },
                 "required": ["id"]
+            }
+        },
+        {
+            "name": "board_events",
+            "description": "List decision board events with seq greater than `since`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "integer", "minimum": 0 }
+                }
             }
         }
     ])
@@ -414,6 +462,8 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_decide",
                 "board_say",
                 "board_wait",
+                "board_prompt",
+                "board_events",
             ];
             if !known.contains(&name) {
                 return Some(
@@ -500,35 +550,127 @@ mod tests {
         serde_json::from_str(&handle_line(stub, &line.to_string()).expect("response")).unwrap()
     }
 
-    // TC-3113 / FR-3113: board MCP tools are listed and callable.
+    // TC-3113 / FR-3113: board MCP tools are listed, every optional CLI flag
+    // has a schema field, and calls map validation errors to exit code 2.
     #[test]
     fn tc_3113_mcp_board_tools_listed_and_mapped() {
         let state_home = tempfile::tempdir().unwrap();
+        let _guard = crate::state_path::test_env_lock();
         // SAFETY: test-only mutation of the process environment.
         unsafe { std::env::set_var("XDG_STATE_HOME", state_home.path()) };
         let stub = Stub::default();
         let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
-        let names: Vec<&str> = list["result"]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
-        for name in ["board_add", "board_wait"] {
-            assert!(names.contains(&name));
-        }
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let properties = |name: &str| -> Vec<String> {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["inputSchema"]["properties"].as_object())
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "board_add",
+                &[
+                    "title",
+                    "kind",
+                    "summary",
+                    "grade",
+                    "lane",
+                    "bot",
+                    "channel",
+                    "ref",
+                    "workspace",
+                    "recommendation",
+                    "options",
+                    "plan_hash",
+                    "key",
+                    "by",
+                ],
+            ),
+            ("board_list", &["lane", "workspace", "all"]),
+            ("board_show", &["id"]),
+            (
+                "board_update",
+                &[
+                    "id",
+                    "title",
+                    "summary",
+                    "recommendation",
+                    "options",
+                    "grade",
+                    "kind",
+                    "run_id",
+                    "if_version",
+                    "by",
+                ],
+            ),
+            ("board_move", &["id", "lane", "if_version", "by"]),
+            (
+                "board_plan",
+                &["id", "hash", "steps", "tasks", "prompt", "by"],
+            ),
+            (
+                "board_decide",
+                &["id", "verdict", "text", "option", "plan_hash", "by"],
+            ),
+            ("board_say", &["id", "text", "from"]),
+            (
+                "board_wait",
+                &[
+                    "id",
+                    "any",
+                    "since_version",
+                    "since_seq",
+                    "timeout_secs",
+                    "wait_for",
+                    "waiter",
+                ],
+            ),
+            ("board_prompt", &["id", "hash"]),
+            ("board_events", &["since"]),
+        ];
         let ok_call = call(
             &stub,
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"debug"}}}),
         );
-        assert_eq!(ok_call["result"]["structuredContent"]["ok"], true);
         let bad = call(
             &stub,
             json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"not-a-kind"}}}),
         );
+        let bad_lane = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"debug","lane":"not-a-lane"}}}),
+        );
+        let events = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"board_events","arguments":{"since":0}}}),
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+
+        for (name, wanted) in expected {
+            assert!(names.contains(name), "missing MCP tool {name}");
+            let actual = properties(name);
+            for property in *wanted {
+                assert!(
+                    actual.iter().any(|p| p == property),
+                    "tool {name} schema missing property {property}: {actual:?}"
+                );
+            }
+            assert_eq!(
+                actual.len(),
+                wanted.len(),
+                "tool {name} has unexpected schema fields: {actual:?}"
+            );
+        }
+        assert_eq!(ok_call["result"]["structuredContent"]["ok"], true);
         assert_eq!(bad["result"]["isError"], true);
         assert_eq!(bad["result"]["structuredContent"]["exit_code"], 2);
-        assert!(names.contains(&"board_prompt"));
+        assert_eq!(bad_lane["result"]["isError"], true);
+        assert_eq!(bad_lane["result"]["structuredContent"]["exit_code"], 2);
+        assert_eq!(events["result"]["structuredContent"]["ok"], true);
     }
 
     // TC-768 / FR-767: initialize, tools/list, tools/call for every tool,

@@ -135,6 +135,8 @@ pub fn edit_plan_from_json(
         && let Some(tasks) = inherit_tasks
     {
         doc.tasks = tasks;
+        doc.task_errors.clear();
+        doc.require_tasks = !doc.tasks.is_empty();
     }
     let settings = DmuxSettings::load(workspace_root);
     let holder = PlanValidationCtx::from_settings(&settings);
@@ -245,20 +247,78 @@ mod tests {
                 state_root: state.clone(),
             })
             .unwrap();
+        // Edit from a file path, as `board plan --edit <file>` does.
+        let plan_path = dir.path().join("plan.json");
+        std::fs::write(&plan_path, sample_plan_json()).unwrap();
+        let from_file = crate::board::read_path_or_stdin(plan_path.to_str().unwrap()).unwrap();
         let (_, hash) =
-            edit_plan_from_json(&workspace, &state, "ship it", &sample_plan_json(), None).unwrap();
+            edit_plan_from_json(&workspace, &state, "ship it", &from_file, None).unwrap();
         let updated = store
             .attach_plan(&item.id, &hash, &state, "bot:test")
             .unwrap();
         assert_eq!(updated.plan.as_ref().unwrap().revision, 1);
-        let revised_json = sample_plan_json().replace("\"edit\"", "\"edit-more\"");
-        let (_, hash2) =
-            edit_plan_from_json(&workspace, &state, "ship it", &revised_json, None).unwrap();
+        assert_eq!(updated.plan.as_ref().unwrap().tasks.len(), 1);
+
+        // Omitted tasks are inherited from the current plan.
+        let steps_only = r#"{"steps":[{"id":"step-1","role":"implement","job":"edit-more","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash2) = edit_plan_from_json(
+            &workspace,
+            &state,
+            "ship it",
+            steps_only,
+            updated.plan.as_ref().map(|p| p.tasks.clone()),
+        )
+        .unwrap();
         let edited = store
             .edit_plan(&item.id, &hash2, &workspace, &state, "bot:test")
             .unwrap();
         assert_eq!(edited.plan.as_ref().unwrap().revision, 2);
+        assert_eq!(edited.plan.as_ref().unwrap().tasks.len(), 1);
+        assert_eq!(edited.plan.as_ref().unwrap().tasks[0].id, "task-1");
+        assert_eq!(edited.plan.as_ref().unwrap().steps[0].job, "edit-more");
         assert_ne!(hash, hash2);
+
+        // An approved item goes back to needs_decision and loses its decision.
+        let approved = store
+            .decide(
+                &item.id,
+                crate::board::DecideRequest {
+                    verdict: crate::board::Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash2.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(approved.lane, crate::board::Lane::Approved);
+        assert!(approved.decision.is_some());
+
+        // A validation error leaves the stored item unchanged.
+        let invalid = sample_plan_json().replace("\"cursor\"", "\"not-a-runner\"");
+        let error = edit_plan_from_json(&workspace, &state, "ship it", &invalid, None).unwrap_err();
+        assert!(matches!(error, BoardError::Failed(_)));
+        let unchanged = store.get(&item.id).unwrap();
+        assert_eq!(unchanged.version, approved.version);
+        assert_eq!(unchanged.plan.as_ref().unwrap().hash, hash2);
+        assert_eq!(unchanged.lane, crate::board::Lane::Approved);
+        assert!(unchanged.decision.is_some());
+
+        let final_json = sample_plan_json().replace("\"edit\"", "\"edit-final\"");
+        let (_, hash3) = edit_plan_from_json(
+            &workspace,
+            &state,
+            "ship it",
+            &final_json,
+            unchanged.plan.as_ref().map(|p| p.tasks.clone()),
+        )
+        .unwrap();
+        let revised = store
+            .edit_plan(&item.id, &hash3, &workspace, &state, "bot:test")
+            .unwrap();
+        assert_eq!(revised.plan.as_ref().unwrap().revision, 3);
+        assert_eq!(revised.lane, crate::board::Lane::NeedsDecision);
+        assert!(revised.decision.is_none());
     }
 
     #[test]

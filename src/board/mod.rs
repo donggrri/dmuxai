@@ -475,6 +475,15 @@ pub fn validate_new_text(
     Ok(())
 }
 
+pub fn validate_text_limit(label: &str, text: &str, max: usize) -> Result<(), BoardError> {
+    if text.chars().count() > max {
+        return Err(BoardError::Usage(format!(
+            "{label} exceeds {max} characters"
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_options(options: &[String]) -> Result<(), BoardError> {
     if options.len() > OPTIONS_MAX {
         return Err(BoardError::Usage(format!(
@@ -544,24 +553,106 @@ mod tests {
         assert!(resolve_actor(None, BoardCaller::CliNonTty).unwrap() == "bot:coordinator");
         assert!(resolve_actor(None, BoardCaller::Mcp).unwrap() == "bot:mcp");
         assert!(resolve_actor(None, BoardCaller::Dashboard).unwrap() == "owner");
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let _guard = crate::state_path::test_env_lock();
+        // SAFETY: test-only mutation of the process environment.
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+        let bad_id = super::mcp_invoke(
+            std::path::Path::new("/tmp"),
+            "board_show",
+            &serde_json::json!({ "id": "../items/x" }),
+        );
+        let bad_lane = super::mcp_invoke(
+            std::path::Path::new("/tmp"),
+            "board_move",
+            &serde_json::json!({ "id": "b000000000000", "lane": "not-a-lane" }),
+        );
+        let bad_add_lane = super::mcp_invoke(
+            std::path::Path::new("/tmp"),
+            "board_add",
+            &serde_json::json!({ "title": "t", "kind": "debug", "lane": "not-a-lane" }),
+        );
+        let bad_kind = super::mcp_invoke(
+            std::path::Path::new("/tmp"),
+            "board_add",
+            &serde_json::json!({ "title": "t", "kind": "not-a-kind" }),
+        );
+        unsafe { std::env::remove_var("DMUXAI_STATE_DIR") };
+        assert_eq!(bad_id["exit_code"], exit::USAGE);
+        assert_eq!(bad_lane["exit_code"], exit::USAGE);
+        assert_eq!(bad_add_lane["exit_code"], exit::USAGE);
+        assert_eq!(bad_kind["exit_code"], exit::USAGE);
+        assert!(
+            !state.join("board").exists(),
+            "invalid input must not create the board directory"
+        );
     }
 
     #[test]
     fn tc_3103_free_text_is_masked_on_write() {
+        use crate::board::plan::{PendingPlanFile, write_pending_plan};
+        use crate::board::store::{AddItemRequest, BoardStore, ensure_dir};
+        use crate::graph::{PlanStep, PlanTask, TaskSize};
+        use tempfile::tempdir;
+
+        let secret = "sk-abcdefghijklmnop";
         let mut item = BoardItem {
             id: generate_item_id(),
-            title: "token sk-abcdefghij token".to_owned(),
-            summary: String::new(),
+            title: format!("title {secret}"),
+            summary: format!("summary {secret}"),
             kind: Kind::Debug,
             grade: None,
             lane: Lane::Auto,
-            source: Source::default(),
+            source: Source {
+                bot: Some(format!("bot {secret}")),
+                channel: Some(format!("channel {secret}")),
+                ref_url: Some(format!("https://example.com/x?token={secret}")),
+            },
             workspace: WorkspaceRef::default(),
-            recommendation: None,
-            options: vec![],
-            plan: None,
-            decision: None,
-            thread: vec![],
+            recommendation: Some(format!("recommend {secret}")),
+            options: vec![format!("option {secret}")],
+            plan: Some(BoardPlan {
+                hash: "0123456789abcdef".to_owned(),
+                prompt: format!("prompt {secret}"),
+                tasks: vec![PlanTask {
+                    id: "task-1".to_owned(),
+                    title: format!("task {secret}"),
+                    done_check: format!("done {secret}"),
+                    areas: vec![],
+                    size: TaskSize::Small,
+                    depends_on: vec![],
+                    implicit: false,
+                }],
+                steps: vec![PlanStep {
+                    id: "s1".to_owned(),
+                    role: "implement".to_owned(),
+                    job: format!("job {secret}"),
+                    runner: "cursor".to_owned(),
+                    model: None,
+                    depends_on: vec![],
+                    sensitive: None,
+                    task: Some("task-1".to_owned()),
+                    ..Default::default()
+                }],
+                revision: 1,
+                history: vec![],
+            }),
+            decision: Some(Decision {
+                verdict: Verdict::RequestChanges,
+                text: Some(format!("decision {secret}")),
+                option: None,
+                plan_hash: None,
+                by: "owner".to_owned(),
+                at_ms: 0,
+            }),
+            thread: vec![ThreadMessage {
+                from: "owner".to_owned(),
+                text: format!("thread {secret}"),
+                at_ms: 0,
+            }],
             run_ids: vec![],
             key: None,
             created_ms: 0,
@@ -569,7 +660,75 @@ mod tests {
             version: 1,
         };
         mask_item_fields(&mut item);
-        assert!(!item.title.contains("sk-abcdefghij"));
+        let serialized = serde_json::to_string(&item).unwrap();
+        assert!(!serialized.contains(secret), "masked item leaked secret");
+        for text in [
+            &item.title,
+            &item.summary,
+            item.source.bot.as_ref().unwrap(),
+            item.source.channel.as_ref().unwrap(),
+            item.source.ref_url.as_ref().unwrap(),
+            item.recommendation.as_ref().unwrap(),
+            &item.options[0],
+            &item.thread[0].text,
+            item.decision.as_ref().unwrap().text.as_ref().unwrap(),
+        ] {
+            assert!(!text.contains(secret), "unmasked text: {text}");
+        }
+        let plan = item.plan.as_ref().unwrap();
+        assert!(!plan.prompt.contains(secret));
+        assert!(!plan.steps[0].job.contains(secret));
+        assert!(!plan.tasks[0].title.contains(secret));
+        assert!(!plan.tasks[0].done_check.contains(secret));
+
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        ensure_dir(&state).unwrap();
+        let store = BoardStore::open(state.join("board")).unwrap();
+        let unmasked_prompt = format!("deploy {secret} now");
+        let pending = PendingPlanFile {
+            prompt: unmasked_prompt.clone(),
+            tasks: vec![],
+            steps: vec![],
+        };
+        let hash = write_pending_plan(&state, &pending).unwrap();
+        let created = store
+            .add(AddItemRequest {
+                title: "plan".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: None,
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash),
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let stored = store.get(&created.id).unwrap();
+        assert!(!stored.plan.as_ref().unwrap().prompt.contains(secret));
+        assert_eq!(
+            store.unmasked_prompt(&created.id, None).unwrap(),
+            unmasked_prompt
+        );
+
+        let _guard = crate::state_path::test_env_lock();
+        // SAFETY: test-only mutation of the process environment.
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+        let reply = super::mcp_invoke(
+            std::path::Path::new("/tmp"),
+            "board_prompt",
+            &serde_json::json!({ "id": created.id }),
+        );
+        unsafe { std::env::remove_var("DMUXAI_STATE_DIR") };
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["prompt"], unmasked_prompt);
     }
 
     #[test]
