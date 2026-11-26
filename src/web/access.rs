@@ -1,8 +1,7 @@
 //! Host allowlist, CSRF guards, and peer checks (SPEC-web-local-access FR-2952..FR-2955).
 
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use axum::http::header::ORIGIN;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -10,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::web::auth::token_matches;
 use crate::web::local_peer::{LocalPeerSource, peer_uid_for_connection};
+use crate::web::peer_connect::PeerConnectInfo;
 
 pub const CLIENT_HEADER: &str = "x-dmuxai-client";
 pub const FETCH_SITE_HEADER: &str = "sec-fetch-site";
@@ -54,15 +54,25 @@ pub struct WebAccess {
 impl WebAccess {
     /// Backward-compatible default for router tests (`build_router`): token always required.
     pub fn legacy_token_required(token: String, allowed_hosts: Option<Vec<String>>) -> Self {
-        let hosts = allowed_hosts.unwrap_or_else(|| vec!["localhost:7420".to_string()]);
-        Self {
-            token_required: true,
-            listener: ListenerKind::Loopback,
-            allowed_hosts: Arc::new(hosts),
-            wsl_host_peer: None,
-            server_uid: effective_server_uid(),
-            peer_source: crate::web::local_peer::shared_peer_source(),
-            token: Arc::new(token),
+        match allowed_hosts {
+            None => Self {
+                token_required: true,
+                listener: ListenerKind::Remote,
+                allowed_hosts: Arc::new(Vec::new()),
+                wsl_host_peer: None,
+                server_uid: effective_server_uid(),
+                peer_source: crate::web::local_peer::shared_peer_source(),
+                token: Arc::new(token),
+            },
+            Some(hosts) => Self {
+                token_required: true,
+                listener: ListenerKind::Loopback,
+                allowed_hosts: Arc::new(hosts),
+                wsl_host_peer: None,
+                server_uid: effective_server_uid(),
+                peer_source: crate::web::local_peer::shared_peer_source(),
+                token: Arc::new(token),
+            },
         }
     }
 
@@ -171,11 +181,18 @@ pub fn host_allowed(access: &WebAccess, host_header: &str) -> bool {
     access.allowed_hosts.iter().any(|h| h == host_header)
 }
 
+pub fn normalize_guarded_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.starts_with("//") {
+        format!("/{}", trimmed.trim_start_matches('/'))
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 pub fn is_guarded_path(path: &str) -> bool {
-    path.starts_with("/api/")
-        || path == "/api"
-        || path.starts_with("//api/")
-        || path.contains("/api/")
+    let path = normalize_guarded_path(path);
+    path.starts_with("/api/") || path == "/api" || path.contains("/api/")
 }
 
 pub fn classify_provided_token(
@@ -249,7 +266,13 @@ pub fn tokenless_write_allowed(headers: &HeaderMap, host_header: &str) -> bool {
         return true;
     }
 
-    origin.is_none() && fetch_site.is_none() && client == Some("1")
+    if client != Some("1") {
+        return false;
+    }
+    match fetch_site {
+        None | Some("same-origin") | Some("none") => true,
+        Some(_) => false,
+    }
 }
 
 pub fn tokenless_get_allowed(headers: &HeaderMap) -> bool {
@@ -260,15 +283,40 @@ pub fn tokenless_get_allowed(headers: &HeaderMap) -> bool {
     }
 }
 
+fn decode_query_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+        {
+            out.push(char::from(byte));
+            i += 3;
+            continue;
+        }
+        out.push(char::from(bytes[i]));
+        i += 1;
+    }
+    out
+}
+
+fn refresh_truthy(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes" | "on")
+}
+
 fn jira_refresh_requested(query: Option<&str>) -> bool {
     let Some(query) = query else {
         return false;
     };
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == "refresh"
-            && matches!(v, "1" | "true" | "yes" | "on")
-        {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        if k == "refresh" && refresh_truthy(&decode_query_component(v)) {
             return true;
         }
     }
@@ -276,7 +324,27 @@ fn jira_refresh_requested(query: Option<&str>) -> bool {
 }
 
 pub fn get_request_needs_write_guard(path: &str, query: Option<&str>) -> bool {
-    path == "/api/jira/issues" && jira_refresh_requested(query)
+    normalize_guarded_path(path) == "/api/jira/issues" && jira_refresh_requested(query)
+}
+
+#[allow(clippy::result_large_err)]
+fn check_loopback_peer_uid(access: &WebAccess, peer: &PeerConnectInfo) -> Result<(), Response> {
+    let mut guard = peer.loopback_uid.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(result) = *guard {
+        return result.map_err(|_| forbidden());
+    }
+    let verdict = if let Some(uid) = peer_uid_for_connection(access.peer_source.as_ref(), peer.addr)
+    {
+        if uid != access.server_uid && uid != 0 {
+            Err(())
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    };
+    *guard = Some(verdict);
+    verdict.map_err(|_| forbidden())
 }
 
 pub fn effective_token_required(
@@ -320,10 +388,10 @@ pub fn check_guarded_request(
     headers: &HeaderMap,
     host_header: &str,
     query: Option<&str>,
-    peer: Option<SocketAddr>,
-    peer_cache: &Mutex<HashSet<SocketAddr>>,
+    peer: Option<&PeerConnectInfo>,
 ) -> std::result::Result<(), Response> {
-    if !is_guarded_path(path) {
+    let path = normalize_guarded_path(path);
+    if !is_guarded_path(&path) {
         return Ok(());
     }
 
@@ -333,7 +401,7 @@ pub fn check_guarded_request(
     }
     let has_valid = token_state == ProvidedToken::Valid;
 
-    let peer_ip = peer.map(|a| a.ip());
+    let peer_ip = peer.map(|p| p.addr.ip());
     if effective_token_required(access, peer_ip, has_valid) {
         if !has_valid {
             return Err(unauthorized());
@@ -347,25 +415,16 @@ pub fn check_guarded_request(
 
     // Tokenless path
     if access.listener == ListenerKind::Loopback
-        && let Some(peer_addr) = peer
+        && let Some(peer_info) = peer
     {
-        let mut cache = peer_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if !cache.contains(&peer_addr) {
-            cache.insert(peer_addr);
-            if let Some(uid) = peer_uid_for_connection(access.peer_source.as_ref(), peer_addr)
-                && uid != access.server_uid
-                && uid != 0
-            {
-                return Err(forbidden());
-            }
-        }
+        check_loopback_peer_uid(access, peer_info)?;
     }
 
     if method == Method::GET || method == Method::HEAD {
         if !tokenless_get_allowed(headers) {
             return Err(forbidden());
         }
-        if get_request_needs_write_guard(path, query)
+        if get_request_needs_write_guard(&path, query)
             && !tokenless_write_allowed(headers, host_header)
         {
             return Err(forbidden());
@@ -384,14 +443,39 @@ pub fn get_api_routes_with_possible_side_effects() -> Vec<&'static str> {
     vec!["GET /api/jira/issues?refresh=1"]
 }
 
+/// Every `GET` route registered under `/api/*` on the dashboard router (for FR-2954 tests).
+pub fn all_api_get_routes() -> Vec<&'static str> {
+    vec![
+        "/api/state",
+        "/api/workspaces",
+        "/api/workspace",
+        "/api/workspace/dirs",
+        "/api/skills",
+        "/api/agent-prompts",
+        "/api/memory",
+        "/api/docs",
+        "/api/docs/tree",
+        "/api/docs/file",
+        "/api/docs/diff",
+        "/api/docs/render",
+        "/api/docs/changes",
+        "/api/events",
+        "/api/events/log",
+        "/api/runs",
+        "/api/runs/{id}",
+        "/api/runs/{id}/stream",
+        "/api/todos",
+        "/api/jira/issues",
+        "/api/mcp/servers",
+        "/api/attachments/{name}",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-
-    fn empty_peer_cache() -> Mutex<HashSet<SocketAddr>> {
-        Mutex::new(HashSet::new())
-    }
+    use std::net::SocketAddr;
 
     // TC-2950 / FR-2950 (middleware helpers)
     #[test]
@@ -403,7 +487,6 @@ mod tests {
             7420,
             crate::web::local_peer::shared_peer_source(),
         );
-        let cache = empty_peer_cache();
         let mut headers = HeaderMap::new();
         headers.insert(CLIENT_HEADER, HeaderValue::from_static("1"));
         assert!(
@@ -415,7 +498,6 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &cache,
             )
             .is_ok()
         );
@@ -434,7 +516,6 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &cache,
             )
             .is_err()
         );
@@ -481,7 +562,6 @@ mod tests {
             7420,
             crate::web::local_peer::shared_peer_source(),
         );
-        let cache = empty_peer_cache();
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:7420"));
         headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("same-origin"));
@@ -495,7 +575,6 @@ mod tests {
                     "localhost:7420",
                     None,
                     None,
-                    &cache,
                 )
                 .is_ok(),
                 "{method}"
@@ -512,7 +591,6 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &cache,
             )
             .is_err()
         );
@@ -528,7 +606,6 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &cache,
             )
             .is_ok()
         );
@@ -545,7 +622,6 @@ mod tests {
             7420,
             crate::web::local_peer::shared_peer_source(),
         );
-        let cache = empty_peer_cache();
         let mut headers = HeaderMap::new();
         headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("cross-site"));
         assert!(
@@ -557,7 +633,6 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &cache,
             )
             .is_err()
         );
@@ -572,7 +647,6 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &cache,
             )
             .is_err()
         );
@@ -587,7 +661,6 @@ mod tests {
                 "localhost:7420",
                 Some("refresh=1"),
                 None,
-                &cache,
             )
             .is_err()
         );
@@ -601,10 +674,52 @@ mod tests {
                 "localhost:7420",
                 Some("refresh=1"),
                 None,
-                &cache,
             )
             .is_ok()
         );
+
+        let mut jira_originless = HeaderMap::new();
+        jira_originless.insert(CLIENT_HEADER, HeaderValue::from_static("1"));
+        jira_originless.insert(FETCH_SITE_HEADER, HeaderValue::from_static("same-origin"));
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/jira/issues",
+                &jira_originless,
+                "localhost:7420",
+                Some("refresh=1"),
+                None,
+            )
+            .is_ok()
+        );
+
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "//api/jira/issues",
+                &jira_originless,
+                "localhost:7420",
+                Some("refresh=%31"),
+                None,
+            )
+            .is_ok()
+        );
+
+        for route in get_api_routes_with_possible_side_effects() {
+            let path = route
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            assert!(
+                all_api_get_routes().contains(&path),
+                "side-effect route {route} missing from router GET list"
+            );
+        }
 
         assert!(!is_guarded_path("/"));
         assert!(!is_guarded_path("/docs/view/ticket"));
@@ -621,7 +736,6 @@ mod tests {
         assert!(access.token_required);
         assert_eq!(access.listener, ListenerKind::Remote);
         assert!(host_allowed(&access, "any.host:1"));
-        let cache = empty_peer_cache();
         let headers = HeaderMap::new();
         assert!(
             check_guarded_request(
@@ -632,7 +746,6 @@ mod tests {
                 "any.host:1",
                 None,
                 None,
-                &cache,
             )
             .is_err()
         );
@@ -658,7 +771,6 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("http://172.24.64.5:7420"));
         headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("same-origin"));
-        let cache = empty_peer_cache();
         let trusted: SocketAddr = "172.24.48.1:12345".parse().unwrap();
         assert!(
             check_guarded_request(
@@ -668,10 +780,164 @@ mod tests {
                 &headers,
                 "172.24.64.5:7420",
                 None,
-                Some(trusted),
-                &cache,
+                Some(&PeerConnectInfo::new(trusted)),
             )
             .is_ok()
+        );
+    }
+
+    // TC-2955 / FR-2955
+    #[test]
+    fn tc_2955_peer_uid_mismatch_rejected_root_allowed_once_per_connection() {
+        use crate::web::local_peer::LocalPeerSource;
+
+        #[derive(Clone, Default)]
+        struct MockPeer {
+            tcp: String,
+        }
+
+        impl LocalPeerSource for MockPeer {
+            fn proc_version(&self) -> Option<String> {
+                None
+            }
+            fn wsl_distro_name(&self) -> Option<String> {
+                None
+            }
+            fn wslinfo_networking_mode(&self) -> Option<String> {
+                None
+            }
+            fn proc_net_route(&self) -> Option<String> {
+                None
+            }
+            fn default_route_interface_ip(&self) -> Option<Ipv4Addr> {
+                None
+            }
+            fn proc_net_tcp(&self) -> Option<String> {
+                Some(self.tcp.clone())
+            }
+            fn proc_net_tcp6(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             0: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 123 1 00000000\n";
+        let peer_src = Arc::new(MockPeer {
+            tcp: table.to_owned(),
+        }) as Arc<dyn LocalPeerSource>;
+        let server_uid = 2000_u32;
+        let access = WebAccess {
+            token_required: false,
+            listener: ListenerKind::Loopback,
+            allowed_hosts: Arc::new(vec!["localhost:7420".to_owned()]),
+            wsl_host_peer: None,
+            server_uid,
+            peer_source: peer_src,
+            token: Arc::new("tok".to_owned()),
+        };
+        let peer: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let peer_info = PeerConnectInfo::new(peer);
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_HEADER, HeaderValue::from_static("1"));
+
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &headers,
+                "localhost:7420",
+                None,
+                Some(&peer_info),
+            )
+            .is_err()
+        );
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &headers,
+                "localhost:7420",
+                None,
+                Some(&peer_info),
+            )
+            .is_err(),
+            "rejected peer stays rejected on keep-alive"
+        );
+
+        let root_table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             0: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 123 1 00000000\n";
+        let root_src = Arc::new(MockPeer {
+            tcp: root_table.to_owned(),
+        }) as Arc<dyn LocalPeerSource>;
+        let root_access = WebAccess {
+            token_required: false,
+            listener: ListenerKind::Loopback,
+            allowed_hosts: Arc::new(vec!["localhost:7420".to_owned()]),
+            wsl_host_peer: None,
+            server_uid,
+            peer_source: root_src,
+            token: Arc::new("tok".to_owned()),
+        };
+        let root_peer = PeerConnectInfo::new(peer);
+        assert!(
+            check_guarded_request(
+                &root_access,
+                &Method::GET,
+                "/",
+                &headers,
+                "localhost:7420",
+                None,
+                Some(&root_peer),
+            )
+            .is_ok(),
+            "root path skips guarded peer check"
+        );
+
+        let v6_peer: SocketAddr = "[::ffff:127.0.0.1]:50001".parse().unwrap();
+        let v6_info = PeerConnectInfo::new(v6_peer);
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &headers,
+                "localhost:7420",
+                None,
+                Some(&v6_info),
+            )
+            .is_err()
+        );
+
+        let token_access = WebAccess {
+            token_required: true,
+            listener: ListenerKind::Loopback,
+            allowed_hosts: Arc::new(vec!["localhost:7420".to_owned()]),
+            wsl_host_peer: None,
+            server_uid,
+            peer_source: Arc::new(MockPeer {
+                tcp: table.to_owned(),
+            }) as Arc<dyn LocalPeerSource>,
+            token: Arc::new("sekrit".to_owned()),
+        };
+        let mut with_token = headers.clone();
+        with_token.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sekrit"),
+        );
+        assert!(
+            check_guarded_request(
+                &token_access,
+                &Method::GET,
+                "/api/state",
+                &with_token,
+                "localhost:7420",
+                None,
+                Some(&peer_info),
+            )
+            .is_ok(),
+            "valid token skips peer uid check"
         );
     }
 }

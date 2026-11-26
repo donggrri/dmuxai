@@ -948,8 +948,8 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         let (base_url, token) = server
             .url
             .split_once("/?token=")
-            .map(|(base, token)| (base.to_owned(), token.to_owned()))
-            .unwrap_or_else(|| (server.url.clone(), String::new()));
+            .map(|(base, token)| (base.trim_end_matches('/').to_owned(), token.to_owned()))
+            .unwrap_or_else(|| (server.url.trim_end_matches('/').to_owned(), String::new()));
         workspace_runtime::HostContext {
             directory: server.workspaces(),
             token: if server.token_required {

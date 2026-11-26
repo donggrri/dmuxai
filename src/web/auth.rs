@@ -216,6 +216,19 @@ mod tests {
             false,
             false
         ));
+        assert!(resolve_token_required(
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            true,
+        ));
+        unsafe { std::env::set_var("DMUXAI_WEB_TOKEN_REQUIRED", "0") };
+        assert!(resolve_token_required(
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            true,
+        ));
         unsafe { std::env::set_var("DMUXAI_WEB_TOKEN_REQUIRED", "1") };
         assert!(resolve_token_required(
             false,

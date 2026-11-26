@@ -255,7 +255,10 @@ pub fn peer_uid_from_proc_net(tables: &[&str], peer: SocketAddr) -> Option<u32> 
             if !ip_matches(peer.ip(), ip) {
                 continue;
             }
-            let uid = cols.get(7).and_then(|u| u.parse().ok())?;
+            let uid = match cols.get(7).and_then(|u| u.parse().ok()) {
+                Some(uid) => uid,
+                None => continue,
+            };
             return Some(uid);
         }
     }
@@ -291,12 +294,18 @@ fn parse_proc_socket_field(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
     }
 }
 
-fn ip_matches(expected: IpAddr, found: IpAddr) -> bool {
-    match (expected, found) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => a == b,
-        (IpAddr::V6(a), IpAddr::V6(b)) => a == b,
-        _ => false,
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        other => other,
     }
+}
+
+fn ip_matches(expected: IpAddr, found: IpAddr) -> bool {
+    canonical_ip(expected) == canonical_ip(found)
 }
 
 pub fn peer_uid_for_connection<S: LocalPeerSource + ?Sized>(
@@ -383,7 +392,7 @@ mod tests {
         assert_eq!(windows_host_ipv4(&not_wsl), None);
     }
 
-    // TC-2960 partial / FR-2960
+    // TC-2960 / FR-2960
     #[test]
     fn tc_2960_wsl2_nat_detection_and_extra_listener_only_in_nat_mode() {
         let nat = MockSource {
@@ -421,6 +430,8 @@ mod tests {
         assert_eq!(peer_uid_from_proc_net(&[table], peer), Some(0));
         let peer2: SocketAddr = "127.0.0.1:50003".parse().unwrap();
         assert_eq!(peer_uid_from_proc_net(&[table], peer2), Some(1000));
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:50001".parse().unwrap();
+        assert_eq!(peer_uid_from_proc_net(&[table], mapped), Some(0));
     }
 
     // TC-2959 / FR-2959 (middleware-level expectations exercised via access)
@@ -428,9 +439,8 @@ mod tests {
     #[test]
     fn tc_2961_wsl_listener_trusts_windows_host_peer_and_requires_token_for_others() {
         use crate::web::access::{WebAccess, check_guarded_request};
+        use crate::web::peer_connect::PeerConnectInfo;
         use axum::http::{HeaderMap, Method};
-        use std::collections::HashSet;
-        use std::sync::Mutex;
         let host_peer: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 24, 48, 1));
         let access = WebAccess::wsl_interface(
             "secret".to_owned(),
@@ -440,7 +450,6 @@ mod tests {
             Some(host_peer),
             crate::web::local_peer::shared_peer_source(),
         );
-        let cache = Mutex::new(HashSet::new());
         let headers = HeaderMap::new();
         let trusted: SocketAddr = "172.24.48.1:54000".parse().unwrap();
         assert!(
@@ -451,8 +460,7 @@ mod tests {
                 &headers,
                 "172.24.64.5:7420",
                 None,
-                Some(trusted),
-                &cache,
+                Some(&PeerConnectInfo::new(trusted)),
             )
             .is_ok()
         );
@@ -465,8 +473,7 @@ mod tests {
                 &headers,
                 "172.24.64.5:7420",
                 None,
-                Some(other),
-                &cache,
+                Some(&PeerConnectInfo::new(other)),
             )
             .is_err()
         );
@@ -475,9 +482,8 @@ mod tests {
     #[test]
     fn tc_2959_wsl_localhost_forwarding_hosts_and_origins_accepted_tokenless() {
         use crate::web::access::{WebAccess, check_guarded_request};
+        use crate::web::peer_connect::PeerConnectInfo;
         use axum::http::{HeaderMap, HeaderValue, Method};
-        use std::collections::HashSet;
-        use std::sync::Mutex;
         let access = WebAccess::loopback(
             "t".to_owned(),
             false,
@@ -491,7 +497,6 @@ mod tests {
             HeaderValue::from_static("http://127.0.0.1:7420"),
         );
         headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-        let cache = Mutex::new(HashSet::new());
         let peer: SocketAddr = "127.0.0.1:55123".parse().unwrap();
         assert!(
             check_guarded_request(
@@ -501,8 +506,7 @@ mod tests {
                 &headers,
                 "127.0.0.1:7420",
                 None,
-                Some(peer),
-                &cache,
+                Some(&PeerConnectInfo::new(peer)),
             )
             .is_ok()
         );

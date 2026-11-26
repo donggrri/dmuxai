@@ -17,6 +17,7 @@ mod hub;
 pub mod layout;
 pub mod local_peer;
 pub mod parity;
+mod peer_connect;
 pub mod runs_api;
 mod server;
 mod snapshot;
@@ -30,6 +31,7 @@ pub use docs_api::{DocsService, OpenTickets};
 pub use file_source::FileGraphSource;
 pub use hub::DashboardHub;
 pub use layout::{NodeLayout, layout_graph};
+pub use peer_connect::PeerConnectInfo;
 pub use server::{
     DashboardServer, DashboardServices, ExecFn, ServerConfig, WorkspaceSwitchConfig, build_router,
     build_router_with, format_reexec_failure, start_server,

@@ -129,7 +129,6 @@ impl ServerConfig {
 pub(crate) struct AppState {
     pub(crate) access: WebAccess,
     workspaces: Arc<WorkspaceDirectory>,
-    loopback_peer_checked: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
 }
 
 impl AppState {
@@ -1604,8 +1603,8 @@ async fn security_and_auth_middleware(
 
     let peer = req
         .extensions()
-        .get::<axum::extract::ConnectInfo<SocketAddr>>()
-        .map(|c| c.0);
+        .get::<axum::extract::ConnectInfo<crate::web::peer_connect::PeerConnectInfo>>()
+        .map(|c| &c.0);
 
     if is_guarded_path(&path)
         && let Err(resp) = check_guarded_request(
@@ -1616,7 +1615,6 @@ async fn security_and_auth_middleware(
             &host_header,
             query.as_deref(),
             peer,
-            state.loopback_peer_checked.as_ref(),
         )
     {
         return resp;
@@ -2235,11 +2233,7 @@ pub fn build_router_with_directory_access(
     workspaces: Arc<WorkspaceDirectory>,
     access: WebAccess,
 ) -> Router {
-    let state = AppState {
-        access,
-        workspaces,
-        loopback_peer_checked: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-    };
+    let state = AppState { access, workspaces };
 
     Router::new()
         .route("/", get(get_index))
@@ -2400,15 +2394,17 @@ pub async fn start_server(
     let workspaces = Arc::new(WorkspaceDirectory::single(hub, config.services));
     let loopback_router =
         build_router_with_directory_access(workspaces.clone(), primary_access.clone());
-    let loopback_make = loopback_router.into_make_service_with_connect_info::<SocketAddr>();
+    let loopback_make = loopback_router
+        .into_make_service_with_connect_info::<crate::web::peer_connect::PeerConnectInfo>();
 
     let wsl_listener = if let Some((wsl_ip, access)) = wsl_access {
         let wsl_addr = SocketAddr::new(wsl_ip, port);
-        windows_url = Some(crate::web::auth::dashboard_url_plain(wsl_addr));
         match tokio::net::TcpListener::bind(wsl_addr).await {
             Ok(wsl_listener) => {
+                windows_url = Some(crate::web::auth::dashboard_url_plain(wsl_addr));
                 let wsl_router = build_router_with_directory_access(workspaces.clone(), access);
-                let wsl_make = wsl_router.into_make_service_with_connect_info::<SocketAddr>();
+                let wsl_make = wsl_router
+                    .into_make_service_with_connect_info::<crate::web::peer_connect::PeerConnectInfo>();
                 Some((wsl_listener, wsl_make))
             }
             Err(error) => {
@@ -2518,6 +2514,81 @@ mod tests {
         assert!(session_command_needs_web_write(
             &SessionCommand::GraphCancel
         ));
+    }
+
+    // TC-2960 / FR-2960 (listener plan from mocked /proc data, no bind)
+    #[test]
+    fn tc_2960_wsl_extra_listener_access_from_mocked_nat_source() {
+        use crate::web::local_peer::{LocalPeerSource, windows_host_ipv4, wsl_nat_listen_ipv4};
+
+        #[derive(Clone, Default)]
+        struct MockNat {
+            tcp: Option<String>,
+            version: Option<String>,
+            wslinfo: Option<String>,
+            route: Option<String>,
+            iface_ip: Option<std::net::Ipv4Addr>,
+        }
+
+        impl LocalPeerSource for MockNat {
+            fn proc_version(&self) -> Option<String> {
+                self.version.clone()
+            }
+            fn wsl_distro_name(&self) -> Option<String> {
+                None
+            }
+            fn wslinfo_networking_mode(&self) -> Option<String> {
+                self.wslinfo.clone()
+            }
+            fn proc_net_route(&self) -> Option<String> {
+                self.route.clone()
+            }
+            fn default_route_interface_ip(&self) -> Option<std::net::Ipv4Addr> {
+                self.iface_ip
+            }
+            fn proc_net_tcp(&self) -> Option<String> {
+                self.tcp.clone()
+            }
+            fn proc_net_tcp6(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let mock = Arc::new(MockNat {
+            version: Some("microsoft WSL2".to_owned()),
+            wslinfo: Some("nat".to_owned()),
+            route: Some(
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                 eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+                    .to_owned(),
+            ),
+            iface_ip: Some(std::net::Ipv4Addr::new(172, 24, 64, 5)),
+            ..Default::default()
+        });
+        let wsl_ip = wsl_nat_listen_ipv4(mock.as_ref()).expect("nat listen ip");
+        let host = windows_host_ipv4(mock.as_ref()).expect("windows host");
+        let config = ServerConfig {
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 7420,
+            allow_remote: false,
+            bind_explicit: false,
+            token: "tok".to_owned(),
+            token_required: false,
+            trust_wsl_host: true,
+            discovery_mode: "web".to_owned(),
+            peer_source: Some(mock.clone()),
+            services: DashboardServices::default(),
+        };
+        let extra = wsl_extra_listener_access(&config, 7420, mock);
+        let (listen_ip, access) = extra.expect("extra listener in nat mode");
+        assert_eq!(listen_ip, IpAddr::V4(wsl_ip));
+        assert_eq!(access.wsl_host_peer, Some(IpAddr::V4(host)));
+        assert!(
+            access
+                .allowed_hosts
+                .iter()
+                .any(|h| h.contains("172.24.64.5"))
+        );
     }
 
     // TC-2950 / FR-2950

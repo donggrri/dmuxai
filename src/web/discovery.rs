@@ -73,6 +73,32 @@ pub fn write_discovery(workspace_root: &Path, d: &Discovery) -> io::Result<PathB
     write_owner_only_json(&path, &dir, d)
 }
 
+fn ensure_owned_state_dir_permissions(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        if !dir.exists() {
+            return Ok(());
+        }
+        let meta = std::fs::metadata(dir)?;
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() == uid {
+            let mut perms = meta.permissions();
+            let mode = perms.mode() & 0o777;
+            if mode != 0o700 {
+                perms.set_mode((perms.mode() & !0o777) | 0o700);
+                std::fs::set_permissions(dir, perms)?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 pub fn write_user_discovery(d: &UserDiscovery) -> io::Result<PathBuf> {
     let base = crate::state_path::state_base()?;
     #[cfg(unix)]
@@ -82,6 +108,7 @@ pub fn write_user_discovery(d: &UserDiscovery) -> io::Result<PathBuf> {
             .recursive(true)
             .mode(0o700)
             .create(&base)?;
+        ensure_owned_state_dir_permissions(&base)?;
     }
     #[cfg(not(unix))]
     {
@@ -197,6 +224,9 @@ pub fn user_discovery_may_overwrite(mode: &str) -> bool {
     if !process_alive(existing.pid) {
         return true;
     }
+    if existing.mode == "serve" && mode == "web" {
+        return true;
+    }
     if existing.mode == "web" && mode != "web" {
         return false;
     }
@@ -284,6 +314,7 @@ mod tests {
     // TC-2957 / FR-2957
     #[test]
     fn tc_2957_user_level_discovery_written_0600_not_clobbered_removed_and_stale_ignored() {
+        let _guard = crate::state_path::test_env_lock();
         let prev = std::env::var_os("DMUXAI_STATE_DIR");
         let state_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("DMUXAI_STATE_DIR", state_dir.path()) };
@@ -311,10 +342,64 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            let base = crate::state_path::state_base().unwrap();
+            assert_eq!(
+                std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
         }
         assert_eq!(read_user_discovery().as_ref(), Some(&user));
 
         assert!(!user_discovery_may_overwrite("serve"));
+
+        #[cfg(unix)]
+        {
+            let other_pid = unsafe { libc::getppid() as u32 };
+            if other_pid > 1 && process_alive(other_pid) && other_pid != std::process::id() {
+                let foreign = UserDiscovery {
+                    base_url: "http://127.0.0.1:7421/".to_owned(),
+                    windows_url: None,
+                    port: 7421,
+                    pid: other_pid,
+                    uid: user.uid,
+                    mode: "web".to_owned(),
+                    token_required: false,
+                    token: None,
+                    workspaces: vec![],
+                    started_at_ms: 2,
+                };
+                write_user_discovery(&foreign).unwrap();
+                assert!(!user_discovery_may_overwrite("web"));
+                write_user_discovery(&user).unwrap();
+            }
+        }
+
+        let serve_live = UserDiscovery {
+            mode: "serve".to_owned(),
+            pid: std::process::id(),
+            ..user.clone()
+        };
+        write_user_discovery(&serve_live).unwrap();
+        assert!(user_discovery_may_overwrite("web"));
+
+        let dead_pid = 4_194_304_u32;
+        assert!(!process_alive(dead_pid));
+        let stale = UserDiscovery {
+            pid: dead_pid,
+            mode: "web".to_owned(),
+            ..user.clone()
+        };
+        write_user_discovery(&stale).unwrap();
+        assert!(user_discovery_may_overwrite("web"));
+
+        write_user_discovery(&user).unwrap();
+        sync_user_discovery_workspaces(&[UserWorkspaceRef {
+            id: "ws2".to_owned(),
+            path: "/tmp/ws2".to_owned(),
+        }])
+        .unwrap();
+        let updated = read_user_discovery().unwrap();
+        assert_eq!(updated.workspaces[0].id, "ws2");
 
         remove_user_discovery_owned();
         assert!(!path.exists());
