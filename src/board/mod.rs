@@ -7,11 +7,14 @@ mod store;
 
 pub use mcp::invoke as mcp_invoke;
 
-pub use plan::{PendingPlanFile, edit_plan_from_json, pending_plan_path, read_pending_plan};
+pub use plan::{
+    PendingPlanFile, edit_plan_from_json, pending_plan_path, read_pending_plan,
+    unmasked_prompt_from_item_plan,
+};
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{
     AddItemRequest, BoardStore, DecideRequest, ListFilter, SayRequest, UpdateItemRequest,
-    WaitEvent, WaitFilter, WaitFor, WaitOutcome,
+    WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
 };
 
 /// Who is invoking a board write (FR-3108 owner identity).
@@ -151,7 +154,12 @@ pub struct Source {
     pub bot: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "ref",
+        alias = "ref_url"
+    )]
     pub ref_url: Option<String>,
 }
 
@@ -248,6 +256,8 @@ pub struct BoardItem {
     pub thread: Vec<ThreadMessage>,
     #[serde(default)]
     pub run_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
     pub version: u32,
@@ -304,15 +314,37 @@ pub fn default_actor_by(caller: BoardCaller) -> String {
 }
 
 pub fn resolve_actor(by: Option<&str>, caller: BoardCaller) -> Result<String, BoardError> {
+    use std::io::IsTerminal;
     let actor = by
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| default_actor_by(caller));
-    if actor == "owner" && matches!(caller, BoardCaller::Mcp | BoardCaller::CliNonTty) {
-        return Err(BoardError::Forbidden(
-            "owner actions need an interactive terminal or the dashboard".to_owned(),
-        ));
+    if actor == "owner" {
+        match caller {
+            BoardCaller::Mcp | BoardCaller::CliNonTty => {
+                return Err(BoardError::Forbidden(
+                    "owner actions need an interactive terminal or the dashboard".to_owned(),
+                ));
+            }
+            BoardCaller::CliTty => {
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    return Err(BoardError::Forbidden(
+                        "owner actions need stdin and stdout on a TTY".to_owned(),
+                    ));
+                }
+                if !std::env::var(crate::term::policy::RUN_ID_ENV)
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
+                    return Err(BoardError::Forbidden(
+                        "owner actions are refused while DMUXAI_RUN_ID is set".to_owned(),
+                    ));
+                }
+            }
+            BoardCaller::Dashboard => {}
+        }
     }
     if actor != "owner" && actor != "planner" && !actor.starts_with("bot:") {
         return Err(BoardError::Usage(format!(
@@ -322,8 +354,48 @@ pub fn resolve_actor(by: Option<&str>, caller: BoardCaller) -> Result<String, Bo
     Ok(actor)
 }
 
+/// Read a local file path or stdin when `path` is `-`.
+pub fn read_path_or_stdin(path: &str) -> Result<String, BoardError> {
+    use std::io::Read;
+    if path.trim() == "-" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| BoardError::Usage(format!("could not read stdin: {e}")))?;
+        if text.trim().is_empty() {
+            return Err(BoardError::Usage("stdin is empty".to_owned()));
+        }
+        return Ok(text);
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| BoardError::Usage(format!("could not read '{}': {e}", path.trim())))
+}
+
+pub fn actor_may_use_planner(actor: &str) -> bool {
+    actor == "owner" || actor == "planner"
+}
+
+pub fn actor_is_owner(actor: &str) -> bool {
+    actor == "owner"
+}
+
+pub fn validate_item_id_early(id: &str) -> Result<(), BoardError> {
+    if !valid_item_id(id) {
+        return Err(BoardError::Usage("invalid board item id".to_owned()));
+    }
+    Ok(())
+}
+
 /// JSON body for a successful `board wait` (FR-3112).
 pub fn wait_ready_json(event: &WaitEvent, item: &BoardItem) -> serde_json::Value {
+    serde_json::json!({
+        "timed_out": false,
+        "event": event,
+        "item": item,
+    })
+}
+
+pub fn wait_ready_json_any(event: &WaitEventAny, item: &BoardItem) -> serde_json::Value {
     serde_json::json!({
         "timed_out": false,
         "event": event,
@@ -345,6 +417,15 @@ pub fn mask_board_plan(plan: &mut BoardPlan) {
 pub fn mask_item_fields(item: &mut BoardItem) {
     item.title = crate::run_journal::mask_sensitive_tokens(&item.title);
     item.summary = crate::run_journal::mask_sensitive_tokens(&item.summary);
+    if let Some(bot) = item.source.bot.as_mut() {
+        *bot = crate::run_journal::mask_sensitive_tokens(bot);
+    }
+    if let Some(channel) = item.source.channel.as_mut() {
+        *channel = crate::run_journal::mask_sensitive_tokens(channel);
+    }
+    if let Some(ref_url) = item.source.ref_url.as_mut() {
+        *ref_url = crate::run_journal::mask_sensitive_tokens(ref_url);
+    }
     if let Some(rec) = item.recommendation.as_mut() {
         *rec = crate::run_journal::mask_sensitive_tokens(rec);
     }
@@ -455,7 +536,11 @@ mod tests {
         assert!(validate_message(&"m".repeat(TEXT_MAX + 1)).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::Mcp).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
-        assert!(resolve_actor(None, BoardCaller::CliTty).unwrap() == "owner");
+        match resolve_actor(None, BoardCaller::CliTty) {
+            Ok(actor) => assert_eq!(actor, "owner"),
+            Err(BoardError::Forbidden(_)) => {}
+            Err(other) => panic!("unexpected resolve_actor error: {other}"),
+        }
         assert!(resolve_actor(None, BoardCaller::CliNonTty).unwrap() == "bot:coordinator");
         assert!(resolve_actor(None, BoardCaller::Mcp).unwrap() == "bot:mcp");
         assert!(resolve_actor(None, BoardCaller::Dashboard).unwrap() == "owner");
@@ -478,6 +563,7 @@ mod tests {
             decision: None,
             thread: vec![],
             run_ids: vec![],
+            key: None,
             created_ms: 0,
             updated_ms: 0,
             version: 1,
@@ -488,16 +574,25 @@ mod tests {
 
     #[test]
     fn tc_3115_board_never_touches_credentials_or_token() {
-        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/board/store.rs"));
+        let files = [
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/board/store.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/board/mcp.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/board/plan.rs")),
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/board/rules.rs")),
+        ]
+        .join("\n");
+        let web_token = format!("DMUXAI_{}", "WEB_TOKEN");
+        let dash_token = format!("DMUXAI_{}", "DASHBOARD_TOKEN");
         for forbidden in [
+            web_token.as_str(),
+            &format!("{}=", "token"),
             ".cursor",
             "credentials.json",
-            "dashboard_token",
-            "DMUXAI_DASHBOARD_TOKEN",
+            dash_token.as_str(),
         ] {
             assert!(
-                !src.contains(forbidden),
-                "board store must not reference {forbidden}"
+                !files.contains(forbidden),
+                "board sources must not reference {forbidden}"
             );
         }
     }

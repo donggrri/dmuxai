@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 
 use super::{BoardError, Kind, Lane};
@@ -78,11 +78,18 @@ impl BoardRules {
             {
                 return Err(BoardError::Usage(format!("invalid rule kind '{kind}'")));
             }
+            if let Some(grade) = &rule.grade
+                && super::Grade::parse(grade).is_none()
+            {
+                return Err(BoardError::Usage(format!("invalid rule grade '{grade}'")));
+            }
             if let Some(re) = &rule.title_regex {
                 if re.len() > REGEX_SIZE_LIMIT {
                     return Err(BoardError::Usage("title_regex too large".to_owned()));
                 }
-                Regex::new(re)
+                RegexBuilder::new(re)
+                    .size_limit(REGEX_SIZE_LIMIT)
+                    .build()
                     .map_err(|e| BoardError::Usage(format!("invalid title_regex: {e}")))?;
             }
         }
@@ -101,11 +108,17 @@ impl BoardRules {
             if rule.kind.as_ref().is_some_and(|k| k != kind_str) {
                 continue;
             }
-            if rule.grade.as_deref().is_some_and(|g| grade_str != Some(g)) {
+            if rule
+                .grade
+                .as_deref()
+                .is_some_and(|g| !grade_str.is_some_and(|gs| gs.eq_ignore_ascii_case(g)))
+            {
                 continue;
             }
             if let Some(re) = &rule.title_regex {
-                let regex = Regex::new(re)
+                let regex = RegexBuilder::new(re)
+                    .size_limit(REGEX_SIZE_LIMIT)
+                    .build()
                     .map_err(|e| BoardError::Internal(format!("invalid stored regex: {e}")))?;
                 if !regex.is_match(title) {
                     continue;

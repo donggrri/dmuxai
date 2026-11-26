@@ -208,7 +208,26 @@ fn tool_definitions() -> Value {
             "description": "Wait for decision board activity (timeout capped at 300s).",
             "inputSchema": {
                 "type": "object",
-                "properties": { "id": { "type": "string" } },
+                "properties": {
+                    "id": { "type": "string" },
+                    "since_version": { "type": "integer", "minimum": 0 },
+                    "since_seq": { "type": "integer", "minimum": 0 },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
+                    "wait_for": { "type": "string", "enum": ["decision", "message", "any"] },
+                    "waiter": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_prompt",
+            "description": "Return the unmasked graph plan prompt for a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "hash": { "type": "string" }
+                },
                 "required": ["id"]
             }
         }
@@ -468,8 +487,12 @@ mod tests {
                 .push(agent.map(str::to_owned));
             Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
         }
-        fn board_tool(&self, name: &str, _args: &Value) -> Result<Value, String> {
-            Ok(json!({ "ok": true, "exit_code": 0, "tool": name }))
+        fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
+            Ok(crate::board::mcp_invoke(
+                std::path::Path::new("/tmp"),
+                name,
+                args,
+            ))
         }
     }
 
@@ -480,6 +503,9 @@ mod tests {
     // TC-3113 / FR-3113: board MCP tools are listed and callable.
     #[test]
     fn tc_3113_mcp_board_tools_listed_and_mapped() {
+        let state_home = tempfile::tempdir().unwrap();
+        // SAFETY: test-only mutation of the process environment.
+        unsafe { std::env::set_var("XDG_STATE_HOME", state_home.path()) };
         let stub = Stub::default();
         let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
         let names: Vec<&str> = list["result"]["tools"]
@@ -491,12 +517,18 @@ mod tests {
         for name in ["board_add", "board_wait"] {
             assert!(names.contains(&name));
         }
-        let call = call(
+        let ok_call = call(
             &stub,
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"debug"}}}),
         );
-        assert_eq!(call["result"]["structuredContent"]["ok"], true);
-        assert_eq!(call["result"]["structuredContent"]["tool"], "board_add");
+        assert_eq!(ok_call["result"]["structuredContent"]["ok"], true);
+        let bad = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"not-a-kind"}}}),
+        );
+        assert_eq!(bad["result"]["isError"], true);
+        assert_eq!(bad["result"]["structuredContent"]["exit_code"], 2);
+        assert!(names.contains(&"board_prompt"));
     }
 
     // TC-768 / FR-767: initialize, tools/list, tools/call for every tool,

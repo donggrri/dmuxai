@@ -54,11 +54,20 @@ pub fn write_pending_plan(state: &Path, plan: &PendingPlanFile) -> Result<String
     let dir = state.join("graph-pending");
     crate::board::store::ensure_dir(&dir)?;
     let path = dir.join(format!("{hash}.json"));
-    if !path.exists() {
-        let json = serde_json::to_string(plan).map_err(|e| BoardError::Internal(e.to_string()))?;
-        crate::board::store::atomic_write(&path, json.as_bytes())?;
-    }
+    let json = serde_json::to_string(plan).map_err(|e| BoardError::Internal(e.to_string()))?;
+    crate::board::store::atomic_write(&path, json.as_bytes())?;
     Ok(hash)
+}
+
+pub fn unmasked_prompt_from_item_plan(
+    state_root: &Path,
+    plan: Option<&super::BoardPlan>,
+) -> Result<Option<String>, BoardError> {
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    let pending = read_pending_plan(state_root, &plan.hash)?;
+    Ok(Some(pending.prompt))
 }
 
 /// Runner list and model hints for board plan edits. This is a pre-check only;
@@ -89,6 +98,9 @@ impl PlanValidationCtx {
 
     fn effective_model(&self, runner: &str) -> Option<String> {
         let key = runner.trim().to_ascii_lowercase();
+        if let Some(model) = self.settings.runner_models.get(&key) {
+            return Some(model.clone());
+        }
         if let Some(spec) = self
             .settings
             .custom_agents
@@ -108,8 +120,9 @@ pub fn edit_plan_from_json(
     state_root: &Path,
     stored_prompt: &str,
     json_text: &str,
+    inherit_tasks: Option<Vec<PlanTask>>,
 ) -> Result<(PendingPlanFile, String), BoardError> {
-    let doc = parse_plan(json_text).map_err(|errors| {
+    let mut doc = parse_plan(json_text).map_err(|errors| {
         BoardError::Failed(
             errors
                 .iter()
@@ -118,6 +131,11 @@ pub fn edit_plan_from_json(
                 .join("\n"),
         )
     })?;
+    if doc.tasks.is_empty()
+        && let Some(tasks) = inherit_tasks
+    {
+        doc.tasks = tasks;
+    }
     let settings = DmuxSettings::load(workspace_root);
     let holder = PlanValidationCtx::from_settings(&settings);
     let cap = settings.graph_max_nodes.clamp(1, 8) as usize;
@@ -222,18 +240,22 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state.clone(),
             })
             .unwrap();
         let (_, hash) =
-            edit_plan_from_json(&workspace, &state, "ship it", &sample_plan_json()).unwrap();
-        let updated = store.attach_plan(&item.id, &hash, &state).unwrap();
+            edit_plan_from_json(&workspace, &state, "ship it", &sample_plan_json(), None).unwrap();
+        let updated = store
+            .attach_plan(&item.id, &hash, &state, "bot:test")
+            .unwrap();
         assert_eq!(updated.plan.as_ref().unwrap().revision, 1);
         let revised_json = sample_plan_json().replace("\"edit\"", "\"edit-more\"");
-        let (_, hash2) = edit_plan_from_json(&workspace, &state, "ship it", &revised_json).unwrap();
+        let (_, hash2) =
+            edit_plan_from_json(&workspace, &state, "ship it", &revised_json, None).unwrap();
         let edited = store
-            .edit_plan(&item.id, &hash2, &workspace, &state)
+            .edit_plan(&item.id, &hash2, &workspace, &state, "bot:test")
             .unwrap();
         assert_eq!(edited.plan.as_ref().unwrap().revision, 2);
         assert_ne!(hash, hash2);

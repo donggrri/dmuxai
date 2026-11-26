@@ -73,6 +73,10 @@ pub fn invoke(workspace_root: &std::path::Path, name: &str, args: &Value) -> Val
             Ok(v) => board_ok_json(v),
             Err(e) => board_err_json(e),
         },
+        "board_prompt" => match board_prompt(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
         other => board_err_json(ApiError::new(
             exit::USAGE,
             format!("unknown board tool: {other}"),
@@ -121,6 +125,7 @@ fn board_add(workspace_root: &std::path::Path, args: &Value) -> Result<Value, Ap
             recommendation: str_arg(args, "recommendation").map(str::to_owned),
             options,
             plan_hash: str_arg(args, "plan_hash").map(str::to_owned),
+            key: str_arg(args, "key").map(str::to_owned),
             by,
             state_root,
         })
@@ -130,17 +135,20 @@ fn board_add(workspace_root: &std::path::Path, args: &Value) -> Result<Value, Ap
 
 fn board_list(args: &Value) -> Result<Value, ApiError> {
     let store = open_board_store()?;
-    let lanes: Vec<Lane> = args
-        .get("lane")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .filter_map(Lane::parse)
-                .collect()
-        })
-        .unwrap_or_default();
+    let lanes: Vec<Lane> = if let Some(items) = args.get("lane").and_then(Value::as_array) {
+        items
+            .iter()
+            .map(|v| {
+                let lane = v.as_str().ok_or_else(|| {
+                    ApiError::new(exit::USAGE, "lane must be a string".to_owned())
+                })?;
+                Lane::parse(lane)
+                    .ok_or_else(|| ApiError::new(exit::USAGE, format!("invalid lane '{lane}'")))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let workspace = str_arg(args, "workspace").map(PathBuf::from);
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let items = store
@@ -182,8 +190,18 @@ fn board_update(_workspace_root: &std::path::Path, args: &Value) -> Result<Value
                             .collect()
                     })
                 }),
-                grade: None,
-                kind: str_arg(args, "kind").and_then(Kind::parse),
+                grade: match str_arg(args, "grade") {
+                    None | Some("") => None,
+                    Some(g) => Some(Some(Grade::parse(g).ok_or_else(|| {
+                        ApiError::new(exit::USAGE, format!("invalid grade '{g}'"))
+                    })?)),
+                },
+                kind: match str_arg(args, "kind") {
+                    None => None,
+                    Some(k) => Some(Kind::parse(k).ok_or_else(|| {
+                        ApiError::new(exit::USAGE, format!("invalid kind '{k}'"))
+                    })?),
+                },
                 run_id: str_arg(args, "run_id").map(str::to_owned),
                 if_version: args
                     .get("if_version")
@@ -204,7 +222,13 @@ fn board_move(args: &Value) -> Result<Value, ApiError> {
         .ok_or_else(|| ApiError::new(exit::USAGE, "lane is required".to_owned()))?;
     let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
-    let item = store.move_lane(id, lane, &by).map_err(ApiError::from)?;
+    let if_version = args
+        .get("if_version")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let item = store
+        .move_lane(id, lane, &by, if_version)
+        .map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }
 
@@ -215,30 +239,48 @@ fn board_plan(workspace_root: &std::path::Path, args: &Value) -> Result<Value, A
     let state_root = crate::state_path::state_base()
         .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
     let item = if let Some(hash) = str_arg(args, "hash") {
+        let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
         store
-            .attach_plan(id, hash, &state_root)
+            .attach_plan(id, hash, &state_root, &by)
             .map_err(ApiError::from)?
     } else if let Some(steps) = args.get("steps") {
-        let prompt = store
-            .get(id)
-            .map_err(ApiError::from)?
-            .plan
-            .map(|p| p.prompt)
-            .unwrap_or_else(|| str_arg(args, "prompt").unwrap_or_default().to_owned());
+        let item = store.get(id).map_err(ApiError::from)?;
+        let ws = item
+            .workspace
+            .path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root.to_path_buf());
+        let prompt = if let Some(prompt) = str_arg(args, "prompt") {
+            super::read_path_or_stdin(prompt).map_err(ApiError::from)?
+        } else {
+            super::plan::unmasked_prompt_from_item_plan(&state_root, item.plan.as_ref())
+                .map_err(ApiError::from)?
+                .unwrap_or_default()
+        };
+        if prompt.trim().is_empty() {
+            return Err(ApiError::new(
+                exit::USAGE,
+                "board_plan edit needs prompt when the item has no plan".to_owned(),
+            ));
+        }
+        let inherit_tasks = item.plan.as_ref().map(|p| p.tasks.clone());
         let mut doc = json!({ "steps": steps });
         if let Some(tasks) = args.get("tasks") {
             doc["tasks"] = tasks.clone();
         }
+        let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
         let (_pending, hash) = edit_plan_from_json(
-            workspace_root,
+            &ws,
             &state_root,
             &prompt,
             &serde_json::to_string(&doc)
                 .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?,
+            inherit_tasks,
         )
         .map_err(ApiError::from)?;
         store
-            .edit_plan(id, &hash, workspace_root, &state_root)
+            .edit_plan(id, &hash, &ws, &state_root, &by)
             .map_err(ApiError::from)?
     } else {
         return Err(ApiError::new(
@@ -293,6 +335,16 @@ fn board_say(args: &Value) -> Result<Value, ApiError> {
         )
         .map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+}
+
+fn board_prompt(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id")
+        .ok_or_else(|| ApiError::new(exit::USAGE, "id is required".to_owned()))?;
+    super::validate_item_id_early(id).map_err(ApiError::from)?;
+    let hash = str_arg(args, "hash");
+    let store = open_board_store()?;
+    let prompt = store.unmasked_prompt(id, hash).map_err(ApiError::from)?;
+    Ok(json!({ "prompt": prompt }))
 }
 
 fn board_wait(args: &Value) -> Result<Value, ApiError> {

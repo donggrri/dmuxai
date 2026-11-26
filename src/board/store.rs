@@ -11,7 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use serde::{Deserialize, Serialize};
 
-use super::plan::{board_plan_from_pending, read_pending_plan};
+use super::plan::{board_plan_from_pending, pending_hash_for_plan, read_pending_plan};
 use super::rules::RulesStore;
 use super::{
     BoardError, BoardItem, CLOSED_HIDE_DAYS, Decision, Kind, Lane, Source, THREAD_MAX,
@@ -35,6 +35,7 @@ pub struct AddItemRequest {
     pub recommendation: Option<String>,
     pub options: Vec<String>,
     pub plan_hash: Option<String>,
+    pub key: Option<String>,
     pub by: String,
     pub state_root: PathBuf,
 }
@@ -91,6 +92,17 @@ pub struct WaitFilter {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WaitEvent {
+    pub seq: u64,
+    pub item_id: String,
+    pub kind: String,
+    pub by: String,
+    pub version: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitEventAny {
+    pub seq: u64,
+    pub item_id: String,
     pub kind: String,
     pub by: String,
     pub version: u32,
@@ -136,7 +148,33 @@ pub struct BoardStore {
 }
 
 pub fn ensure_dir(path: &Path) -> Result<(), BoardError> {
+    crate::run_journal::verify_no_symlinks(path).map_err(|e| BoardError::Usage(e.to_string()))?;
+    if crate::run_journal::is_symlink(path).unwrap_or(false) {
+        return Err(BoardError::Usage(format!(
+            "refusing symlinked board path at {}",
+            path.display()
+        )));
+    }
     if path.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if path.is_dir() {
+                let mode = fs::metadata(path)
+                    .map_err(|e| BoardError::Internal(e.to_string()))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                if mode != 0o700 {
+                    let mut perms = fs::metadata(path)
+                        .map_err(|e| BoardError::Internal(e.to_string()))?
+                        .permissions();
+                    perms.set_mode(0o700);
+                    fs::set_permissions(path, perms)
+                        .map_err(|e| BoardError::Internal(e.to_string()))?;
+                }
+            }
+        }
         return Ok(());
     }
     let mut builder = fs::DirBuilder::new();
@@ -254,9 +292,13 @@ impl BoardStore {
         handle
             .read_to_end(&mut tail)
             .map_err(|e| BoardError::Internal(e.to_string()))?;
-        let text = String::from_utf8_lossy(&tail);
         let mut last = 0u64;
-        for line in text.lines() {
+        let mut scan_text = String::from_utf8_lossy(&tail).into_owned();
+        if len > scan && !tail.ends_with(b"\n") {
+            scan_text = fs::read_to_string(&self.events_path)
+                .map_err(|e| BoardError::Internal(e.to_string()))?;
+        }
+        for line in scan_text.lines() {
             if let Ok(event) = serde_json::from_str::<BoardEvent>(line) {
                 last = last.max(event.seq);
             }
@@ -336,8 +378,18 @@ impl BoardStore {
             ));
         }
         self.with_lock(|store| {
+            if let Some(key) = &req.key
+                && let Some(existing) = store.find_item_by_key(key, req.source_bot.as_deref())?
+            {
+                return Ok(existing);
+            }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
+                if req.by != "owner" && matches!(lane, Lane::Auto | Lane::Approved) {
+                    return Err(BoardError::Forbidden(
+                        "only the owner may set lane auto or approved".to_owned(),
+                    ));
+                }
                 lane
             } else {
                 rules.initial_lane(req.kind, req.grade, &req.title)?
@@ -362,13 +414,19 @@ impl BoardStore {
                 decision: None,
                 thread: Vec::new(),
                 run_ids: Vec::new(),
+                key: req.key.clone(),
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
                 version: 1,
             };
             if let Some(hash) = req.plan_hash {
                 let pending = read_pending_plan(&req.state_root, &hash)?;
+                let computed = pending_hash_for_plan(&pending)?;
+                if computed != hash {
+                    return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
+                }
                 item.plan = Some(board_plan_from_pending(pending, hash, None));
+                store.clear_decision_on_plan_change(&mut item);
             }
             mask_item_fields(&mut item);
             store.save_item_inner(&item)?;
@@ -466,12 +524,27 @@ impl BoardStore {
         })
     }
 
-    pub fn move_lane(&self, id: &str, lane: Lane, by: &str) -> Result<BoardItem, BoardError> {
+    pub fn move_lane(
+        &self,
+        id: &str,
+        lane: Lane,
+        by: &str,
+        if_version: Option<u32>,
+    ) -> Result<BoardItem, BoardError> {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
+        enforce_sensitive_lane_move(by, lane)?;
         self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
+            if let Some(expected) = if_version
+                && item.version != expected
+            {
+                return Err(BoardError::Conflict(format!(
+                    "version mismatch (expected {expected}, found {})",
+                    item.version
+                )));
+            }
             item.lane = lane;
             item.version += 1;
             item.updated_ms = now_ms();
@@ -486,6 +559,7 @@ impl BoardStore {
         id: &str,
         hash: &str,
         state_root: &Path,
+        by: &str,
     ) -> Result<BoardItem, BoardError> {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
@@ -493,12 +567,17 @@ impl BoardStore {
         self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             let pending = read_pending_plan(state_root, hash)?;
+            let computed = pending_hash_for_plan(&pending)?;
+            if computed != hash {
+                return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
+            }
             let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
             item.plan = Some(plan);
+            store.clear_decision_on_plan_change(&mut item);
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
-            store.append_event(id, EventKind::Plan, item.version, "bot:coordinator")?;
+            store.append_event(id, EventKind::Plan, item.version, by)?;
             Ok(item)
         })
     }
@@ -509,36 +588,203 @@ impl BoardStore {
         hash: &str,
         _workspace: &Path,
         _state_root: &Path,
+        by: &str,
     ) -> Result<BoardItem, BoardError> {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
         self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
-            let prompt = item
-                .plan
-                .as_ref()
-                .map(|p| p.prompt.clone())
-                .unwrap_or_default();
             let pending = read_pending_plan(_state_root, hash)?;
-            if pending.prompt != prompt && !prompt.is_empty() && pending.prompt != prompt {
-                // keep item prompt as source of truth
-            }
-            let mut pending = pending;
-            if !prompt.is_empty() {
-                pending.prompt = prompt.clone();
+            let computed = pending_hash_for_plan(&pending)?;
+            if computed != hash {
+                return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
             }
             let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
             item.plan = Some(plan);
-            if item.lane != Lane::Auto {
-                item.lane = Lane::NeedsDecision;
-            }
+            store.clear_decision_on_plan_change(&mut item);
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
-            store.append_event(id, EventKind::Plan, item.version, "bot:coordinator")?;
+            store.append_event(id, EventKind::Plan, item.version, by)?;
             Ok(item)
         })
+    }
+
+    pub fn unmasked_prompt(&self, id: &str, hash: Option<&str>) -> Result<String, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        let item = self.load_item_inner(id)?;
+        let plan_hash = if let Some(hash) = hash {
+            if !valid_pending_plan_hash(hash) {
+                return Err(BoardError::Usage(
+                    "plan hash must be 16 lowercase hex characters".to_owned(),
+                ));
+            }
+            let current = item.plan.as_ref().map(|p| p.hash.as_str());
+            let in_history = item
+                .plan
+                .as_ref()
+                .map(|p| p.history.iter().any(|h| h == hash))
+                .unwrap_or(false);
+            if current != Some(hash) && !in_history {
+                return Err(BoardError::NotFound(
+                    "plan hash is not current or in history".to_owned(),
+                ));
+            }
+            hash.to_owned()
+        } else {
+            item.plan
+                .as_ref()
+                .map(|p| p.hash.clone())
+                .ok_or_else(|| BoardError::NotFound("item has no plan".to_owned()))?
+        };
+        let state_root =
+            crate::state_path::state_base().map_err(|e| BoardError::Internal(e.to_string()))?;
+        let pending = read_pending_plan(&state_root, &plan_hash)?;
+        Ok(pending.prompt)
+    }
+
+    fn clear_decision_on_plan_change(&self, item: &mut BoardItem) {
+        item.decision = None;
+        if item.lane == Lane::Approved || item.lane != Lane::Auto {
+            item.lane = Lane::NeedsDecision;
+        }
+    }
+
+    fn find_item_by_key(
+        &self,
+        key: &str,
+        bot: Option<&str>,
+    ) -> Result<Option<BoardItem>, BoardError> {
+        for entry in
+            fs::read_dir(&self.items_dir).map_err(|e| BoardError::Internal(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BoardError::Internal(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|e| BoardError::Internal(e.to_string()))?;
+            let item: BoardItem = serde_json::from_slice(&bytes)
+                .map_err(|e| BoardError::Internal(format!("invalid item: {e}")))?;
+            if item.key.as_deref() == Some(key)
+                && bot
+                    .map(|b| item.source.bot.as_deref() == Some(b))
+                    .unwrap_or(true)
+            {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn list_events(&self, since_seq: u64) -> Result<Vec<WaitEventAny>, BoardError> {
+        if !self.events_path.exists() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&self.events_path)
+            .map_err(|e| BoardError::Internal(e.to_string()))?;
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<BoardEvent>(line) else {
+                continue;
+            };
+            if event.seq <= since_seq {
+                continue;
+            }
+            let kind = serde_json::to_value(&event.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned());
+            out.push(WaitEventAny {
+                seq: event.seq,
+                item_id: event.item_id,
+                kind,
+                by: event.by,
+                version: event.version,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn with_rules_lock<T>(
+        &self,
+        work: impl FnOnce() -> Result<T, BoardError>,
+    ) -> Result<T, BoardError> {
+        self.with_lock(|_| work())
+    }
+
+    pub fn wait_any(
+        &self,
+        since_seq: u64,
+        filter: WaitFilter,
+    ) -> Result<Option<(WaitEventAny, BoardItem)>, BoardError> {
+        let deadline = Instant::now() + Duration::from_secs(filter.timeout_secs);
+        let mut file_offset = 0u64;
+        loop {
+            if let Some(event) =
+                self.poll_events_any(&filter, since_seq, file_offset, &mut file_offset)?
+            {
+                let item = self.get(&event.item_id)?;
+                return Ok(Some((event, item)));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn poll_events_any(
+        &self,
+        filter: &WaitFilter,
+        since_seq: u64,
+        read_from: u64,
+        file_offset: &mut u64,
+    ) -> Result<Option<WaitEventAny>, BoardError> {
+        if !self.events_path.exists() {
+            return Ok(None);
+        }
+        let len = fs::metadata(&self.events_path)
+            .map_err(|e| BoardError::Internal(e.to_string()))?
+            .len();
+        if len <= read_from {
+            return Ok(None);
+        }
+        let mut file =
+            File::open(&self.events_path).map_err(|e| BoardError::Internal(e.to_string()))?;
+        file.seek(SeekFrom::Start(read_from))
+            .map_err(|e| BoardError::Internal(e.to_string()))?;
+        let byte_count = (len - read_from) as usize;
+        let mut buf = vec![0u8; byte_count];
+        file.read_exact(&mut buf)
+            .map_err(|e| BoardError::Internal(e.to_string()))?;
+        let Some(last_nl) = buf.iter().rposition(|&b| b == b'\n') else {
+            return Ok(None);
+        };
+        *file_offset = read_from + (last_nl as u64) + 1;
+        let text = String::from_utf8_lossy(&buf[..=last_nl]);
+        let mut last_match = None;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(event) = serde_json::from_str::<BoardEvent>(line) else {
+                continue;
+            };
+            if event.seq <= since_seq {
+                continue;
+            }
+            if let Some(trigger) = wait_trigger_for_event_any(&event, filter) {
+                last_match = Some(trigger);
+            }
+        }
+        Ok(last_match)
     }
 
     pub fn decide(&self, id: &str, req: DecideRequest) -> Result<BoardItem, BoardError> {
@@ -547,6 +793,11 @@ impl BoardStore {
         }
         self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
+            if req.by == "planner" {
+                return Err(BoardError::Forbidden(
+                    "planner cannot record decisions".to_owned(),
+                ));
+            }
             if matches!(req.verdict, Verdict::Approve)
                 && req.by.starts_with("bot:")
                 && item.lane != Lane::Auto
@@ -555,7 +806,16 @@ impl BoardStore {
                     "bots may approve only items in the auto lane".to_owned(),
                 ));
             }
-            if let Some(hash) = &req.plan_hash {
+            if matches!(req.verdict, Verdict::Approve)
+                && let Some(plan) = &item.plan
+            {
+                let hash = req.plan_hash.as_deref().unwrap_or(plan.hash.as_str());
+                if hash != plan.hash {
+                    return Err(BoardError::Conflict(
+                        "plan hash does not match the current plan".to_owned(),
+                    ));
+                }
+            } else if let Some(hash) = &req.plan_hash {
                 let current = item.plan.as_ref().map(|p| p.hash.as_str());
                 if current != Some(hash.as_str()) {
                     return Err(BoardError::Conflict(
@@ -647,6 +907,9 @@ impl BoardStore {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
+        if self.load_item_inner(id).is_err() {
+            return Err(BoardError::NotFound("board item not found".to_owned()));
+        }
         let deadline = Instant::now() + Duration::from_secs(filter.timeout_secs);
         let mut file_offset = 0u64;
         let mut history_scanned = false;
@@ -715,6 +978,10 @@ impl BoardStore {
     }
 }
 
+fn actor_wakes_waiter(by: &str) -> bool {
+    by == "owner" || by == "planner"
+}
+
 fn wait_trigger_for_event(event: &BoardEvent, id: &str, filter: &WaitFilter) -> Option<WaitEvent> {
     if event.item_id != id || event.version <= filter.since_version {
         return None;
@@ -722,12 +989,49 @@ fn wait_trigger_for_event(event: &BoardEvent, id: &str, filter: &WaitFilter) -> 
     if event.by == filter.waiter {
         return None;
     }
+    if !actor_wakes_waiter(&event.by) {
+        return None;
+    }
     let matches = match filter.wait_for {
         WaitFor::Decision => matches!(event.kind, EventKind::Decision),
         WaitFor::Message => matches!(event.kind, EventKind::Message),
         WaitFor::Any => matches!(
             event.kind,
-            EventKind::Decision | EventKind::Message | EventKind::Plan
+            EventKind::Decision | EventKind::Message | EventKind::Plan | EventKind::Lane
+        ),
+    };
+    if !matches {
+        return None;
+    }
+    if matches!(event.kind, EventKind::Lane) && filter.wait_for != WaitFor::Any {
+        return None;
+    }
+    let kind = serde_json::to_value(&event.kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned());
+    Some(WaitEvent {
+        seq: event.seq,
+        item_id: event.item_id.clone(),
+        kind,
+        by: event.by.clone(),
+        version: event.version,
+    })
+}
+
+fn wait_trigger_for_event_any(event: &BoardEvent, filter: &WaitFilter) -> Option<WaitEventAny> {
+    if event.by == filter.waiter {
+        return None;
+    }
+    if !actor_wakes_waiter(&event.by) {
+        return None;
+    }
+    let matches = match filter.wait_for {
+        WaitFor::Decision => matches!(event.kind, EventKind::Decision),
+        WaitFor::Message => matches!(event.kind, EventKind::Message),
+        WaitFor::Any => matches!(
+            event.kind,
+            EventKind::Decision | EventKind::Message | EventKind::Plan | EventKind::Lane
         ),
     };
     if !matches {
@@ -737,11 +1041,25 @@ fn wait_trigger_for_event(event: &BoardEvent, id: &str, filter: &WaitFilter) -> 
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".to_owned());
-    Some(WaitEvent {
+    Some(WaitEventAny {
+        seq: event.seq,
+        item_id: event.item_id.clone(),
         kind,
         by: event.by.clone(),
         version: event.version,
     })
+}
+
+fn enforce_sensitive_lane_move(by: &str, lane: Lane) -> Result<(), BoardError> {
+    if by == "owner" || by == "planner" {
+        return Ok(());
+    }
+    if matches!(lane, Lane::Auto | Lane::Approved) {
+        return Err(BoardError::Forbidden(
+            "bots may not move items into auto or approved".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn workspace_from_path(path: Option<&Path>) -> Result<WorkspaceRef, BoardError> {
@@ -750,6 +1068,8 @@ fn workspace_from_path(path: Option<&Path>) -> Result<WorkspaceRef, BoardError> 
     };
     let canonical = normalize_workspace_path(path)
         .map_err(|e| BoardError::Usage(format!("invalid workspace: {e}")))?;
+    crate::workspace::check_workspace_denied(std::path::Path::new(&canonical))
+        .map_err(|e| BoardError::Usage(e.to_string()))?;
     let key = repo_key(path).map_err(|e| BoardError::Internal(e.to_string()))?;
     Ok(WorkspaceRef {
         path: Some(canonical),
@@ -793,6 +1113,7 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state,
             })
@@ -835,6 +1156,7 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state,
             })
@@ -897,6 +1219,7 @@ mod tests {
                 recommendation: None,
                 options: vec!["a".to_owned()],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state.clone(),
             })
@@ -925,7 +1248,9 @@ mod tests {
             }],
         };
         let hash = write_pending_plan(&state, &plan).unwrap();
-        let item = store.attach_plan(&item.id, &hash, &state).unwrap();
+        let item = store
+            .attach_plan(&item.id, &hash, &state, "bot:test")
+            .unwrap();
         assert!(
             store
                 .decide(
@@ -989,6 +1314,7 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state,
             })
@@ -1023,12 +1349,13 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state,
             })
             .unwrap();
         let moved = store
-            .move_lane(&item.id, Lane::InProgress, "owner")
+            .move_lane(&item.id, Lane::InProgress, "owner", None)
             .unwrap();
         assert_eq!(moved.lane, Lane::InProgress);
         assert!(
@@ -1068,6 +1395,7 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state,
             })
@@ -1103,6 +1431,7 @@ mod tests {
                 recommendation: None,
                 options: vec![],
                 plan_hash: None,
+                key: None,
                 by: "bot:test".to_owned(),
                 state_root: state,
             })
@@ -1253,6 +1582,7 @@ mod tests {
                     recommendation: None,
                     options: vec![],
                     plan_hash: None,
+                    key: None,
                     by: "bot:test".to_owned(),
                     state_root: state.clone(),
                 })

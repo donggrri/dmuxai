@@ -102,6 +102,7 @@ pub enum BoardOp {
         recommendation: Option<String>,
         options: Vec<String>,
         plan_hash: Option<String>,
+        key: Option<String>,
     },
     List {
         lanes: Vec<String>,
@@ -126,11 +127,13 @@ pub enum BoardOp {
     Move {
         id: String,
         lane: String,
+        if_version: Option<u32>,
     },
     Plan {
         id: String,
         hash: Option<String>,
         edit: Option<String>,
+        prompt: Option<String>,
     },
     Decide {
         id: String,
@@ -146,11 +149,20 @@ pub enum BoardOp {
         from: Option<String>,
     },
     Wait {
-        id: String,
+        id: Option<String>,
+        any: bool,
         since_version: Option<u32>,
+        since_seq: Option<u64>,
         timeout_secs: u64,
         wait_for: String,
         waiter: Option<String>,
+    },
+    Events {
+        since_seq: u64,
+    },
+    Prompt {
+        id: String,
+        hash: Option<String>,
     },
     Rules {
         set: Option<String>,
@@ -269,8 +281,10 @@ Subcommands:
   plan       Attach (--hash) or edit (--edit) a graph plan
   decide     Record approve|reject|request_changes|answer
   say        Append a thread message
-  wait       Block until owner/planner activity
-  rules      Print or replace classification rules
+  wait       Block until owner/planner activity (--any for any item)
+  events     List board events (--since SEQ)
+  prompt     Print unmasked plan prompt for piping into run
+  rules      Print or replace classification rules (owner only for --set)
 
 Run `dmuxai board <subcommand> --help` for details.
 ";
@@ -278,7 +292,7 @@ Run `dmuxai board <subcommand> --help` for details.
 pub const BOARD_ADD_USAGE: &str = "\
 Usage: dmuxai board add --title T [--summary S|-] --kind K [--grade G] [--lane L] \
 [--bot NAME] [--channel C] [--ref URL] [-C DIR] [--recommend TEXT] [--option TEXT]... \
-[--plan-hash H] [--json]
+[--plan-hash H] [--key K] [--json]
 ";
 
 pub const BOARD_LIST_USAGE: &str = "\
@@ -312,8 +326,16 @@ Usage: dmuxai board say <id> --text T|- [--from owner|bot:NAME|planner] [--json]
 ";
 
 pub const BOARD_WAIT_USAGE: &str = "\
-Usage: dmuxai board wait <id> [--since-version N] [--timeout SECS] \
+Usage: dmuxai board wait <id>|--any [--since-version N] [--since-seq S] [--timeout SECS] \
 [--for decision|message|any] [--as bot:NAME] [--json]
+";
+
+pub const BOARD_EVENTS_USAGE: &str = "\
+Usage: dmuxai board events [--since SEQ] [--json]
+";
+
+pub const BOARD_PROMPT_USAGE: &str = "\
+Usage: dmuxai board prompt <id> [--hash H] [--json]
 ";
 
 pub const BOARD_RULES_USAGE: &str = "\
@@ -701,6 +723,8 @@ pub fn board_subcommand_usage(subcommand: &str) -> &'static str {
         "decide" => BOARD_DECIDE_USAGE,
         "say" => BOARD_SAY_USAGE,
         "wait" => BOARD_WAIT_USAGE,
+        "events" => BOARD_EVENTS_USAGE,
+        "prompt" => BOARD_PROMPT_USAGE,
         "rules" => BOARD_RULES_USAGE,
         _ => BOARD_USAGE,
     }
@@ -1296,6 +1320,11 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     hidden: false,
                 },
                 FlagSpec {
+                    names: &["--key"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
                     names: &["--json"],
                     takes_value: false,
                     hidden: false,
@@ -1339,6 +1368,7 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     recommendation: parsed.flags.get("--recommend").cloned().flatten(),
                     options,
                     plan_hash: parsed.flags.get("--plan-hash").cloned().flatten(),
+                    key: parsed.flags.get("--key").cloned().flatten(),
                 },
             })
         }
@@ -1478,7 +1508,19 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
             })
         }
         "move" => {
-            let parsed = parse_flags(rest, BOARD_JSON_FLAG, true)?;
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--if-version"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
             let id = parsed
                 .positionals
                 .first()
@@ -1489,9 +1531,20 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 .get(1)
                 .cloned()
                 .ok_or_else(|| "board move needs a lane".to_owned())?;
+            let if_version = parsed
+                .flags
+                .get("--if-version")
+                .and_then(|v| v.as_deref())
+                .map(|raw| raw.parse::<u32>())
+                .transpose()
+                .map_err(|_| "--if-version must be a number".to_owned())?;
             Ok(BoardCommand {
                 json: parsed.flags.contains_key("--json"),
-                op: BoardOp::Move { id, lane },
+                op: BoardOp::Move {
+                    id,
+                    lane,
+                    if_version,
+                },
             })
         }
         "plan" => {
@@ -1503,6 +1556,11 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 },
                 FlagSpec {
                     names: &["--edit"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--prompt"],
                     takes_value: true,
                     hidden: false,
                 },
@@ -1524,6 +1582,7 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     id,
                     hash: parsed.flags.get("--hash").cloned().flatten(),
                     edit: parsed.flags.get("--edit").cloned().flatten(),
+                    prompt: parsed.flags.get("--prompt").cloned().flatten(),
                 },
             })
         }
@@ -1641,6 +1700,16 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     hidden: false,
                 },
                 FlagSpec {
+                    names: &["--any"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--since-seq"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
                     names: &["--as"],
                     takes_value: true,
                     hidden: false,
@@ -1652,11 +1721,18 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 },
             ];
             let parsed = parse_flags(rest, FLAGS, true)?;
-            let id = parsed
-                .positionals
-                .first()
-                .cloned()
-                .ok_or_else(|| "board wait needs an id".to_owned())?;
+            let any = parsed.flags.contains_key("--any");
+            let id = parsed.positionals.first().cloned();
+            if !any && id.is_none() {
+                return Err("board wait needs an id or --any".to_owned());
+            }
+            let since_seq = parsed
+                .flags
+                .get("--since-seq")
+                .and_then(|v| v.as_deref())
+                .map(|raw| raw.parse::<u64>())
+                .transpose()
+                .map_err(|_| "--since-seq must be a number".to_owned())?;
             let since_version = parsed
                 .flags
                 .get("--since-version")
@@ -1682,10 +1758,66 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 json: parsed.flags.contains_key("--json"),
                 op: BoardOp::Wait {
                     id,
+                    any,
                     since_version,
+                    since_seq,
                     timeout_secs,
                     wait_for,
                     waiter: parsed.flags.get("--as").cloned().flatten(),
+                },
+            })
+        }
+        "events" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--since"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, false)?;
+            let since_seq = parsed
+                .flags
+                .get("--since")
+                .and_then(|v| v.as_deref())
+                .map(|raw| raw.parse::<u64>())
+                .transpose()
+                .map_err(|_| "--since must be a number".to_owned())?
+                .unwrap_or(0);
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Events { since_seq },
+            })
+        }
+        "prompt" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--hash"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board prompt needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Prompt {
+                    id,
+                    hash: parsed.flags.get("--hash").cloned().flatten(),
                 },
             })
         }
@@ -2485,10 +2617,6 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
     } else {
         BoardCaller::CliNonTty
     };
-    let store = match agent_api::open_board_store() {
-        Ok(store) => store,
-        Err(error) => return fail(error, json_out),
-    };
     let state_root = match dmuxai::state_path::state_base() {
         Ok(path) => path,
         Err(error) => {
@@ -2496,315 +2624,456 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
         }
     };
 
-    let result: Result<(), ApiError> = (|| match command.op {
-        BoardOp::Add {
-            title,
-            summary,
-            kind,
-            grade,
-            lane,
-            bot,
-            channel,
-            ref_url,
-            workspace,
-            recommendation,
-            options,
-            plan_hash,
-        } => {
-            let kind = Kind::parse(&kind)
-                .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --kind".to_owned()))?;
-            let grade = match grade.as_deref() {
-                None => None,
-                Some(g) => Some(
-                    Grade::parse(g)
-                        .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --grade".to_owned()))?,
-                ),
-            };
-            let lane = match lane.as_deref() {
-                None => None,
-                Some(l) => Some(
-                    Lane::parse(l)
-                        .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --lane".to_owned()))?,
-                ),
-            };
-            let summary = read_prompt(&summary)?;
-            let ws = workspace.unwrap_or_else(|| workspace_root.to_path_buf());
-            let item = store
-                .add(AddItemRequest {
-                    title,
-                    summary,
-                    kind,
-                    grade,
-                    lane,
-                    source_bot: bot,
-                    source_channel: channel,
-                    source_ref: ref_url,
-                    workspace: Some(ws),
-                    recommendation,
-                    options,
-                    plan_hash,
-                    by: default_actor_by(caller),
-                    state_root: state_root.clone(),
-                })
-                .map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            } else {
-                println!("{}", item.id);
-            }
-            Ok(())
-        }
-        BoardOp::List {
-            lanes,
-            workspace,
-            all,
-        } => {
-            let lanes: Result<Vec<Lane>, ApiError> = lanes
-                .iter()
-                .map(|l| {
-                    Lane::parse(l)
-                        .ok_or_else(|| ApiError::new(exit::USAGE, format!("invalid lane '{l}'")))
-                })
-                .collect();
-            let lanes = lanes?;
-            let items = store
-                .list(&dmuxai::board::ListFilter {
-                    lanes,
-                    workspace,
-                    include_all: all,
-                })
-                .map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&items).unwrap_or(Value::Null));
-            } else {
-                for item in items {
-                    println!(
-                        "{}\t{}\t{}\t{}",
-                        item.id,
-                        item.lane.as_str(),
-                        item.kind.as_str(),
-                        item.title
-                    );
-                }
-            }
-            Ok(())
-        }
-        BoardOp::Show { id } => {
-            let item = store.get(&id).map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            } else {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&item).unwrap_or_default()
-                );
-            }
-            Ok(())
-        }
-        BoardOp::Update {
-            id,
-            title,
-            summary,
-            recommendation,
-            options,
-            replace_options,
-            grade,
-            kind,
-            run_id,
-            if_version,
-        } => {
-            let by = default_actor_by(caller);
-            let summary = summary.map(|s| read_prompt(&s)).transpose()?;
-            let grade = grade
-                .map(|g| {
-                    if g.is_empty() {
-                        Ok(None)
-                    } else {
-                        Grade::parse(&g)
-                            .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --grade".to_owned()))
-                            .map(Some)
-                    }
-                })
-                .transpose()?;
-            let kind = kind
-                .map(|k| {
-                    Kind::parse(&k)
-                        .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --kind".to_owned()))
-                })
-                .transpose()?;
-            let item = store
-                .update(
-                    &id,
-                    UpdateItemRequest {
+    let result: Result<(), ApiError> = (|| {
+        let store = agent_api::open_board_store()?;
+        match command.op {
+            BoardOp::Add {
+                title,
+                summary,
+                kind,
+                grade,
+                lane,
+                bot,
+                channel,
+                ref_url,
+                workspace,
+                recommendation,
+                options,
+                plan_hash,
+                key,
+            } => {
+                let kind = Kind::parse(&kind)
+                    .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --kind".to_owned()))?;
+                let grade =
+                    match grade.as_deref() {
+                        None => None,
+                        Some(g) => Some(Grade::parse(g).ok_or_else(|| {
+                            ApiError::new(exit::USAGE, "invalid --grade".to_owned())
+                        })?),
+                    };
+                let lane =
+                    match lane.as_deref() {
+                        None => None,
+                        Some(l) => Some(Lane::parse(l).ok_or_else(|| {
+                            ApiError::new(exit::USAGE, "invalid --lane".to_owned())
+                        })?),
+                    };
+                let summary = if summary.trim() == "-" {
+                    read_prompt(&summary)?
+                } else if summary.is_empty() {
+                    String::new()
+                } else {
+                    summary
+                };
+                let ws = workspace.unwrap_or_else(|| workspace_root.to_path_buf());
+                let by = default_actor_by(caller);
+                let item = store
+                    .add(AddItemRequest {
                         title,
                         summary,
-                        recommendation,
-                        options: if replace_options { Some(options) } else { None },
-                        grade,
                         kind,
-                        run_id,
-                        if_version,
-                        by,
-                    },
-                )
-                .map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            }
-            Ok(())
-        }
-        BoardOp::Move { id, lane } => {
-            let lane = Lane::parse(&lane)
-                .ok_or_else(|| ApiError::new(exit::USAGE, "invalid lane".to_owned()))?;
-            let by = default_actor_by(caller);
-            let item = store.move_lane(&id, lane, &by).map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            }
-            Ok(())
-        }
-        BoardOp::Plan { id, hash, edit } => {
-            let item = match (hash, edit) {
-                (Some(hash), _) => store
-                    .attach_plan(&id, &hash, &state_root)
-                    .map_err(ApiError::from)?,
-                (None, Some(edit)) => {
-                    let text = read_prompt(&edit)?;
-                    let prompt = store
-                        .get(&id)
-                        .map_err(ApiError::from)?
-                        .plan
-                        .as_ref()
-                        .map(|p| p.prompt.clone())
-                        .unwrap_or_default();
-                    let (_pending, hash) =
-                        edit_plan_from_json(workspace_root, &state_root, &prompt, &text)
-                            .map_err(ApiError::from)?;
-                    store
-                        .edit_plan(&id, &hash, workspace_root, &state_root)
-                        .map_err(ApiError::from)?
-                }
-                _ => {
-                    return Err(ApiError::new(
-                        exit::USAGE,
-                        "board plan needs --hash or --edit".to_owned(),
-                    ));
-                }
-            };
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            }
-            Ok(())
-        }
-        BoardOp::Decide {
-            id,
-            verdict,
-            text,
-            option,
-            plan_hash,
-            by,
-        } => {
-            let verdict = Verdict::parse(&verdict)
-                .ok_or_else(|| ApiError::new(exit::USAGE, "invalid verdict".to_owned()))?;
-            let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
-            let item = store
-                .decide(
-                    &id,
-                    DecideRequest {
-                        verdict,
-                        text,
-                        option,
+                        grade,
+                        lane,
+                        source_bot: bot,
+                        source_channel: channel,
+                        source_ref: ref_url,
+                        workspace: Some(ws),
+                        recommendation,
+                        options,
                         plan_hash,
+                        key,
                         by,
-                    },
-                )
-                .map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            }
-            Ok(())
-        }
-        BoardOp::Say { id, text, from } => {
-            let text = read_prompt(&text)?;
-            let from = resolve_actor(from.as_deref(), caller).map_err(ApiError::from)?;
-            let item = store
-                .say(
-                    &id,
-                    SayRequest {
-                        text,
-                        from: from.clone(),
-                    },
-                )
-                .map_err(ApiError::from)?;
-            if json_out {
-                print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
-            }
-            Ok(())
-        }
-        BoardOp::Wait {
-            id,
-            since_version,
-            timeout_secs,
-            wait_for,
-            waiter,
-        } => {
-            let since =
-                since_version.unwrap_or_else(|| store.get(&id).map(|i| i.version).unwrap_or(0));
-            let wait_for = match wait_for.as_str() {
-                "decision" => WaitFor::Decision,
-                "message" => WaitFor::Message,
-                "any" => WaitFor::Any,
-                other => {
-                    return Err(ApiError::new(
-                        exit::USAGE,
-                        format!("invalid --for '{other}'"),
-                    ));
-                }
-            };
-            let waiter = waiter.unwrap_or_else(|| "bot:coordinator".to_owned());
-            let outcome = store
-                .wait(
-                    &id,
-                    WaitFilter {
-                        since_version: since,
-                        timeout_secs,
-                        wait_for,
-                        waiter,
-                    },
-                )
-                .map_err(ApiError::from)?;
-            match outcome {
-                WaitOutcome::Ready { item, event } => {
-                    print_json(&wait_ready_json(&event, &item));
-                }
-                WaitOutcome::TimedOut { version } => {
-                    let val = json!({ "timed_out": true, "version": version });
-                    print_json(&val);
-                }
-            }
-            Ok(())
-        }
-        BoardOp::Rules { set } => {
-            let rules_store = RulesStore::new(store.base());
-            if let Some(source) = set {
-                let text = read_prompt(&source)?;
-                let rules = compile_rules_from_set_text(&text).map_err(ApiError::from)?;
-                rules_store.save(&rules).map_err(ApiError::from)?;
+                        state_root: state_root.clone(),
+                    })
+                    .map_err(ApiError::from)?;
                 if json_out {
-                    print_json(&serde_json::to_value(&rules).unwrap_or(Value::Null));
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                } else {
+                    println!("{}", item.id);
                 }
-            } else {
-                let rules = rules_store.load();
+                Ok(())
+            }
+            BoardOp::List {
+                lanes,
+                workspace,
+                all,
+            } => {
+                let lanes: Result<Vec<Lane>, ApiError> = lanes
+                    .iter()
+                    .map(|l| {
+                        Lane::parse(l).ok_or_else(|| {
+                            ApiError::new(exit::USAGE, format!("invalid lane '{l}'"))
+                        })
+                    })
+                    .collect();
+                let lanes = lanes?;
+                let items = store
+                    .list(&dmuxai::board::ListFilter {
+                        lanes,
+                        workspace,
+                        include_all: all,
+                    })
+                    .map_err(ApiError::from)?;
                 if json_out {
-                    print_json(&serde_json::to_value(&rules).unwrap_or(Value::Null));
+                    print_json(&serde_json::to_value(&items).unwrap_or(Value::Null));
+                } else {
+                    for item in items {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            item.id,
+                            item.lane.as_str(),
+                            item.kind.as_str(),
+                            item.title
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BoardOp::Show { id } => {
+                let item = store.get(&id).map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 } else {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&rules).unwrap_or_default()
+                        serde_json::to_string_pretty(&item).unwrap_or_default()
                     );
                 }
+                Ok(())
             }
-            Ok(())
+            BoardOp::Update {
+                id,
+                title,
+                summary,
+                recommendation,
+                options,
+                replace_options,
+                grade,
+                kind,
+                run_id,
+                if_version,
+            } => {
+                let by = default_actor_by(caller);
+                let summary = summary.map(|s| read_prompt(&s)).transpose()?;
+                let grade = grade
+                    .map(|g| {
+                        if g.is_empty() {
+                            Ok(None)
+                        } else {
+                            Grade::parse(&g)
+                                .ok_or_else(|| {
+                                    ApiError::new(exit::USAGE, "invalid --grade".to_owned())
+                                })
+                                .map(Some)
+                        }
+                    })
+                    .transpose()?;
+                let kind = kind
+                    .map(|k| {
+                        Kind::parse(&k)
+                            .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --kind".to_owned()))
+                    })
+                    .transpose()?;
+                let item = store
+                    .update(
+                        &id,
+                        UpdateItemRequest {
+                            title,
+                            summary,
+                            recommendation,
+                            options: if replace_options { Some(options) } else { None },
+                            grade,
+                            kind,
+                            run_id,
+                            if_version,
+                            by,
+                        },
+                    )
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
+            BoardOp::Move {
+                id,
+                lane,
+                if_version,
+            } => {
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let lane = Lane::parse(&lane)
+                    .ok_or_else(|| ApiError::new(exit::USAGE, "invalid lane".to_owned()))?;
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
+                if dmuxai::board::actor_may_use_planner(&by) {
+                    return Err(ApiError::new(
+                        exit::FORBIDDEN,
+                        "planner cannot move items".to_owned(),
+                    ));
+                }
+                let item = store
+                    .move_lane(&id, lane, &by, if_version)
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
+            BoardOp::Plan {
+                id,
+                hash,
+                edit,
+                prompt,
+            } => {
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
+                let item = match (hash, edit) {
+                    (Some(hash), _) => store
+                        .attach_plan(&id, &hash, &state_root, &by)
+                        .map_err(ApiError::from)?,
+                    (None, Some(edit)) => {
+                        let text =
+                            dmuxai::board::read_path_or_stdin(&edit).map_err(ApiError::from)?;
+                        let item = store.get(&id).map_err(ApiError::from)?;
+                        let ws = item
+                            .workspace
+                            .path
+                            .as_deref()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| workspace_root.to_path_buf());
+                        let stored_prompt = if let Some(prompt_path) = prompt {
+                            dmuxai::board::read_path_or_stdin(&prompt_path)
+                                .map_err(ApiError::from)?
+                        } else {
+                            dmuxai::board::unmasked_prompt_from_item_plan(
+                                &state_root,
+                                item.plan.as_ref(),
+                            )
+                            .map_err(ApiError::from)?
+                            .unwrap_or_default()
+                        };
+                        if stored_prompt.trim().is_empty() {
+                            return Err(ApiError::new(
+                                exit::USAGE,
+                                "board plan --edit needs --prompt when the item has no plan"
+                                    .to_owned(),
+                            ));
+                        }
+                        let inherit = item.plan.as_ref().map(|p| p.tasks.clone());
+                        let (_pending, hash) =
+                            edit_plan_from_json(&ws, &state_root, &stored_prompt, &text, inherit)
+                                .map_err(ApiError::from)?;
+                        store
+                            .edit_plan(&id, &hash, &ws, &state_root, &by)
+                            .map_err(ApiError::from)?
+                    }
+                    _ => {
+                        return Err(ApiError::new(
+                            exit::USAGE,
+                            "board plan needs --hash or --edit".to_owned(),
+                        ));
+                    }
+                };
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
+            BoardOp::Decide {
+                id,
+                verdict,
+                text,
+                option,
+                plan_hash,
+                by,
+            } => {
+                let verdict = Verdict::parse(&verdict)
+                    .ok_or_else(|| ApiError::new(exit::USAGE, "invalid verdict".to_owned()))?;
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
+                if by == "planner" {
+                    return Err(ApiError::new(
+                        exit::FORBIDDEN,
+                        "planner cannot record decisions".to_owned(),
+                    ));
+                }
+                let mut plan_hash = plan_hash;
+                if matches!(verdict, Verdict::Approve)
+                    && plan_hash.is_none()
+                    && caller == BoardCaller::CliTty
+                    && let Ok(item) = store.get(&id)
+                    && let Some(plan) = item.plan.as_ref()
+                {
+                    plan_hash = Some(plan.hash.clone());
+                }
+                let item = store
+                    .decide(
+                        &id,
+                        DecideRequest {
+                            verdict,
+                            text,
+                            option,
+                            plan_hash,
+                            by,
+                        },
+                    )
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
+            BoardOp::Say { id, text, from } => {
+                let text = read_prompt(&text)?;
+                let from = resolve_actor(from.as_deref(), caller).map_err(ApiError::from)?;
+                let item = store
+                    .say(
+                        &id,
+                        SayRequest {
+                            text,
+                            from: from.clone(),
+                        },
+                    )
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
+            BoardOp::Events { since_seq } => {
+                let events = store.list_events(since_seq).map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&events).unwrap_or(Value::Null));
+                } else {
+                    for event in events {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            event.seq, event.item_id, event.kind, event.by, event.version
+                        );
+                    }
+                }
+                Ok(())
+            }
+            BoardOp::Prompt { id, hash } => {
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let prompt = store
+                    .unmasked_prompt(&id, hash.as_deref())
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&json!({ "prompt": prompt }));
+                } else {
+                    println!("{prompt}");
+                }
+                Ok(())
+            }
+            BoardOp::Wait {
+                id,
+                any,
+                since_version,
+                since_seq,
+                timeout_secs,
+                wait_for,
+                waiter,
+            } => {
+                if any {
+                    let since_seq = since_seq.unwrap_or(0);
+                    let wait_for = match wait_for.as_str() {
+                        "decision" => WaitFor::Decision,
+                        "message" => WaitFor::Message,
+                        "any" => WaitFor::Any,
+                        other => {
+                            return Err(ApiError::new(
+                                exit::USAGE,
+                                format!("invalid --for '{other}'"),
+                            ));
+                        }
+                    };
+                    let waiter = waiter.unwrap_or_else(|| "bot:coordinator".to_owned());
+                    let outcome = store
+                        .wait_any(
+                            since_seq,
+                            WaitFilter {
+                                since_version: since_version.unwrap_or(0),
+                                timeout_secs,
+                                wait_for,
+                                waiter,
+                            },
+                        )
+                        .map_err(ApiError::from)?;
+                    if let Some((event, item)) = outcome {
+                        print_json(&dmuxai::board::wait_ready_json_any(&event, &item));
+                    } else {
+                        let val =
+                            json!({ "timed_out": true, "version": since_version.unwrap_or(0) });
+                        print_json(&val);
+                    }
+                    return Ok(());
+                }
+                let id = id.ok_or_else(|| {
+                    ApiError::new(exit::USAGE, "board wait needs an id".to_owned())
+                })?;
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let since =
+                    since_version.unwrap_or_else(|| store.get(&id).map(|i| i.version).unwrap_or(0));
+                let wait_for = match wait_for.as_str() {
+                    "decision" => WaitFor::Decision,
+                    "message" => WaitFor::Message,
+                    "any" => WaitFor::Any,
+                    other => {
+                        return Err(ApiError::new(
+                            exit::USAGE,
+                            format!("invalid --for '{other}'"),
+                        ));
+                    }
+                };
+                let waiter = waiter.unwrap_or_else(|| "bot:coordinator".to_owned());
+                let outcome = store
+                    .wait(
+                        &id,
+                        WaitFilter {
+                            since_version: since,
+                            timeout_secs,
+                            wait_for,
+                            waiter,
+                        },
+                    )
+                    .map_err(ApiError::from)?;
+                match outcome {
+                    WaitOutcome::Ready { item, event } => {
+                        print_json(&wait_ready_json(&event, &item));
+                    }
+                    WaitOutcome::TimedOut { version } => {
+                        let val = json!({ "timed_out": true, "version": version });
+                        print_json(&val);
+                    }
+                }
+                Ok(())
+            }
+            BoardOp::Rules { set } => {
+                let rules_store = RulesStore::new(store.base());
+                if let Some(source) = set {
+                    resolve_actor(Some("owner"), caller).map_err(ApiError::from)?;
+                    let text =
+                        dmuxai::board::read_path_or_stdin(&source).map_err(ApiError::from)?;
+                    let rules = compile_rules_from_set_text(&text).map_err(ApiError::from)?;
+                    store
+                        .with_rules_lock(|| rules_store.save(&rules))
+                        .map_err(ApiError::from)?;
+                    if json_out {
+                        print_json(&serde_json::to_value(&rules).unwrap_or(Value::Null));
+                    }
+                } else {
+                    let rules = rules_store.load();
+                    if json_out {
+                        print_json(&serde_json::to_value(&rules).unwrap_or(Value::Null));
+                    } else {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&rules).unwrap_or_default()
+                        );
+                    }
+                }
+                Ok(())
+            }
         }
     })();
 
@@ -5239,7 +5508,8 @@ mod tests {
     #[test]
     fn tc_3114_board_help_lists_subcommands() {
         for sub in [
-            "add", "list", "show", "update", "move", "plan", "decide", "say", "wait", "rules",
+            "add", "list", "show", "update", "move", "plan", "decide", "say", "wait", "events",
+            "prompt", "rules",
         ] {
             assert!(BOARD_USAGE.contains(sub), "BOARD_USAGE missing {sub}");
         }
