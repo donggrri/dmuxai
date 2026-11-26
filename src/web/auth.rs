@@ -51,11 +51,10 @@ pub fn resolve_token_required(
 ) -> bool {
     if let Ok(value) = std::env::var("DMUXAI_WEB_TOKEN_REQUIRED") {
         if value == "0" {
-            if !config_require_token
-                && !env_require_token_flag()
-                && !explicit_env_token
-                && bind_is_loopback_for_policy(bind, allow_remote)
-            {
+            if config_require_token || env_require_token_flag() || explicit_env_token {
+                return true;
+            }
+            if bind_is_loopback_for_policy(bind, allow_remote) {
                 return false;
             }
         } else if value == "1" {
@@ -207,6 +206,12 @@ mod tests {
         unsafe { std::env::set_var("DMUXAI_WEB_TOKEN_REQUIRED", "0") };
         assert!(!resolve_token_required(
             false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            false,
+            false
+        ));
+        assert!(resolve_token_required(
+            true,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             false,
             false

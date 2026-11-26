@@ -75,11 +75,17 @@ pub fn write_discovery(workspace_root: &Path, d: &Discovery) -> io::Result<PathB
 
 pub fn write_user_discovery(d: &UserDiscovery) -> io::Result<PathBuf> {
     let base = crate::state_path::state_base()?;
-    std::fs::create_dir_all(&base)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&base)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&base)?;
     }
     let path = base.join("web.json");
     write_owner_only_json(&path, &base, d)
@@ -108,6 +114,20 @@ fn write_owner_only_json<T: Serialize>(path: &Path, dir: &Path, value: &T) -> io
         std::fs::write(path, body.as_bytes())?;
     }
     Ok(path.to_path_buf())
+}
+
+/// Refresh `workspaces` in the user-level file when this process owns it (FR-2957).
+pub fn sync_user_discovery_workspaces(workspaces: &[UserWorkspaceRef]) -> io::Result<()> {
+    let path = user_discovery_path()?;
+    let Some(mut existing) = read_user_discovery_raw(&path) else {
+        return Ok(());
+    };
+    if existing.pid != std::process::id() {
+        return Ok(());
+    }
+    existing.workspaces = workspaces.to_vec();
+    write_user_discovery(&existing)?;
+    Ok(())
 }
 
 /// Remove the discovery file if present; ignore a missing file.
@@ -154,7 +174,10 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
@@ -177,7 +200,10 @@ pub fn user_discovery_may_overwrite(mode: &str) -> bool {
     if existing.mode == "web" && mode != "web" {
         return false;
     }
-    existing.pid == std::process::id() || mode == "web"
+    if existing.mode == "web" && mode == "web" && existing.pid != std::process::id() {
+        return false;
+    }
+    existing.pid == std::process::id()
 }
 
 /// Validate a `DMUXAI_WEB_TOKEN` value: `None`/empty means "generate a random
@@ -267,7 +293,7 @@ mod tests {
             windows_url: None,
             port: 7420,
             pid: std::process::id(),
-            uid: std::process::id(),
+            uid: crate::web::access::effective_server_uid(),
             mode: "web".to_owned(),
             token_required: false,
             token: None,

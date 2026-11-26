@@ -1,7 +1,8 @@
 //! Host allowlist, CSRF guards, and peer checks (SPEC-web-local-access FR-2952..FR-2955).
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::header::ORIGIN;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -12,6 +13,25 @@ use crate::web::local_peer::{LocalPeerSource, peer_uid_for_connection};
 
 pub const CLIENT_HEADER: &str = "x-dmuxai-client";
 pub const FETCH_SITE_HEADER: &str = "sec-fetch-site";
+
+/// Effective OS user id for peer-uid checks (FR-2955); skipped on non-Unix builds.
+pub fn effective_server_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvidedToken {
+    Absent,
+    Valid,
+    Invalid,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListenerKind {
@@ -40,8 +60,20 @@ impl WebAccess {
             listener: ListenerKind::Loopback,
             allowed_hosts: Arc::new(hosts),
             wsl_host_peer: None,
-            server_uid: std::process::id(),
+            server_uid: effective_server_uid(),
             peer_source: crate::web::local_peer::shared_peer_source(),
+            token: Arc::new(token),
+        }
+    }
+
+    pub fn remote(token: String, peer_source: Arc<dyn LocalPeerSource>) -> Self {
+        Self {
+            token_required: true,
+            listener: ListenerKind::Remote,
+            allowed_hosts: Arc::new(Vec::new()),
+            wsl_host_peer: None,
+            server_uid: effective_server_uid(),
+            peer_source,
             token: Arc::new(token),
         }
     }
@@ -58,7 +90,7 @@ impl WebAccess {
             listener: ListenerKind::Loopback,
             allowed_hosts: Arc::new(build_allowed_hosts(bind_ip, port)),
             wsl_host_peer: None,
-            server_uid: std::process::id(),
+            server_uid: effective_server_uid(),
             peer_source,
             token: Arc::new(token),
         }
@@ -74,6 +106,9 @@ impl WebAccess {
     ) -> Self {
         let mut hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         hosts.push(host_from_ip(bind_ip, port));
+        if port == 80 {
+            hosts.push(ip_host_only(bind_ip));
+        }
         hosts.sort();
         hosts.dedup();
         Self {
@@ -81,7 +116,7 @@ impl WebAccess {
             listener: ListenerKind::WslInterface,
             allowed_hosts: Arc::new(hosts),
             wsl_host_peer,
-            server_uid: std::process::id(),
+            server_uid: effective_server_uid(),
             peer_source,
             token: Arc::new(token),
         }
@@ -130,6 +165,9 @@ fn ip_host_only(ip: IpAddr) -> String {
 }
 
 pub fn host_allowed(access: &WebAccess, host_header: &str) -> bool {
+    if access.listener == ListenerKind::Remote {
+        return true;
+    }
     access.allowed_hosts.iter().any(|h| h == host_header)
 }
 
@@ -140,7 +178,12 @@ pub fn is_guarded_path(path: &str) -> bool {
         || path.contains("/api/")
 }
 
-pub fn extract_bearer_or_query_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
+pub fn classify_provided_token(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    expected: &str,
+) -> ProvidedToken {
+    let mut rejected = false;
     if let Some(auth_val) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -148,20 +191,40 @@ pub fn extract_bearer_or_query_token(headers: &HeaderMap, query: Option<&str>) -
         let mut parts = auth_val.splitn(2, ' ');
         let scheme = parts.next().unwrap_or_default();
         let tok = parts.next().unwrap_or_default();
-        if scheme.eq_ignore_ascii_case("bearer") && !tok.trim().is_empty() {
-            return Some(tok.trim().to_owned());
+        if scheme.eq_ignore_ascii_case("bearer") {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                rejected = true;
+            } else if token_matches(expected, tok) {
+                return ProvidedToken::Valid;
+            } else {
+                rejected = true;
+            }
+        } else {
+            rejected = true;
         }
     }
-    let query = query?;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == "token"
-            && !v.is_empty()
-        {
-            return Some(v.to_owned());
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=')
+                && k == "token"
+            {
+                if v.is_empty() {
+                    rejected = true;
+                } else if token_matches(expected, v) {
+                    return ProvidedToken::Valid;
+                } else {
+                    rejected = true;
+                }
+                break;
+            }
         }
     }
-    None
+    if rejected {
+        ProvidedToken::Invalid
+    } else {
+        ProvidedToken::Absent
+    }
 }
 
 pub fn tokenless_write_allowed(headers: &HeaderMap, host_header: &str) -> bool {
@@ -193,8 +256,27 @@ pub fn tokenless_get_allowed(headers: &HeaderMap) -> bool {
     match headers.get(FETCH_SITE_HEADER).and_then(|v| v.to_str().ok()) {
         None | Some("same-origin") | Some("none") => true,
         Some("cross-site") | Some("same-site") => false,
-        Some(_) => true,
+        Some(_) => false,
     }
+}
+
+fn jira_refresh_requested(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "refresh"
+            && matches!(v, "1" | "true" | "yes" | "on")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn get_request_needs_write_guard(path: &str, query: Option<&str>) -> bool {
+    path == "/api/jira/issues" && jira_refresh_requested(query)
 }
 
 pub fn effective_token_required(
@@ -239,19 +321,17 @@ pub fn check_guarded_request(
     host_header: &str,
     query: Option<&str>,
     peer: Option<SocketAddr>,
-    peer_checked: &mut bool,
+    peer_cache: &Mutex<HashSet<SocketAddr>>,
 ) -> std::result::Result<(), Response> {
     if !is_guarded_path(path) {
         return Ok(());
     }
 
-    let provided = extract_bearer_or_query_token(headers, query);
-    let has_valid = provided
-        .as_deref()
-        .is_some_and(|t| token_matches(access.token.as_str(), t));
-    if provided.is_some() && !has_valid {
+    let token_state = classify_provided_token(headers, query, access.token.as_str());
+    if token_state == ProvidedToken::Invalid {
         return Err(unauthorized());
     }
+    let has_valid = token_state == ProvidedToken::Valid;
 
     let peer_ip = peer.map(|a| a.ip());
     if effective_token_required(access, peer_ip, has_valid) {
@@ -267,20 +347,27 @@ pub fn check_guarded_request(
 
     // Tokenless path
     if access.listener == ListenerKind::Loopback
-        && !*peer_checked
         && let Some(peer_addr) = peer
     {
-        *peer_checked = true;
-        if let Some(uid) = peer_uid_for_connection(access.peer_source.as_ref(), peer_addr)
-            && uid != access.server_uid
-            && uid != 0
-        {
-            return Err(forbidden());
+        let mut cache = peer_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !cache.contains(&peer_addr) {
+            cache.insert(peer_addr);
+            if let Some(uid) = peer_uid_for_connection(access.peer_source.as_ref(), peer_addr)
+                && uid != access.server_uid
+                && uid != 0
+            {
+                return Err(forbidden());
+            }
         }
     }
 
     if method == Method::GET || method == Method::HEAD {
         if !tokenless_get_allowed(headers) {
+            return Err(forbidden());
+        }
+        if get_request_needs_write_guard(path, query)
+            && !tokenless_write_allowed(headers, host_header)
+        {
             return Err(forbidden());
         }
         return Ok(());
@@ -294,13 +381,74 @@ pub fn check_guarded_request(
 
 /// FR-2954: GET `/api/*` routes must not perform side effects; list any exceptions.
 pub fn get_api_routes_with_possible_side_effects() -> Vec<&'static str> {
-    Vec::new()
+    vec!["GET /api/jira/issues?refresh=1"]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn empty_peer_cache() -> Mutex<HashSet<SocketAddr>> {
+        Mutex::new(HashSet::new())
+    }
+
+    // TC-2950 / FR-2950 (middleware helpers)
+    #[test]
+    fn tc_2950_loopback_api_without_token_is_accepted_and_wrong_token_rejected() {
+        let access = WebAccess::loopback(
+            "secret".to_owned(),
+            false,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            7420,
+            crate::web::local_peer::shared_peer_source(),
+        );
+        let cache = empty_peer_cache();
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_HEADER, HeaderValue::from_static("1"));
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &headers,
+                "localhost:7420",
+                None,
+                None,
+                &cache,
+            )
+            .is_ok()
+        );
+
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &bad,
+                "localhost:7420",
+                None,
+                None,
+                &cache,
+            )
+            .is_err()
+        );
+
+        let mut empty_bearer = HeaderMap::new();
+        empty_bearer.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer "),
+        );
+        assert_eq!(
+            classify_provided_token(&empty_bearer, None, access.token.as_str()),
+            ProvidedToken::Invalid
+        );
+    }
 
     // TC-2952 / FR-2952
     #[test]
@@ -333,23 +481,26 @@ mod tests {
             7420,
             crate::web::local_peer::shared_peer_source(),
         );
-        let mut seen = false;
+        let cache = empty_peer_cache();
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:7420"));
         headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("same-origin"));
-        assert!(
-            check_guarded_request(
-                &access,
-                &Method::POST,
-                "/api/prompt",
-                &headers,
-                "localhost:7420",
-                None,
-                None,
-                &mut seen,
-            )
-            .is_ok()
-        );
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(
+                check_guarded_request(
+                    &access,
+                    &method,
+                    "/api/prompt",
+                    &headers,
+                    "localhost:7420",
+                    None,
+                    None,
+                    &cache,
+                )
+                .is_ok(),
+                "{method}"
+            );
+        }
 
         headers.insert(ORIGIN, HeaderValue::from_static("null"));
         assert!(
@@ -361,7 +512,7 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &mut seen,
+                &cache,
             )
             .is_err()
         );
@@ -377,7 +528,7 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &mut seen,
+                &cache,
             )
             .is_ok()
         );
@@ -394,7 +545,7 @@ mod tests {
             7420,
             crate::web::local_peer::shared_peer_source(),
         );
-        let mut seen = false;
+        let cache = empty_peer_cache();
         let mut headers = HeaderMap::new();
         headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("cross-site"));
         assert!(
@@ -406,14 +557,85 @@ mod tests {
                 "localhost:7420",
                 None,
                 None,
-                &mut seen,
+                &cache,
             )
             .is_err()
         );
 
+        headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("other"));
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &headers,
+                "localhost:7420",
+                None,
+                None,
+                &cache,
+            )
+            .is_err()
+        );
+
+        let mut jira = HeaderMap::new();
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/jira/issues",
+                &jira,
+                "localhost:7420",
+                Some("refresh=1"),
+                None,
+                &cache,
+            )
+            .is_err()
+        );
+        jira.insert(CLIENT_HEADER, HeaderValue::from_static("1"));
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/jira/issues",
+                &jira,
+                "localhost:7420",
+                Some("refresh=1"),
+                None,
+                &cache,
+            )
+            .is_ok()
+        );
+
         assert!(!is_guarded_path("/"));
         assert!(!is_guarded_path("/docs/view/ticket"));
-        assert!(get_api_routes_with_possible_side_effects().is_empty());
+        assert!(!get_api_routes_with_possible_side_effects().is_empty());
+    }
+
+    // TC-2951 partial / FR-2951
+    #[test]
+    fn tc_2951_require_token_config_env_token_remote_bind_and_reexec_enforce_token() {
+        let access = WebAccess::remote(
+            "tok".to_owned(),
+            crate::web::local_peer::shared_peer_source(),
+        );
+        assert!(access.token_required);
+        assert_eq!(access.listener, ListenerKind::Remote);
+        assert!(host_allowed(&access, "any.host:1"));
+        let cache = empty_peer_cache();
+        let headers = HeaderMap::new();
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/api/state",
+                &headers,
+                "any.host:1",
+                None,
+                None,
+                &cache,
+            )
+            .is_err()
+        );
     }
 
     // TC-2962 / FR-2962
@@ -436,7 +658,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(ORIGIN, HeaderValue::from_static("http://172.24.64.5:7420"));
         headers.insert(FETCH_SITE_HEADER, HeaderValue::from_static("same-origin"));
-        let mut seen = false;
+        let cache = empty_peer_cache();
         let trusted: SocketAddr = "172.24.48.1:12345".parse().unwrap();
         assert!(
             check_guarded_request(
@@ -447,7 +669,7 @@ mod tests {
                 "172.24.64.5:7420",
                 None,
                 Some(trusted),
-                &mut seen,
+                &cache,
             )
             .is_ok()
         );

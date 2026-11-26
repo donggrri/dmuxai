@@ -62,10 +62,9 @@ Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
 On the default **loopback** bind (`127.0.0.1:7420`), `dmuxai --web` and
 `dmuxai serve` print a URL **without** `?token=` (for example
-`dmuxai dashboard: http://127.0.0.1:7420/`). Any local process on the same
-machine (and, on Linux, any local user whose TCP socket is visible in
-`/proc/net/tcp`, except root and your uid) can call the dashboard API without a
-token. That is the default tradeoff so agents and curl can read `/api/*`
+`dmuxai dashboard: http://127.0.0.1:7420/`). Any local process on the same machine can call the dashboard API without a
+token. On Linux, peers whose TCP socket is visible in `/proc/net/tcp` with a
+uid other than yours (and not root) are rejected. That is the default tradeoff so agents and curl can read `/api/*`
 without copying a secret.
 
 To restore the old behaviour (token on every `/api/*` request), set

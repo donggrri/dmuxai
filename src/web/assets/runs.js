@@ -782,8 +782,8 @@ function runsConnectStream(id) {
   runsStreamStickBottom = true;
   if (typeof EventSource === 'undefined') { return; }
   var tok = runsToken();
-  if (!tok) { return; }
-  var path = '/api/runs/' + encodeURIComponent(id) + '/stream?token=' + encodeURIComponent(tok);
+  var path = '/api/runs/' + encodeURIComponent(id) + '/stream';
+  if (tok) { path += '?token=' + encodeURIComponent(tok); }
   try {
     runsStreamSse = new EventSource(runsApiUrl(path));
   } catch (err) {

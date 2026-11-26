@@ -635,11 +635,6 @@
   function renderLazyTree(silent) {
     var tree = $('docs-tree');
     if (!tree) { return; }
-    if (!currentToken()) {
-      tree.replaceChildren();
-      tree.appendChild(el('p', 'empty', 'documents need token'));
-      return;
-    }
     var focusedPath = getFocusedTreePath();
     if (!silent && !tree.hasChildNodes()) {
       tree.replaceChildren();
@@ -958,10 +953,6 @@
   // -----------------------------------------------------------------------
 
   function refreshList() {
-    if (!currentToken()) {
-      renderTree();
-      return;
-    }
     treeDirCache = {};
     api('GET', '/api/docs')
       .then(function (payload) {
@@ -1065,7 +1056,7 @@
   }
 
   function startChangesPolling() {
-    if (changesTimer !== null || !currentToken()) { return; }
+    if (changesTimer !== null) { return; }
     refreshChanges();
     changesTimer = window.setInterval(refreshChanges, CHANGES_POLL_MS);
   }
@@ -1480,11 +1471,16 @@
     updateDocControls();
   }
 
-  function loadServeState() {
+  function authHeaders() {
+    var headers = { 'X-Dmuxai-Client': '1' };
     var token = currentToken();
-    if (!token) { return; }
+    if (token) { headers.Authorization = 'Bearer ' + token; }
+    return headers;
+  }
+
+  function loadServeState() {
     fetch(apiUrl('/api/state'), {
-      headers: { Authorization: 'Bearer ' + token },
+      headers: authHeaders(),
       cache: 'no-store'
     })
       .then(function (res) {
@@ -1499,7 +1495,7 @@
     applyServeState(e && e.detail);
     // If the token came back (e.g. the page was reloaded with a fresh
     // ?token= URL), restart polling.
-    if (changesTimer === null && currentToken()) { startChangesPolling(); }
+    if (changesTimer === null) { startChangesPolling(); }
     scheduleSnapshotRefresh();
   }
 
@@ -2429,12 +2425,6 @@
     window.addEventListener('dmuxai:transcript-rendered', syncChatLinks);
     initSidebar();
     bindFilter();
-    if (!currentToken()) {
-      refreshList();
-      window.addEventListener('beforeunload', onBeforeUnload);
-      window.addEventListener(SNAPSHOT_EVENT, onSnapshotEvent);
-      return;
-    }
     refreshList();
     loadServeState();
     startChangesPolling();

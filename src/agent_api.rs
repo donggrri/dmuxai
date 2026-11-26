@@ -161,15 +161,22 @@ fn resolve_status_dashboard(workspace_root: &Path) -> Value {
         && crate::web::discovery::process_alive(d.pid)
     {
         let url = crate::workspace::discovery_dashboard_url(&d);
-        return json!({
+        let mut val = json!({
             "url": url,
             "port": d.port,
             "pid": d.pid,
             "process_alive": true,
             "token_required": d.token_required,
             "source": "workspace",
-            "token_file": crate::web::discovery::discovery_path(workspace_root).display().to_string(),
         });
+        if d.token_required {
+            val["token_file"] = json!(
+                crate::web::discovery::discovery_path(workspace_root)
+                    .display()
+                    .to_string()
+            );
+        }
+        return val;
     }
     if let Some(d) = crate::web::discovery::read_user_discovery() {
         let url = d.base_url.trim_end_matches('/').to_string();

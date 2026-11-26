@@ -802,15 +802,10 @@ fn publish_discovery(
     server: &DashboardServer,
     token: &str,
 ) -> Option<String> {
-    let host = if server.addr.ip().is_unspecified() {
-        "127.0.0.1".to_owned()
-    } else if server.addr.is_ipv6() {
-        format!("[{}]", server.addr.ip())
-    } else {
-        server.addr.ip().to_string()
-    };
     let discovery = dmuxai::web::discovery::Discovery {
-        base_url: format!("http://{host}:{}", server.addr.port()),
+        base_url: dmuxai::web::dashboard_url_plain(server.addr)
+            .trim_end_matches('/')
+            .to_owned(),
         port: server.addr.port(),
         pid: std::process::id(),
         token_required: server.token_required,
@@ -841,11 +836,13 @@ fn publish_user_discovery(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let user = dmuxai::web::discovery::UserDiscovery {
-        base_url: server.url.clone(),
+        base_url: dmuxai::web::dashboard_url_plain(server.addr)
+            .trim_end_matches('/')
+            .to_owned(),
         windows_url: server.windows_url.clone(),
         port: server.addr.port(),
         pid: std::process::id(),
-        uid: std::process::id(),
+        uid: dmuxai::web::effective_server_uid(),
         mode: mode.to_owned(),
         token_required: server.token_required,
         token: if server.token_required {
@@ -1158,7 +1155,9 @@ async fn attach_web_dashboard(
             {
                 app.push_startup_notice(warning);
             }
-            let base_url = server.url.trim_end_matches('/').to_string();
+            let base_url = dmuxai::web::dashboard_url_plain(server.addr)
+                .trim_end_matches('/')
+                .to_string();
             workspace_runtime::attach_web_workspace(
                 app,
                 parts.hub,

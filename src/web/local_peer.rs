@@ -25,7 +25,9 @@ impl LocalPeerSource for OsLocalPeerSource {
     }
 
     fn wsl_distro_name(&self) -> Option<String> {
-        std::env::var("WSL_DISTRO_NAME").ok()
+        std::env::var("WSL_DISTRO_NAME")
+            .ok()
+            .filter(|name| !name.is_empty())
     }
 
     fn wslinfo_networking_mode(&self) -> Option<String> {
@@ -63,7 +65,10 @@ impl LocalPeerSource for OsLocalPeerSource {
 
 /// Returns true when the environment looks like WSL (Terms).
 pub fn is_wsl<S: LocalPeerSource + ?Sized>(source: &S) -> bool {
-    if source.wsl_distro_name().is_some() {
+    if source
+        .wsl_distro_name()
+        .is_some_and(|name| !name.is_empty())
+    {
         return true;
     }
     source
@@ -147,18 +152,35 @@ pub fn wsl_nat_listen_ipv4<S: LocalPeerSource + ?Sized>(source: &S) -> Option<Ip
     source.default_route_interface_ip()
 }
 
+const RTF_GATEWAY: u32 = 0x0002;
+
 pub fn default_route_gateway_v4(route_table: &str) -> Option<Ipv4Addr> {
     for line in route_table.lines().skip(1) {
         let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 3 {
+        if cols.len() < 8 {
             continue;
         }
         let dest = cols.get(1).copied().unwrap_or("");
         if dest != "00000000" {
             continue;
         }
+        let mask = cols.get(7).copied().unwrap_or("");
+        if mask != "00000000" {
+            continue;
+        }
+        let flags = cols
+            .get(3)
+            .and_then(|f| u32::from_str_radix(f, 16).ok())
+            .unwrap_or(0);
+        if flags & RTF_GATEWAY == 0 {
+            continue;
+        }
         let gateway_hex = cols.get(2).copied()?;
-        return parse_proc_ipv4_hex(gateway_hex);
+        let gateway = parse_proc_ipv4_hex(gateway_hex)?;
+        if gateway == Ipv4Addr::UNSPECIFIED {
+            continue;
+        }
+        return Some(gateway);
     }
     None
 }
@@ -190,10 +212,8 @@ fn first_ipv4_on_iface(iface: &str) -> Option<Ipv4Addr> {
         let mut parts = line.split_whitespace();
         let _ = parts.next();
         let _ = parts.next();
-        if let Some(inet) = parts.next()
-            && let Some(addr) = inet.strip_prefix("inet ")
-        {
-            let ip = addr.split('/').next()?;
+        if parts.next()? == "inet" {
+            let ip = parts.next()?.split('/').next()?;
             return ip.parse().ok();
         }
     }
@@ -217,12 +237,18 @@ pub fn peer_uid_from_proc_net(tables: &[&str], peer: SocketAddr) -> Option<u32> 
             if cols.len() < 8 {
                 continue;
             }
-            let remote_field = cols.get(2).copied().unwrap_or("");
-            let is_v6 = remote_field
+            let local_field = match cols.get(1) {
+                Some(value) => *value,
+                None => continue,
+            };
+            let is_v6 = local_field
                 .split(':')
                 .next()
                 .is_some_and(|addr| addr.len() == 32);
-            let (ip, port) = parse_proc_socket_field(remote_field, is_v6)?;
+            let (ip, port) = match parse_proc_socket_field(local_field, is_v6) {
+                Some(parsed) => parsed,
+                None => continue,
+            };
             if port != peer.port() {
                 continue;
             }
@@ -244,9 +270,16 @@ fn parse_proc_socket_field(field: &str, v6: bool) -> Option<(IpAddr, u16)> {
             return None;
         }
         let mut bytes = [0u8; 16];
-        for i in 0..16 {
-            let part = &addr_hex[i * 2..i * 2 + 2];
-            bytes[i] = u8::from_str_radix(part, 16).ok()?;
+        for (i, chunk) in bytes.chunks_mut(4).enumerate() {
+            let word_hex = &addr_hex[i * 8..i * 8 + 8];
+            let word = u32::from_str_radix(word_hex, 16).ok()?;
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        if bytes[..10] == [0u8; 10] && bytes[10] == 0xff && bytes[11] == 0xff {
+            return Some((
+                IpAddr::V4(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15])),
+                port,
+            ));
         }
         Some((IpAddr::from(bytes), port))
     } else if addr_hex.len() == 8 {
@@ -293,6 +326,7 @@ mod tests {
         distro: Option<String>,
         wslinfo: Option<String>,
         route: Option<String>,
+        iface_ip: Option<Ipv4Addr>,
         tcp: Option<String>,
         tcp6: Option<String>,
     }
@@ -311,9 +345,7 @@ mod tests {
             self.route.clone()
         }
         fn default_route_interface_ip(&self) -> Option<Ipv4Addr> {
-            self.route
-                .as_deref()
-                .and_then(|route| windows_host_ipv4_from_route(Some(route)))
+            self.iface_ip
         }
         fn proc_net_tcp(&self) -> Option<String> {
             self.tcp.clone()
@@ -362,6 +394,7 @@ mod tests {
                  eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
                     .to_owned(),
             ),
+            iface_ip: Some(Ipv4Addr::new(192, 168, 1, 1)),
             ..Default::default()
         };
         assert!(is_wsl2_nat_mode(&nat));
@@ -382,8 +415,8 @@ mod tests {
     #[test]
     fn tc_2955_proc_net_tcp_peer_uid_parsing_mismatch_rejected_root_allowed_once_per_connection() {
         let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-             0: 0100007F:C350 0100007F:C351 01 00000000:00000000 00:00000000 00000000     0        0 123 1 00000000\n\
-             1: 0100007F:C352 0100007F:C353 01 00000000:00000000 00:00000000 00000000  1000        0 456 1 00000000\n";
+             0: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 123 1 00000000\n\
+             1: 0100007F:C353 0100007F:C352 01 00000000:00000000 00:00000000 00000000  1000        0 456 1 00000000\n";
         let peer: SocketAddr = "127.0.0.1:50001".parse().unwrap();
         assert_eq!(peer_uid_from_proc_net(&[table], peer), Some(0));
         let peer2: SocketAddr = "127.0.0.1:50003".parse().unwrap();
@@ -396,6 +429,8 @@ mod tests {
     fn tc_2961_wsl_listener_trusts_windows_host_peer_and_requires_token_for_others() {
         use crate::web::access::{WebAccess, check_guarded_request};
         use axum::http::{HeaderMap, Method};
+        use std::collections::HashSet;
+        use std::sync::Mutex;
         let host_peer: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 24, 48, 1));
         let access = WebAccess::wsl_interface(
             "secret".to_owned(),
@@ -405,7 +440,7 @@ mod tests {
             Some(host_peer),
             crate::web::local_peer::shared_peer_source(),
         );
-        let mut seen = false;
+        let cache = Mutex::new(HashSet::new());
         let headers = HeaderMap::new();
         let trusted: SocketAddr = "172.24.48.1:54000".parse().unwrap();
         assert!(
@@ -417,7 +452,7 @@ mod tests {
                 "172.24.64.5:7420",
                 None,
                 Some(trusted),
-                &mut seen,
+                &cache,
             )
             .is_ok()
         );
@@ -431,7 +466,7 @@ mod tests {
                 "172.24.64.5:7420",
                 None,
                 Some(other),
-                &mut seen,
+                &cache,
             )
             .is_err()
         );
@@ -441,6 +476,8 @@ mod tests {
     fn tc_2959_wsl_localhost_forwarding_hosts_and_origins_accepted_tokenless() {
         use crate::web::access::{WebAccess, check_guarded_request};
         use axum::http::{HeaderMap, HeaderValue, Method};
+        use std::collections::HashSet;
+        use std::sync::Mutex;
         let access = WebAccess::loopback(
             "t".to_owned(),
             false,
@@ -454,7 +491,8 @@ mod tests {
             HeaderValue::from_static("http://127.0.0.1:7420"),
         );
         headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
-        let mut seen = false;
+        let cache = Mutex::new(HashSet::new());
+        let peer: SocketAddr = "127.0.0.1:55123".parse().unwrap();
         assert!(
             check_guarded_request(
                 &access,
@@ -463,8 +501,8 @@ mod tests {
                 &headers,
                 "127.0.0.1:7420",
                 None,
-                None,
-                &mut seen,
+                Some(peer),
+                &cache,
             )
             .is_ok()
         );

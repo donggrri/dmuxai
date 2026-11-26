@@ -21,7 +21,7 @@ pub mod runs_api;
 mod server;
 mod snapshot;
 
-pub use access::{WebAccess, build_allowed_hosts};
+pub use access::{WebAccess, build_allowed_hosts, effective_server_uid};
 pub use auth::{
     BindCheck, check_bind, dashboard_url, dashboard_url_plain, generate_token,
     resolve_token_required,

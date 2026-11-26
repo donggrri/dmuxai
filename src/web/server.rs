@@ -129,11 +129,7 @@ impl ServerConfig {
 pub(crate) struct AppState {
     pub(crate) access: WebAccess,
     workspaces: Arc<WorkspaceDirectory>,
-}
-
-#[derive(Clone, Default)]
-struct ConnectionAccessState {
-    loopback_peer_checked: bool,
+    loopback_peer_checked: Arc<std::sync::Mutex<std::collections::HashSet<SocketAddr>>>,
 }
 
 impl AppState {
@@ -1573,7 +1569,7 @@ fn import_error_response(error: ImportError) -> Response {
 
 async fn security_and_auth_middleware(
     State(state): State<AppState>,
-    mut req: Request,
+    req: Request,
     next: Next,
 ) -> Response {
     let host_header = match req
@@ -1595,9 +1591,7 @@ async fn security_and_auth_middleware(
     let method = req.method().clone();
     let headers = req.headers().clone();
 
-    if let Some(origin) = headers.get(header::ORIGIN)
-        && !is_guarded_path(&path)
-    {
+    if let Some(origin) = headers.get(header::ORIGIN) {
         let origin_str = match origin.to_str() {
             Ok(s) => s,
             Err(_) => return StatusCode::FORBIDDEN.into_response(),
@@ -1612,11 +1606,6 @@ async fn security_and_auth_middleware(
         .extensions()
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
-    let mut conn_state = req
-        .extensions_mut()
-        .get::<ConnectionAccessState>()
-        .cloned()
-        .unwrap_or_default();
 
     if is_guarded_path(&path)
         && let Err(resp) = check_guarded_request(
@@ -1627,13 +1616,12 @@ async fn security_and_auth_middleware(
             &host_header,
             query.as_deref(),
             peer,
-            &mut conn_state.loopback_peer_checked,
+            state.loopback_peer_checked.as_ref(),
         )
     {
         return resp;
     }
 
-    req.extensions_mut().insert(conn_state);
     next.run(req).await
 }
 
@@ -2247,7 +2235,11 @@ pub fn build_router_with_directory_access(
     workspaces: Arc<WorkspaceDirectory>,
     access: WebAccess,
 ) -> Router {
-    let state = AppState { access, workspaces };
+    let state = AppState {
+        access,
+        workspaces,
+        loopback_peer_checked: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+    };
 
     Router::new()
         .route("/", get(get_index))
@@ -2378,13 +2370,19 @@ pub async fn start_server(
     } else {
         addr.ip()
     };
-    let loopback_access = WebAccess::loopback(
-        config.token.clone(),
-        config.token_required,
-        bind_ip,
-        port,
-        peer_source.clone(),
-    );
+    let remote_bind =
+        !crate::web::auth::bind_is_loopback_for_policy(config.bind, config.allow_remote);
+    let primary_access = if remote_bind {
+        WebAccess::remote(config.token.clone(), peer_source.clone())
+    } else {
+        WebAccess::loopback(
+            config.token.clone(),
+            config.token_required,
+            bind_ip,
+            port,
+            peer_source.clone(),
+        )
+    };
     let wsl_access = wsl_extra_listener_access(&config, port, peer_source.clone());
 
     let url = dashboard_url(addr, &config.token, config.token_required);
@@ -2401,7 +2399,7 @@ pub async fn start_server(
     hub.set_switch_config(switch_cfg);
     let workspaces = Arc::new(WorkspaceDirectory::single(hub, config.services));
     let loopback_router =
-        build_router_with_directory_access(workspaces.clone(), loopback_access.clone());
+        build_router_with_directory_access(workspaces.clone(), primary_access.clone());
     let loopback_make = loopback_router.into_make_service_with_connect_info::<SocketAddr>();
 
     let wsl_listener = if let Some((wsl_ip, access)) = wsl_access {
@@ -3868,7 +3866,7 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // foreign Origin with a valid token is allowed (bearer auth).
+        // foreign Origin with a valid token is rejected (CSRF parity with main).
         let req = axum::http::Request::builder()
             .method("GET")
             .uri("/api/todos")
@@ -3878,7 +3876,7 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // TC-570 / FR-563: link fields validate on POST/PATCH (400), round-trip in
@@ -4517,7 +4515,7 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 6. foreign Origin with a valid bearer token is allowed
+        // 6. foreign Origin with a valid bearer token is rejected
         let req = axum::http::Request::builder()
             .method("POST")
             .uri("/api/prompt")
@@ -4528,7 +4526,7 @@ mod tests {
             .body(axum::body::Body::from(r#"{"text":"hello"}"#))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         // UX-933: optional `route` (auto | plan | direct), slash wins, empty/unknown → 400
         let (tx, seen) = spawn_prompt_route_capture();

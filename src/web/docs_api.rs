@@ -1868,7 +1868,7 @@ mod tests {
         let resp = router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 2. Foreign Origin with a valid bearer token is allowed
+        // 2. Foreign Origin with a valid bearer token is rejected
         let req = axum::http::Request::builder()
             .uri("/api/docs")
             .header("Host", "localhost:7420")
@@ -1877,7 +1877,7 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         // 3. Correct token and origin -> 200
         let req = axum::http::Request::builder()

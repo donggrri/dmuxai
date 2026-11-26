@@ -233,6 +233,7 @@ pub(crate) async fn run_headless_host(
                             app.shutdown().await;
                             if let Some(ctx) = ctx.as_ref() {
                                 let _ = ctx.directory.remove(&id);
+                                sync_user_workspaces_list(&ctx.directory);
                             }
                             stop_flags.remove(&id);
                             let _ = reply.send(Ok(()));
@@ -446,13 +447,18 @@ async fn open_hosted_workspace(
         parts.hub.set_switch_config(config);
     }
 
+    let storage_path = std::fs::canonicalize(&path)
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .into_owned();
+
     let id = format!("w{next_id}");
     *next_id += 1;
     let entry = ctx
         .directory
         .insert(WorkspaceEntry {
             id,
-            path: key.clone(),
+            path: storage_path.clone(),
             hub: parts.hub.clone(),
             services: parts.services,
             restricted,
@@ -476,9 +482,22 @@ async fn open_hosted_workspace(
         parts.todos,
         ctx.base_url.clone(),
     );
-    app.push_local_notice(format!("Opened {key} in this dashboard."));
+    app.push_local_notice(format!("Opened {storage_path} in this dashboard."));
+    sync_user_workspaces_list(&ctx.directory);
     let _ = dmuxai::workspace::record_recent_workspace(&path);
     Ok((app, entry))
+}
+
+fn sync_user_workspaces_list(directory: &WorkspaceDirectory) {
+    let refs: Vec<dmuxai::web::discovery::UserWorkspaceRef> = directory
+        .entries()
+        .into_iter()
+        .map(|entry| dmuxai::web::discovery::UserWorkspaceRef {
+            id: entry.id.clone(),
+            path: entry.path.clone(),
+        })
+        .collect();
+    let _ = dmuxai::web::discovery::sync_user_discovery_workspaces(&refs);
 }
 
 fn folder_is_restricted(settings: &DmuxSettings) -> bool {
