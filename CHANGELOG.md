@@ -5,6 +5,10 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Decision board (v0.4.1, PR 1):** User-level coordinator board under `<state base>/board/` with lanes, rules, graph plan attach/edit, decisions, thread messages, blocking `board wait`, `dmuxai board` CLI, and MCP `board_*` tools (SPEC-decision-board FR-3100..FR-3115).
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

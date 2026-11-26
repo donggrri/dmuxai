@@ -2,6 +2,7 @@ pub mod activity;
 pub mod agent_api;
 pub mod agent_prompt;
 pub mod attachments;
+pub mod board;
 pub mod chat_selection;
 pub mod clipboard;
 pub mod clipboard_image;

@@ -37,6 +37,7 @@ The following flags can be used before or after subcommands, or with the interac
 | `dmuxai runners` | `[--json]` | Registered runners, admission, installation and model policy |
 | `dmuxai models` | `[--agent ID]`, `[--json]` | Available models and runner policy |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
+| `dmuxai board` | see [Decision board](#decision-board) | Coordinator items (user-level store) |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
 
 Notes:
@@ -423,6 +424,15 @@ Tools (`tools/list`):
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
 | `models` | `agent` (optional) | Available models and runner policy JSON (same as `dmuxai models --json`) |
+| `board_add` | `title`, `kind` (required); `summary`, `grade`, `lane`, `plan_hash`, `workspace`, `by`, … | Created board item JSON (`exit_code` in errors) |
+| `board_list` | `lane[]`, `all`, `workspace` | Item array |
+| `board_show` | `id` | One item |
+| `board_update` | `id`, optional fields, `if_version` | Updated item |
+| `board_move` | `id`, `lane` | Updated item |
+| `board_plan` | `id`, `hash` or `steps` (+ optional `tasks`) | Item with plan revision |
+| `board_decide` | `id`, `verdict`, `text` / `option`, `plan_hash`, `by` | Item with decision |
+| `board_say` | `id`, `text`, `from` | Item with thread |
+| `board_wait` | `id`, `since_version`, `timeout_secs` (≤300), `wait_for` | Item or `{timed_out:true,version}` |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
 the forwarded flags, and blocks until it finishes, so the result is final. Tool
@@ -443,6 +453,26 @@ Most clients wrap it, for example:
 ```json
 { "mcpServers": { "dmuxai": { "command": "dmuxai", "args": ["mcp"], "cwd": "<repo>" } } }
 ```
+
+## Decision board
+
+The coordinator board is **user-level** state under `<state base>/board/`, not per
+repo. Items from every workspace appear together. Bots use the same operations as
+the owner through `dmuxai board …` or MCP `board_*` tools.
+
+Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
+
+1. `dmuxai -C <repo> run --graph --json -` — on exit `7`, take `plan_hash`.
+2. `dmuxai board add -C <repo> --title … --kind feature --plan-hash <hash> --bot coordinator --json`.
+3. Lane `auto`: run `dmuxai -C <repo> run --graph --approve-plan-id <hash> -`, then `board move <id> in_progress` / `done`.
+4. Lane `needs_decision`: `dmuxai board wait <id> --for any`; on approve, run the decided plan; on `request_changes` or messages, revise with `board plan --edit` and reply with `board say`.
+
+Subcommands: `add`, `list`, `show`, `update`, `move`, `plan`, `decide`, `say`,
+`wait`, `rules`. MCP callers default to `by=bot:mcp`; `by=owner` over MCP is
+rejected (exit `5`). CLI defaults to `by=owner` only when stdin is a TTY.
+
+Exit codes match the headless agent API: usage `2`, not found `3`, conflict `4`,
+forbidden `5`, validation `1`, internal `6`.
 
 ### Memory MCP server
 

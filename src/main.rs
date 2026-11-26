@@ -187,6 +187,13 @@ where
             };
             return CliAction::HelpTopic(text);
         }
+        if wants_help && args.first().map(String::as_str) == Some("board") {
+            let text = match args.get(1).map(String::as_str) {
+                Some(subcommand) => cli::board_subcommand_usage(subcommand),
+                None => cli::BOARD_USAGE,
+            };
+            return CliAction::HelpTopic(text);
+        }
         if wants_help {
             if let Some(sub) = args.first().map(String::as_str)
                 && let Some(text) = cli::subcommand_usage(sub)

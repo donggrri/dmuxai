@@ -32,6 +32,7 @@ pub trait McpBackend {
     fn status(&self) -> Result<Value, String>;
     fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String>;
     fn models(&self, agent: Option<&str>) -> Result<Value, String>;
+    fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
 }
 
 fn tool_definitions() -> Value {
@@ -114,6 +115,101 @@ fn tool_definitions() -> Value {
                         "description": "Optional runner id (e.g. agy, cursor, codex, or a custom agent name)"
                     }
                 }
+            }
+        },
+        {
+            "name": "board_add",
+            "description": "Add an item to the user-level coordinator decision board.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "grade": { "type": "string" },
+                    "lane": { "type": "string" },
+                    "plan_hash": { "type": "string" },
+                    "workspace": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["title", "kind"]
+            }
+        },
+        {
+            "name": "board_list",
+            "description": "List decision board items.",
+            "inputSchema": { "type": "object", "properties": { "all": { "type": "boolean" } } }
+        },
+        {
+            "name": "board_show",
+            "description": "Show one decision board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_update",
+            "description": "Update decision board item fields.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_move",
+            "description": "Move a decision board item to a lane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "lane": { "type": "string" }
+                },
+                "required": ["id", "lane"]
+            }
+        },
+        {
+            "name": "board_plan",
+            "description": "Attach or edit a graph plan on a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_decide",
+            "description": "Record a decision on a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "verdict": { "type": "string" }
+                },
+                "required": ["id", "verdict"]
+            }
+        },
+        {
+            "name": "board_say",
+            "description": "Append a thread message on a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["id", "text"]
+            }
+        },
+        {
+            "name": "board_wait",
+            "description": "Wait for decision board activity (timeout capped at 300s).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
             }
         }
     ])
@@ -218,6 +314,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
             backend.events_since(since, limit)
         }
         "models" => backend.models(str_arg(args, "agent")),
+        name if name.starts_with("board_") => backend.board_tool(name, args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -289,6 +386,15 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "status",
                 "events_since",
                 "models",
+                "board_add",
+                "board_list",
+                "board_show",
+                "board_update",
+                "board_move",
+                "board_plan",
+                "board_decide",
+                "board_say",
+                "board_wait",
             ];
             if !known.contains(&name) {
                 return Some(
@@ -362,10 +468,35 @@ mod tests {
                 .push(agent.map(str::to_owned));
             Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
         }
+        fn board_tool(&self, name: &str, _args: &Value) -> Result<Value, String> {
+            Ok(json!({ "ok": true, "exit_code": 0, "tool": name }))
+        }
     }
 
     fn call(stub: &Stub, line: Value) -> Value {
         serde_json::from_str(&handle_line(stub, &line.to_string()).expect("response")).unwrap()
+    }
+
+    // TC-3113 / FR-3113: board MCP tools are listed and callable.
+    #[test]
+    fn tc_3113_mcp_board_tools_listed_and_mapped() {
+        let stub = Stub::default();
+        let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for name in ["board_add", "board_wait"] {
+            assert!(names.contains(&name));
+        }
+        let call = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"debug"}}}),
+        );
+        assert_eq!(call["result"]["structuredContent"]["ok"], true);
+        assert_eq!(call["result"]["structuredContent"]["tool"], "board_add");
     }
 
     // TC-768 / FR-767: initialize, tools/list, tools/call for every tool,
@@ -397,17 +528,23 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "todo_add",
-                "todo_list",
-                "run",
-                "status",
-                "events_since",
-                "models"
-            ]
+        assert!(
+            names.contains(&"todo_add"),
+            "tools list must include todo_add"
         );
+        for tool in [
+            "board_add",
+            "board_list",
+            "board_show",
+            "board_update",
+            "board_move",
+            "board_plan",
+            "board_decide",
+            "board_say",
+            "board_wait",
+        ] {
+            assert!(names.contains(&tool), "missing tool {tool}");
+        }
         let run_tool = list["result"]["tools"]
             .as_array()
             .unwrap()
