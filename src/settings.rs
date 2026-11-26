@@ -108,9 +108,11 @@ pub struct DmuxSettings {
     pub ui: UiSettings,
     /// `[ui] default_mode` (`"web"` or `"tui"`), if explicitly configured (FR-2970).
     pub ui_default_mode: Option<DefaultUiMode>,
+    /// Validation error for an invalid `[ui] default_mode` value (FR-2970).
+    pub ui_default_mode_error: Option<String>,
     /// Web dashboard theme settings from `[web]`.
     pub web_theme: WebThemeSettings,
-    /// True when the trusted workspace `dmuxai.toml` defines `[[agents.custom]]` (FR-2978).
+    /// True when the raw workspace `dmuxai.toml` defines `[[agents.custom]]` (FR-2978).
     pub workspace_defines_custom_agents: bool,
     /// Event delivery settings from `[notify]` (FR-770..FR-772).
     pub notify: NotifySettings,
@@ -530,6 +532,17 @@ impl DmuxSettings {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(mut parsed) => {
+                    // FR-2978: record whether the raw repo config defines `[[agents.custom]]`
+                    // before trust stripping so untrusted or client-trusted repos still fall
+                    // back to a separate dashboard instead of attaching in-process.
+                    if parsed
+                        .agents
+                        .as_ref()
+                        .and_then(|agents| agents.custom.as_ref())
+                        .is_some_and(|custom| !custom.is_empty())
+                    {
+                        settings.workspace_defines_custom_agents = true;
+                    }
                     let sha256 = content_hash(contents.as_bytes());
                     let restricted = restricted_workspace_keys_with_user(
                         &parsed,
@@ -604,14 +617,6 @@ impl DmuxSettings {
                         }
                         workspace_runners = Some(parsed_map);
                         workspace_fallback_tables = Some(fallback_map);
-                    }
-                    if parsed
-                        .agents
-                        .as_ref()
-                        .and_then(|agents| agents.custom.as_ref())
-                        .is_some_and(|custom| !custom.is_empty())
-                    {
-                        settings.workspace_defines_custom_agents = true;
                     }
                     configs.push(parsed);
                 }
@@ -1203,10 +1208,13 @@ impl DmuxSettings {
                 let trimmed = raw_mode.trim();
                 if trimmed.eq_ignore_ascii_case("web") {
                     self.ui_default_mode = Some(DefaultUiMode::Web);
+                    self.ui_default_mode_error = None;
                 } else if trimmed.eq_ignore_ascii_case("tui") {
                     self.ui_default_mode = Some(DefaultUiMode::Tui);
+                    self.ui_default_mode_error = None;
                 } else {
-                    self.config_warnings.push(format!(
+                    self.ui_default_mode = None;
+                    self.ui_default_mode_error = Some(format!(
                         "[ui] default_mode = \"{raw_mode}\" is not valid; expected \"web\" or \"tui\""
                     ));
                 }
@@ -2000,6 +2008,7 @@ impl Default for DmuxSettings {
             jira: None,
             ui: UiSettings::default(),
             ui_default_mode: None,
+            ui_default_mode_error: None,
             web_theme: WebThemeSettings::default(),
             workspace_defines_custom_agents: false,
             notify: NotifySettings::default(),
@@ -6129,5 +6138,67 @@ usbipd_attach = false
                 invalid.config_warnings
             );
         }
+    }
+
+    // TC-2970 / FR-2970: `[ui] default_mode` TOML parsing, workspace-over-user merge, and invalid error.
+    #[test]
+    fn tc_2970_ui_default_mode_toml_merge_and_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let env = RuntimeEnv::from_process();
+        let user_cfg = user_dir.join("dmuxai.toml");
+
+        // User config sets tui; workspace overrides to web.
+        std::fs::write(&user_cfg, "[ui]\ndefault_mode = \"tui\"\n").unwrap();
+        let user_only = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(user_only.ui_default_mode, Some(DefaultUiMode::Tui));
+        assert_eq!(user_only.ui_default_mode_error, None);
+
+        std::fs::write(ws.join("dmuxai.toml"), "[ui]\ndefault_mode = \"web\"\n").unwrap();
+        let ws_override = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(ws_override.ui_default_mode, Some(DefaultUiMode::Web));
+        assert_eq!(ws_override.ui_default_mode_error, None);
+
+        // Workspace invalid value overrides valid user value and records config error.
+        std::fs::write(ws.join("dmuxai.toml"), "[ui]\ndefault_mode = \"bogus\"\n").unwrap();
+        let ws_invalid = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(ws_invalid.ui_default_mode, None);
+        let err = ws_invalid.ui_default_mode_error.as_deref().unwrap();
+        assert!(err.contains("[ui] default_mode"), "got: {err}");
+
+        // Valid workspace value clears an invalid user value.
+        std::fs::write(&user_cfg, "[ui]\ndefault_mode = \"bogus\"\n").unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), "[ui]\ndefault_mode = \"tui\"\n").unwrap();
+        let recovered = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(recovered.ui_default_mode, Some(DefaultUiMode::Tui));
+        assert_eq!(recovered.ui_default_mode_error, None);
+    }
+
+    // TC-2979 / FR-2978: untrusted workspace `[[agents.custom]]` still sets `workspace_defines_custom_agents`.
+    #[test]
+    fn tc_2979_untrusted_workspace_sets_custom_agents_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[[agents.custom]]\nname = \"my-agent\"\ncommand = [\"echo\"]\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv::from_process();
+        let settings = DmuxSettings::load_with_user_config_and_env(
+            &ws,
+            Some(&user_dir.join("missing.toml")),
+            &env,
+        );
+        assert!(
+            settings.workspace_defines_custom_agents,
+            "raw repo config with [[agents.custom]] must set flag even when untrusted"
+        );
     }
 }

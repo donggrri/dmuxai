@@ -65,7 +65,7 @@ pub enum DirectoryError {
 impl fmt::Display for DirectoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DirectoryError::Full => write!(f, "too many open folders (max 4)"),
+            DirectoryError::Full => write!(f, "too many open folders"),
             DirectoryError::Duplicate => write!(f, "folder is already open"),
             DirectoryError::Missing => write!(f, "no such open folder"),
             DirectoryError::LastEntry => write!(f, "cannot close the last open folder"),

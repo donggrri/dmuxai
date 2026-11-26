@@ -457,7 +457,11 @@ async fn open_hosted_workspace(
                 _ => 500,
             };
             if error == DirectoryError::Full {
-                OpenError::with_code(status, "full", error.to_string())
+                OpenError::with_code(
+                    status,
+                    "full",
+                    format!("too many open folders (max {max_workspaces}); close one first"),
+                )
             } else {
                 OpenError::new(status, error.to_string())
             }

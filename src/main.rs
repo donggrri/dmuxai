@@ -41,6 +41,7 @@ type DmuxTerminal = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WebOptions {
     port: u16,
+    port_explicit: bool,
     bind: IpAddr,
     allow_remote: bool,
     bind_explicit: bool,
@@ -51,11 +52,18 @@ impl Default for WebOptions {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            port_explicit: false,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             allow_remote: false,
             bind_explicit: false,
             new: false,
         }
+    }
+}
+
+impl WebOptions {
+    fn has_explicit_web_flags(&self) -> bool {
+        self.new || self.port_explicit || self.bind_explicit || self.allow_remote
     }
 }
 
@@ -153,6 +161,7 @@ Options:
 
 Configuration:
   dmuxai.toml      Optional configuration file in the workspace root or parent directories
+                   ([ui] default_mode = \"web\"|\"tui\", [web] max_workspaces = 1..32, default 8)
 
 Environment variables:
   DMUXAI_UI           Default mode for plain `dmuxai` (`web` or `tui`; overrides [ui] default_mode)
@@ -299,7 +308,10 @@ where
             "--port" => {
                 index += 1;
                 match args.get(index).and_then(|value| value.parse::<u16>().ok()) {
-                    Some(port) => options.port = port,
+                    Some(port) => {
+                        options.port = port;
+                        options.port_explicit = true;
+                    }
                     None => return CliAction::Unknown("--port".to_owned()),
                 }
             }
@@ -915,6 +927,7 @@ fn resolve_default_mode(
     flag: Option<DefaultUiMode>,
     env_ui: Option<&str>,
     settings_mode: Option<DefaultUiMode>,
+    settings_mode_error: Option<&str>,
 ) -> Result<DefaultUiMode, String> {
     if let Some(mode) = flag {
         return Ok(mode);
@@ -929,6 +942,9 @@ fn resolve_default_mode(
         return Err(format!(
             "DMUXAI_UI = \"{raw}\" is not valid; expected \"web\" or \"tui\""
         ));
+    }
+    if let Some(err) = settings_mode_error {
+        return Err(err.to_owned());
     }
     Ok(settings_mode.unwrap_or(DefaultUiMode::Web))
 }
@@ -957,11 +973,14 @@ async fn run_entry(
             std::process::exit(2);
         }
     };
-    dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
-    let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
     let settings = load_settings_with_trust_prompt(&workspace_root);
     let env_ui = std::env::var("DMUXAI_UI").ok();
-    let mode = match resolve_default_mode(flag_mode, env_ui.as_deref(), settings.ui_default_mode) {
+    let mode = match resolve_default_mode(
+        flag_mode,
+        env_ui.as_deref(),
+        settings.ui_default_mode,
+        settings.ui_default_mode_error.as_deref(),
+    ) {
         Ok(mode) => mode,
         Err(error) => {
             eprintln!("error: {error}");
@@ -971,11 +990,29 @@ async fn run_entry(
 
     let web = match mode {
         DefaultUiMode::Tui => {
+            if options.has_explicit_web_flags() {
+                eprintln!(
+                    "error: --port, --bind, --allow-remote, and --new cannot be used in tui mode\n\n{USAGE}"
+                );
+                std::process::exit(2);
+            }
             require_tty_or_exit();
+            dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
+            let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
             None
         }
         DefaultUiMode::Web => {
-            if !options.new {
+            if let Err(error) = check_bind(options.bind, options.allow_remote) {
+                eprintln!("error: {error}\n\n{USAGE}");
+                std::process::exit(2);
+            }
+            if let Err(reason) = dmuxai::workspace::validate_workspace_dir(&workspace_root) {
+                eprintln!("error: {reason}");
+                std::process::exit(2);
+            }
+            dmuxai::workspace::ensure_directory_writable(&workspace_root)?;
+            let _ = dmuxai::workspace::record_recent_workspace(&workspace_root);
+            if !options.has_explicit_web_flags() {
                 match dmuxai::web::reuse::try_attach_to_live_dashboard(&workspace_root) {
                     AttachOutcome::Attached { url } => {
                         println!("dmuxai dashboard: {url}");
@@ -1449,6 +1486,7 @@ mod tests {
             parse_cli(["serve", "--port", "9000"]),
             CliAction::Serve(WebOptions {
                 port: 9000,
+                port_explicit: true,
                 ..web_default()
             })
         );
@@ -1490,6 +1528,7 @@ mod tests {
             parse_cli(["--web", "--port", "0"]),
             CliAction::RunWeb(WebOptions {
                 port: 0,
+                port_explicit: true,
                 ..web_default()
             })
         );
@@ -1509,6 +1548,7 @@ mod tests {
             parse_cli(["--port", "9000"]),
             CliAction::Run(WebOptions {
                 port: 9000,
+                port_explicit: true,
                 ..web_default()
             })
         );
@@ -1809,26 +1849,27 @@ mod tests {
     #[test]
     fn tc_2970_default_mode_resolution_order() {
         assert_eq!(
-            resolve_default_mode(None, None, None),
+            resolve_default_mode(None, None, None, None),
             Ok(DefaultUiMode::Web)
         );
         assert_eq!(
-            resolve_default_mode(None, None, Some(DefaultUiMode::Tui)),
+            resolve_default_mode(None, None, Some(DefaultUiMode::Tui), None),
             Ok(DefaultUiMode::Tui)
         );
         assert_eq!(
-            resolve_default_mode(None, Some("web"), Some(DefaultUiMode::Tui)),
+            resolve_default_mode(None, Some("web"), Some(DefaultUiMode::Tui), None),
             Ok(DefaultUiMode::Web)
         );
         assert_eq!(
-            resolve_default_mode(None, Some("TUI"), Some(DefaultUiMode::Web)),
+            resolve_default_mode(None, Some("TUI"), Some(DefaultUiMode::Web), None),
             Ok(DefaultUiMode::Tui)
         );
         assert_eq!(
             resolve_default_mode(
                 Some(DefaultUiMode::Tui),
                 Some("web"),
-                Some(DefaultUiMode::Web)
+                Some(DefaultUiMode::Web),
+                None,
             ),
             Ok(DefaultUiMode::Tui)
         );
@@ -1836,12 +1877,16 @@ mod tests {
             resolve_default_mode(
                 Some(DefaultUiMode::Web),
                 Some("tui"),
-                Some(DefaultUiMode::Tui)
+                Some(DefaultUiMode::Tui),
+                None,
             ),
             Ok(DefaultUiMode::Web)
         );
-        let err = resolve_default_mode(None, Some("bogus"), None).unwrap_err();
+        let err = resolve_default_mode(None, Some("bogus"), None, None).unwrap_err();
         assert!(err.contains("DMUXAI_UI"), "got: {err}");
+        let cfg_err = resolve_default_mode(None, None, None, Some("[ui] default_mode = \"bogus\""))
+            .unwrap_err();
+        assert!(cfg_err.contains("[ui] default_mode"), "got: {cfg_err}");
     }
 
     // TC-2971 / FR-2971: --tui flag and conflicts with --web, serve, and web-only flags.
@@ -1868,12 +1913,13 @@ mod tests {
         assert!(matches!(parse_cli(["serve", "--new"]), CliAction::Usage(_)));
     }
 
-    // TC-2977 / FR-2977: `dmuxai --help` documents default mode, --tui, --new, DMUXAI_UI.
+    // TC-2977 / FR-2977: `dmuxai --help` documents default mode, --tui, --new, DMUXAI_UI, [web] max_workspaces.
     #[test]
     fn tc_2977_help_documents_default_mode_flags() {
         assert!(USAGE.contains("--tui"));
         assert!(USAGE.contains("--new"));
         assert!(USAGE.contains("default mode"));
         assert!(USAGE.contains("DMUXAI_UI"));
+        assert!(USAGE.contains("[web] max_workspaces"));
     }
 }
