@@ -167,6 +167,19 @@ pub enum BoardOp {
     Rules {
         set: Option<String>,
     },
+    Ask {
+        id: String,
+        text: String,
+        revise: bool,
+        agent: Option<String>,
+        model: Option<String>,
+        by: Option<String>,
+    },
+    Run {
+        id: String,
+        detach: bool,
+        by: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +298,8 @@ Subcommands:
   events     List board events (--since SEQ)
   prompt     Print unmasked plan prompt for piping into run
   rules      Print or replace classification rules (owner only for --set)
+  ask        Ask the planner a question or request a plan revision
+  run        Execute an approved or auto item's graph plan
 
 Run `dmuxai board <subcommand> --help` for details.
 ";
@@ -340,6 +355,14 @@ Usage: dmuxai board prompt <id> [--hash H] [--json]
 
 pub const BOARD_RULES_USAGE: &str = "\
 Usage: dmuxai board rules [--set FILE|-] [--json]
+";
+
+pub const BOARD_ASK_USAGE: &str = "\
+Usage: dmuxai board ask <id> --text T|- [--revise] [--agent A] [--model M] [--by ACTOR] [--json]
+";
+
+pub const BOARD_RUN_USAGE: &str = "\
+Usage: dmuxai board run <id> [--detach] [--by ACTOR] [--json]
 ";
 
 pub const RUN_USAGE: &str = "\
@@ -726,6 +749,8 @@ pub fn board_subcommand_usage(subcommand: &str) -> &'static str {
         "events" => BOARD_EVENTS_USAGE,
         "prompt" => BOARD_PROMPT_USAGE,
         "rules" => BOARD_RULES_USAGE,
+        "ask" => BOARD_ASK_USAGE,
+        "run" => BOARD_RUN_USAGE,
         _ => BOARD_USAGE,
     }
 }
@@ -1842,6 +1867,95 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 },
             })
         }
+        "ask" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--text"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--revise"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--agent"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--model"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--by"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board ask needs an id".to_owned())?;
+            let text = parsed
+                .flags
+                .get("--text")
+                .and_then(|v| v.clone())
+                .ok_or_else(|| "--text is required".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Ask {
+                    id,
+                    text,
+                    revise: parsed.flags.contains_key("--revise"),
+                    agent: parsed.flags.get("--agent").cloned().flatten(),
+                    model: parsed.flags.get("--model").cloned().flatten(),
+                    by: parsed.flags.get("--by").cloned().flatten(),
+                },
+            })
+        }
+        "run" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--detach"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--by"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board run needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Run {
+                    id,
+                    detach: parsed.flags.contains_key("--detach"),
+                    by: parsed.flags.get("--by").cloned().flatten(),
+                },
+            })
+        }
         other => Err(format!("unknown board subcommand '{other}'")),
     }
 }
@@ -2785,6 +2899,15 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
             }
         }
         BoardOp::Rules { .. } => {}
+        BoardOp::Ask { id, text, .. } => {
+            check_id(id)?;
+            if text.trim() != "-" {
+                validate_message(text).map_err(ApiError::from)?;
+            }
+        }
+        BoardOp::Run { id, .. } => {
+            check_id(id)?;
+        }
     }
     Ok(())
 }
@@ -3260,6 +3383,68 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                             serde_json::to_string_pretty(&rules).unwrap_or_default()
                         );
                     }
+                }
+                Ok(())
+            }
+            BoardOp::Ask {
+                id,
+                text,
+                revise,
+                agent,
+                model,
+                by,
+            } => {
+                let text = read_prompt(&text)?;
+                let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
+                let item = dmuxai::board::runner::ask_item(
+                    &store,
+                    dmuxai::board::runner::AskParams {
+                        id,
+                        text,
+                        revise,
+                        agent,
+                        model,
+                        by,
+                        state_root,
+                    },
+                )
+                .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                } else if let Some(last) = item.thread.last() {
+                    println!("{}", last.text);
+                }
+                Ok(())
+            }
+            BoardOp::Run { id, detach, by } => {
+                let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
+                let prepared = dmuxai::board::runner::run_item_prepare(
+                    &store,
+                    dmuxai::board::runner::RunParams {
+                        id,
+                        expected_plan_hash: None,
+                        by,
+                        state_root,
+                    },
+                )
+                .map_err(ApiError::from)?;
+                let item = if detach {
+                    let out_item = prepared.item.clone();
+                    let board_base = store.base().to_path_buf();
+                    std::thread::spawn(move || {
+                        if let Ok(bg_store) = dmuxai::board::BoardStore::open(board_base) {
+                            let _ = dmuxai::board::runner::run_item_execute(&bg_store, prepared);
+                        }
+                    });
+                    out_item
+                } else {
+                    dmuxai::board::runner::run_item_execute(&store, prepared)
+                        .map_err(ApiError::from)?
+                };
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                } else {
+                    println!("{}\t{}", item.id, item.lane.as_str());
                 }
                 Ok(())
             }

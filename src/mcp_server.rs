@@ -278,6 +278,34 @@ fn tool_definitions() -> Value {
                     "since": { "type": "integer", "minimum": 0 }
                 }
             }
+        },
+        {
+            "name": "board_ask",
+            "description": "Ask the planner a question on a decision board item or request a plan revision (blocks up to 900s).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "revise": { "type": "boolean" },
+                    "agent": { "type": "string" },
+                    "model": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id", "text"]
+            }
+        },
+        {
+            "name": "board_run",
+            "description": "Start executing an approved or auto decision board item's graph plan (detached; returns once in_progress).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id"]
+            }
         }
     ])
 }
@@ -464,6 +492,8 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_wait",
                 "board_prompt",
                 "board_events",
+                "board_ask",
+                "board_run",
             ];
             if !known.contains(&name) {
                 return Some(

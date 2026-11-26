@@ -11,7 +11,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use serde::{Deserialize, Serialize};
 
-use super::plan::{board_plan_from_pending, pending_hash_for_plan, read_pending_plan};
+use super::plan::{
+    board_plan_from_pending, pending_hash_for_plan, read_pending_plan, write_board_plan_copy,
+};
 use super::rules::RulesStore;
 use super::{
     BoardError, BoardItem, CLOSED_HIDE_DAYS, Decision, Kind, Lane, Source, THREAD_MAX,
@@ -425,12 +427,16 @@ impl BoardStore {
                 if computed != hash {
                     return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
                 }
+                write_board_plan_copy(&req.state_root, &store.base, &hash)?;
                 item.plan = Some(board_plan_from_pending(pending, hash, None));
                 store.clear_decision_on_plan_change(&mut item);
             }
             mask_item_fields(&mut item);
             store.save_item_inner(&item)?;
             store.append_event(&item.id, EventKind::Created, item.version, &req.by)?;
+            if item.lane == Lane::NeedsDecision {
+                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", &req.by);
+            }
             Ok(item)
         })
     }
@@ -545,11 +551,15 @@ impl BoardStore {
                     item.version
                 )));
             }
+            let prev_lane = item.lane;
             item.lane = lane;
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Lane, item.version, by)?;
+            if prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision {
+                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", by);
+            }
             Ok(item)
         })
     }
@@ -571,6 +581,8 @@ impl BoardStore {
             if computed != hash {
                 return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
             }
+            write_board_plan_copy(state_root, &store.base, hash)?;
+            let prev_lane = item.lane;
             let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
@@ -578,6 +590,9 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
+            if prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision {
+                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", by);
+            }
             Ok(item)
         })
     }
@@ -600,6 +615,8 @@ impl BoardStore {
             if computed != hash {
                 return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
             }
+            write_board_plan_copy(_state_root, &store.base, hash)?;
+            let prev_lane = item.lane;
             let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
@@ -607,6 +624,9 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
+            if prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision {
+                super::notify::dispatch_board_event(&store.base, &item, "needs_decision", by);
+            }
             Ok(item)
         })
     }
@@ -875,6 +895,7 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Decision, item.version, &req.by)?;
+            super::notify::dispatch_board_event(&store.base, &item, "decision", &req.by);
             Ok(item)
         })
     }
@@ -901,6 +922,69 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Message, item.version, &from)?;
+            if from == "owner" {
+                super::notify::dispatch_board_event(&store.base, &item, "message", &from);
+            }
+            Ok(item)
+        })
+    }
+
+    /// Record the outcome of `board run` (FR-3133, FR-3135).
+    pub fn record_run_result(
+        &self,
+        id: &str,
+        run_id: Option<&str>,
+        exit_code: i32,
+        summary: Option<&str>,
+        by: &str,
+    ) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if let Some(rid) = run_id.map(str::trim).filter(|s| !s.is_empty())
+                && !item.run_ids.iter().any(|existing| existing == rid)
+            {
+                item.run_ids.push(rid.to_owned());
+            }
+            let run_label = run_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown");
+            let mut msg = if exit_code == 0 {
+                format!("Run {run_label} completed (exit 0).")
+            } else {
+                let mut m = format!("Run {run_label} failed (exit {exit_code}).");
+                if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+                    let masked = crate::run_journal::mask_sensitive_tokens(summary);
+                    let clipped: String = masked.chars().take(2000).collect();
+                    m.push(' ');
+                    m.push_str(&clipped);
+                }
+                m
+            };
+            if msg.chars().count() > super::TEXT_MAX {
+                msg = msg.chars().take(super::TEXT_MAX).collect();
+            }
+            if item.thread.len() >= THREAD_MAX {
+                item.thread.remove(0);
+            }
+            item.thread.push(ThreadMessage {
+                from: "run".to_owned(),
+                text: msg,
+                at_ms: now_ms(),
+            });
+            item.lane = if exit_code == 0 {
+                Lane::Done
+            } else {
+                Lane::Unknown
+            };
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            store.append_event(id, EventKind::Lane, item.version, by)?;
+            super::notify::dispatch_board_event(&store.base, &item, "run_finished", by);
             Ok(item)
         })
     }

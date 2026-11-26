@@ -1,15 +1,18 @@
 //! User-level coordinator decision board (SPEC-decision-board FR-3100..FR-3115).
 
 mod mcp;
+pub mod notify;
 mod plan;
 mod rules;
+pub mod runner;
 mod store;
 
 pub use mcp::invoke as mcp_invoke;
 
 pub use plan::{
-    PendingPlanFile, edit_plan_from_json, pending_plan_path, read_pending_plan,
-    unmasked_prompt_from_item_plan,
+    PendingPlanFile, board_plan_copy_path, edit_plan_from_json, ensure_pending_plan_from_copy,
+    pending_plan_path, prune_old_plan_copies, read_pending_plan, unmasked_prompt_from_item_plan,
+    write_board_plan_copy,
 };
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{

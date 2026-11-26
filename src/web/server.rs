@@ -2337,6 +2337,7 @@ pub fn build_router_with_directory(
         .merge(crate::web::board_api::router(
             crate::web::board_api::board_base_from_services(&state.workspaces.focused().services),
             crate::web::board_api::state_root_from_services(&state.workspaces.focused().services),
+            state.workspaces.focused().services.web_attached,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),

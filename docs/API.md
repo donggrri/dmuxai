@@ -434,6 +434,8 @@ Tools (`tools/list`):
 | `board_say` | `id`, `text`, `from` | Item with thread |
 | `board_wait` | `id` or global wait, `since_version`, `since_seq`, `timeout_secs` (≤300), `wait_for` | Item or `{timed_out:true,version}` |
 | `board_prompt` | `id`, optional `hash` | `{prompt}` unmasked text from `graph-pending/` |
+| `board_ask` | `id`, `text` (required); `revise`, `agent`, `model`, `by` | Item with planner answer or revised plan (blocks up to 900 s) |
+| `board_run` | `id` (required); `by` | `in_progress` item (detached; records run id and moves to `done`/`unknown` on exit) |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
 the forwarded flags, and blocks until it finishes, so the result is final. Tool
@@ -465,16 +467,30 @@ Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 
 1. `dmuxai -C <repo> run --graph --json -` — on exit `7`, take `plan_hash`.
 2. `dmuxai board add -C <repo> --title … --kind feature --plan-hash <hash> --bot coordinator --json`.
-3. Lane `auto`: run `dmuxai -C <repo> run --graph --approve-plan-id <hash> -`, then `board move <id> in_progress` / `done`.
-4. Lane `needs_decision`: `dmuxai board wait <id> --for any` (or `board wait --any`); on approve, `dmuxai board prompt <id>` pipes into `dmuxai -C <ws> run --graph --approve-plan-id <hash> -`; on `request_changes` or messages, revise with `board plan --edit` and reply with `board say`.
-5. Bots poll with `dmuxai board events --since S`; plan prompts stay unmasked only under `graph-pending/<hash>.json`.
+3. Lane `auto`: `dmuxai board run <id>` (replaces the manual `board prompt` pipe).
+4. Lane `needs_decision`: `dmuxai board wait <id> --for any` (or `board wait --any`); on `approve`, run `dmuxai board run <id>`; on `request_changes` or messages, revise with `dmuxai board ask <id> --revise --text …` (or `board plan --edit`) and reply with `board say`. A failed run moves to `unknown` and can be retried with the same hash from `<state base>/board/plans/<hash>.json`.
+5. Bots poll with `dmuxai board events --since S`; plan prompts stay unmasked only under `graph-pending/<hash>.json` (and board plan copies `<state base>/board/plans/<hash>.json`).
 
 Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
-(`--if-version`), `plan`, `prompt`, `decide`, `say`, `wait`, `events`, `rules`.
+(`--if-version`), `plan`, `prompt`, `decide`, `say`, `wait`, `events`, `rules`,
+`ask` (`--text`, `--revise`, `--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
 `board rules --set` and owner lane/decision actions require an interactive owner
 (TTY, `DMUXAI_RUN_ID` unset). MCP callers default to `by=bot:mcp`; `by=owner` over
 MCP is rejected (exit `5`). CLI defaults to `by=owner` only when stdin and stdout
-are TTYs and `DMUXAI_RUN_ID` is unset.
+are TTYs and `DMUXAI_RUN_ID` is unset. Bots may run only `auto` items or items
+approved by `owner`.
+
+User-only `[board]` configuration (`$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`; ignored
+with a warning in workspace `dmuxai.toml`):
+
+```toml
+[board]
+planner = "codex:gpt-5.4"
+notify_command = ["notify-send", "dmuxai-board"]
+notify_webhook_url = "https://hooks.example.test/board"
+notify_webhook_secret_env = "DMUXAI_BOARD_SECRET"
+notify_events = ["needs_decision", "decision", "message", "run_finished"]
+```
 
 Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 
@@ -489,6 +505,8 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
 | PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
 | GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
+| POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
+| POST | `/api/board/{id}/run` | `{plan_hash?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
 
 Dashboard writes act as `owner`. Invalid item ids return `400` before any store
 access.

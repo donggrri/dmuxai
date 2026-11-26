@@ -141,6 +141,14 @@ pub fn invoke(workspace_root: &std::path::Path, name: &str, args: &Value) -> Val
             Ok(v) => board_ok_json(v),
             Err(e) => board_err_json(e),
         },
+        "board_ask" => match board_ask(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
+        "board_run" => match board_run(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
         other => board_err_json(ApiError::new(
             exit::USAGE,
             format!("unknown board tool: {other}"),
@@ -521,4 +529,61 @@ fn board_wait(args: &Value) -> Result<Value, ApiError> {
         WaitOutcome::Ready { item, event } => wait_ready_json(&event, &item),
         WaitOutcome::TimedOut { version } => json!({ "timed_out": true, "version": version }),
     })
+}
+
+fn board_ask(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
+    validate_item_id_early(id).map_err(ApiError::from)?;
+    let text = str_arg(args, "text")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| usage("text is required"))?;
+    validate_message(text).map_err(ApiError::from)?;
+    let revise = args.get("revise").and_then(Value::as_bool).unwrap_or(false);
+    let agent = str_arg(args, "agent").map(str::to_owned);
+    let model = str_arg(args, "model").map(str::to_owned);
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
+    let state_root = crate::state_path::state_base()
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
+    let store = open_board_store()?;
+    let item = super::runner::ask_item(
+        &store,
+        super::runner::AskParams {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            revise,
+            agent,
+            model,
+            by,
+            state_root,
+        },
+    )
+    .map_err(ApiError::from)?;
+    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+}
+
+fn board_run(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
+    validate_item_id_early(id).map_err(ApiError::from)?;
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
+    let state_root = crate::state_path::state_base()
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
+    let store = open_board_store()?;
+    let prepared = super::runner::run_item_prepare(
+        &store,
+        super::runner::RunParams {
+            id: id.to_owned(),
+            expected_plan_hash: None,
+            by,
+            state_root,
+        },
+    )
+    .map_err(ApiError::from)?;
+    let item = prepared.item.clone();
+    let board_base = store.base().to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(bg_store) = super::BoardStore::open(board_base) {
+            let _ = super::runner::run_item_execute(&bg_store, prepared);
+        }
+    });
+    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }
