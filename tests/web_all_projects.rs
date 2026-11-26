@@ -802,6 +802,38 @@ fn wait_until(session: &mut ChromeSession, expr: &str) {
     panic!("timed out waiting for: {expr}");
 }
 
+// Wait for the initial /api/state render so handlers installed by init() (including
+// the More menu) are bound before a test clicks. Mirrors web_tab_trim.rs.
+fn wait_for_dashboard_ready(session: &mut ChromeSession) {
+    wait_until(
+        session,
+        "typeof applySnapshot === 'function' && snapshot !== null",
+    );
+}
+
+// Click the same #more-toggle the user clicks, retrying until the menu opens.
+// The click is skipped while the menu is already open so a retry cannot toggle it closed.
+fn open_more_menu(session: &mut ChromeSession) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let _ = session.cdp.eval(
+            "(() => { const m = document.getElementById('more-menu'); \
+             if (m && m.hidden) document.getElementById('more-toggle').click(); })()",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        if session
+            .cdp
+            .eval("(() => { const m = document.getElementById('more-menu'); return !!m && !m.hidden; })()")
+            .ok()
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            return;
+        }
+    }
+    panic!("timed out waiting for more menu to open");
+}
+
 // TC-2984 / FR-2984: All projects UI renders projects with counts, active-run marker,
 // conversations, runs, and read-only detail badge.
 #[test]
@@ -856,12 +888,8 @@ fn tc_2984_all_projects_view_renders_projects_conversations_runs() {
     let (url, _guard) = spawn_dashboard("serve", &ws1, &env);
     let mut chrome = open_in_chrome(&url);
 
-    wait_until(&mut chrome, "!!document.querySelector('#more-toggle')");
-    chrome
-        .cdp
-        .eval("document.querySelector('#more-toggle').click()")
-        .unwrap();
-    wait_until(&mut chrome, "!document.querySelector('#more-menu').hidden");
+    wait_for_dashboard_ready(&mut chrome);
+    open_more_menu(&mut chrome);
     chrome
         .cdp
         .eval("document.querySelector('#all-projects-toggle').click()")
@@ -948,18 +976,8 @@ fn tc_2985_open_project_attaches_and_loads_conversation_disabled_in_serve() {
     // 1. In view-only serve, Open project is disabled with a hint.
     let (serve_url, _serve_guard) = spawn_dashboard("serve", &ws1, &env);
     let mut serve_chrome = open_in_chrome(&serve_url);
-    wait_until(
-        &mut serve_chrome,
-        "!!document.querySelector('#more-toggle')",
-    );
-    serve_chrome
-        .cdp
-        .eval("document.querySelector('#more-toggle').click()")
-        .unwrap();
-    wait_until(
-        &mut serve_chrome,
-        "!document.querySelector('#more-menu').hidden",
-    );
+    wait_for_dashboard_ready(&mut serve_chrome);
+    open_more_menu(&mut serve_chrome);
     serve_chrome
         .cdp
         .eval("document.querySelector('#all-projects-toggle').click()")
@@ -987,15 +1005,8 @@ fn tc_2985_open_project_attaches_and_loads_conversation_disabled_in_serve() {
     // 2. In --web host, Open project is enabled, attaches ws2, and loads selected conversation.
     let (web_url, _web_guard) = spawn_dashboard("web", &ws1, &env);
     let mut web_chrome = open_in_chrome(&web_url);
-    wait_until(&mut web_chrome, "!!document.querySelector('#more-toggle')");
-    web_chrome
-        .cdp
-        .eval("document.querySelector('#more-toggle').click()")
-        .unwrap();
-    wait_until(
-        &mut web_chrome,
-        "!document.querySelector('#more-menu').hidden",
-    );
+    wait_for_dashboard_ready(&mut web_chrome);
+    open_more_menu(&mut web_chrome);
     web_chrome
         .cdp
         .eval("document.querySelector('#all-projects-toggle').click()")
