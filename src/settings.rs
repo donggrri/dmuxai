@@ -4928,7 +4928,7 @@ mod runner_fallback_settings_tests {
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join("dmuxai.toml"),
-            "[runners.agy]\nfallback = [\"agy:claude-opus\", \"nosuchrunner\", \"codex\"]\n",
+            "[runners.agy]\nfallback = [\"agy:gemini-3.8-flash-fast\", \"nosuchrunner\", \"codex\"]\n",
         )
         .unwrap();
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
@@ -4946,7 +4946,7 @@ mod runner_fallback_settings_tests {
             settings
                 .config_warnings
                 .iter()
-                .any(|w| w.contains("fallback 'agy:claude-opus' ignored")),
+                .any(|w| w.contains("fallback 'agy:gemini-3.8-flash-fast' ignored")),
             "warnings: {:?}",
             settings.config_warnings
         );
