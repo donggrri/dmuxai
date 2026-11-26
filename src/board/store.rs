@@ -121,6 +121,26 @@ pub enum WaitOutcome {
     },
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingItem {
+    pub id: String,
+    pub reason: String,
+    pub lane: Lane,
+    pub workspace_path: Option<String>,
+    pub repo_key: Option<String>,
+    pub title: String,
+    pub kind: Kind,
+    pub grade: Option<super::Grade>,
+    pub age_ms: u64,
+    pub updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingList {
+    pub items: Vec<PendingItem>,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum EventKind {
@@ -130,6 +150,7 @@ enum EventKind {
     Plan,
     Decision,
     Message,
+    Checked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,9 +408,14 @@ impl BoardStore {
             }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
-                if req.by != "owner" && matches!(lane, Lane::Auto | Lane::Approved) {
+                if matches!(lane, Lane::Approved | Lane::Rejected) {
                     return Err(BoardError::Forbidden(
-                        "only the owner may set lane auto or approved".to_owned(),
+                        "cannot create item in approved or rejected (use board decide)".to_owned(),
+                    ));
+                }
+                if req.by != "owner" && lane == Lane::Auto {
+                    return Err(BoardError::Forbidden(
+                        "only the owner may set lane auto".to_owned(),
                     ));
                 }
                 lane
@@ -414,6 +440,7 @@ impl BoardStore {
                 options: req.options,
                 plan: None,
                 decision: None,
+                checked: None,
                 thread: Vec::new(),
                 run_ids: Vec::new(),
                 key: req.key.clone(),
@@ -481,6 +508,105 @@ impl BoardStore {
         }
         items.sort_by_key(|item| std::cmp::Reverse(item.updated_ms));
         Ok(items)
+    }
+
+    /// List items waiting on human action, oldest first (FR-3137).
+    pub fn pending(&self, workspace: Option<&Path>) -> Result<PendingList, BoardError> {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(CLOSED_HIDE_DAYS * 86_400 * 1000);
+        let workspace_key = workspace
+            .map(normalize_workspace_path)
+            .transpose()
+            .map_err(|e| BoardError::Usage(e.to_string()))?;
+        let mut entries = Vec::new();
+        for entry in
+            fs::read_dir(&self.items_dir).map_err(|e| BoardError::Internal(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BoardError::Internal(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|e| BoardError::Internal(e.to_string()))?;
+            let item: BoardItem = serde_json::from_slice(&bytes)
+                .map_err(|e| BoardError::Internal(format!("invalid item: {e}")))?;
+            if let Some(ref ws) = workspace_key
+                && item.workspace.path.as_deref() != Some(ws.as_str())
+            {
+                continue;
+            }
+            let reason = match item.lane {
+                Lane::NeedsDecision => "decide",
+                Lane::Unknown if item.checked.is_none() && item.updated_ms >= cutoff => "failed",
+                Lane::Done if item.checked.is_none() && item.updated_ms >= cutoff => "check",
+                _ => continue,
+            };
+            entries.push(PendingItem {
+                id: item.id,
+                reason: reason.to_owned(),
+                lane: item.lane,
+                workspace_path: item.workspace.path,
+                repo_key: item.workspace.repo_key,
+                title: item.title,
+                kind: item.kind,
+                grade: item.grade,
+                age_ms: now.saturating_sub(item.updated_ms),
+                updated_ms: item.updated_ms,
+            });
+        }
+        entries.sort_by(|a, b| {
+            a.updated_ms
+                .cmp(&b.updated_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let count = entries.len();
+        Ok(PendingList {
+            items: entries,
+            count,
+        })
+    }
+
+    /// Mark a `done` or `unknown` item as checked by the owner (FR-3137, FR-3138).
+    pub fn check(&self, id: &str, text: Option<String>, by: &str) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        if by != "owner" {
+            return Err(BoardError::Forbidden(
+                "only the owner may check items".to_owned(),
+            ));
+        }
+        if let Some(t) = text.as_deref() {
+            super::validate_text_limit("text", t, super::TEXT_MAX)?;
+        }
+        let clean_text = text.and_then(|t| {
+            let trimmed = t.trim().to_owned();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if !matches!(item.lane, Lane::Done | Lane::Unknown) {
+                return Err(BoardError::Conflict(format!(
+                    "item in lane '{}' cannot be checked (must be done or unknown)",
+                    item.lane.as_str()
+                )));
+            }
+            let now = now_ms();
+            item.checked = Some(super::CheckedRecord {
+                by: by.to_owned(),
+                at_ms: now,
+                text: clean_text,
+            });
+            item.version += 1;
+            item.updated_ms = now;
+            store.save_item_inner(&item)?;
+            store.append_event(id, EventKind::Checked, item.version, by)?;
+            Ok(item)
+        })
     }
 
     pub fn update(&self, id: &str, req: UpdateItemRequest) -> Result<BoardItem, BoardError> {
@@ -821,21 +947,13 @@ impl BoardStore {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
+        if req.by != "owner" {
+            return Err(BoardError::Forbidden(
+                "only the owner may record decisions".to_owned(),
+            ));
+        }
         let item = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
-            if req.by == "planner" {
-                return Err(BoardError::Forbidden(
-                    "planner cannot record decisions".to_owned(),
-                ));
-            }
-            if matches!(req.verdict, Verdict::Approve)
-                && req.by.starts_with("bot:")
-                && item.lane != Lane::Auto
-            {
-                return Err(BoardError::Forbidden(
-                    "bots may approve only items in the auto lane".to_owned(),
-                ));
-            }
             if matches!(req.verdict, Verdict::Approve)
                 && let Some(plan) = &item.plan
             {
@@ -990,6 +1108,7 @@ impl BoardStore {
             } else {
                 Lane::Unknown
             };
+            item.checked = None;
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
@@ -1148,12 +1267,14 @@ fn wait_trigger_for_event_any(event: &BoardEvent, filter: &WaitFilter) -> Option
 }
 
 fn enforce_sensitive_lane_move(by: &str, lane: Lane) -> Result<(), BoardError> {
-    if by == "owner" {
-        return Ok(());
-    }
-    if matches!(lane, Lane::Auto | Lane::Approved) {
+    if matches!(lane, Lane::Approved | Lane::Rejected) {
         return Err(BoardError::Forbidden(
-            "bots may not move items into auto or approved".to_owned(),
+            "cannot move item into approved or rejected (use board decide)".to_owned(),
+        ));
+    }
+    if lane == Lane::Auto && by != "owner" {
+        return Err(BoardError::Forbidden(
+            "only the owner may move items into auto".to_owned(),
         ));
     }
     Ok(())
@@ -1486,6 +1607,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(bot_move.exit_code(), crate::agent_api::exit::FORBIDDEN);
 
+        let owner_move_approved = store
+            .move_lane(&item.id, Lane::Approved, "owner", None)
+            .unwrap_err();
+        assert_eq!(
+            owner_move_approved.exit_code(),
+            crate::agent_api::exit::FORBIDDEN
+        );
+
         let auto = store
             .add(AddItemRequest {
                 title: "dbg".to_owned(),
@@ -1506,7 +1635,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(auto.lane, Lane::Auto);
-        let auto_approved = store
+        let auto_bot_err = store
             .decide(
                 &auto.id,
                 DecideRequest {
@@ -1517,8 +1646,8 @@ mod tests {
                     by: "bot:x".to_owned(),
                 },
             )
-            .unwrap();
-        assert_eq!(auto_approved.lane, Lane::Approved);
+            .unwrap_err();
+        assert_eq!(auto_bot_err.exit_code(), crate::agent_api::exit::FORBIDDEN);
 
         use crate::board::{BoardCaller, resolve_actor};
         assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
@@ -1947,5 +2076,104 @@ mod tests {
             "list took {} ms",
             elapsed.as_millis()
         );
+    }
+
+    // TC-3137 / FR-3137: board pending lists decide, failed, check (oldest first, excluding >30d
+    // done/unknown), and board check records checked + event and removes from pending.
+    #[test]
+    fn tc_3137_board_pending_lists_decide_failed_check_and_check_clears() {
+        let (_dir, store, state) = test_store();
+        let ws1 = _dir.path().join("ws-one");
+        let ws2 = _dir.path().join("ws-two");
+        fs::create_dir_all(&ws1).unwrap();
+        fs::create_dir_all(&ws2).unwrap();
+
+        let make = |title: &str, lane: Lane, ws: &Path| {
+            store
+                .add(AddItemRequest {
+                    title: title.to_owned(),
+                    summary: String::new(),
+                    kind: Kind::Feature,
+                    grade: None,
+                    lane: Some(lane),
+                    source_bot: None,
+                    source_channel: None,
+                    source_ref: None,
+                    workspace: Some(ws.to_path_buf()),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                    by: "owner".to_owned(),
+                    state_root: state.clone(),
+                })
+                .unwrap()
+        };
+
+        let i_decide = make("needs decision", Lane::NeedsDecision, &ws1);
+        let i_failed = make("failed run", Lane::Unknown, &ws2);
+        let i_done = make("done unchecked", Lane::Done, &ws1);
+        let i_old_done = make("old done", Lane::Done, &ws1);
+        let _i_auto = make("auto item", Lane::Auto, &ws1);
+
+        // Set explicit updated_ms to verify oldest-first ordering and 30d cutoff.
+        let now = now_ms();
+        for (id, updated) in [
+            (&i_done.id, now - 3 * 3_600_000),
+            (&i_failed.id, now - 2 * 3_600_000),
+            (&i_decide.id, now - 600_000),
+            (&i_old_done.id, now - 35 * 86_400 * 1000),
+        ] {
+            let mut it = store.get(id).unwrap();
+            it.updated_ms = updated;
+            store.save_item_inner(&it).unwrap();
+        }
+
+        let all_pending = store.pending(None).unwrap();
+        assert_eq!(all_pending.count, 3);
+        let got: Vec<(&str, &str)> = all_pending
+            .items
+            .iter()
+            .map(|p| (p.id.as_str(), p.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (i_done.id.as_str(), "check"),
+                (i_failed.id.as_str(), "failed"),
+                (i_decide.id.as_str(), "decide"),
+            ]
+        );
+
+        let ws1_pending = store.pending(Some(&ws1)).unwrap();
+        assert_eq!(ws1_pending.count, 2);
+
+        // Check on needs_decision -> Conflict (exit 4).
+        let conflict = store.check(&i_decide.id, None, "owner").unwrap_err();
+        assert_eq!(conflict.exit_code(), crate::agent_api::exit::CONFLICT);
+
+        // Bot cannot check -> Forbidden (exit 5).
+        let forbidden = store.check(&i_done.id, None, "bot:coord").unwrap_err();
+        assert_eq!(forbidden.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        // Owner checks done item -> records checked, appends checked event, removes from pending.
+        let checked_done = store
+            .check(&i_done.id, Some("looks good".to_owned()), "owner")
+            .unwrap();
+        assert_eq!(checked_done.checked.as_ref().unwrap().by, "owner");
+        assert_eq!(
+            checked_done.checked.as_ref().unwrap().text.as_deref(),
+            Some("looks good")
+        );
+        let events = store.list_events(0).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.item_id == i_done.id && e.kind == "checked" && e.by == "owner")
+        );
+
+        let after = store.pending(None).unwrap();
+        assert_eq!(after.count, 2);
+        assert!(!after.items.iter().any(|p| p.id == i_done.id));
     }
 }

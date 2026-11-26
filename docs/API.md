@@ -430,7 +430,7 @@ Tools (`tools/list`):
 | `board_update` | `id`, optional fields, `if_version` | Updated item |
 | `board_move` | `id`, `lane` | Updated item |
 | `board_plan` | `id`, `hash` or `steps` (+ optional `tasks`) | Item with plan revision |
-| `board_decide` | `id`, `verdict`, `text` / `option`, `plan_hash`, `by` | Item with decision |
+| `board_pending` | `workspace` (optional) | `{items, count}` waiting for human action (`needs_decision`, `unknown`, unchecked `done`) |
 | `board_say` | `id`, `text`, `from` | Item with thread |
 | `board_wait` | `id` or global wait, `since_version`, `since_seq`, `timeout_secs` (≤300), `wait_for` | Item or `{timed_out:true,version}` |
 | `board_prompt` | `id`, optional `hash` | `{prompt}` unmasked text from `graph-pending/` |
@@ -472,13 +472,17 @@ Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 5. Bots poll with `dmuxai board events --since S`; plan prompts stay unmasked only under `graph-pending/<hash>.json` (and board plan copies `<state base>/board/plans/<hash>.json`).
 
 Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
-(`--if-version`), `plan`, `prompt`, `decide`, `say`, `wait`, `events`, `rules`,
-`ask` (`--text`, `--revise`, `--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
-`board rules --set` and owner lane/decision actions require an interactive owner
-(TTY, `DMUXAI_RUN_ID` unset). MCP callers default to `by=bot:mcp`; `by=owner` over
-MCP is rejected (exit `5`). CLI defaults to `by=owner` only when stdin and stdout
-are TTYs and `DMUXAI_RUN_ID` is unset. Bots may run only `auto` items or items
-approved by `owner`.
+(`--if-version`), `plan`, `prompt`, `decide`, `check` (`--text`), `pending`
+(`--workspace`), `say`, `wait`, `events`, `rules`, `ask` (`--text`, `--revise`,
+`--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
+Approval is **always human-only**: `decide` (every verdict, in every lane),
+`check`, `move` into `auto`, and `rules --set` require `owner` (dashboard browser
+request, or CLI with stdin and stdout on a TTY, `DMUXAI_RUN_ID` unset, and typed
+item-id confirmation on `/dev/tty`). Nobody may `move` an item into `approved` or
+`rejected` (use `board decide`). MCP callers default to `by=bot:mcp`; `by=owner`
+over MCP or non-TTY CLI is rejected (exit `5`), and `board_decide` is not
+exposed over MCP. Bots may run only `auto` items or items approved by `owner`;
+`board run` and `board ask` never write `decision` or `checked`.
 
 User-only `[board]` configuration (`$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`; ignored
 with a warning in workspace `dmuxai.toml`):
@@ -497,19 +501,23 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | Method | Path | Body / query | Success | Errors |
 | --- | --- | --- | --- | --- |
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
+| GET | `/api/board/pending` | `?workspace=` | `200` `{items, count}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
-| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` | `200` item | 400, 401, 403, 404, 409, 422 |
+| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item | 400, 401, 403, 404, 409, 422 |
+| POST | `/api/board/{id}/check` | `{text?}` (human headers required) | `200` item | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |
-| POST | `/api/board/{id}/lane` | `{lane}` | `200` item | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/lane` | `{lane}` (human headers required) | `200` item | 400, 401, 403, 404 |
 | GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
 | PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
 | GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
 | POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/run` | `{plan_hash?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
 
-Dashboard writes act as `owner`. Invalid item ids return `400` before any store
-access.
+Dashboard writes act as `owner`. Owner writes (`POST /decision`, `POST /check`,
+`POST /lane`) require `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode`, and
+`X-Dmuxai-Human: 1` (else `403`). Invalid item ids return `400` before any
+store access.
 
 Exit codes match the headless agent API: usage `2`, not found `3`, conflict `4`,
 forbidden `5`, validation `1`, internal `6`.

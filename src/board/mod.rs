@@ -16,8 +16,8 @@ pub use plan::{
 };
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{
-    AddItemRequest, BoardStore, DecideRequest, ListFilter, SayRequest, UpdateItemRequest,
-    WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
+    AddItemRequest, BoardStore, DecideRequest, ListFilter, PendingItem, PendingList, SayRequest,
+    UpdateItemRequest, WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
 };
 
 /// Who is invoking a board write (FR-3108 owner identity).
@@ -232,6 +232,14 @@ pub struct Decision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedRecord {
+    pub by: String,
+    pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMessage {
     pub from: String,
     pub text: String,
@@ -258,6 +266,8 @@ pub struct BoardItem {
     pub plan: Option<BoardPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Decision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<CheckedRecord>,
     #[serde(default)]
     pub thread: Vec<ThreadMessage>,
     #[serde(default)]
@@ -395,6 +405,23 @@ pub fn actor_is_owner(actor: &str) -> bool {
     actor == "owner"
 }
 
+/// Prompt-agnostic owner confirmation check for CLI TTY owner actions (FR-3138).
+pub fn confirm_owner_action(
+    id: &str,
+    verb: &str,
+    title: &str,
+    read_answer: impl FnOnce(&str) -> Result<String, BoardError>,
+) -> Result<(), BoardError> {
+    let prompt = format!("Type the item id to confirm {verb} {title}:");
+    let answer = read_answer(&prompt)?;
+    if answer.trim() != id {
+        return Err(BoardError::Forbidden(
+            "confirmation did not match item id".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_item_id_early(id: &str) -> Result<(), BoardError> {
     if !valid_item_id(id) {
         return Err(BoardError::Usage("invalid board item id".to_owned()));
@@ -458,6 +485,11 @@ pub fn mask_item_fields(item: &mut BoardItem) {
     }
     if let Some(decision) = item.decision.as_mut()
         && let Some(text) = decision.text.as_mut()
+    {
+        *text = crate::run_journal::mask_sensitive_tokens(text);
+    }
+    if let Some(checked) = item.checked.as_mut()
+        && let Some(text) = checked.text.as_mut()
     {
         *text = crate::run_journal::mask_sensitive_tokens(text);
     }
@@ -673,6 +705,7 @@ mod tests {
                 by: "owner".to_owned(),
                 at_ms: 0,
             }),
+            checked: None,
             thread: vec![ThreadMessage {
                 from: "owner".to_owned(),
                 text: format!("thread {secret}"),

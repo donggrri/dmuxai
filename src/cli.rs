@@ -182,6 +182,13 @@ pub enum BoardOp {
         exec_prepared: bool,
         plan_hash: Option<String>,
     },
+    Pending {
+        workspace: Option<PathBuf>,
+    },
+    Check {
+        id: String,
+        text: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +309,8 @@ Subcommands:
   rules      Print or replace classification rules (owner only for --set)
   ask        Ask the planner a question or request a plan revision
   run        Execute an approved or auto item's graph plan
+  pending    List items waiting for human action
+  check      Mark a done or unknown item as checked (owner only)
 
 Run `dmuxai board <subcommand> --help` for details.
 ";
@@ -365,6 +374,14 @@ Usage: dmuxai board ask <id> --text T|- [--revise] [--agent A] [--model M] [--by
 
 pub const BOARD_RUN_USAGE: &str = "\
 Usage: dmuxai board run <id> [--detach] [--by ACTOR] [--json]
+";
+
+pub const BOARD_PENDING_USAGE: &str = "\
+Usage: dmuxai board pending [--workspace DIR] [--json]
+";
+
+pub const BOARD_CHECK_USAGE: &str = "\
+Usage: dmuxai board check <id> [--text T] [--json]
 ";
 
 pub const RUN_USAGE: &str = "\
@@ -753,6 +770,8 @@ pub fn board_subcommand_usage(subcommand: &str) -> &'static str {
         "rules" => BOARD_RULES_USAGE,
         "ask" => BOARD_ASK_USAGE,
         "run" => BOARD_RUN_USAGE,
+        "pending" => BOARD_PENDING_USAGE,
+        "check" => BOARD_CHECK_USAGE,
         _ => BOARD_USAGE,
     }
 }
@@ -1869,6 +1888,58 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 },
             })
         }
+        "pending" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--workspace"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, false)?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Pending {
+                    workspace: parsed
+                        .flags
+                        .get("--workspace")
+                        .and_then(|v| v.clone())
+                        .map(PathBuf::from),
+                },
+            })
+        }
+        "check" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--text"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board check needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Check {
+                    id,
+                    text: parsed.flags.get("--text").cloned().flatten(),
+                },
+            })
+        }
         "ask" => {
             const FLAGS: &[FlagSpec] = &[
                 FlagSpec {
@@ -2925,8 +2996,59 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
                 check_hash(hash)?;
             }
         }
+        BoardOp::Pending { .. } => {}
+        BoardOp::Check { id, text } => {
+            check_id(id)?;
+            if let Some(t) = text {
+                validate_text_limit("text", t, TEXT_MAX).map_err(ApiError::from)?;
+            }
+        }
     }
     Ok(())
+}
+
+fn prompt_tty_confirmation(prompt: &str) -> Result<String, dmuxai::board::BoardError> {
+    use dmuxai::board::BoardError;
+    use std::io::{BufRead, BufReader, Write};
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| {
+            BoardError::Forbidden(format!("cannot open /dev/tty for confirmation: {e}"))
+        })?;
+    write!(tty, "{prompt} ")
+        .and_then(|_| tty.flush())
+        .map_err(|e| BoardError::Forbidden(format!("failed to write /dev/tty: {e}")))?;
+    let mut line = String::new();
+    BufReader::new(tty)
+        .read_line(&mut line)
+        .map_err(|e| BoardError::Forbidden(format!("failed to read /dev/tty: {e}")))?;
+    Ok(line.trim().to_owned())
+}
+
+fn confirm_owner_action_cli(id: &str, verb: &str, title: &str) -> Result<(), ApiError> {
+    dmuxai::board::confirm_owner_action(id, verb, title, prompt_tty_confirmation)
+        .map_err(ApiError::from)
+}
+
+fn format_pending_age(age_ms: u64) -> String {
+    let mins = age_ms / 60_000;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hrs = mins / 60;
+    if hrs < 48 {
+        return format!("{hrs}h");
+    }
+    format!("{}d", hrs / 24)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    text.chars().take(max).collect()
 }
 
 fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
@@ -2939,7 +3061,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
     use std::io::IsTerminal;
 
     let json_out = command.json;
-    let is_tty = std::io::stdin().is_terminal();
+    let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let caller = if is_tty {
         BoardCaller::CliTty
     } else {
@@ -3139,6 +3261,10 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                         "planner cannot move items".to_owned(),
                     ));
                 }
+                if lane == Lane::Auto && by == "owner" {
+                    let existing = store.get(&id).map_err(ApiError::from)?;
+                    confirm_owner_action_cli(&id, "move to auto", &existing.title)?;
+                }
                 let item = store
                     .move_lane(&id, lane, &by, if_version)
                     .map_err(ApiError::from)?;
@@ -3225,6 +3351,10 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                         exit::FORBIDDEN,
                         "planner cannot record decisions".to_owned(),
                     ));
+                }
+                if by == "owner" {
+                    let existing = store.get(&id).map_err(ApiError::from)?;
+                    confirm_owner_action_cli(&id, verdict.as_str(), &existing.title)?;
                 }
                 let mut plan_hash = plan_hash;
                 if matches!(verdict, Verdict::Approve)
@@ -3480,6 +3610,42 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 } else {
                     println!("{}\t{}", item.id, item.lane.as_str());
+                }
+                Ok(())
+            }
+            BoardOp::Pending { workspace } => {
+                let pending = store
+                    .pending(workspace.as_deref())
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&pending).unwrap_or(Value::Null));
+                } else {
+                    for item in &pending.items {
+                        let ws_base = item
+                            .workspace_path
+                            .as_deref()
+                            .and_then(|p| Path::new(p).file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "-".to_owned());
+                        let title = truncate_chars(&item.title, 80);
+                        let age = format_pending_age(item.age_ms);
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            item.id, item.reason, ws_base, title, age
+                        );
+                    }
+                    println!("{} pending", pending.count);
+                }
+                Ok(())
+            }
+            BoardOp::Check { id, text } => {
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let by = resolve_actor(Some("owner"), caller).map_err(ApiError::from)?;
+                let existing = store.get(&id).map_err(ApiError::from)?;
+                confirm_owner_action_cli(&id, "check", &existing.title)?;
+                let item = store.check(&id, text, &by).map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 }
                 Ok(())
             }
@@ -5980,11 +6146,13 @@ mod tests {
     fn tc_3114_board_help_lists_subcommands() {
         for sub in [
             "add", "list", "show", "update", "move", "plan", "decide", "say", "wait", "events",
-            "prompt", "rules",
+            "prompt", "rules", "ask", "run", "pending", "check",
         ] {
             assert!(BOARD_USAGE.contains(sub), "BOARD_USAGE missing {sub}");
         }
         assert!(board_subcommand_usage("add").contains("--title"));
         assert!(board_subcommand_usage("wait").contains("--timeout"));
+        assert!(board_subcommand_usage("pending").contains("--workspace"));
+        assert!(board_subcommand_usage("check").contains("--text"));
     }
 }

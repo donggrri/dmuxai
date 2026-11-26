@@ -2566,5 +2566,11 @@ mod tests {
         assert!(BOARD_JS.contains("item.decision.plan_hash === item.plan.hash"));
         assert!(BOARD_JS.contains("/ask"));
         assert!(BOARD_JS.contains("/run"));
+        assert!(BOARD_JS.contains("X-Dmuxai-Human"));
+        assert!(BOARD_JS.contains("BOARD_MOVABLE_LANES"));
+        assert!(BOARD_JS.contains("Mark checked"));
+        assert!(BOARD_JS.contains("To check"));
+        assert!(BOARD_JS.contains("board-mark-checked"));
+        assert!(BOARD_JS.contains("/check"));
     }
 }

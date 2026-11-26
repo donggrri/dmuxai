@@ -60,6 +60,7 @@ where
     };
     Router::new()
         .route("/api/board", get(board_list))
+        .route("/api/board/pending", get(board_pending))
         .route("/api/board/events", get(board_events_sse))
         .route(
             "/api/board/rules",
@@ -67,6 +68,7 @@ where
         )
         .route("/api/board/{id}", get(board_get))
         .route("/api/board/{id}/decision", post(board_decision))
+        .route("/api/board/{id}/check", post(board_check))
         .route("/api/board/{id}/messages", post(board_messages))
         .route("/api/board/{id}/plan", post(board_plan))
         .route("/api/board/{id}/lane", post(board_lane))
@@ -74,6 +76,30 @@ where
         .route("/api/board/{id}/run", post(board_run))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .with_state(state)
+}
+
+fn human_browser_rejection(headers: &axum::http::HeaderMap) -> Option<Response> {
+    let sec_site = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    let sec_mode = headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let human = headers
+        .get("x-dmuxai-human")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    if sec_site == Some("same-origin") && sec_mode.is_some() && human == Some("1") {
+        None
+    } else {
+        Some(error_json(
+            StatusCode::FORBIDDEN,
+            "human browser headers required for this board action",
+        ))
+    }
 }
 
 fn board_error_response(error: BoardError) -> Response {
@@ -171,6 +197,26 @@ async fn board_list(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct PendingQuery {
+    workspace: Option<String>,
+}
+
+async fn board_pending(
+    State(state): State<BoardApiState>,
+    Query(query): Query<PendingQuery>,
+) -> Response {
+    let workspace = query.workspace.map(PathBuf::from);
+    match with_store(state.board_base.clone(), move |store| {
+        store.pending(workspace.as_deref())
+    })
+    .await
+    {
+        Ok(pending) => json_ok(StatusCode::OK, &pending),
+        Err(error) => board_error_response(error),
+    }
+}
+
 fn item_response(item: BoardItem) -> serde_json::Value {
     serde_json::to_value(&item).unwrap_or(serde_json::json!({}))
 }
@@ -198,9 +244,13 @@ struct DecisionBody {
 
 async fn board_decision(
     State(state): State<BoardApiState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     axum::Json(body): axum::Json<DecisionBody>,
 ) -> Response {
+    if let Some(resp) = human_browser_rejection(&headers) {
+        return resp;
+    }
     if !valid_item_id(&id) {
         return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
     }
@@ -221,6 +271,39 @@ async fn board_decision(
     };
     match with_store(state.board_base.clone(), move |store| {
         store.decide(&id, req)
+    })
+    .await
+    {
+        Ok(item) => json_ok(StatusCode::OK, &item_response(item)),
+        Err(error) => board_error_response(error),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct CheckBody {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+async fn board_check(
+    State(state): State<BoardApiState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    body: Option<axum::Json<CheckBody>>,
+) -> Response {
+    if let Some(resp) = human_browser_rejection(&headers) {
+        return resp;
+    }
+    if !valid_item_id(&id) {
+        return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
+    }
+    let by = match resolve_actor(None, BoardCaller::Dashboard) {
+        Ok(actor) => actor,
+        Err(error) => return board_error_response(error),
+    };
+    let text = body.and_then(|axum::Json(b)| b.text);
+    match with_store(state.board_base.clone(), move |store| {
+        store.check(&id, text, &by)
     })
     .await
     {
@@ -335,9 +418,13 @@ struct LaneBody {
 
 async fn board_lane(
     State(state): State<BoardApiState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     axum::Json(body): axum::Json<LaneBody>,
 ) -> Response {
+    if let Some(resp) = human_browser_rejection(&headers) {
+        return resp;
+    }
     if !valid_item_id(&id) {
         return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
     }
@@ -762,6 +849,9 @@ mod tests {
             .header("Host", "localhost:7420")
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("X-Dmuxai-Human", "1")
             .body(axum::body::Body::from(
                 r#"{"verdict":"approve","plan_hash":"0000000000000000"}"#,
             ))
@@ -1119,5 +1209,221 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    // TC-3138 / FR-3138, OQ-3104: human-only enforcement across store, CLI, MCP, HTTP, and run.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3138_human_only_decisions_cli_mcp_http_and_run_never_approves() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&ws, &state, "ship it", plan_json, None).unwrap();
+
+        let auto_item = store
+            .add(AddItemRequest {
+                title: "auto item".to_owned(),
+                summary: String::new(),
+                kind: Kind::Debug,
+                grade: None,
+                lane: None,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        assert_eq!(auto_item.lane, Lane::Auto);
+
+        // 1. Bot decide in auto lane -> exit 5 (Forbidden).
+        let bot_decide = store
+            .decide(
+                &auto_item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "bot:coord".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(bot_decide.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        // 2. Move into approved/rejected is refused even for owner.
+        let move_approved = store
+            .move_lane(&auto_item.id, Lane::Approved, "owner", None)
+            .unwrap_err();
+        assert_eq!(move_approved.exit_code(), crate::agent_api::exit::FORBIDDEN);
+        let move_rejected = store
+            .move_lane(&auto_item.id, Lane::Rejected, "owner", None)
+            .unwrap_err();
+        assert_eq!(move_rejected.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        // 3. CLI confirmation mismatch -> refused (exit 5); non-TTY owner -> exit 5.
+        let mismatch =
+            crate::board::confirm_owner_action(&auto_item.id, "approve", "auto item", |_| {
+                Ok("wrong-id".to_owned())
+            })
+            .unwrap_err();
+        assert_eq!(mismatch.exit_code(), crate::agent_api::exit::FORBIDDEN);
+        assert!(
+            crate::board::confirm_owner_action(&auto_item.id, "approve", "auto item", |_| {
+                Ok(auto_item.id.clone())
+            })
+            .is_ok()
+        );
+        let non_tty_owner = resolve_actor(Some("owner"), BoardCaller::CliNonTty).unwrap_err();
+        assert_eq!(non_tty_owner.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        // 4. MCP board_decide is unknown; board_pending is available and read-only.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &state) };
+        let mcp_decide = crate::board::mcp_invoke(
+            &ws,
+            "board_decide",
+            &serde_json::json!({ "id": auto_item.id, "verdict": "approve" }),
+        );
+        assert_eq!(mcp_decide["ok"], false);
+        assert!(
+            mcp_decide["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unknown board tool")
+        );
+
+        // 5. board run on auto lane leaves decision == None and checked == None.
+        let fake_bin = dir.path().join("fake-run.sh");
+        std::fs::write(
+            &fake_bin,
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}\\n'\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).unwrap();
+        }
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+        let prep = crate::board::runner::run_item_prepare(
+            &store,
+            crate::board::runner::RunParams {
+                id: auto_item.id.clone(),
+                expected_plan_hash: Some(hash.clone()),
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        let finished = crate::board::runner::run_item_execute(&store, prep).unwrap();
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var("XDG_STATE_HOME");
+        }
+        assert_eq!(finished.lane, Lane::Done);
+        assert!(finished.decision.is_none());
+        assert!(finished.checked.is_none());
+
+        // 6. HTTP: decision/check/lane without human headers -> 403; with headers -> 200.
+        let need_item = seed_item(&store, &state);
+        let token = "boardtesttoken";
+        let router = test_router(board, state, token);
+
+        let no_hdr_decide = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{need_item}/decision"))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"verdict":"approve"}"#))
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(no_hdr_decide)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let no_hdr_check = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{}/check", finished.id))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(no_hdr_check).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let with_hdr_decide = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{need_item}/decision"))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("X-Dmuxai-Human", "1")
+            .body(axum::body::Body::from(r#"{"verdict":"approve"}"#))
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(with_hdr_decide)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let with_hdr_check = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{}/check", finished.id))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("X-Dmuxai-Human", "1")
+            .body(axum::body::Body::from(r#"{"text":"verified"}"#))
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(with_hdr_check)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let pending_req = axum::http::Request::builder()
+            .uri("/api/board/pending")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let pending_resp = router.oneshot(pending_req).await.unwrap();
+        assert_eq!(pending_resp.status(), StatusCode::OK);
+        let pending_body = body_string(pending_resp).await;
+        assert!(pending_body.contains("\"count\":0"));
     }
 }

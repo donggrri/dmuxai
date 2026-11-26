@@ -6,6 +6,9 @@ var BOARD_TOKEN_KEY = 'dmuxai.token';
 var BOARD_LANES = [
   'auto', 'needs_decision', 'approved', 'in_progress', 'done', 'rejected', 'unknown'
 ];
+var BOARD_MOVABLE_LANES = [
+  'auto', 'needs_decision', 'in_progress', 'done', 'unknown'
+];
 var BOARD_LANE_LABELS = {
   auto: 'Auto',
   needs_decision: 'Needs decision',
@@ -49,9 +52,12 @@ function boardEl(tag, className, text) {
   return node;
 }
 
-function boardFetchJson(method, path, body) {
+function boardFetchJson(method, path, body, humanAction) {
   var tok = boardToken();
   var headers = tok ? { Authorization: 'Bearer ' + tok } : {};
+  if (humanAction === true) {
+    headers['X-Dmuxai-Human'] = '1';
+  }
   var init = { method: method || 'GET', headers: headers, cache: 'no-store' };
   if (body !== undefined) {
     headers['Content-Type'] = 'application/json';
@@ -183,6 +189,46 @@ function boardRenderMyDecisions(container, items) {
     row.appendChild(boardEl('p', 'empty', 'No items need your decision'));
   }
   container.appendChild(row);
+
+  var toCheck = [];
+  for (var ci = 0; ci < boardItems.length; ci++) {
+    var cItem = boardItems[ci];
+    if ((cItem.lane !== 'done' && cItem.lane !== 'unknown') || cItem.checked) { continue; }
+    if (boardWorkspaceFilter) {
+      var cWs = cItem.workspace && cItem.workspace.path ? cItem.workspace.path : '';
+      if (cWs.indexOf(boardWorkspaceFilter) < 0) { continue; }
+    }
+    toCheck.push(cItem);
+  }
+  if (toCheck.length) {
+    var checkGroup = boardEl('div', 'board-to-check-group');
+    checkGroup.id = 'board-to-check-group';
+    checkGroup.appendChild(boardEl('h4', 'board-to-check-head', 'To check'));
+    var checkRow = boardEl('div', 'board-my-row');
+    for (var ti = 0; ti < toCheck.length; ti++) {
+      var chk = toCheck[ti];
+      var chkCard = boardEl('div', 'board-decision-card board-check-card');
+      chkCard.setAttribute('tabindex', '0');
+      chkCard.setAttribute('data-item-id', chk.id);
+      chkCard.appendChild(boardEl('div', 'board-decision-title', chk.title));
+      var chkMeta = [
+        boardBasename(chk.workspace && chk.workspace.path),
+        BOARD_LANE_LABELS[chk.lane] || chk.lane,
+        boardAgeMs(chk.updated_ms)
+      ].filter(Boolean).join(' · ');
+      chkCard.appendChild(boardEl('div', 'board-decision-meta', chkMeta));
+      var chkActions = boardEl('div', 'board-decision-actions');
+      var chkBtn = boardEl('button', 'btn btn-small btn-primary', 'Mark checked');
+      chkBtn.type = 'button';
+      chkBtn.setAttribute('data-board-action', 'check');
+      chkBtn.setAttribute('data-item-id', chk.id);
+      chkActions.appendChild(chkBtn);
+      chkCard.appendChild(chkActions);
+      checkRow.appendChild(chkCard);
+    }
+    checkGroup.appendChild(checkRow);
+    container.appendChild(checkGroup);
+  }
 }
 
 function boardRenderKanban(root, items) {
@@ -207,17 +253,26 @@ function boardRenderKanban(root, items) {
       menu.className = 'board-card-menu';
       menu.setAttribute('aria-label', 'Move lane');
       menu.setAttribute('data-item-id', item.id);
-      for (var mi = 0; mi < BOARD_LANES.length; mi++) {
+      if (item.lane === 'approved' || item.lane === 'rejected') {
+        var curOpt = document.createElement('option');
+        curOpt.value = '';
+        curOpt.textContent = BOARD_LANE_LABELS[item.lane] || item.lane;
+        curOpt.disabled = true;
+        curOpt.selected = true;
+        menu.appendChild(curOpt);
+      }
+      for (var mi = 0; mi < BOARD_MOVABLE_LANES.length; mi++) {
         var opt = document.createElement('option');
-        opt.value = BOARD_LANES[mi];
-        opt.textContent = BOARD_LANE_LABELS[BOARD_LANES[mi]] || BOARD_LANES[mi];
-        if (BOARD_LANES[mi] === item.lane) { opt.selected = true; }
+        opt.value = BOARD_MOVABLE_LANES[mi];
+        opt.textContent = BOARD_LANE_LABELS[BOARD_MOVABLE_LANES[mi]] || BOARD_MOVABLE_LANES[mi];
+        if (BOARD_MOVABLE_LANES[mi] === item.lane) { opt.selected = true; }
         menu.appendChild(opt);
       }
       menu.addEventListener('change', function (ev) {
         var sel = ev.target;
+        if (!sel.value) { return; }
         var id = sel.getAttribute('data-item-id');
-        boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/lane', { lane: sel.value })
+        boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/lane', { lane: sel.value }, true)
           .then(function () { boardRefreshList(); })
           .catch(function () { /* ignore */ });
       });
@@ -481,6 +536,19 @@ function boardRenderDrawer(item) {
     decisionLine = dParts.filter(Boolean).join(' · ');
   }
   drawer.appendChild(boardEl('p', 'board-decision-record', decisionLine));
+  if ((item.lane === 'done' || item.lane === 'unknown') && !item.checked) {
+    var checkWrap = boardEl('div', 'board-check-actions');
+    var checkBtn = boardEl('button', 'btn btn-small btn-primary', 'Mark checked');
+    checkBtn.type = 'button';
+    checkBtn.id = 'board-mark-checked';
+    checkBtn.addEventListener('click', function () { boardCheckItem(item.id); });
+    checkWrap.appendChild(checkBtn);
+    drawer.appendChild(checkWrap);
+  } else if (item.checked) {
+    var chkLine = 'Checked by ' + (item.checked.by || 'owner');
+    if (item.checked.text) { chkLine += ' · ' + item.checked.text; }
+    drawer.appendChild(boardEl('p', 'board-checked-record', chkLine));
+  }
   var runWrap = boardEl('div', 'board-run-actions');
   var runnable = boardIsItemRunnable(item);
   runWrap.hidden = !runnable;
@@ -754,6 +822,14 @@ function boardFindItem(id) {
   return boardSelectedItem && boardSelectedItem.id === id ? boardSelectedItem : null;
 }
 
+function boardCheckItem(id) {
+  return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/check', {}, true)
+    .then(function () {
+      boardRefreshList();
+    })
+    .catch(function () { /* ignore */ });
+}
+
 function boardDecide(id, verdict, extra) {
   extra = extra || {};
   var body = { verdict: verdict };
@@ -763,7 +839,7 @@ function boardDecide(id, verdict, extra) {
   if (src && src.plan && src.plan.hash) {
     body.plan_hash = src.plan.hash;
   }
-  return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/decision', body)
+  return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/decision', body, true)
     .then(function () {
       boardPlanConflict = false;
       boardRefreshList();
@@ -944,6 +1020,10 @@ function boardOnActionClick(e) {
   if (action === 'reject') {
     if (!window.confirm('Reject this item?')) { return true; }
     boardDecide(id, 'reject');
+    return true;
+  }
+  if (action === 'check') {
+    boardCheckItem(id);
     return true;
   }
   return false;

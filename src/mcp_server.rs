@@ -213,19 +213,13 @@ fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "board_decide",
-            "description": "Record a decision on a board item.",
+            "name": "board_pending",
+            "description": "List decision board items waiting for human action (needs_decision, failed/unknown, or unchecked done).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string" },
-                    "verdict": { "type": "string", "enum": ["approve", "reject", "request_changes", "answer"] },
-                    "text": { "type": "string" },
-                    "option": { "type": "integer", "minimum": 0 },
-                    "plan_hash": { "type": "string" },
-                    "by": { "type": "string" }
-                },
-                "required": ["id", "verdict"]
+                    "workspace": { "type": "string" }
+                }
             }
         },
         {
@@ -487,7 +481,7 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_update",
                 "board_move",
                 "board_plan",
-                "board_decide",
+                "board_pending",
                 "board_say",
                 "board_wait",
                 "board_prompt",
@@ -642,10 +636,7 @@ mod tests {
                 "board_plan",
                 &["id", "hash", "steps", "tasks", "prompt", "by"],
             ),
-            (
-                "board_decide",
-                &["id", "verdict", "text", "option", "plan_hash", "by"],
-            ),
+            ("board_pending", &["workspace"]),
             ("board_say", &["id", "text", "from"]),
             (
                 "board_wait",
@@ -743,12 +734,16 @@ mod tests {
             "board_update",
             "board_move",
             "board_plan",
-            "board_decide",
+            "board_pending",
             "board_say",
             "board_wait",
         ] {
             assert!(names.contains(&tool), "missing tool {tool}");
         }
+        assert!(
+            !names.contains(&"board_decide"),
+            "board_decide must not be exposed over MCP"
+        );
         let run_tool = list["result"]["tools"]
             .as_array()
             .unwrap()
