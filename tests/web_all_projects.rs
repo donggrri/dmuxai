@@ -856,10 +856,12 @@ fn tc_2984_all_projects_view_renders_projects_conversations_runs() {
     let (url, _guard) = spawn_dashboard("serve", &ws1, &env);
     let mut chrome = open_in_chrome(&url);
 
-    wait_until(
-        &mut chrome,
-        "!!document.querySelector('#all-projects-toggle')",
-    );
+    wait_until(&mut chrome, "!!document.querySelector('#more-toggle')");
+    chrome
+        .cdp
+        .eval("document.querySelector('#more-toggle').click()")
+        .unwrap();
+    wait_until(&mut chrome, "!document.querySelector('#more-menu').hidden");
     chrome
         .cdp
         .eval("document.querySelector('#all-projects-toggle').click()")
@@ -948,7 +950,15 @@ fn tc_2985_open_project_attaches_and_loads_conversation_disabled_in_serve() {
     let mut serve_chrome = open_in_chrome(&serve_url);
     wait_until(
         &mut serve_chrome,
-        "!!document.querySelector('#all-projects-toggle')",
+        "!!document.querySelector('#more-toggle')",
+    );
+    serve_chrome
+        .cdp
+        .eval("document.querySelector('#more-toggle').click()")
+        .unwrap();
+    wait_until(
+        &mut serve_chrome,
+        "!document.querySelector('#more-menu').hidden",
     );
     serve_chrome
         .cdp
@@ -977,9 +987,14 @@ fn tc_2985_open_project_attaches_and_loads_conversation_disabled_in_serve() {
     // 2. In --web host, Open project is enabled, attaches ws2, and loads selected conversation.
     let (web_url, _web_guard) = spawn_dashboard("web", &ws1, &env);
     let mut web_chrome = open_in_chrome(&web_url);
+    wait_until(&mut web_chrome, "!!document.querySelector('#more-toggle')");
+    web_chrome
+        .cdp
+        .eval("document.querySelector('#more-toggle').click()")
+        .unwrap();
     wait_until(
         &mut web_chrome,
-        "!!document.querySelector('#all-projects-toggle')",
+        "!document.querySelector('#more-menu').hidden",
     );
     web_chrome
         .cdp

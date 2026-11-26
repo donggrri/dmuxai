@@ -20,7 +20,6 @@
   <h1 class="brand">DmuxAI<span class="brand-sub">dashboard</span></h1>
   <nav class="top-views" aria-label="Dashboard views">
     <button id="runs-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="runs" aria-controls="runs" aria-expanded="false" aria-pressed="false" title="Show headless runs (Esc closes)" aria-label="Runs">Runs <span id="runs-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
-    <button id="all-projects-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="all-projects" aria-controls="all-projects" aria-expanded="false" aria-pressed="false" title="Browse all projects (Esc closes)" aria-label="All projects">All projects</button>
     <button id="diff-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="diff" aria-controls="docs" aria-expanded="false" aria-pressed="false" title="Show files changed by agents (Esc closes)" aria-label="Diff">Diff <span id="diff-count" class="todos-count" aria-hidden="true" hidden>0</span></button>
     <button id="chat-toggle" type="button" class="btn sidebar-toggle chat-toggle active" aria-pressed="true" aria-controls="session" title="Back to the chat (closes Diff, Graph, Memory and Skills)">Chat</button>
     <button id="workspace-toggle" type="button" class="btn sidebar-toggle" aria-controls="sidebar" aria-expanded="false" title="Toggle workspace sidebar" aria-label="Workspace, 0 open to-dos">Workspace <span id="todos-count" class="todos-count" aria-hidden="true">0</span></button>
@@ -32,6 +31,7 @@
         <button id="skills-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="skills-popover" title="Stage skills">Skills</button>
         <button id="agent-prompts-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="agent-prompts-popover" title="System prompts">System prompts</button>
         <button id="graph-toggle" type="button" class="btn more-menu-item view-toggle" role="menuitem" data-view="graph" aria-controls="graph" aria-expanded="false" aria-pressed="false" title="Open the full graph view (Esc closes)" aria-label="Full graph">Full graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
+        <button id="all-projects-toggle" type="button" class="btn more-menu-item view-toggle" role="menuitem" data-view="all-projects" aria-controls="all-projects" aria-expanded="false" aria-pressed="false" title="Browse all projects (Esc closes)" aria-label="All projects">All projects</button>
         <label class="more-menu-label theme-label" for="theme-select">Theme</label>
         <select id="theme-select" class="theme-select more-menu-item">
           <option value="light">Light</option>
