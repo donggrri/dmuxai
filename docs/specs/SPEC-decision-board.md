@@ -1,6 +1,6 @@
 # SPEC: Decision board (coordinator board)
 
-Status: in progress (series 1/3: core store, CLI, MCP) · Target: v0.4.1
+Status: in progress (series 2/3: dashboard Board view and HTTP API) · Target: v0.4.1
 Owner: DmuxAI
 Created: 2026-11-26
 Baseline: `897c973`
@@ -101,6 +101,14 @@ Series:
 | FR-3114 | Must | `dmuxai board --help` and per-subcommand help describe the commands; `docs/API.md` documents the CLI and MCP tools and the coordinator workflow. |
 | FR-3115 | Must | Board operations never read or write agent credential files, never print the dashboard token, and do not store company or private data beyond what the caller sends (docs warn that the repo is public). |
 | NFR-3100 | Must | Board code runs only for `board` commands/tools; `run`, the TUI and the dashboard have no added work in PR 1. `board list` with 500 items finishes in under 200 ms on the gate box. |
+| FR-3120 | Must | HTTP API (`src/web/board_api.rs`, merged into both `--web` and `serve` routers behind the existing `security_and_auth_middleware`): `GET /api/board?lane=&workspace=&all=` (list), `GET /api/board/{id}`, `POST /api/board/{id}/decision` `{verdict,text?,option?,plan_hash}`, `POST /api/board/{id}/messages` `{text}`, `POST /api/board/{id}/plan` `{steps,tasks?}`, `POST /api/board/{id}/lane` `{lane}`, `GET /api/board/rules`, `PUT /api/board/rules`. Dashboard writes act as `owner` (BoardCaller::Dashboard). Errors map to HTTP: usage 400, not found 404, conflict 409, forbidden 403, failed 422, internal 500, as JSON `{error}`. The id path segment is validated with `valid_item_id` before any store call. Writes are allowed in view-only `serve` too (OQ-3102) because they launch no agent. |
+| FR-3121 | Must | `GET /api/board/events?since=SEQ` is an SSE stream of board events (`seq`, `item_id`, `kind`, `version`, `by`) tailing `events.jsonl` (≤ 1 s poll of the file length, only while a client is connected); `since` replays later events. |
+| FR-3122 | Must | Dashboard header gets a "Board" toggle (`#board-toggle`, `data-view="board"`) with a badge counting `needs_decision` items. The Board view shows (a) "My decisions": one card per `needs_decision` item with title, workspace basename, kind, grade, source bot, age, recommendation, options as buttons, and Approve / Request changes / Reject buttons; (b) a kanban with columns Auto, Needs decision, Approved, In progress, Done, Rejected, Unknown across all projects; (c) a workspace filter and a "show closed" switch. Cards can be moved between lanes with a lane menu (no drag-and-drop required). |
+| FR-3123 | Must | Clicking a card opens a drawer: summary, plan revision and hash, plan steps table (id, role, runner, model, depends_on, job) editable inline with add/remove step and Save (calls `POST /plan`; validation errors shown per step, nothing saved); diff of steps against the previous revision when one exists; decision history; and a side chat panel (thread messages with sender labels and times, a textarea and Send; Ctrl/Cmd+Enter sends). Approve sends the plan hash currently shown so a stale approval gets 409 and a "plan changed, reload" notice. |
+| FR-3124 | Must | The Board view updates live from the board SSE stream while it is visible and closes the stream when hidden; no timers run when the view is hidden. |
+| FR-3125 | Must | All board text is inserted with `textContent` (no `innerHTML`), the dashboard token never appears in the Board view, and `board.js`/`board.css` are served like the other assets (no-store). |
+| FR-3126 | Should | Rules editor in the Board view (list of rules with kind/grade/title regex → lane, default lane) saving through `PUT /api/board/rules`. |
+| NFR-3120 | Must | Board API and assets add no work to other routes; listing 500 items over HTTP stays under 300 ms; the board stream costs nothing when no client is connected (#301). |
 
 ## 5. Acceptance scenarios and test design
 
@@ -123,6 +131,14 @@ Series:
 | TC-3114 | FR-3114 | `tc_3114_board_help_lists_subcommands` |
 | TC-3115 | FR-3115 | `tc_3115_board_never_touches_credentials_or_token` |
 | TC-3116 | NFR-3100 | `tc_3116_list_500_items_under_budget` |
+| TC-3120 | FR-3120 | `tc_3120_board_http_routes_status_codes_and_owner_actor` |
+| TC-3121 | FR-3121 | `tc_3121_board_sse_replays_since_and_streams_new_events` |
+| TC-3122 | FR-3122 | `tc_3122_board_view_markup_toggle_lanes_and_decision_cards` |
+| TC-3123 | FR-3123 | `tc_3123_board_drawer_plan_edit_chat_and_stale_approve_conflict` |
+| TC-3124 | FR-3124 | `tc_3124_board_stream_only_while_visible` |
+| TC-3125 | FR-3125 | `tc_3125_board_assets_no_innerhtml_no_token` |
+| TC-3126 | FR-3126 | `tc_3126_board_rules_get_put_validation` |
+| TC-3127 | NFR-3120 | `tc_3127_board_http_list_500_under_budget` |
 
 ## 6. Data and safety contracts
 
@@ -149,13 +165,6 @@ Series:
    `board plan --hash`) and reply with `board say`.
 
 ## 8. Planned requirements for PR 2 and PR 3 (not yet gated)
-
-PR 2 (dashboard and HTTP):
-- FR-3120: `GET /api/board` (filters), `GET /api/board/{id}`, `POST /api/board/{id}/decision`, `POST /api/board/{id}/messages`, `POST /api/board/{id}/plan` (edit), `POST /api/board/{id}/lane`, `GET /api/board/events?since=` (SSE), behind the existing security middleware; same validation/masking.
-- FR-3121: Board view: "My decisions" cards (title, workspace, kind/grade, recommendation, options, Approve / Request changes / Reject buttons) above a lane kanban across all projects with a workspace filter.
-- FR-3122: Item drawer: plan steps (id, role, runner/model, depends_on, job) editable as a table with add/remove step, Validate and Save (new revision), diff against the previous revision; side chat thread with an input box.
-- FR-3123: live update through the board SSE; no polling when the Board view is hidden.
-- FR-3124: the dashboard token is never shown in the Board view; demo screenshot uses demo data only.
 
 PR 3 (planner chat, run, notify):
 - FR-3135: "Ask planner" (`dmuxai board ask <id> --text T`, dashboard button in `--web`): a read-only planner turn with the configured `[board] planner` runner/model gets the plan, thread and question and answers in the thread; a returned plan JSON becomes a new validated revision.
