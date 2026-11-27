@@ -2115,6 +2115,7 @@ mod tests {
                 user_prompt: "go".to_string(),
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![GraphNode {
                     id: "n1".to_string(),
                     role: NodeRole::Implement,

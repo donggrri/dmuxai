@@ -6343,6 +6343,7 @@ fallback = ["agy:composer-2.5"]
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 limits: Default::default(),
+                dynamic_cap: None,
                 tasks: Vec::new(),
             },
             conversation_id: "c".to_owned(),

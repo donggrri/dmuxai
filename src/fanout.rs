@@ -156,7 +156,7 @@ pub fn parse_agents_flag(raw: &str) -> Result<Vec<FanoutLegSpec>, String> {
             return Err("--agents has an empty runner id".to_owned());
         }
         legs.push(FanoutLegSpec {
-            runner: runner.to_ascii_lowercase(),
+            runner: crate::runner_id::canonical_runner_id(runner),
             model,
         });
     }
@@ -597,6 +597,19 @@ pub fn fanout_text_with_aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TC-3201 / FR-3201
+    #[test]
+    fn parse_agents_flag_normalizes_cursor_and_rejects_alias_duplicate() {
+        let legacy = parse_agents_flag("cursor,agy").expect("legacy cursor");
+        let canonical = parse_agents_flag("cursor-agent,agy").expect("canonical cursor-agent");
+        assert_eq!(legacy, canonical);
+        assert_eq!(legacy[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
+        assert_eq!(legacy[1].runner, "agy");
+
+        let dup = parse_agents_flag("cursor,cursor-agent").unwrap_err();
+        assert!(dup.contains(crate::runner_id::CURSOR_RUNNER_ID));
+    }
 
     // TC-2915 / FR-2915
     #[test]
