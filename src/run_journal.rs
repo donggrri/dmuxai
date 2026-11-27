@@ -148,6 +148,8 @@ pub struct RunManifest {
     pub links: RunLinks,
     pub diagnostics: RunDiagnosticsRef,
     pub end_summary: Option<serde_json::Value>,
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 /// Normalizes legacy `"cursor"` `"agent"` / `"runner"` fields inside one JSONL
@@ -552,18 +554,27 @@ fn sync_dir(_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
+/// Resolves the data base directory for dmuxai runs:
+/// `$DMUXAI_DATA_DIR` when set, otherwise `$XDG_DATA_HOME/dmuxai` or
+/// `~/.local/share/dmuxai`.
+pub fn data_base() -> io::Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("DMUXAI_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME")
+        && !data_home.is_empty()
+    {
+        return Ok(PathBuf::from(data_home).join("dmuxai"));
+    }
+    fallback_data_base()
+}
+
 /// Resolves the XDG data home base directory for dmuxai runs:
-/// `$XDG_DATA_HOME/dmuxai/repos/<repo-key>/runs` or `~/.local/share/dmuxai/repos/<repo-key>/runs`.
+/// `<data_base>/repos/<repo-key>/runs`.
 pub fn repo_runs_dir(workspace_root: &Path) -> io::Result<PathBuf> {
-    let base = if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        if !data_home.is_empty() {
-            PathBuf::from(data_home).join("dmuxai")
-        } else {
-            fallback_data_base()?
-        }
-    } else {
-        fallback_data_base()?
-    };
+    let base = data_base()?;
     let key = repo_key(workspace_root)?;
     Ok(base.join("repos").join(key).join("runs"))
 }
@@ -1590,6 +1601,7 @@ mod tests {
             links: RunLinks::default(),
             diagnostics: RunDiagnosticsRef::default(),
             end_summary: None,
+            workspace_root: None,
         };
         store.save_relaxed(&fresh).unwrap();
         let saved_raw = std::fs::read_to_string(dir.path().join(fresh_id).join("manifest.json"))

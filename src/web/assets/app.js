@@ -370,10 +370,13 @@ function applySnapshotUi(snap) {
 // Use the ?token= from the URL when present, stash it for refreshes, and hide
 // it from the address bar afterwards (deepseek cross-review finding 3).
 var token = (function () {
-  var fromQuery = new URLSearchParams(location.search).get('token');
+  var params = new URLSearchParams(location.search);
+  var fromQuery = params.get('token');
   if (fromQuery) {
     storageSet(TOKEN_KEY, fromQuery);
-    history.replaceState(null, '', location.pathname + location.hash);
+    params.delete('token');
+    var qs = params.toString();
+    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : '') + location.hash);
     return fromQuery;
   }
   return storageGet(TOKEN_KEY);
@@ -1926,7 +1929,8 @@ var CENTER_VIEWS = {
   diff: { panel: 'docs', toggle: 'diff-toggle' },
   graph: { panel: 'graph', toggle: 'graph-toggle' },
   board: { panel: 'board', toggle: 'board-toggle' },
-  runs: { panel: 'runs', toggle: 'runs-toggle' }
+  runs: { panel: 'runs', toggle: 'runs-toggle' },
+  'all-projects': { panel: 'all-projects', toggle: 'all-projects-toggle' }
 };
 var centerView = null;
 var graphViewOverride = null;

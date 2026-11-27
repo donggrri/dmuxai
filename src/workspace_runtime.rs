@@ -479,6 +479,7 @@ async fn open_hosted_workspace(
     app.push_local_notice(format!("Opened {storage_path} in this dashboard."));
     sync_user_workspaces_list(&ctx.directory);
     let _ = dmuxai::workspace::record_recent_workspace(&path);
+    dmuxai::state_path::warn_write_workspace_metadata(&path);
     Ok((app, entry))
 }
 

@@ -54,6 +54,10 @@ default_mode = "web"   # "web" (default) or "tui"
 max_workspaces = 8     # workspaces hosted per dashboard (1..32, default 8)
 ```
 
+### All projects view
+
+The **All projects** view in the web dashboard lists every project of the current OS user across both the state directory (`conversations.sqlite3` and `workspace.json`) and the data directory (`runs/`), showing conversation counts, run counts, and active-run indicators. Selecting a project lets you inspect its conversations and runs read-only (with live SSE streaming for active runs). In `--web` mode, **Open project** attaches the project in-process and loads the selected conversation; in view-only `dmuxai serve` and for missing folders, the open action is disabled.
+
 You can also set a default workspace and extra dashboard browse roots in your
 user config (`~/.config/dmuxai/dmuxai.toml`; precedence is `-C` /
 `--workspace-dir`, then `DMUXAI_WORKSPACE`, then user-config `[workspace] dir`,

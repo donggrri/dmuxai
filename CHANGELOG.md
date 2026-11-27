@@ -22,6 +22,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- **All projects global view (SPEC-web-all-projects).** Added `<state base>/repos/<key>/workspace.json` index (0700/0600, written on workspace open and headless run start) and `workspace_root` on new run manifests; added read-only `GET /api/global/projects*` endpoints with 5s caching, bounded queries, and secret/token masking; added the "All projects" dashboard view with read-only conversation/run inspection (live SSE stream for active runs) and "Open project" (`POST /api/workspace/attach` + `load_conversation`, disabled in `serve` and for missing folders).
 - **Web dashboard is now the default mode (SPEC-web-default-mode).** Plain `dmuxai` starts web mode by default (`--tui`, `DMUXAI_UI=tui`, or `[ui] default_mode = "tui"` restores the TUI). When a live web dashboard of the same user is already running, starting `dmuxai` in another project attaches that workspace in-process via `POST /api/workspace/attach` and prints its `?ws=<id>` URL (`--new` starts a separate dashboard). `[web] max_workspaces` (default 8, 1..32) configures the per-dashboard workspace limit.
 - **Loopback dashboard is tokenless by default (SPEC-web-local-access).** Local
   agents and curl can call `/api/*` without `?token=`; CSRF guards, Host checks,

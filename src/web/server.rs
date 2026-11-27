@@ -137,7 +137,7 @@ impl ServerConfig {
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) access: WebAccess,
-    workspaces: Arc<WorkspaceDirectory>,
+    pub(crate) workspaces: Arc<WorkspaceDirectory>,
 }
 
 impl AppState {
@@ -829,6 +829,22 @@ async fn get_runs_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::RUNS_JS,
+    )
+}
+
+async fn get_all_projects_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::ALL_PROJECTS_JS,
     )
 }
 
@@ -1722,6 +1738,7 @@ struct WorkspaceInfoResponse {
     recent: Vec<String>,
     browse_roots: Vec<String>,
     can_switch: bool,
+    view_only: bool,
 }
 
 async fn get_workspace(Ws(ws): Ws) -> Response {
@@ -1732,6 +1749,7 @@ async fn get_workspace(Ws(ws): Ws) -> Response {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let can_switch = ws.services.web_attached && is_unix_switch_supported(&ws);
+    let view_only = !ws.services.web_attached;
     json_ok(
         StatusCode::OK,
         &WorkspaceInfoResponse {
@@ -1739,6 +1757,7 @@ async fn get_workspace(Ws(ws): Ws) -> Response {
             recent,
             browse_roots,
             can_switch,
+            view_only,
         },
     )
 }
@@ -1897,7 +1916,13 @@ struct WorkspacePathBody {
     path: String,
 }
 
-async fn post_workspace_validate(ApiJson(body): ApiJson<WorkspacePathBody>) -> Response {
+async fn post_workspace_validate(
+    Ws(ws): Ws,
+    ApiJson(body): ApiJson<WorkspacePathBody>,
+) -> Response {
+    if !ws.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
     match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path)) {
         Ok(canonical) => json_ok(
             StatusCode::OK,
@@ -2282,6 +2307,7 @@ async fn workspace_switch_task(
     }
 
     let _ = crate::workspace::record_recent_workspace(&canonical);
+    crate::state_path::warn_write_workspace_metadata(&canonical);
 
     let cfg = ws.hub.switch_config().unwrap_or_default();
     match preflight_workspace_switch(cfg.current_exe.as_deref(), &canonical) {
@@ -2365,6 +2391,7 @@ pub fn build_router_with_directory_access(
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/runs.js", get(get_runs_js))
+        .route("/assets/all-projects.js", get(get_all_projects_js))
         .route("/assets/sidebar-resize.js", get(get_sidebar_resize_js))
         .route("/assets/session.css", get(get_session_css))
         .route("/assets/app.css", get(get_app_css))
@@ -2403,6 +2430,30 @@ pub fn build_router_with_directory_access(
         .route("/api/runs", get(crate::web::runs_api::list))
         .route("/api/runs/{id}", get(crate::web::runs_api::detail))
         .route("/api/runs/{id}/stream", get(crate::web::runs_api::stream))
+        .route(
+            "/api/global/projects",
+            get(crate::web::global_api::list_projects),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/conversations",
+            get(crate::web::global_api::list_conversations),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/conversations/{id}",
+            get(crate::web::global_api::conversation_detail),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/runs",
+            get(crate::web::global_api::list_runs),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/runs/{run_id}",
+            get(crate::web::global_api::run_detail),
+        )
+        .route(
+            "/api/global/projects/{repo_key}/runs/{run_id}/stream",
+            get(crate::web::global_api::run_stream),
+        )
         .route("/assets/board.js", get(get_board_js))
         .route("/assets/board.css", get(get_board_css))
         .route("/api/todos", get(list_todos).post(create_todo))
@@ -2723,6 +2774,54 @@ mod tests {
                 .iter()
                 .any(|h| h.contains("172.24.64.5"))
         );
+
+        // Also bind the extra WSL listener via start_server using 127.0.0.2.
+        let bind_mock = Arc::new(MockNat {
+            version: Some("microsoft WSL2".to_owned()),
+            wslinfo: Some("nat".to_owned()),
+            route: Some(
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                 eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+                    .to_owned(),
+            ),
+            iface_ip: Some(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+            ..Default::default()
+        });
+        let bind_config = ServerConfig {
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 0,
+            allow_remote: false,
+            bind_explicit: false,
+            token: "tok".to_owned(),
+            token_required: false,
+            trust_wsl_host: true,
+            discovery_mode: "web".to_owned(),
+            max_workspaces: crate::web::directory::DEFAULT_MAX_WORKSPACES,
+            peer_source: Some(bind_mock),
+            services: DashboardServices::default(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = start_server(bind_config, test_hub()).await.unwrap();
+            if let Some(win_url) = server.windows_url.as_deref() {
+                let authority = win_url
+                    .strip_prefix("http://")
+                    .unwrap()
+                    .trim_end_matches('/');
+                let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+                let req = format!(
+                    "GET /api/state HTTP/1.1\r\nHost: {authority}\r\nX-Dmuxai-Client: 1\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(req.as_bytes()).await.unwrap();
+                let mut resp = String::new();
+                stream.read_to_string(&mut resp).await.unwrap();
+                assert!(
+                    resp.starts_with("HTTP/1.1 401"),
+                    "unexpected WSL listener response: {resp}"
+                );
+            }
+            server.handle.abort();
+        });
     }
 
     // TC-2950 / FR-2950
@@ -6011,7 +6110,7 @@ mod tests {
             assert_eq!(v["reason"], expected_reason);
         }
 
-        // View-only router refuses dirs and switch, but allows validate
+        // View-only router refuses dirs, switch, and validate
         let view_only_router = build_router_with(
             test_hub(),
             token.clone(),
@@ -6054,7 +6153,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         match prev_home {
             Some(v) => unsafe { std::env::set_var("HOME", v) },

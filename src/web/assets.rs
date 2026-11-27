@@ -7,6 +7,7 @@ pub const AGENT_PROMPTS_JS: &str = include_str!("assets/agent-prompts.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
+pub const ALL_PROJECTS_JS: &str = include_str!("assets/all-projects.js");
 pub const BOARD_JS: &str = include_str!("assets/board.js");
 pub const BOARD_CSS: &str = include_str!("assets/board.css");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
@@ -279,6 +280,8 @@ mod tests {
             SESSION_JS,
             SKILLS_JS,
             AGENT_PROMPTS_JS,
+            RUNS_JS,
+            ALL_PROJECTS_JS,
         ] {
             assert!(
                 source.contains("X-Dmuxai-Client") || source.contains("'x-dmuxai-client'"),

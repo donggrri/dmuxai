@@ -38,7 +38,7 @@ const GRAPH_READ_CAP: u64 = 4 * 1024 * 1024;
 
 /// Opens a regular file without following symlinks. Returns `None` when the
 /// path is a symlink, not a regular file, missing, or unreadable.
-fn open_regular_nofollow(path: &Path) -> Option<fs::File> {
+pub(crate) fn open_regular_nofollow(path: &Path) -> Option<fs::File> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => return None,
         Ok(_) => {}
@@ -81,7 +81,7 @@ fn redact_token_in_text(text: &str, token: &str) -> String {
     }
 }
 
-fn redact_token_in_value(value: &mut serde_json::Value, token: &str) {
+pub(crate) fn redact_token_in_value(value: &mut serde_json::Value, token: &str) {
     if token.is_empty() {
         return;
     }
@@ -107,7 +107,7 @@ fn redact_token_in_value(value: &mut serde_json::Value, token: &str) {
 
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct RunsListQuery {
-    limit: Option<String>,
+    pub(crate) limit: Option<String>,
 }
 
 fn workspace_root_from_events(path: &Path) -> Option<PathBuf> {
@@ -125,7 +125,7 @@ fn journal_for(ws: &crate::web::directory::WorkspaceEntry) -> Option<(PathBuf, J
     Some((root, JournalStore::new(dir)))
 }
 
-fn parse_runs_limit(raw: Option<&str>) -> Result<usize, ()> {
+pub(crate) fn parse_runs_limit(raw: Option<&str>) -> Result<usize, ()> {
     match raw {
         None | Some("") => Ok(50),
         Some(value) => {
@@ -139,7 +139,7 @@ fn parse_runs_limit(raw: Option<&str>) -> Result<usize, ()> {
     }
 }
 
-fn is_run_active(status: &str) -> bool {
+pub(crate) fn is_run_active(status: &str) -> bool {
     status == "active" || status == "running"
 }
 
@@ -280,7 +280,7 @@ fn run_item_from_manifest(store: &JournalStore, manifest: &RunManifest) -> RunIt
     }
 }
 
-fn list_manifests(store: &JournalStore) -> Vec<RunManifest> {
+pub(crate) fn list_manifests(store: &JournalStore) -> Vec<RunManifest> {
     let root = store.root();
     if !root.is_dir() {
         return Vec::new();
@@ -405,9 +405,22 @@ fn progress_as_json_values(store: &JournalStore, id: &str) -> Vec<serde_json::Va
         .into_iter()
         .filter_map(|line| {
             let masked = mask_sensitive_tokens(&line);
-            serde_json::from_str::<serde_json::Value>(&masked).ok()
+            let mut value = serde_json::from_str::<serde_json::Value>(&masked).ok()?;
+            mask_json_value(&mut value);
+            Some(value)
         })
         .collect()
+}
+
+pub(crate) fn list_response(store: &JournalStore, limit: usize, token: &str) -> Response {
+    let runs: Vec<RunItem> = list_manifests(store)
+        .into_iter()
+        .take(limit)
+        .map(|manifest| run_item_from_manifest(store, &manifest))
+        .collect();
+    let mut payload = serde_json::json!({ "runs": runs });
+    redact_token_in_value(&mut payload, token);
+    json_ok(StatusCode::OK, &payload)
 }
 
 pub(crate) async fn list(
@@ -422,13 +435,37 @@ pub(crate) async fn list(
     let Some((_, store)) = journal_for(&ws) else {
         return json_ok(StatusCode::OK, &serde_json::json!({ "runs": [] }));
     };
-    let runs: Vec<RunItem> = list_manifests(&store)
-        .into_iter()
-        .take(limit)
-        .map(|manifest| run_item_from_manifest(&store, &manifest))
-        .collect();
-    let mut payload = serde_json::json!({ "runs": runs });
-    redact_token_in_value(&mut payload, state.token());
+    list_response(&store, limit, state.token())
+}
+
+pub(crate) fn detail_response(
+    store: &JournalStore,
+    workspace_root: Option<&Path>,
+    id: &str,
+    token: &str,
+) -> Response {
+    let manifest = match store.load(id) {
+        Ok(m) => m,
+        Err(_) => return error_json(StatusCode::NOT_FOUND, "run not found"),
+    };
+    let run = run_item_from_manifest(store, &manifest);
+    let graph = workspace_root.and_then(|root| {
+        manifest
+            .links
+            .graph_id
+            .as_deref()
+            .and_then(|gid| load_graph_view(root, gid))
+    });
+    let approval = approval_for(&manifest);
+    let progress = progress_as_json_values(store, id);
+    let mut payload = serde_json::json!({
+        "run": run,
+        "manifest": manifest_to_json(&manifest),
+        "graph": graph,
+        "approval": approval,
+        "progress": progress,
+    });
+    redact_token_in_value(&mut payload, token);
     json_ok(StatusCode::OK, &payload)
 }
 
@@ -443,27 +480,7 @@ pub(crate) async fn detail(
     let Some((workspace_root, store)) = journal_for(&ws) else {
         return error_json(StatusCode::NOT_FOUND, "run not found");
     };
-    let manifest = match store.load(&id) {
-        Ok(m) => m,
-        Err(_) => return error_json(StatusCode::NOT_FOUND, "run not found"),
-    };
-    let run = run_item_from_manifest(&store, &manifest);
-    let graph = manifest
-        .links
-        .graph_id
-        .as_deref()
-        .and_then(|gid| load_graph_view(&workspace_root, gid));
-    let approval = approval_for(&manifest);
-    let progress = progress_as_json_values(&store, &id);
-    let mut payload = serde_json::json!({
-        "run": run,
-        "manifest": manifest_to_json(&manifest),
-        "graph": graph,
-        "approval": approval,
-        "progress": progress,
-    });
-    redact_token_in_value(&mut payload, state.token());
-    json_ok(StatusCode::OK, &payload)
+    detail_response(&store, Some(&workspace_root), &id, state.token())
 }
 
 fn masked_event_data(record: &crate::events::EventRecord, token: &str) -> String {
@@ -557,14 +574,25 @@ pub(crate) async fn stream(
     let Some((_, store)) = journal_for(&ws) else {
         return error_json(StatusCode::NOT_FOUND, "run not found");
     };
-    if store.load(&id).is_err() {
+    stream_response(
+        &store,
+        ws.services.events_path.clone(),
+        id,
+        state.token().to_owned(),
+    )
+}
+
+pub(crate) fn stream_response(
+    store: &JournalStore,
+    events_path: Option<PathBuf>,
+    run_id: String,
+    token: String,
+) -> Response {
+    if store.load(&run_id).is_err() {
         return error_json(StatusCode::NOT_FOUND, "run not found");
     }
 
-    let events_path = ws.services.events_path.clone();
     let store_root = store.root().to_path_buf();
-    let run_id = id.clone();
-    let token = state.token().to_owned();
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
@@ -611,7 +639,16 @@ pub(crate) async fn stream(
 
                 for line in tail_text_lines(&progress_path, &mut progress_offset, 500) {
                     had_new_data = true;
-                    let line = redact_token_in_text(&line, &token);
+                    let line =
+                        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) {
+                            mask_json_value(&mut value);
+                            redact_token_in_value(&mut value, &token);
+                            serde_json::to_string(&value).unwrap_or_else(|_| {
+                                redact_token_in_text(&mask_sensitive_tokens(&line), &token)
+                            })
+                        } else {
+                            redact_token_in_text(&mask_sensitive_tokens(&line), &token)
+                        };
                     if tx
                         .send(Ok(Event::default().event("progress").data(line)))
                         .is_err()

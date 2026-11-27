@@ -12,13 +12,19 @@ use tokio::net::TcpListener;
 #[derive(Clone)]
 pub struct PeerConnectInfo {
     pub addr: SocketAddr,
+    pub local_addr: Option<SocketAddr>,
     pub loopback_uid: Arc<Mutex<Option<Result<(), ()>>>>,
 }
 
 impl PeerConnectInfo {
     pub fn new(addr: SocketAddr) -> Self {
+        Self::with_local(addr, None)
+    }
+
+    pub fn with_local(addr: SocketAddr, local_addr: Option<SocketAddr>) -> Self {
         Self {
             addr,
+            local_addr,
             loopback_uid: Arc::new(Mutex::new(None)),
         }
     }
@@ -26,6 +32,6 @@ impl PeerConnectInfo {
 
 impl Connected<IncomingStream<'_, TcpListener>> for PeerConnectInfo {
     fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        PeerConnectInfo::new(*stream.remote_addr())
+        PeerConnectInfo::with_local(*stream.remote_addr(), stream.io().local_addr().ok())
     }
 }

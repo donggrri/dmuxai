@@ -1,4 +1,11 @@
-use std::{io, path::Path, path::PathBuf};
+use std::{
+    io,
+    path::Path,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
 
 use crate::workspace::normalize_workspace_path;
 
@@ -124,6 +131,129 @@ pub fn prepare_repo_db(workspace_root: &Path) -> io::Result<(PathBuf, Option<Str
         legacy.display()
     );
     Ok((db_path, Some(notice)))
+}
+
+/// Per-repo metadata stored at `<state base>/repos/<key>/workspace.json` (FR-2980).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceMetadata {
+    pub canonical_path: String,
+    pub repo_key: String,
+    pub last_seen_ms: u64,
+}
+
+/// Path to `<state base>/repos/<repo_key>/workspace.json`.
+pub fn workspace_metadata_path(repo_key: &str) -> io::Result<PathBuf> {
+    Ok(state_base()?
+        .join("repos")
+        .join(repo_key)
+        .join("workspace.json"))
+}
+
+/// Atomically writes `<state base>/repos/<key>/workspace.json` with directory
+/// mode `0700` and file mode `0600` (FR-2980).
+pub fn write_workspace_metadata(workspace_root: &Path) -> io::Result<PathBuf> {
+    let canonical_path = normalize_workspace_path(workspace_root)?;
+    let key = repo_key_for_canonical(&canonical_path);
+    let base = state_base()?;
+    let repos_dir = base.join("repos");
+    let repo_dir = repos_dir.join(&key);
+    create_private_dir(&base)?;
+    create_private_dir(&repos_dir)?;
+    create_private_dir(&repo_dir)?;
+
+    let last_seen_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let metadata = WorkspaceMetadata {
+        canonical_path,
+        repo_key: key,
+        last_seen_ms,
+    };
+    let bytes = serde_json::to_vec_pretty(&metadata).map_err(io::Error::other)?;
+    let dest = repo_dir.join("workspace.json");
+    write_private_atomic(&dest, &bytes)?;
+    Ok(dest)
+}
+
+/// Best-effort wrapper around [`write_workspace_metadata`] that logs a warning
+/// on failure instead of returning an error (FR-2980).
+pub fn warn_write_workspace_metadata(workspace_root: &Path) {
+    if let Err(err) = write_workspace_metadata(workspace_root) {
+        eprintln!("warning: failed to write workspace.json: {err}");
+    }
+}
+
+fn create_private_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(dir)?;
+        handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+fn write_private_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let parent = dest
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent directory"))?;
+    let tmp = parent.join(format!(".workspace.json.tmp.{pid}.{seq}"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let write_res = (|| -> io::Result<()> {
+        let mut file = opts.open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Global test environment lock serializing tests that mutate process environment variables.

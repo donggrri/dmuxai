@@ -2955,3 +2955,127 @@ main {
     max-height: 45vh;
   }
 }
+
+/* SPEC-web-all-projects FR-2984..FR-2985 */
+.all-projects-layout {
+  display: flex;
+  gap: 1rem;
+  min-height: 24rem;
+}
+
+.all-projects-list-pane {
+  flex: 0 0 38%;
+  min-width: 14rem;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  padding-right: 0.75rem;
+}
+
+.all-projects-list,
+.all-projects-sub-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.all-projects-item-btn,
+.all-projects-sub-btn {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elevated, transparent);
+  color: inherit;
+  cursor: pointer;
+}
+
+.all-projects-item.selected .all-projects-item-btn {
+  border-color: var(--accent, #4aa8ff);
+}
+
+.all-projects-item-path {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.all-projects-item-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.all-projects-detail-pane {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.all-projects-detail-head,
+.all-projects-readonly-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.all-projects-detail-title,
+.all-projects-readonly-title {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.all-projects-open-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.all-projects-sub-cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.all-projects-sub-heading {
+  margin: 0 0 0.35rem 0;
+}
+
+.all-projects-item-detail {
+  border-top: 1px solid var(--border);
+  padding-top: 0.75rem;
+}
+
+.all-projects-transcript,
+.all-projects-run-log {
+  margin: 0.5rem 0 0 0;
+  padding-left: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 22rem;
+  overflow-y: auto;
+}
+
+.all-projects-msg-role {
+  font-weight: 600;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.all-projects-msg-text,
+.all-projects-run-log-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

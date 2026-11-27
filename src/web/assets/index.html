@@ -13,6 +13,7 @@
 <link rel="stylesheet" href="/assets/board.css">
 <script src="/assets/app.js" defer></script>
 <script src="/assets/runs.js" defer></script>
+<script src="/assets/all-projects.js" defer></script>
 <script src="/assets/board.js" defer></script>
 <script src="/assets/docs.js" defer></script>
 </head>
@@ -33,6 +34,7 @@
         <button id="skills-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="skills-popover" title="Stage skills">Skills</button>
         <button id="agent-prompts-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="agent-prompts-popover" title="System prompts">System prompts</button>
         <button id="graph-toggle" type="button" class="btn more-menu-item view-toggle" role="menuitem" data-view="graph" aria-controls="graph" aria-expanded="false" aria-pressed="false" title="Open the full graph view (Esc closes)" aria-label="Full graph">Full graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
+        <button id="all-projects-toggle" type="button" class="btn more-menu-item view-toggle" role="menuitem" data-view="all-projects" aria-controls="all-projects" aria-expanded="false" aria-pressed="false" title="Browse all projects (Esc closes)" aria-label="All projects">All projects</button>
         <label class="more-menu-label theme-label" for="theme-select">Theme</label>
         <select id="theme-select" class="theme-select more-menu-item">
           <option value="light">Light</option>
@@ -200,6 +202,39 @@
             <ol id="runs-stream" class="runs-stream"></ol>
           </div>
         </aside>
+      </div>
+    </div>
+  </section>
+
+  <section id="all-projects" class="panel center-view" aria-label="All projects" hidden>
+    <div class="center-view-head">
+      <h2 class="panel-title center-view-title">All projects</h2>
+      <button type="button" class="btn sidebar-close center-view-close" data-view="all-projects" aria-label="Close All projects">&times;</button>
+    </div>
+    <div class="all-projects-layout">
+      <div class="all-projects-list-pane">
+        <p id="all-projects-empty" class="empty" hidden>No projects found.</p>
+        <ul id="all-projects-list" class="all-projects-list"></ul>
+      </div>
+      <div id="all-projects-detail" class="all-projects-detail-pane" hidden>
+        <div class="all-projects-detail-head">
+          <h3 id="all-projects-detail-title" class="all-projects-detail-title"></h3>
+          <div class="all-projects-open-wrap">
+            <button id="all-projects-open-btn" type="button" class="btn btn-primary btn-small" disabled>Open project</button>
+            <span id="all-projects-open-hint" class="hint all-projects-open-hint" hidden></span>
+          </div>
+        </div>
+        <div class="all-projects-sub-cols">
+          <div class="all-projects-sub-col">
+            <h4 class="all-projects-sub-heading">Conversations</h4>
+            <ul id="all-projects-conversations" class="all-projects-sub-list"></ul>
+          </div>
+          <div class="all-projects-sub-col">
+            <h4 class="all-projects-sub-heading">Runs</h4>
+            <ul id="all-projects-runs" class="all-projects-sub-list"></ul>
+          </div>
+        </div>
+        <div id="all-projects-item-detail" class="all-projects-item-detail" hidden></div>
       </div>
     </div>
   </section>

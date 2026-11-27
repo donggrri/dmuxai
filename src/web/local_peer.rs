@@ -229,12 +229,20 @@ fn parse_proc_ipv4_hex(hex: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(octets))
 }
 
-/// Parses `/proc/net/tcp` (or tcp6) and returns the uid owning a socket with the given peer.
-pub fn peer_uid_from_proc_net(tables: &[&str], peer: SocketAddr) -> Option<u32> {
+/// Parses `/proc/net/tcp` (or tcp6) and returns the uid owning an established (`st == 01`)
+/// socket with the given peer and optional server local address.
+pub fn peer_uid_from_proc_net(
+    tables: &[&str],
+    peer: SocketAddr,
+    local_addr: Option<SocketAddr>,
+) -> Option<u32> {
     for table in tables {
         for line in table.lines().skip(1) {
             let cols: Vec<&str> = line.split_whitespace().collect();
             if cols.len() < 8 {
+                continue;
+            }
+            if cols.get(3).copied() != Some("01") {
                 continue;
             }
             let local_field = match cols.get(1) {
@@ -249,11 +257,25 @@ pub fn peer_uid_from_proc_net(tables: &[&str], peer: SocketAddr) -> Option<u32> 
                 Some(parsed) => parsed,
                 None => continue,
             };
-            if port != peer.port() {
+            if port != peer.port() || !ip_matches(peer.ip(), ip) {
                 continue;
             }
-            if !ip_matches(peer.ip(), ip) {
-                continue;
+            if let Some(expected_remote) = local_addr {
+                let rem_field = match cols.get(2) {
+                    Some(value) => *value,
+                    None => continue,
+                };
+                let rem_is_v6 = rem_field
+                    .split(':')
+                    .next()
+                    .is_some_and(|addr| addr.len() == 32);
+                let (rem_ip, rem_port) = match parse_proc_socket_field(rem_field, rem_is_v6) {
+                    Some(parsed) => parsed,
+                    None => continue,
+                };
+                if rem_port != expected_remote.port() || !ip_matches(expected_remote.ip(), rem_ip) {
+                    continue;
+                }
             }
             let uid = match cols.get(7).and_then(|u| u.parse().ok()) {
                 Some(uid) => uid,
@@ -311,6 +333,7 @@ fn ip_matches(expected: IpAddr, found: IpAddr) -> bool {
 pub fn peer_uid_for_connection<S: LocalPeerSource + ?Sized>(
     source: &S,
     peer: SocketAddr,
+    local_addr: Option<SocketAddr>,
 ) -> Option<u32> {
     let tcp = source.proc_net_tcp();
     let tcp6 = source.proc_net_tcp6();
@@ -318,7 +341,7 @@ pub fn peer_uid_for_connection<S: LocalPeerSource + ?Sized>(
         .into_iter()
         .filter_map(|opt| opt.as_deref())
         .collect();
-    peer_uid_from_proc_net(&tables, peer)
+    peer_uid_from_proc_net(&tables, peer, local_addr)
 }
 
 pub fn shared_peer_source() -> Arc<dyn LocalPeerSource> {
@@ -424,14 +447,41 @@ mod tests {
     #[test]
     fn tc_2955_proc_net_tcp_peer_uid_parsing_mismatch_rejected_root_allowed_once_per_connection() {
         let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-             0: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 123 1 00000000\n\
-             1: 0100007F:C353 0100007F:C352 01 00000000:00000000 00:00000000 00000000  1000        0 456 1 00000000\n";
+             0: 0100007F:C351 0100007F:C350 06 00000000:00000000 00:00000000 00000000     0        0 100 1 00000000\n\
+             1: 0100007F:C351 0100007F:9999 01 00000000:00000000 00:00000000 00000000     0        0 101 1 00000000\n\
+             2: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 123 1 00000000\n\
+             3: 0100007F:C353 0100007F:C352 01 00000000:00000000 00:00000000 00000000  1000        0 456 1 00000000\n";
         let peer: SocketAddr = "127.0.0.1:50001".parse().unwrap();
-        assert_eq!(peer_uid_from_proc_net(&[table], peer), Some(0));
+        let server_local: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        assert_eq!(
+            peer_uid_from_proc_net(&[table], peer, Some(server_local)),
+            Some(0)
+        );
         let peer2: SocketAddr = "127.0.0.1:50003".parse().unwrap();
-        assert_eq!(peer_uid_from_proc_net(&[table], peer2), Some(1000));
+        let server_local2: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        assert_eq!(
+            peer_uid_from_proc_net(&[table], peer2, Some(server_local2)),
+            Some(1000)
+        );
+        let wrong_local: SocketAddr = "127.0.0.1:50004".parse().unwrap();
+        assert_eq!(
+            peer_uid_from_proc_net(&[table], peer, Some(wrong_local)),
+            None
+        );
         let mapped: SocketAddr = "[::ffff:127.0.0.1]:50001".parse().unwrap();
-        assert_eq!(peer_uid_from_proc_net(&[table], mapped), Some(0));
+        assert_eq!(
+            peer_uid_from_proc_net(&[table], mapped, Some(server_local)),
+            Some(0)
+        );
+
+        // TIME_WAIT (st=06) uid=0 row must be ignored in favor of ESTABLISHED (st=01) uid=1000.
+        let tw_table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             0: 0100007F:C351 0100007F:C350 06 00000000:00000000 00:00000000 00000000     0        0 100 1 00000000\n\
+             1: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 123 1 00000000\n";
+        assert_eq!(
+            peer_uid_from_proc_net(&[tw_table], peer, Some(server_local)),
+            Some(1000)
+        );
     }
 
     // TC-2959 / FR-2959 (middleware-level expectations exercised via access)

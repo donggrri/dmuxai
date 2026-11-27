@@ -4474,6 +4474,7 @@ fn execute_runs(
     failed: bool,
     json: bool,
 ) -> i32 {
+    dmuxai::state_path::warn_write_workspace_metadata(workspace_root);
     let runs_dir = match dmuxai::run_journal::repo_runs_dir(workspace_root) {
         Ok(dir) => dir,
         Err(e) => {
@@ -4819,6 +4820,7 @@ fn start_headless_journal(
     dmuxai::run_journal::JournalStore,
     dmuxai::run_journal::RunManifest,
 )> {
+    dmuxai::state_path::warn_write_workspace_metadata(workspace_root);
     let runs_dir = match dmuxai::run_journal::repo_runs_dir(workspace_root) {
         Ok(dir) => dir,
         Err(e) => {
@@ -4862,6 +4864,10 @@ fn start_headless_journal(
         links: dmuxai::run_journal::RunLinks::default(),
         diagnostics: dmuxai::run_journal::RunDiagnosticsRef::default(),
         end_summary: None,
+        workspace_root: Some(
+            dmuxai::workspace::normalize_workspace_path(workspace_root)
+                .unwrap_or_else(|_| workspace_root.display().to_string()),
+        ),
     };
     if let Err(e) = store.save_relaxed(&manifest) {
         eprintln!("warning: run journal unavailable: {e}");
