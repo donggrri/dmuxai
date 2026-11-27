@@ -11,9 +11,11 @@ mod types;
 
 pub use executor::{GraphAction, GraphRunSession, GraphSession, GraphStopReason, NodeAssignment};
 pub use judge::{
-    FallbackCause, JUDGE_PROMPT, OverrideKind, QUESTION_ANSWER_HINT, Route, TriageSource, Verdict,
-    build_judge_prompt, is_question_prompt, is_trivial_prompt, parse_verdict,
+    FallbackCause, JUDGE_PROMPT, OverrideKind, PromptBlocked, QUESTION_ANSWER_HINT, Route,
+    TriageSource, Verdict, build_judge_prompt, is_question_prompt, is_trivial_prompt,
+    parse_verdict,
 };
+pub(crate) use judge::{json_objects, reject_data};
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
     PlanPromptRequest, PlanStep, build_plan_prompt, diff_plan_steps, fallback_plan,
