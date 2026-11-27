@@ -8,7 +8,6 @@ All notable changes to dmuxai are listed here. Versions follow
 ### Added
 
 - Dashboard: Markdown file paths in agent and board messages open in a read-only viewer (workspace files, and `.md` files under your home folder).
-
 - Board: approving an item wakes the posting bot (decision event and notify payload with `bot`/`verdict`) and starts the approved plan right away (`[board] auto_run_on_approve`, default on).
 
 ### Changed
