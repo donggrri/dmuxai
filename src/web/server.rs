@@ -111,6 +111,7 @@ pub struct ServerConfig {
     pub token_required: bool,
     pub trust_wsl_host: bool,
     pub discovery_mode: String,
+    pub max_workspaces: usize,
     pub peer_source: Option<Arc<dyn LocalPeerSource>>,
     pub services: DashboardServices,
 }
@@ -126,6 +127,7 @@ impl ServerConfig {
             token_required: true,
             trust_wsl_host: false,
             discovery_mode: "web".to_owned(),
+            max_workspaces: crate::web::directory::DEFAULT_MAX_WORKSPACES,
             peer_source: None,
             services,
         }
@@ -939,6 +941,23 @@ async fn get_favicon_failed() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::FAVICON_FAILED_SVG,
+    )
+}
+
+/// Lightweight side-effect-free liveness/mode probe used by `dmuxai` reuse (FR-2972).
+async fn get_ping(State(state): State<AppState>) -> Response {
+    let mode = if state.workspaces.opener().is_some() {
+        "web"
+    } else {
+        "serve"
+    };
+    json_ok(
+        StatusCode::OK,
+        &serde_json::json!({
+            "schema": crate::web::snapshot::SNAPSHOT_SCHEMA,
+            "mode": mode,
+            "pid": std::process::id(),
+        }),
     )
 }
 
@@ -1768,7 +1787,7 @@ async fn get_workspaces(axum::extract::State(state): axum::extract::State<AppSta
     json_ok(
         StatusCode::OK,
         &WorkspacesListResponse {
-            max: crate::web::directory::MAX_WORKSPACES,
+            max: state.workspaces.max_workspaces(),
             workspaces,
         },
     )
@@ -1998,10 +2017,11 @@ async fn post_workspace_switch(
     };
 
     if let Some(opener) = state.workspaces.opener() {
-        return tokio::spawn(workspace_switch_in_process_task(
+        return tokio::spawn(workspace_in_process_open_task(
             state.workspaces.clone(),
             opener,
             canonical,
+            true,
         ))
         .await
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
@@ -2021,6 +2041,33 @@ async fn post_workspace_switch(
         state.access.token.clone(),
         ws.clone(),
         canonical,
+    ))
+    .await
+    .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
+}
+
+/// Attach a workspace in-process without changing the active browser focus (FR-2972).
+async fn post_workspace_attach(
+    State(state): State<AppState>,
+    Ws(ws): Ws,
+    ApiJson(body): ApiJson<WorkspacePathBody>,
+) -> Response {
+    if !ws.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
+    let canonical = match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path))
+    {
+        Ok(path) => path,
+        Err(reason) => return error_json(StatusCode::BAD_REQUEST, &reason.to_string()),
+    };
+    let Some(opener) = state.workspaces.opener() else {
+        return error_json(StatusCode::CONFLICT, "requires dmuxai --web");
+    };
+    tokio::spawn(workspace_in_process_open_task(
+        state.workspaces.clone(),
+        opener,
+        canonical,
+        false,
     ))
     .await
     .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"))
@@ -2099,15 +2146,18 @@ async fn workspace_close_task(
     }
 }
 
-async fn workspace_switch_in_process_task(
+async fn workspace_in_process_open_task(
     workspaces: Arc<WorkspaceDirectory>,
     opener: tokio::sync::mpsc::Sender<crate::web::directory::OpenRequest>,
     canonical: std::path::PathBuf,
+    focus: bool,
 ) -> Response {
     let key = crate::workspace::normalize_workspace_path(&canonical)
         .unwrap_or_else(|_| canonical.display().to_string());
     if let Some(entry) = workspaces.find_by_path(&key) {
-        workspaces.set_focused(&entry.id);
+        if focus {
+            workspaces.set_focused(&entry.id);
+        }
         return json_ok(
             StatusCode::OK,
             &serde_json::json!({
@@ -2134,7 +2184,9 @@ async fn workspace_switch_in_process_task(
 
     match tokio::time::timeout(Duration::from_secs(60), rx).await {
         Ok(Ok(Ok(entry))) => {
-            workspaces.set_focused(&entry.id);
+            if focus {
+                workspaces.set_focused(&entry.id);
+            }
             json_ok(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -2147,9 +2199,35 @@ async fn workspace_switch_in_process_task(
             )
         }
         Ok(Ok(Err(e))) => {
+            // If another concurrent attach/switch opened the same folder while we were waiting
+            // on the opener channel, return the winning entry so attach prints its URL (FR-2972).
+            if e.status == 409
+                && let Some(entry) = workspaces.find_by_path(&key)
+            {
+                if focus {
+                    workspaces.set_focused(&entry.id);
+                }
+                return json_ok(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "ok": true,
+                        "path": entry.path,
+                        "id": entry.id,
+                        "in_process": true,
+                        "opened": false
+                    }),
+                );
+            }
             let status =
                 StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            error_json(status, &e.message)
+            if let Some(code) = e.code {
+                json_ok(
+                    status,
+                    &serde_json::json!({ "error": e.message, "code": code }),
+                )
+            } else {
+                error_json(status, &e.message)
+            }
         }
         Ok(Err(_)) => error_json(StatusCode::CONFLICT, "requires dmuxai --web"),
         Err(_) => error_json(
@@ -2294,6 +2372,7 @@ pub fn build_router_with_directory_access(
         .route("/assets/favicon-running.svg", get(get_favicon_running))
         .route("/assets/favicon-done.svg", get(get_favicon_done))
         .route("/assets/favicon-failed.svg", get(get_favicon_failed))
+        .route("/api/ping", get(get_ping))
         .route("/api/state", get(get_state))
         .route("/api/workspaces", get(get_workspaces))
         .route("/api/workspaces/{id}/close", post(post_workspace_close))
@@ -2301,6 +2380,7 @@ pub fn build_router_with_directory_access(
         .route("/api/workspace/dirs", get(get_workspace_dirs))
         .route("/api/workspace/validate", post(post_workspace_validate))
         .route("/api/workspace/switch", post(post_workspace_switch))
+        .route("/api/workspace/attach", post(post_workspace_attach))
         .route("/api/workspace/open", post(post_workspace_open))
         .route("/api/skills", get(get_skills).post(post_skills))
         .route("/api/skills/approve", post(post_skills_approve))
@@ -2440,7 +2520,11 @@ pub async fn start_server(
         });
     switch_cfg.bound_port = Some(port);
     hub.set_switch_config(switch_cfg);
-    let workspaces = Arc::new(WorkspaceDirectory::single(hub, config.services));
+    let workspaces = Arc::new(WorkspaceDirectory::single_with_max(
+        hub,
+        config.services,
+        config.max_workspaces,
+    ));
     let loopback_router =
         build_router_with_directory_access(workspaces.clone(), primary_access.clone());
     let loopback_make = loopback_router
@@ -2625,6 +2709,7 @@ mod tests {
             token_required: false,
             trust_wsl_host: true,
             discovery_mode: "web".to_owned(),
+            max_workspaces: crate::web::directory::DEFAULT_MAX_WORKSPACES,
             peer_source: Some(mock.clone()),
             services: DashboardServices::default(),
         };
@@ -7368,7 +7453,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body_str = read_body(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-        assert_eq!(v["max"], 4);
+        assert_eq!(v["max"], crate::web::directory::DEFAULT_MAX_WORKSPACES);
         let list = v["workspaces"].as_array().unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0]["id"], "default");
@@ -7579,10 +7664,10 @@ mod tests {
 
         tokio::spawn(async move {
             if let Some(req) = opener_rx.recv().await {
-                let _ = req.reply.send(Err(crate::web::directory::OpenError {
-                    status: 409,
-                    message: "too many open folders (max 4)".to_string(),
-                }));
+                let _ = req.reply.send(Err(crate::web::directory::OpenError::new(
+                    409,
+                    "too many open folders (max 8)",
+                )));
             }
         });
 
@@ -7599,7 +7684,260 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body_str = read_body(resp).await;
         let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-        assert_eq!(v["error"], "too many open folders (max 4)");
+        assert_eq!(v["error"], "too many open folders (max 8)");
+    }
+
+    // Direct security & validation tests for POST /api/workspace/attach (FR-2972).
+    #[tokio::test]
+    async fn post_workspace_attach_security_and_validation() {
+        let temp_ws = tempfile::tempdir().unwrap();
+        let canonical_path = crate::workspace::validate_workspace_dir(temp_ws.path()).unwrap();
+        let canonical_str = crate::workspace::normalize_workspace_path(&canonical_path).unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+        let (opener_tx, _opener_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::OpenRequest>(4);
+        dir.set_opener(opener_tx);
+
+        let token = "test-token-attach-sec";
+        let router =
+            build_router_with_directory(dir.clone(), token.to_owned(), allowed_localhost());
+
+        // 1. 401 when token required and missing.
+        let req_unauth = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/workspace/attach")
+            .header("Host", "localhost:7420")
+            .header("Content-Type", "application/json")
+            .header("X-Dmuxai-Client", "1")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "path": canonical_str }).to_string(),
+            ))
+            .unwrap();
+        let resp_unauth = router.clone().oneshot(req_unauth).await.unwrap();
+        assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // 2. 403 cross-origin Origin header.
+        let req_origin = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/workspace/attach")
+            .header("Host", "localhost:7420")
+            .header("Origin", "https://evil.example")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "path": canonical_str }).to_string(),
+            ))
+            .unwrap();
+        let resp_origin = router.clone().oneshot(req_origin).await.unwrap();
+        assert_eq!(resp_origin.status(), StatusCode::FORBIDDEN);
+
+        // 3. 403 bad Host header.
+        let req_host = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/workspace/attach")
+            .header("Host", "evil.example:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({ "path": canonical_str }).to_string(),
+            ))
+            .unwrap();
+        let resp_host = router.clone().oneshot(req_host).await.unwrap();
+        assert_eq!(resp_host.status(), StatusCode::FORBIDDEN);
+
+        // 4. 400 for denied/invalid path ("/").
+        let req_denied = json_request(
+            "POST",
+            "/api/workspace/attach",
+            token,
+            &serde_json::json!({ "path": "/" }).to_string(),
+        );
+        let resp_denied = router.oneshot(req_denied).await.unwrap();
+        assert_eq!(resp_denied.status(), StatusCode::BAD_REQUEST);
+
+        // 5. 403 under `serve` (`web_attached: false`).
+        let serve_hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let serve_dir = Arc::new(WorkspaceDirectory::single(
+            serve_hub,
+            DashboardServices {
+                web_attached: false,
+                ..DashboardServices::default()
+            },
+        ));
+        let serve_router =
+            build_router_with_directory(serve_dir, token.to_owned(), allowed_localhost());
+        let req_serve = json_request(
+            "POST",
+            "/api/workspace/attach",
+            token,
+            &serde_json::json!({ "path": canonical_str }).to_string(),
+        );
+        let resp_serve = serve_router.clone().oneshot(req_serve).await.unwrap();
+        assert_eq!(resp_serve.status(), StatusCode::FORBIDDEN);
+
+        // 6. GET /api/ping requires auth/guards and reports "web" vs "serve".
+        let ping_unauth = axum::http::Request::builder()
+            .method("GET")
+            .uri("/api/ping")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            serve_router
+                .clone()
+                .oneshot(ping_unauth)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let ping_serve = serve_router
+            .oneshot(json_request("GET", "/api/ping", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(ping_serve.status(), StatusCode::OK);
+        let ping_serve_bytes = axum::body::to_bytes(ping_serve.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let ping_serve_json: serde_json::Value = serde_json::from_slice(&ping_serve_bytes).unwrap();
+        assert_eq!(ping_serve_json["mode"], "serve");
+        assert_eq!(
+            ping_serve_json["schema"],
+            crate::web::snapshot::SNAPSHOT_SCHEMA
+        );
+
+        let web_router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+        let ping_web = web_router
+            .oneshot(json_request("GET", "/api/ping", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(ping_web.status(), StatusCode::OK);
+        let ping_web_bytes = axum::body::to_bytes(ping_web.into_body(), 1024 * 64)
+            .await
+            .unwrap();
+        let ping_web_json: serde_json::Value = serde_json::from_slice(&ping_web_bytes).unwrap();
+        assert_eq!(ping_web_json["mode"], "web");
+    }
+
+    // Concurrent race on POST /api/workspace/attach returns 200 with existing id (FR-2972).
+    #[tokio::test]
+    async fn post_workspace_attach_concurrent_race_returns_existing_id() {
+        let temp_ws = tempfile::tempdir().unwrap();
+        let canonical_path = crate::workspace::validate_workspace_dir(temp_ws.path()).unwrap();
+        let canonical_str = crate::workspace::normalize_workspace_path(&canonical_path).unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+        ));
+        let (opener_tx, mut opener_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::OpenRequest>(4);
+        dir.set_opener(opener_tx);
+
+        let dir_clone = dir.clone();
+        let path_for_task = canonical_str.clone();
+        tokio::spawn(async move {
+            if let Some(req) = opener_rx.recv().await {
+                // Simulate another concurrent request having inserted the workspace first.
+                let _ = dir_clone.insert(crate::web::directory::WorkspaceEntry {
+                    id: "w-race".to_string(),
+                    path: path_for_task.clone(),
+                    hub: DashboardHub::new(SnapshotSource::Tui, path_for_task),
+                    services: DashboardServices::default(),
+                    restricted: false,
+                });
+                let _ = req.reply.send(Err(crate::web::directory::OpenError::new(
+                    409,
+                    "folder is already open",
+                )));
+            }
+        });
+
+        let token = "test-token-attach-race";
+        let router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+        let req = json_request(
+            "POST",
+            "/api/workspace/attach",
+            token,
+            &serde_json::json!({ "path": canonical_str }).to_string(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_str = read_body(resp).await;
+        let v: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["id"], "w-race");
+        assert_eq!(v["opened"], false);
+    }
+
+    // TC-2975 / FR-2975: Server enforces configured `max_workspaces` limit.
+    #[tokio::test]
+    async fn tc_2975_server_max_workspaces_enforced() {
+        let temp_ws = tempfile::tempdir().unwrap();
+        let canonical_path = crate::workspace::validate_workspace_dir(temp_ws.path()).unwrap();
+        let canonical_str = crate::workspace::normalize_workspace_path(&canonical_path).unwrap();
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/repo/project-a".to_string());
+        let dir = Arc::new(WorkspaceDirectory::single_with_max(
+            hub,
+            DashboardServices {
+                web_attached: true,
+                ..DashboardServices::default()
+            },
+            1,
+        ));
+        let (opener_tx, mut opener_rx) =
+            tokio::sync::mpsc::channel::<crate::web::directory::OpenRequest>(4);
+        dir.set_opener(opener_tx);
+        tokio::spawn(async move {
+            if let Some(req) = opener_rx.recv().await {
+                let _ = req
+                    .reply
+                    .send(Err(crate::web::directory::OpenError::with_code(
+                        409,
+                        "full",
+                        "too many open folders (max 1); close one first",
+                    )));
+            }
+        });
+
+        let token = "test-token-max-2975";
+        let router = build_router_with_directory(dir, token.to_owned(), allowed_localhost());
+
+        let list_req = axum::http::Request::builder()
+            .uri("/api/workspaces")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let list_resp = router.clone().oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list_v: serde_json::Value = serde_json::from_str(&read_body(list_resp).await).unwrap();
+        assert_eq!(list_v["max"], 1);
+
+        let attach_req = json_request(
+            "POST",
+            "/api/workspace/attach",
+            token,
+            &serde_json::json!({ "path": canonical_str }).to_string(),
+        );
+        let attach_resp = router.oneshot(attach_req).await.unwrap();
+        assert_eq!(attach_resp.status(), StatusCode::CONFLICT);
+        let v: serde_json::Value = serde_json::from_str(&read_body(attach_resp).await).unwrap();
+        assert_eq!(v["code"], "full");
     }
 
     #[tokio::test]

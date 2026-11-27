@@ -13,7 +13,26 @@ use crate::web::server::DashboardServices;
 #[derive(Debug, Clone)]
 pub struct OpenError {
     pub status: u16,
+    pub code: Option<&'static str>,
     pub message: String,
+}
+
+impl OpenError {
+    pub fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    pub fn with_code(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code: Some(code),
+            message: message.into(),
+        }
+    }
 }
 
 /// Request sent to an opener channel to open a workspace in-process.
@@ -28,8 +47,11 @@ pub struct CloseRequest {
     pub reply: tokio::sync::oneshot::Sender<Result<(), OpenError>>,
 }
 
-/// Maximum number of workspaces that can be open simultaneously.
-pub const MAX_WORKSPACES: usize = 4;
+/// Default maximum number of workspaces that can be open simultaneously (FR-2975).
+pub const DEFAULT_MAX_WORKSPACES: usize = 8;
+
+/// Backward-compatible alias for the default workspace limit.
+pub const MAX_WORKSPACES: usize = DEFAULT_MAX_WORKSPACES;
 
 /// Errors returned by workspace directory operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +65,7 @@ pub enum DirectoryError {
 impl fmt::Display for DirectoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DirectoryError::Full => write!(f, "too many open folders (max 4)"),
+            DirectoryError::Full => write!(f, "too many open folders"),
             DirectoryError::Duplicate => write!(f, "folder is already open"),
             DirectoryError::Missing => write!(f, "no such open folder"),
             DirectoryError::LastEntry => write!(f, "cannot close the last open folder"),
@@ -70,15 +92,23 @@ struct Inner {
 /// Directory of active workspaces. The dashboard currently creates exactly one entry.
 pub struct WorkspaceDirectory {
     inner: RwLock<Inner>,
+    max_workspaces: usize,
     opener: RwLock<Option<tokio::sync::mpsc::Sender<OpenRequest>>>,
     closer: RwLock<Option<tokio::sync::mpsc::Sender<CloseRequest>>>,
 }
 
 impl WorkspaceDirectory {
-    /// Creates a directory with a single workspace entry ("default").
-    ///
-    /// The dashboard currently creates exactly one entry.
+    /// Creates a directory with a single workspace entry ("default") and the default limit.
     pub fn single(hub: DashboardHub, services: DashboardServices) -> Self {
+        Self::single_with_max(hub, services, DEFAULT_MAX_WORKSPACES)
+    }
+
+    /// Creates a directory with a single workspace entry ("default") and a configured limit.
+    pub fn single_with_max(
+        hub: DashboardHub,
+        services: DashboardServices,
+        max_workspaces: usize,
+    ) -> Self {
         let path = hub.workspace();
         let entry = Arc::new(WorkspaceEntry {
             id: "default".to_string(),
@@ -92,9 +122,15 @@ impl WorkspaceDirectory {
                 entries: vec![entry],
                 focused: 0,
             }),
+            max_workspaces: max_workspaces.clamp(1, 32),
             opener: RwLock::new(None),
             closer: RwLock::new(None),
         }
+    }
+
+    /// Returns the configured maximum number of open workspaces.
+    pub fn max_workspaces(&self) -> usize {
+        self.max_workspaces
     }
 
     /// Sets the opener sender for in-process workspace opening.
@@ -164,11 +200,11 @@ impl WorkspaceDirectory {
 
     /// Inserts a new workspace entry.
     ///
-    /// Returns `DirectoryError::Full` if directory already has `MAX_WORKSPACES`.
+    /// Returns `DirectoryError::Full` if directory already has `max_workspaces`.
     /// Returns `DirectoryError::Duplicate` if id or path already exists.
     pub fn insert(&self, entry: WorkspaceEntry) -> Result<Arc<WorkspaceEntry>, DirectoryError> {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if inner.entries.len() >= MAX_WORKSPACES {
+        if inner.entries.len() >= self.max_workspaces {
             return Err(DirectoryError::Full);
         }
         if inner
@@ -305,28 +341,35 @@ mod tests {
         let dir = WorkspaceDirectory::single(hub, DashboardServices::default());
 
         assert_eq!(dir.len(), 1);
-        let e2 = dir.insert(make_entry("w2", "/w2")).unwrap();
-        assert_eq!(e2.id, "w2");
-        let e3 = dir.insert(make_entry("w3", "/w3")).unwrap();
-        assert_eq!(e3.id, "w3");
-        let e4 = dir.insert(make_entry("w4", "/w4")).unwrap();
-        assert_eq!(e4.id, "w4");
-        assert_eq!(dir.len(), 4);
+        assert_eq!(dir.max_workspaces(), DEFAULT_MAX_WORKSPACES);
+        for i in 2..=DEFAULT_MAX_WORKSPACES {
+            let id = format!("w{i}");
+            let path = format!("/w{i}");
+            let entry = dir.insert(make_entry(&id, &path)).unwrap();
+            assert_eq!(entry.id, id);
+        }
+        assert_eq!(dir.len(), DEFAULT_MAX_WORKSPACES);
 
-        let err = match dir.insert(make_entry("w5", "/w5")) {
+        let err = match dir.insert(make_entry("w9", "/w9")) {
             Ok(_) => panic!("expected Full error"),
             Err(e) => e,
         };
         assert_eq!(err, DirectoryError::Full);
-        assert_eq!(err.to_string(), "too many open folders (max 4)");
-        assert_eq!(dir.len(), 4);
+        assert_eq!(dir.len(), DEFAULT_MAX_WORKSPACES);
 
         let entries = dir.entries();
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), DEFAULT_MAX_WORKSPACES);
         assert_eq!(entries[0].id, "default");
-        assert_eq!(entries[1].id, "w2");
-        assert_eq!(entries[2].id, "w3");
-        assert_eq!(entries[3].id, "w4");
+        assert_eq!(entries[DEFAULT_MAX_WORKSPACES - 1].id, "w8");
+
+        // Custom limit via single_with_max
+        let hub2 = DashboardHub::new(SnapshotSource::Tui, "/c1".to_string());
+        let dir2 = WorkspaceDirectory::single_with_max(hub2, DashboardServices::default(), 2);
+        dir2.insert(make_entry("w2", "/c2")).unwrap();
+        assert_eq!(
+            dir2.insert(make_entry("w3", "/c3")).err(),
+            Some(DirectoryError::Full)
+        );
     }
 
     #[test]
@@ -633,10 +676,7 @@ mod tests {
 
         let received = rx.recv().await.expect("received open request");
         assert_eq!(received.path, path);
-        let _ = received.reply.send(Err(OpenError {
-            status: 404,
-            message: "not found".to_string(),
-        }));
+        let _ = received.reply.send(Err(OpenError::new(404, "not found")));
         let res = reply_rx.await.unwrap();
         assert!(res.is_err());
     }

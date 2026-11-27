@@ -16,6 +16,16 @@ use crate::workspace_trust::{
 #[doc(hidden)]
 pub use crate::state_path::test_env_lock;
 
+/// Default UI mode for plain `dmuxai` (FR-2970).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultUiMode {
+    Web,
+    Tui,
+}
+
+/// Default `[web] max_workspaces` (FR-2975).
+pub const DEFAULT_WEB_MAX_WORKSPACES: usize = 8;
+
 const CURSOR_RUNNER_TABLE_CONFLICT: &str =
     "[runners.cursor] and [runners.cursor-agent] both define settings; [runners.cursor-agent] wins";
 
@@ -75,6 +85,8 @@ pub struct WebThemeSettings {
     pub require_token: bool,
     /// WSL2 NAT: trust the Windows host peer without a token (FR-2960).
     pub trust_wsl_host: bool,
+    /// Maximum number of workspaces hosted by one web dashboard (1..=32, default 8; FR-2975).
+    pub max_workspaces: usize,
 }
 
 impl Default for WebThemeSettings {
@@ -84,6 +96,7 @@ impl Default for WebThemeSettings {
             accent: None,
             require_token: false,
             trust_wsl_host: true,
+            max_workspaces: DEFAULT_WEB_MAX_WORKSPACES,
         }
     }
 }
@@ -276,8 +289,14 @@ pub struct DmuxSettings {
     pub jira: Option<JiraSettings>,
     /// Activity rendering settings (tool calls and model thinking).
     pub ui: UiSettings,
+    /// `[ui] default_mode` (`"web"` or `"tui"`), if explicitly configured (FR-2970).
+    pub ui_default_mode: Option<DefaultUiMode>,
+    /// Validation error for an invalid `[ui] default_mode` value (FR-2970).
+    pub ui_default_mode_error: Option<String>,
     /// Web dashboard theme settings from `[web]`.
     pub web_theme: WebThemeSettings,
+    /// True when the raw workspace `dmuxai.toml` defines `[[agents.custom]]` (FR-2978).
+    pub workspace_defines_custom_agents: bool,
     /// Event delivery settings from `[notify]` (FR-770..FR-772).
     pub notify: NotifySettings,
     /// User-config `[workspace]` settings (FR-870, FR-872).
@@ -343,7 +362,7 @@ struct DmuxToml {
     fanout: Option<FanoutToml>,
     theme: Option<ThemeToml>,
     agents: Option<AgentsToml>,
-    ui: Option<UiSettings>,
+    ui: Option<UiToml>,
     web: Option<WebToml>,
     notify: Option<NotifySettings>,
     memory: Option<MemoryToml>,
@@ -447,11 +466,19 @@ struct MemoryToml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct UiToml {
+    show_tools: Option<crate::activity::ShowTools>,
+    show_thinking: Option<crate::activity::ShowThinking>,
+    default_mode: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct WebToml {
     theme: Option<String>,
     accent: Option<String>,
     require_token: Option<bool>,
     trust_wsl_host: Option<bool>,
+    max_workspaces: Option<i64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -713,6 +740,17 @@ impl DmuxSettings {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(mut parsed) => {
+                    // FR-2978: record whether the raw repo config defines `[[agents.custom]]`
+                    // before trust stripping so untrusted or client-trusted repos still fall
+                    // back to a separate dashboard instead of attaching in-process.
+                    if parsed
+                        .agents
+                        .as_ref()
+                        .and_then(|agents| agents.custom.as_ref())
+                        .is_some_and(|custom| !custom.is_empty())
+                    {
+                        settings.workspace_defines_custom_agents = true;
+                    }
                     if parsed.board.take().is_some() {
                         settings.config_warnings.push(
                             "[board] in workspace dmuxai.toml is ignored (user config only)"
@@ -1390,7 +1428,27 @@ impl DmuxSettings {
             }
         }
         if let Some(ui) = parsed.ui {
-            self.ui = ui;
+            if let Some(show_tools) = ui.show_tools {
+                self.ui.show_tools = show_tools;
+            }
+            if let Some(show_thinking) = ui.show_thinking {
+                self.ui.show_thinking = show_thinking;
+            }
+            if let Some(raw_mode) = ui.default_mode {
+                let trimmed = raw_mode.trim();
+                if trimmed.eq_ignore_ascii_case("web") {
+                    self.ui_default_mode = Some(DefaultUiMode::Web);
+                    self.ui_default_mode_error = None;
+                } else if trimmed.eq_ignore_ascii_case("tui") {
+                    self.ui_default_mode = Some(DefaultUiMode::Tui);
+                    self.ui_default_mode_error = None;
+                } else {
+                    self.ui_default_mode = None;
+                    self.ui_default_mode_error = Some(format!(
+                        "[ui] default_mode = \"{raw_mode}\" is not valid; expected \"web\" or \"tui\""
+                    ));
+                }
+            }
         }
         if let Some(web) = parsed.web {
             if let Some(theme) = web.theme {
@@ -1420,6 +1478,16 @@ impl DmuxSettings {
             }
             if let Some(trust_wsl_host) = web.trust_wsl_host {
                 self.web_theme.trust_wsl_host = trust_wsl_host;
+            }
+            if let Some(max_workspaces) = web.max_workspaces {
+                if (1..=32).contains(&max_workspaces) {
+                    self.web_theme.max_workspaces = max_workspaces as usize;
+                } else {
+                    self.config_warnings.push(format!(
+                        "[web] max_workspaces = {max_workspaces} is out of range 1..=32; using {DEFAULT_WEB_MAX_WORKSPACES}"
+                    ));
+                    self.web_theme.max_workspaces = DEFAULT_WEB_MAX_WORKSPACES;
+                }
             }
         }
         if let Some(notify) = parsed.notify {
@@ -2188,7 +2256,10 @@ impl Default for DmuxSettings {
             todo_jira_base_url: None,
             jira: None,
             ui: UiSettings::default(),
+            ui_default_mode: None,
+            ui_default_mode_error: None,
             web_theme: WebThemeSettings::default(),
+            workspace_defines_custom_agents: false,
             board: BoardSettings::default(),
             notify: NotifySettings::default(),
             workspace: WorkspaceSettings::default(),
@@ -6399,6 +6470,130 @@ usbipd_attach = false
             "workspace wins"
         );
         assert_eq!(settings.terminal_serial_usbipd_attach, Some(false));
+    }
+
+    // TC-2975 / FR-2975: `[web] max_workspaces` default 8, range 1..=32, bounds warning.
+    #[test]
+    fn tc_2975_max_workspaces_setting_bounds_and_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let env = RuntimeEnv::from_process();
+
+        // Default is 8
+        let defaults = DmuxSettings::load_with_user_config_and_env(
+            &ws,
+            Some(&user_dir.join("missing.toml")),
+            &env,
+        );
+        assert_eq!(defaults.web_theme.max_workspaces, 8);
+        assert!(defaults.config_warnings.is_empty());
+
+        // In-range boundary values 1 and 32
+        std::fs::write(user_dir.join("dmuxai.toml"), "[web]\nmax_workspaces = 1\n").unwrap();
+        let min_ok = DmuxSettings::load_with_user_config_and_env(
+            &ws,
+            Some(&user_dir.join("dmuxai.toml")),
+            &env,
+        );
+        assert_eq!(min_ok.web_theme.max_workspaces, 1);
+        assert!(min_ok.config_warnings.is_empty());
+
+        std::fs::write(ws.join("dmuxai.toml"), "[web]\nmax_workspaces = 32\n").unwrap();
+        let max_ok = DmuxSettings::load_with_user_config_and_env(
+            &ws,
+            Some(&user_dir.join("dmuxai.toml")),
+            &env,
+        );
+        assert_eq!(max_ok.web_theme.max_workspaces, 32);
+        assert!(max_ok.config_warnings.is_empty());
+
+        // Out-of-range (0 and 33) warn and fall back to 8
+        for bad in [0, 33, -1] {
+            std::fs::write(
+                ws.join("dmuxai.toml"),
+                format!("[web]\nmax_workspaces = {bad}\n"),
+            )
+            .unwrap();
+            let invalid = DmuxSettings::load_with_user_config_and_env(
+                &ws,
+                Some(&user_dir.join("dmuxai.toml")),
+                &env,
+            );
+            assert_eq!(invalid.web_theme.max_workspaces, 8);
+            assert!(
+                invalid
+                    .config_warnings
+                    .iter()
+                    .any(|w| w.contains("[web] max_workspaces")),
+                "expected warning for {bad}, got: {:?}",
+                invalid.config_warnings
+            );
+        }
+    }
+
+    // TC-2970 / FR-2970: `[ui] default_mode` TOML parsing, workspace-over-user merge, and invalid error.
+    #[test]
+    fn tc_2970_ui_default_mode_toml_merge_and_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        let env = RuntimeEnv::from_process();
+        let user_cfg = user_dir.join("dmuxai.toml");
+
+        // User config sets tui; workspace overrides to web.
+        std::fs::write(&user_cfg, "[ui]\ndefault_mode = \"tui\"\n").unwrap();
+        let user_only = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(user_only.ui_default_mode, Some(DefaultUiMode::Tui));
+        assert_eq!(user_only.ui_default_mode_error, None);
+
+        std::fs::write(ws.join("dmuxai.toml"), "[ui]\ndefault_mode = \"web\"\n").unwrap();
+        let ws_override = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(ws_override.ui_default_mode, Some(DefaultUiMode::Web));
+        assert_eq!(ws_override.ui_default_mode_error, None);
+
+        // Workspace invalid value overrides valid user value and records config error.
+        std::fs::write(ws.join("dmuxai.toml"), "[ui]\ndefault_mode = \"bogus\"\n").unwrap();
+        let ws_invalid = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(ws_invalid.ui_default_mode, None);
+        let err = ws_invalid.ui_default_mode_error.as_deref().unwrap();
+        assert!(err.contains("[ui] default_mode"), "got: {err}");
+
+        // Valid workspace value clears an invalid user value.
+        std::fs::write(&user_cfg, "[ui]\ndefault_mode = \"bogus\"\n").unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), "[ui]\ndefault_mode = \"tui\"\n").unwrap();
+        let recovered = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user_cfg), &env);
+        assert_eq!(recovered.ui_default_mode, Some(DefaultUiMode::Tui));
+        assert_eq!(recovered.ui_default_mode_error, None);
+    }
+
+    // TC-2979 / FR-2978: untrusted workspace `[[agents.custom]]` still sets `workspace_defines_custom_agents`.
+    #[test]
+    fn tc_2979_untrusted_workspace_sets_custom_agents_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let user_dir = tmp.path().join("user");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[[agents.custom]]\nname = \"my-agent\"\ncommand = [\"echo\"]\n",
+        )
+        .unwrap();
+        let env = RuntimeEnv::from_process();
+        let settings = DmuxSettings::load_with_user_config_and_env(
+            &ws,
+            Some(&user_dir.join("missing.toml")),
+            &env,
+        );
+        assert!(
+            settings.workspace_defines_custom_agents,
+            "raw repo config with [[agents.custom]] must set flag even when untrusted"
+        );
     }
 
     #[test]
