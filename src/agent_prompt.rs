@@ -134,6 +134,7 @@ pub struct RunnerModelPromptToml {
 /// Raw TOML table under `[runners.<id>]`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 pub struct RunnerPromptToml {
+    pub enabled: Option<bool>,
     pub system_prompt: Option<String>,
     pub system_prompt_file: Option<String>,
     pub prompt_inject: Option<String>,

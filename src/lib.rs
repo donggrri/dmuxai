@@ -27,6 +27,7 @@ pub mod run_journal;
 pub mod runner_fallback;
 pub mod runner_id;
 pub mod runner_protocol;
+pub mod runner_status;
 pub mod runtime_env;
 pub mod settings;
 pub mod skills;

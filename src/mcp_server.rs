@@ -32,6 +32,7 @@ pub trait McpBackend {
     fn status(&self) -> Result<Value, String>;
     fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String>;
     fn models(&self, agent: Option<&str>) -> Result<Value, String>;
+    fn runners_status(&self, agent: Option<&str>) -> Result<Value, String>;
     fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
 }
 
@@ -107,6 +108,19 @@ fn tool_definitions() -> Value {
         {
             "name": "models",
             "description": "List available models and runner model policy for all runners or a specific agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "Optional runner id (e.g. agy, cursor-agent, codex, or a custom agent name)"
+                    }
+                }
+            }
+        },
+        {
+            "name": "runners_status",
+            "description": "Read-only runner status: installed, version, auth state and masked account for all runners or a specific agent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -403,6 +417,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
             backend.events_since(since, limit)
         }
         "models" => backend.models(str_arg(args, "agent")),
+        "runners_status" => backend.runners_status(str_arg(args, "agent")),
         name if name.starts_with("board_") => backend.board_tool(name, args),
         other => Err(format!("unknown tool: {other}")),
     }
@@ -475,6 +490,7 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "status",
                 "events_since",
                 "models",
+                "runners_status",
                 "board_add",
                 "board_list",
                 "board_show",
@@ -530,6 +546,7 @@ mod tests {
         runs: Mutex<Vec<RunArgs>>,
         run_result: Mutex<Option<Value>>,
         models_calls: Mutex<Vec<Option<String>>>,
+        runners_status_calls: Mutex<Vec<Option<String>>>,
     }
 
     impl McpBackend for Stub {
@@ -560,6 +577,13 @@ mod tests {
                 .unwrap()
                 .push(agent.map(str::to_owned));
             Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
+        }
+        fn runners_status(&self, agent: Option<&str>) -> Result<Value, String> {
+            self.runners_status_calls
+                .lock()
+                .unwrap()
+                .push(agent.map(str::to_owned));
+            Ok(json!({ "ok": true, "runners": [{ "id": agent }] }))
         }
         fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
             Ok(crate::board::mcp_invoke(
@@ -1111,6 +1135,56 @@ mod tests {
         assert_eq!(res["result"]["isError"], false);
         let calls = stub.models_calls.lock().unwrap();
         assert_eq!(calls.as_slice(), &[Some("agy".to_owned())]);
+    }
+
+    // TC-3309 / FR-3310: the read-only runners_status tool is listed with only
+    // an optional agent argument, has no write counterpart, and dispatches.
+    #[test]
+    fn tc_3309_mcp_runners_status() {
+        let stub = Stub::default();
+        let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"runners_status"), "tools: {names:?}");
+        assert!(
+            names.iter().all(|name| !name.contains("enable")),
+            "runner enable must not be exposed over MCP: {names:?}"
+        );
+
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == "runners_status")
+            .expect("runners_status tool");
+        let properties: Vec<String> = tool["inputSchema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(properties, vec!["agent".to_owned()]);
+
+        let res = call(
+            &stub,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "runners_status",
+                    "arguments": { "agent": "agy" }
+                }
+            }),
+        );
+        assert_eq!(res["result"]["isError"], false);
+        assert_eq!(res["result"]["structuredContent"]["ok"], true);
+        assert_eq!(
+            res["result"]["structuredContent"]["runners"][0]["id"],
+            "agy"
+        );
+        assert_eq!(
+            stub.runners_status_calls.lock().unwrap().as_slice(),
+            &[Some("agy".to_owned())]
+        );
     }
 
     // TC-3205 / FR-3204

@@ -522,6 +522,100 @@ async fn post_agent_prompts(Ws(ws): Ws, ApiJson(body): ApiJson<AgentPromptsPostB
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RunnersStatusQuery {
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+/// FR-3309: read-only runner status probe for the dashboard.
+async fn get_runners_status(Ws(ws): Ws, Query(params): Query<RunnersStatusQuery>) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
+    let settings = crate::settings::DmuxSettings::load(&workspace);
+    let _ = crate::custom_agent::install_registry(settings.custom_agents.clone());
+
+    if let Some(target) = params.agent.as_deref() {
+        let target_canon = crate::runner_id::canonical_runner_id(target);
+        let known = crate::agent_api::runner_ids(&settings)
+            .iter()
+            .any(|(id, _)| crate::runner_id::canonical_runner_id(id) == target_canon);
+        if !known {
+            return error_json(StatusCode::BAD_REQUEST, "unknown runner");
+        }
+    }
+
+    let refresh = matches!(params.refresh.as_deref(), Some("1") | Some("true"));
+    let rows =
+        crate::runner_status::collect_status(&settings, params.agent.as_deref(), refresh).await;
+    json_ok(StatusCode::OK, &crate::runner_status::status_json(&rows))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerEnabledBody {
+    runner: String,
+    enabled: bool,
+}
+
+fn runner_config_write_is_internal(error: &str) -> bool {
+    error.starts_with("failed to read ")
+        || error.starts_with("failed to write ")
+        || error.starts_with("cannot locate user config directory")
+}
+
+/// FR-3309: toggles `[runners.<id>] enabled` in the user config.
+async fn post_runner_enabled(Ws(ws): Ws, ApiJson(body): ApiJson<RunnerEnabledBody>) -> Response {
+    let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
+    let settings = crate::settings::DmuxSettings::load(&workspace);
+    let _ = crate::custom_agent::install_registry(settings.custom_agents.clone());
+
+    let runner = crate::runner_id::canonical_runner_id(&body.runner);
+    let known = crate::agent_api::runner_ids(&settings)
+        .iter()
+        .any(|(id, _)| crate::runner_id::canonical_runner_id(id) == runner);
+    if !known {
+        return error_json(StatusCode::BAD_REQUEST, "unknown runner");
+    }
+
+    let env = ws
+        .services
+        .trust_env
+        .clone()
+        .unwrap_or_else(crate::runtime_env::RuntimeEnv::from_process);
+    let runner_for_write = runner.clone();
+    let enabled = body.enabled;
+    let write = tokio::task::spawn_blocking(move || {
+        crate::settings::set_runner_enabled_in_user_config(&env, &runner_for_write, enabled)
+    })
+    .await;
+
+    match write {
+        Ok(Ok(())) => {
+            let settings = crate::settings::DmuxSettings::load(&workspace);
+            let _ = crate::custom_agent::install_registry(settings.custom_agents.clone());
+            let rows = crate::runner_status::collect_status(&settings, Some(&runner), false).await;
+            match rows.into_iter().next() {
+                Some(row) => json_ok(
+                    StatusCode::OK,
+                    &serde_json::json!({ "ok": true, "runner": row }),
+                ),
+                None => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            }
+        }
+        Ok(Err(error)) => {
+            let status = if runner_config_write_is_internal(&error) {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            error_json(status, &error)
+        }
+        Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    }
+}
+
 async fn get_agent_prompts_js() -> impl IntoResponse {
     (
         [
@@ -535,6 +629,22 @@ async fn get_agent_prompts_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::AGENT_PROMPTS_JS,
+    )
+}
+
+async fn get_runners_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::RUNNERS_JS,
     )
 }
 
@@ -2404,6 +2514,7 @@ pub fn build_router_with_directory_access(
         .route("/assets/skills.js", get(get_skills_js))
         .route("/assets/jira-todos.js", get(get_jira_todos_js))
         .route("/assets/agent-prompts.js", get(get_agent_prompts_js))
+        .route("/assets/runners.js", get(get_runners_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/runs.js", get(get_runs_js))
@@ -2431,6 +2542,8 @@ pub fn build_router_with_directory_access(
             "/api/agent-prompts",
             get(get_agent_prompts).post(post_agent_prompts),
         )
+        .route("/api/runners/status", get(get_runners_status))
+        .route("/api/runners/enabled", post(post_runner_enabled))
         .route("/api/memory", get(get_memory))
         .route("/api/memory/save", post(post_memory_save))
         .route(
@@ -3203,6 +3316,46 @@ mod tests {
             .header("Content-Type", "application/json")
             .body(axum::body::Body::from(body.to_owned()))
             .unwrap()
+    }
+
+    struct TestEnvRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl TestEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|&key| (key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                // SAFETY: callers hold crate::state_path::test_env_lock().
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_test_executable(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
     }
 
     async fn read_body(response: Response) -> String {
@@ -7310,6 +7463,224 @@ mod tests {
             .find(|r| r["runner"] == "codex")
             .unwrap();
         assert_eq!(codex["preview"].as_str().unwrap().len(), 200);
+    }
+
+    // TC-3308 / FR-3309: runner status GET and enabled POST share the API
+    // auth/host middleware and only touch the user config.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock must serialize the whole test
+    async fn tc_3308_runners_status_http() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let _restore = TestEnvRestore::capture(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "DMUXAI_CONFIG",
+            "DMUXAI_CURSOR_BIN",
+            "DMUXAI_AGY_BIN",
+            "CURSOR_API_KEY",
+            "CURSOR_AUTH_TOKEN",
+        ]);
+        crate::runner_status::clear_status_cache();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let config_home = root.join("config");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let fake_cursor = write_test_executable(
+            &root,
+            "cursor",
+            r#"#!/usr/bin/env bash
+case "$1" in
+  --version)
+    echo "2026.11.22-e9042b2"
+    ;;
+  status)
+    echo '{"isAuthenticated":true,"userInfo":{"email":"dongjin@example.com","name":"Dongjin"}}'
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 9
+    ;;
+esac
+"#,
+        );
+        let fake_agy = write_test_executable(
+            &root,
+            "agy",
+            r#"#!/usr/bin/env bash
+case "$1" in
+  --version)
+    echo "1.5.18"
+    ;;
+  models)
+    echo "Fetching available models..."
+    echo "gemini-4-hydrogen-high	Gemini 4 Hydrogen (High)"
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 9
+    ;;
+esac
+"#,
+        );
+
+        // SAFETY: serialized by test_env_lock().
+        unsafe {
+            std::env::set_var("HOME", &config_home);
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::remove_var("DMUXAI_CONFIG");
+            std::env::set_var("DMUXAI_CURSOR_BIN", &fake_cursor);
+            std::env::set_var("DMUXAI_AGY_BIN", &fake_agy);
+            std::env::remove_var("CURSOR_API_KEY");
+            std::env::remove_var("CURSOR_AUTH_TOKEN");
+        }
+
+        let token = "runners-http-token-3308";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let router = build_router_with(
+            hub,
+            token.to_owned(),
+            allowed_localhost(),
+            DashboardServices::default(),
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/runners/status", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["ok"], true);
+        let cursor = value["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor-agent row");
+        assert_eq!(cursor["auth"], "ok");
+        assert_eq!(cursor["account"], "d***@example.com");
+        assert_eq!(cursor["version"], "2026.11.22-e9042b2");
+        assert!(
+            !body.contains("dongjin@example.com"),
+            "plain email must not appear in the response: {body}"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                "/api/runners/status?agent=agy",
+                token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        let rows = value["runners"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "agy");
+        assert_eq!(rows[0]["auth"], "ok");
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                "/api/runners/status?agent=nope",
+                token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(read_body(resp).await.contains("unknown runner"));
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/runners/enabled",
+                token,
+                r#"{"runner":"agy","enabled":false}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["runner"]["id"], "agy");
+        assert_eq!(value["runner"]["enabled"], false);
+
+        let user_config = config_home.join("dmuxai").join("dmuxai.toml");
+        let text = std::fs::read_to_string(&user_config).unwrap();
+        assert!(text.contains("[runners.agy]"), "{text}");
+        assert!(text.contains("enabled = false"), "{text}");
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "GET",
+                "/api/runners/status?agent=agy",
+                token,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let value: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(value["runners"][0]["enabled"], false);
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/runners/enabled",
+                token,
+                r#"{"runner":"agy","enabled":true}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = std::fs::read_to_string(&user_config).unwrap();
+        assert!(!text.contains("enabled = false"), "{text}");
+
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/runners/enabled",
+                token,
+                r#"{"runner":"nope","enabled":false}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let no_content_type = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/runners/enabled")
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(
+                r#"{"runner":"agy","enabled":false}"#,
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(no_content_type).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let no_token = axum::http::Request::builder()
+            .uri("/api/runners/status")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(no_token).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

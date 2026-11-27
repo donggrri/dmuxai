@@ -10,6 +10,8 @@ All notable changes to dmuxai are listed here. Versions follow
 - Dashboard: Markdown file paths in agent and board messages open in a read-only viewer (workspace files, and `.md` files under your home folder).
 - Board: approving an item wakes the posting bot (decision event and notify payload with `bot`/`verdict`) and starts the approved plan right away (`[board] auto_run_on_approve`, default on).
 
+- **Runner status and enable switch (SPEC-runner-status).** `dmuxai runners status [--json] [--agent ID]` shows, for cursor-agent and agy, whether the CLI is installed, its version and whether it is signed in (account masked, login hint), using only `--version`, `status --format json`, `models` style probes that never start a model turn. `dmuxai runners enable|disable <id>` writes `[runners.<id>] enabled` to the user config; a disabled runner is refused by `run` and graph routing. The same status is available at `GET /api/runners/status`, the MCP tool `runners_status`, and a new Runners panel in the dashboard More menu (status badge, Refresh, enable switch). Nothing is probed at startup or during runs.
+
 ### Changed
 
 - Board item detail opens as a centered popup instead of a side drawer.

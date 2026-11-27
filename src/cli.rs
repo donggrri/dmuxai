@@ -70,6 +70,17 @@ pub enum AgentCommand {
     Runners {
         json: bool,
     },
+    /// `runners status [--json] [--agent ID]` (FR-3306).
+    RunnersStatus {
+        agent: Option<String>,
+        json: bool,
+    },
+    /// `runners enable|disable <id> [--json]` (FR-3308).
+    RunnersEnable {
+        runner: String,
+        enabled: bool,
+        json: bool,
+    },
     /// `models [--agent ID] [--json]` (FR-2832).
     Models {
         agent: Option<String>,
@@ -516,11 +527,14 @@ Options:
 
 pub const RUNNERS_USAGE: &str = "\
 Usage: dmuxai runners [options]
+       dmuxai runners status [--json] [--agent ID]
+       dmuxai runners enable|disable <id> [--json]
 
 List registered runners (primary Cursor keyword: cursor-agent; `cursor` is an alias), admission, installation and model policy.
 
 Options:
   --json                   Print machine-readable JSON on stdout
+  --agent ID               Only report status for the given runner id
   -h, --help               Print help information
 ";
 
@@ -1168,6 +1182,25 @@ pub const RUNNERS_FLAGS: &[FlagSpec] = &[FlagSpec {
     hidden: false,
 }];
 
+pub const RUNNERS_STATUS_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--agent"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const RUNNERS_ENABLE_FLAGS: &[FlagSpec] = &[FlagSpec {
+    names: &["--json"],
+    takes_value: false,
+    hidden: false,
+}];
+
 pub const MODELS_FLAGS: &[FlagSpec] = &[
     FlagSpec {
         names: &["--agent"],
@@ -1447,12 +1480,35 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 json,
             })
         }
-        "runners" => {
-            let parsed = parse_flags(rest, RUNNERS_FLAGS, false)?;
-            Ok(AgentCommand::Runners {
-                json: parsed.flags.contains_key("--json"),
-            })
-        }
+        "runners" => match rest.first().map(String::as_str) {
+            Some("status") => {
+                let parsed = parse_flags(&rest[1..], RUNNERS_STATUS_FLAGS, false)?;
+                Ok(AgentCommand::RunnersStatus {
+                    agent: parsed.flags.get("--agent").cloned().flatten(),
+                    json: parsed.flags.contains_key("--json"),
+                })
+            }
+            Some(sub @ ("enable" | "disable")) => {
+                let parsed = parse_flags(&rest[1..], RUNNERS_ENABLE_FLAGS, true)?;
+                let Some(runner) = parsed.positionals.first().cloned() else {
+                    return Err(format!("runners {sub} needs a runner id"));
+                };
+                if let Some(extra) = parsed.positionals.get(1) {
+                    return Err(format!("unexpected argument '{extra}'"));
+                }
+                Ok(AgentCommand::RunnersEnable {
+                    runner,
+                    enabled: sub == "enable",
+                    json: parsed.flags.contains_key("--json"),
+                })
+            }
+            _ => {
+                let parsed = parse_flags(rest, RUNNERS_FLAGS, false)?;
+                Ok(AgentCommand::Runners {
+                    json: parsed.flags.contains_key("--json"),
+                })
+            }
+        },
         "models" => {
             let parsed = parse_flags(rest, MODELS_FLAGS, false)?;
             let agent = parsed.flags.get("--agent").cloned().flatten();
@@ -4082,6 +4138,11 @@ pub async fn execute(command: AgentCommand) -> i32 {
                         Some(Value::Bool(false)) => "not installed",
                         _ => "unknown",
                     };
+                    let enabled = if runner["enabled"].as_bool().unwrap_or(true) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
                     let default_model = runner
                         .get("default_model")
                         .and_then(Value::as_str)
@@ -4091,11 +4152,100 @@ pub async fn execute(command: AgentCommand) -> i32 {
                         .and_then(Value::as_str)
                         .unwrap_or("-");
                     println!(
-                        "{id}\t{label} ({kind})\tallowed: {allowed}\tgraph_allowed: {graph_allowed}\tinstalled: {installed}\tdefault: {default_model}\tpolicy: {policy}"
+                        "{id}\t{label} ({kind})\tallowed: {allowed}\tgraph_allowed: {graph_allowed}\tinstalled: {installed}\tenabled: {enabled}\tdefault: {default_model}\tpolicy: {policy}"
                     );
                 }
             }
             exit::OK
+        }
+        AgentCommand::RunnersStatus { agent, json } => {
+            let settings = DmuxSettings::load(&workspace_root);
+            let _ = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
+            if let Some(target) = agent.as_deref() {
+                let target_canon = dmuxai::runner_id::canonical_runner_id(target);
+                let known = agent_api::runner_ids(&settings)
+                    .iter()
+                    .any(|(id, _)| dmuxai::runner_id::canonical_runner_id(id) == target_canon);
+                if !known {
+                    return fail(
+                        ApiError::new(
+                            exit::NOT_FOUND,
+                            dmuxai::runner_id::format_unknown_agent_message(target),
+                        ),
+                        json,
+                    );
+                }
+            }
+            let rows =
+                dmuxai::runner_status::collect_status(&settings, agent.as_deref(), false).await;
+            if json {
+                print_json(&dmuxai::runner_status::status_json(&rows));
+            } else {
+                for row in &rows {
+                    let enabled = if row.enabled { "enabled" } else { "disabled" };
+                    let installed = match row.installed {
+                        Some(true) => "installed",
+                        Some(false) => "not installed",
+                        None => "unknown",
+                    };
+                    let version = row.version.as_deref().unwrap_or("-");
+                    let auth = match row.auth {
+                        dmuxai::runner_status::AuthState::Ok => "ok",
+                        dmuxai::runner_status::AuthState::NotLoggedIn => "not_logged_in",
+                        dmuxai::runner_status::AuthState::Unknown => "unknown",
+                        dmuxai::runner_status::AuthState::Error => "error",
+                    };
+                    let account = row.account.as_deref().unwrap_or("-");
+                    println!(
+                        "{}\t{enabled}\t{installed}\t{version}\t{auth}\t{account}",
+                        row.id
+                    );
+                    if let Some(hint) = &row.hint {
+                        println!("  {hint}");
+                    }
+                }
+            }
+            exit::OK
+        }
+        AgentCommand::RunnersEnable {
+            runner,
+            enabled,
+            json,
+        } => {
+            let settings = DmuxSettings::load(&workspace_root);
+            let canonical = dmuxai::runner_id::canonical_runner_id(&runner);
+            let known = agent_api::runner_ids(&settings)
+                .iter()
+                .any(|(id, _)| dmuxai::runner_id::canonical_runner_id(id) == canonical);
+            if !known {
+                return fail(
+                    ApiError::new(
+                        exit::NOT_FOUND,
+                        dmuxai::runner_id::format_unknown_agent_message(&runner),
+                    ),
+                    json,
+                );
+            }
+            match dmuxai::settings::set_runner_enabled_in_user_config(
+                &dmuxai::runtime_env::RuntimeEnv::from_process(),
+                &runner,
+                enabled,
+            ) {
+                Ok(()) => {
+                    if json {
+                        print_json(&json!({
+                            "ok": true,
+                            "runner": canonical,
+                            "enabled": enabled,
+                        }));
+                    } else {
+                        let state = if enabled { "enabled" } else { "disabled" };
+                        println!("runner '{canonical}' {state}");
+                    }
+                    exit::OK
+                }
+                Err(error) => fail(ApiError::new(exit::FAILED, error), json),
+            }
         }
         AgentCommand::Models { agent, json } => {
             let settings = DmuxSettings::load(&workspace_root);
@@ -5522,6 +5672,32 @@ impl McpBackend for CliMcpBackend {
             Err(err) => Ok(err.to_json()),
         }
     }
+
+    fn runners_status(&self, agent: Option<&str>) -> Result<Value, String> {
+        let settings = DmuxSettings::load(&self.workspace_root);
+        let _ = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
+        if let Some(target) = agent {
+            let target_canon = dmuxai::runner_id::canonical_runner_id(target);
+            let known = agent_api::runner_ids(&settings)
+                .iter()
+                .any(|(id, _)| dmuxai::runner_id::canonical_runner_id(id) == target_canon);
+            if !known {
+                return Ok(ApiError::new(
+                    exit::NOT_FOUND,
+                    dmuxai::runner_id::format_unknown_agent_message(target),
+                )
+                .to_json());
+            }
+        }
+        let fut = dmuxai::runner_status::collect_status(&settings, agent, false);
+        let rows = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())?
+                .block_on(fut),
+        };
+        Ok(dmuxai::runner_status::status_json(&rows))
+    }
 }
 
 /// Waits for any of Ctrl+C, SIGTERM or SIGHUP (Unix); Ctrl+C only elsewhere.
@@ -5738,6 +5914,32 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    struct EnvRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys.iter().map(|&k| (k, std::env::var_os(k))).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                // SAFETY: callers hold dmuxai::state_path::test_env_lock().
+                unsafe {
+                    match v {
+                        Some(val) => std::env::set_var(k, val),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
     }
 
     // TC-2910 / FR-2910
@@ -6832,6 +7034,168 @@ mod tests {
         assert!(err.is_err());
     }
 
+    // TC-3305 / FR-3306, FR-3308: runners status and enable/disable parsing,
+    // unknown agent exit 3, and the user-config write path.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3305_runners_status_cli() {
+        assert_eq!(
+            parse(&args(&["runners", "status"])),
+            Ok(AgentCommand::RunnersStatus {
+                agent: None,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["runners", "status", "--json", "--agent", "cursor"])),
+            Ok(AgentCommand::RunnersStatus {
+                agent: Some("cursor".to_owned()),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["runners", "enable", "agy"])),
+            Ok(AgentCommand::RunnersEnable {
+                runner: "agy".to_owned(),
+                enabled: true,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["runners", "disable", "cursor-agent", "--json"])),
+            Ok(AgentCommand::RunnersEnable {
+                runner: "cursor-agent".to_owned(),
+                enabled: false,
+                json: true,
+            })
+        );
+        assert!(parse(&args(&["runners", "status", "--bogus"])).is_err());
+        assert!(parse(&args(&["runners", "enable"])).is_err());
+        assert_eq!(
+            parse(&args(&["runners"])),
+            Ok(AgentCommand::Runners { json: false })
+        );
+        assert_eq!(
+            parse(&args(&["runners", "--json"])),
+            Ok(AgentCommand::Runners { json: true })
+        );
+
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_home = dir.path().join("config");
+        std::fs::create_dir_all(&config_home).unwrap();
+        let _env = EnvRestore::capture(&["XDG_CONFIG_HOME", "DMUXAI_CONFIG"]);
+        // SAFETY: test-only mutation of the process environment.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::remove_var("DMUXAI_CONFIG");
+        }
+        let config_path = config_home.join("dmuxai").join("dmuxai.toml");
+
+        let code = execute(AgentCommand::RunnersStatus {
+            agent: Some("nope".to_owned()),
+            json: true,
+        })
+        .await;
+        assert_eq!(code, exit::NOT_FOUND);
+
+        let code = execute(AgentCommand::RunnersEnable {
+            runner: "agy".to_owned(),
+            enabled: false,
+            json: true,
+        })
+        .await;
+        assert_eq!(code, exit::OK);
+        let disabled = std::fs::read_to_string(&config_path).unwrap();
+        assert!(disabled.contains("[runners.agy]"), "{disabled}");
+        assert!(disabled.contains("enabled = false"), "{disabled}");
+
+        let code = execute(AgentCommand::RunnersEnable {
+            runner: "agy".to_owned(),
+            enabled: false,
+            json: true,
+        })
+        .await;
+        assert_eq!(code, exit::OK, "disable is idempotent");
+        let again = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(again.matches("enabled = false").count(), 1, "{again}");
+
+        let code = execute(AgentCommand::RunnersEnable {
+            runner: "nope".to_owned(),
+            enabled: false,
+            json: true,
+        })
+        .await;
+        assert_eq!(code, exit::NOT_FOUND);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), again);
+
+        let code = execute(AgentCommand::RunnersEnable {
+            runner: "agy".to_owned(),
+            enabled: true,
+            json: true,
+        })
+        .await;
+        assert_eq!(code, exit::OK);
+        let enabled = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!enabled.contains("enabled = false"), "{enabled}");
+    }
+
+    // TC-3312 / FR-3307: a disabled runner is refused by headless run admission
+    // with exit 5 and the enable hint, even when allowed_runners lists it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3312_disabled_runner_refused() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_home = dir.path().join("config");
+        let user_config = config_home.join("dmuxai").join("dmuxai.toml");
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(&user_config, "[runners.agy]\nenabled = false\n").unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
+        env.xdg_config_home = Some(config_home);
+        env.config_path = None;
+        env.home = Some(dir.path().join("home"));
+        let settings = DmuxSettings::load_with_env(&workspace, &env);
+        assert!(!settings.runner_enabled("agy"));
+        assert!(dmuxai::agent_api::runner_run_admitted(
+            &settings,
+            "cursor-agent"
+        ));
+
+        let mut listed = settings.clone();
+        listed.graph_allowed_runners = Some(vec!["agy".to_owned()]);
+        assert!(!dmuxai::agent_api::runner_run_admitted(&listed, "agy"));
+
+        let engine = ConversationEngine::open(Path::new(":memory:"), &workspace).unwrap();
+        let mut app = App::new(engine, workspace.clone(), settings).unwrap();
+        app.set_headless(true);
+        let outcome = app
+            .run_headless(
+                HeadlessRequest {
+                    prompt: "hi".to_owned(),
+                    agent: Some("agy".to_owned()),
+                    mode: None,
+                    graph: false,
+                    approve_plan: false,
+                    approve_plan_id: None,
+                    allow_sensitive: false,
+                    todo_id: None,
+                    model: None,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        app.shutdown().await;
+        assert_eq!(outcome.exit_code, exit::FORBIDDEN);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("runner 'agy' is disabled; run `dmuxai runners enable agy`")
+        );
+    }
+
     // TC-2830 / FR-2830: subcommand usage texts list every non-hidden flag
     #[test]
     fn tc_2830_help_lists_parser_flags() {
@@ -6844,6 +7208,7 @@ mod tests {
             (TRUST_USAGE, TRUST_FLAGS),
             (RUNS_USAGE, RUNS_FLAGS),
             (RUNNERS_USAGE, RUNNERS_FLAGS),
+            (RUNNERS_USAGE, RUNNERS_STATUS_FLAGS),
             (MODELS_USAGE, MODELS_FLAGS),
         ];
 
