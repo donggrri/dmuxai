@@ -588,6 +588,7 @@ mod tests {
                 ..GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
 
         let run = GraphRun {
@@ -711,6 +712,7 @@ mod tests {
                 ..GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
 
         let run = GraphRun {

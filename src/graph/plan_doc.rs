@@ -617,6 +617,7 @@ pub fn validate_plan_with_limit(
         edges,
         limits: default_limits(),
         tasks: doc.tasks.clone(),
+        dynamic_cap: None,
     })
 }
 
@@ -1035,6 +1036,7 @@ pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) ->
             edges: Vec::new(),
             limits: default_limits(),
             tasks: vec![task],
+            dynamic_cap: None,
         },
         note: format!(
             "Plan fallback ({cause}): one step on {runner} {model}. Edit to ask for a real plan."
@@ -1042,7 +1044,7 @@ pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) ->
     }
 }
 
-fn valid_step_id(id: &str) -> bool {
+pub(crate) fn valid_step_id(id: &str) -> bool {
     let mut chars = id.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -1063,7 +1065,7 @@ fn valid_step_id(id: &str) -> bool {
     true
 }
 
-fn parse_role(role: &str) -> Option<NodeRole> {
+pub(crate) fn parse_role(role: &str) -> Option<NodeRole> {
     Some(match role {
         "research" => NodeRole::Research,
         "explore" => NodeRole::Explore,
@@ -1270,6 +1272,7 @@ mod tests {
             edges: vec![],
             limits: default_limits(),
             tasks: vec![],
+            dynamic_cap: None,
         };
         let notes = pin_graph_plan_runners(&mut plan, "agy", "provider default", &|runner| {
             runner == "agy"

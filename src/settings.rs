@@ -68,6 +68,10 @@ pub struct DmuxSettings {
     pub graph_tasks_file: bool,
     /// `[graph] enforce_read_only_roles` (FR-2900): role-derived turn policy per graph node.
     pub graph_enforce_read_only_roles: bool,
+    /// `[graph] dynamic_nodes` (FR-2940): allow running nodes to request dynamic node additions.
+    pub graph_dynamic_nodes: bool,
+    /// `[graph] dynamic_node_cap` (FR-2940): maximum dynamic nodes per run (0 disables).
+    pub graph_dynamic_node_cap: usize,
     /// `[fanout] company_workspace` (FR-2916): skip free runners in fan-out legs.
     pub fanout_company_workspace: bool,
     /// `[fanout] min_free_gb` (FR-2937): minimum free GiB before write fan-out worktrees.
@@ -286,6 +290,8 @@ struct GraphToml {
     tasks_file: Option<bool>,
     enforce_read_only_roles: Option<bool>,
     allowed_runners: Option<Vec<String>>,
+    dynamic_nodes: Option<bool>,
+    dynamic_node_cap: Option<usize>,
 }
 
 /// Warning emitted once per settings load when `[graph] enabled` is present (FR-931).
@@ -296,6 +302,7 @@ const GRAPH_ENABLED_DEPRECATED: &str =
 const DEFAULT_GRAPH_MAX_REPLANS: u32 = 3;
 const DEFAULT_GRAPH_REPLAN_BUDGET_CHARS: u32 = 24_000;
 const DEFAULT_GRAPH_MAX_NODES: u32 = 12;
+pub const DEFAULT_GRAPH_DYNAMIC_NODE_CAP: usize = 3;
 
 /// Validates a `[graph]` replan cap (FR-958): a value inside `range` is used;
 /// an out-of-range value falls back to `default` with a config warning.
@@ -1133,6 +1140,12 @@ impl DmuxSettings {
             if let Some(enforce) = graph.enforce_read_only_roles {
                 self.graph_enforce_read_only_roles = enforce;
             }
+            if let Some(dynamic_nodes) = graph.dynamic_nodes {
+                self.graph_dynamic_nodes = dynamic_nodes;
+            }
+            if let Some(dynamic_node_cap) = graph.dynamic_node_cap {
+                self.graph_dynamic_node_cap = dynamic_node_cap;
+            }
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
                 for runner in runners {
@@ -1945,6 +1958,8 @@ impl Default for DmuxSettings {
             graph_max_nodes: DEFAULT_GRAPH_MAX_NODES,
             graph_tasks_file: false,
             graph_enforce_read_only_roles: false,
+            graph_dynamic_nodes: false,
+            graph_dynamic_node_cap: DEFAULT_GRAPH_DYNAMIC_NODE_CAP,
             fanout_company_workspace: false,
             fanout_min_free_gb: 5,
             graph_allowed_runners: None,
@@ -2774,6 +2789,49 @@ text_path = "/part/text"
         let settings_on =
             DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
         assert!(settings_on.graph_enforce_read_only_roles);
+
+        std::fs::remove_dir_all(&temp_base).ok();
+    }
+
+    #[test]
+    fn tc_2940_dynamic_settings_defaults_and_merge() {
+        let defaults = DmuxSettings::default();
+        assert!(!defaults.graph_dynamic_nodes);
+        assert_eq!(defaults.graph_dynamic_node_cap, 3);
+
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-dyn-settings-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        std::fs::write(
+            user_dir.join("dmuxai.toml"),
+            "[graph]\ndynamic_nodes = true\ndynamic_node_cap = 5\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\ndynamic_node_cap = 2\n",
+        )
+        .unwrap();
+
+        let settings =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(settings.graph_dynamic_nodes);
+        assert_eq!(settings.graph_dynamic_node_cap, 2);
+
+        // 0 disables
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\ndynamic_nodes = false\ndynamic_node_cap = 0\n",
+        )
+        .unwrap();
+        let settings_off =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(!settings_off.graph_dynamic_nodes);
+        assert_eq!(settings_off.graph_dynamic_node_cap, 0);
 
         std::fs::remove_dir_all(&temp_base).ok();
     }

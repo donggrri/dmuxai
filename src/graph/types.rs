@@ -155,6 +155,9 @@ pub struct GraphPlan {
     /// FR-963: task list for this plan; empty for old records.
     #[serde(default)]
     pub tasks: Vec<PlanTask>,
+    /// Dynamic node addition cap (SPEC-graph-dynamic-nodes FR-2942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,6 +218,12 @@ pub struct GraphRun {
     /// FR-947: dashboard to-do id when this run was started from a to-do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_id: Option<String>,
+    /// Approved dynamic node cap (SPEC-graph-dynamic-nodes FR-2942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
+    /// Count of dynamically added nodes so far (SPEC-graph-dynamic-nodes FR-2942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_added: Option<usize>,
 }
 
 /// FR-943: at most five plan revisions per run.
@@ -313,6 +322,7 @@ pub enum PlanChangeKind {
     Initial,
     Edit,
     Replan,
+    DynamicAdd,
 }
 
 /// Why the replan was triggered (FR-958).
@@ -322,6 +332,7 @@ pub enum PlanChangeTrigger {
     Failure,
     Marker,
     User,
+    DynamicAdd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

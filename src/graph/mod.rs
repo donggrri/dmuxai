@@ -1,3 +1,4 @@
+mod dynamic;
 mod executor;
 mod judge;
 mod plan_doc;
@@ -9,6 +10,9 @@ mod tasks;
 mod triage_view;
 mod types;
 
+pub use dynamic::{
+    DynamicNodeSpec, parse_add_nodes_marker, strip_add_nodes_marker, validate_add_nodes,
+};
 pub use executor::{GraphAction, GraphRunSession, GraphSession, GraphStopReason, NodeAssignment};
 pub use judge::{
     FallbackCause, JUDGE_PROMPT, OverrideKind, PromptBlocked, QUESTION_ANSWER_HINT, Route,
