@@ -5672,6 +5672,32 @@ impl McpBackend for CliMcpBackend {
             Err(err) => Ok(err.to_json()),
         }
     }
+
+    fn runners_status(&self, agent: Option<&str>) -> Result<Value, String> {
+        let settings = DmuxSettings::load(&self.workspace_root);
+        let _ = dmuxai::custom_agent::install_registry(settings.custom_agents.clone());
+        if let Some(target) = agent {
+            let target_canon = dmuxai::runner_id::canonical_runner_id(target);
+            let known = agent_api::runner_ids(&settings)
+                .iter()
+                .any(|(id, _)| dmuxai::runner_id::canonical_runner_id(id) == target_canon);
+            if !known {
+                return Ok(ApiError::new(
+                    exit::NOT_FOUND,
+                    dmuxai::runner_id::format_unknown_agent_message(target),
+                )
+                .to_json());
+            }
+        }
+        let fut = dmuxai::runner_status::collect_status(&settings, agent, false);
+        let rows = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => tokio::runtime::Runtime::new()
+                .map_err(|e| e.to_string())?
+                .block_on(fut),
+        };
+        Ok(dmuxai::runner_status::status_json(&rows))
+    }
 }
 
 /// Waits for any of Ctrl+C, SIGTERM or SIGHUP (Unix); Ctrl+C only elsewhere.
