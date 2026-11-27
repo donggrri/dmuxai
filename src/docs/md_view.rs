@@ -1,12 +1,12 @@
 //! Confinement, size-capped reading, and HTML rendering for `/api/md/view`
-//! (SPEC-board-ux-042 FR-3214, FR-3215, NFR-3212).
+//! (SPEC-board-ux-042 FR-3314, FR-3315, NFR-3312).
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
 
-/// NFR-3212 / FR-3215: maximum Markdown file size served by `/api/md/view` (1 MiB).
+/// NFR-3312 / FR-3315: maximum Markdown file size served by `/api/md/view` (1 MiB).
 pub const MAX_MD_VIEW_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +109,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// Resolves and validates a Markdown file path for FR-3214 / FR-3215.
+/// Resolves and validates a Markdown file path for FR-3314 / FR-3315.
 pub fn resolve_md_view_path(
     raw: &str,
     workspace_root: &Path,
@@ -276,9 +276,9 @@ pub fn view_markdown(
 mod tests {
     use super::*;
 
-    // TC-3215 (FR-3215, NFR-3212)
+    // TC-3315 (FR-3315, NFR-3312)
     #[test]
-    fn tc_3215_md_view_confines_paths_home_workspace_symlink_ext_size() {
+    fn tc_3315_md_view_confines_paths_home_workspace_symlink_ext_size() {
         let ws = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

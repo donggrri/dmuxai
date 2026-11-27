@@ -2575,16 +2575,17 @@ mod tests {
     // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
     #[test]
     fn tc_3134_drawer_ask_and_run_controls_hidden_in_serve() {
-        assert!(BOARD_JS.contains("board-ask-text"));
-        assert!(BOARD_JS.contains("board-ask"));
+        assert!(!BOARD_JS.contains("board-ask-text"));
+        assert!(BOARD_JS.contains("board-chat-note-only"));
+        assert!(BOARD_JS.contains("Note only (no planner answer)"));
         assert!(BOARD_JS.contains("board-ask-revise"));
         assert!(BOARD_JS.contains("board-ask-busy"));
         assert!(BOARD_JS.contains("aria-live"));
-        assert!(BOARD_JS.contains("Ask planner"));
         assert!(BOARD_JS.contains("Ask & revise plan"));
         assert!(BOARD_JS.contains("board-run"));
         assert!(BOARD_JS.contains("boardLaunchAllowed"));
-        assert!(BOARD_JS.contains("askSec.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("reviseBtn.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("noteLabel.hidden = !boardLaunchAllowed"));
         assert!(BOARD_JS.contains("boardIsItemRunnable"));
         assert!(BOARD_JS.contains("item.lane === 'auto'"));
         assert!(BOARD_JS.contains("item.lane === 'approved'"));
@@ -2599,9 +2600,98 @@ mod tests {
         assert!(BOARD_JS.contains("/check"));
     }
 
-    // TC-3217 (FR-3216, FR-3217)
+    // TC-3312 (FR-3312, FR-3313)
+    #[test]
+    fn tc_3312_board_detail_is_centered_modal_with_close_and_esc() {
+        assert!(INDEX_HTML.contains("id=\"board-drawer\""));
+        assert!(INDEX_HTML.contains("role=\"dialog\""));
+        assert!(INDEX_HTML.contains("aria-modal=\"true\""));
+        assert!(INDEX_HTML.contains("aria-labelledby=\"board-drawer-title\""));
+
+        assert!(BOARD_JS.contains("board-modal-close"));
+        assert!(BOARD_JS.contains("'aria-label', 'Close'"));
+        assert!(BOARD_JS.contains("board-drawer-title"));
+        assert!(BOARD_JS.contains("Escape"));
+        assert!(BOARD_JS.contains("md-viewer-backdrop"));
+        assert!(BOARD_JS.contains("board-modal-open"));
+        assert!(BOARD_JS.contains("boardLastFocus"));
+        assert!(BOARD_JS.contains("_boardInsideDrawer"));
+        assert!(APP_JS.contains("board-drawer-wrap"));
+
+        assert!(BOARD_CSS.contains("align-items: center"));
+        assert!(BOARD_CSS.contains("justify-content: center"));
+        assert!(BOARD_CSS.contains("min(960px, 92vw)"));
+        assert!(BOARD_CSS.contains("max-height: 90vh"));
+        assert!(BOARD_CSS.contains("overflow: auto"));
+        assert!(BOARD_CSS.contains("body.board-modal-open"));
+        assert!(!BOARD_CSS.contains("justify-content: flex-end"));
+        assert!(!BOARD_CSS.contains("border-left: 1px solid var(--line)"));
+    }
+
+    // TC-3318 (FR-3318, FR-3319, FR-3320)
+    #[test]
+    fn tc_3318_board_chat_send_asks_planner_unless_note_only() {
+        assert!(!BOARD_JS.contains("board-ask-text"));
+        assert!(BOARD_JS.contains("board-chat-input"));
+        assert!(BOARD_JS.contains("board-chat-note-only"));
+        assert!(BOARD_JS.contains("Note only (no planner answer)"));
+        assert!(BOARD_JS.contains("board-ask-revise"));
+        assert!(BOARD_JS.contains("board-ask-busy"));
+        assert!(BOARD_JS.contains("Asking planner\\u2026"));
+
+        let send_chat_fn = js_between(
+            BOARD_JS,
+            "function boardSendChat",
+            "function boardOpenDrawer",
+        );
+        assert!(send_chat_fn.contains("board-chat-note-only"));
+        assert!(send_chat_fn.contains("if (boardLaunchAllowed && !noteOnly)"));
+        assert!(send_chat_fn.contains("boardAskPlanner(id, false)"));
+        assert!(send_chat_fn.contains("/messages"));
+
+        assert!(BOARD_JS.contains("reviseBtn.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("noteLabel.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("boardAskPlanner(item.id, true)"));
+    }
+
+    // TC-3321 (FR-3321)
+    #[test]
+    fn tc_3321_readme_documents_board_chat_send() {
+        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).expect("README.md readable");
+        assert!(readme.contains("Decision board"));
+        assert!(readme.contains("Note only"));
+        assert!(readme.contains("[board] planner"));
+    }
+
+    // TC-3322 (FR-3322)
+    #[test]
+    fn tc_3322_tokenless_board_stream_and_client_header() {
+        let open_es_fn = js_between(
+            APP_JS,
+            "window.dmuxaiOpenEventSource",
+            "window.dmuxaiWorkspaceId",
+        );
+        assert!(!open_es_fn.contains("|| !token"));
+        assert!(open_es_fn.contains("token ?"));
+
+        let fetch_fn = js_between(
+            BOARD_JS,
+            "function boardFetchJson",
+            "function boardBasename",
+        );
+        assert!(fetch_fn.contains("X-Dmuxai-Client"));
+
+        assert!(BOARD_JS.contains("BOARD_ASK_POLL_MS = 3000"));
+        assert!(BOARD_JS.contains("BOARD_ASK_TIMEOUT_MS = 15 * 60 * 1000"));
+        assert!(BOARD_JS.contains("boardStartAskPoll"));
+        assert!(BOARD_JS.contains("boardStopAskPoll"));
+        assert!(BOARD_JS.contains("No answer yet"));
+    }
+
+    // TC-3317 (FR-3316, FR-3317)
     #[tokio::test]
-    async fn tc_3217_markdown_paths_linkified_and_open_viewer() {
+    async fn tc_3317_markdown_paths_linkified_and_open_viewer() {
         assert!(MD_VIEWER_JS.contains("md-path-link"));
         assert!(MD_VIEWER_JS.contains("data-md-path"));
         assert!(MD_VIEWER_JS.contains("/api/md/view"));

@@ -2277,9 +2277,9 @@ mod tests {
         assert_eq!(bounded.entries.len(), 3);
     }
 
-    // TC-3214 (FR-3214)
+    // TC-3314 (FR-3314)
     #[tokio::test]
-    async fn tc_3214_md_view_renders_workspace_markdown_sanitized() {
+    async fn tc_3314_md_view_renders_workspace_markdown_sanitized() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         let md_src = "# Spec Title\n\n<script>alert('xss')</script>\n\nHello **world**.\n";
@@ -2335,9 +2335,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // TC-3216 (FR-3214)
+    // TC-3316 (FR-3314)
     #[tokio::test]
-    async fn tc_3216_md_view_requires_same_auth_as_api() {
+    async fn tc_3316_md_view_requires_same_auth_as_api() {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path()).unwrap();
         std::fs::write(dir.path().join("README.md"), "# Auth Check").unwrap();
