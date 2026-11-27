@@ -1,6 +1,6 @@
 # PLAN: runner status and enable switch
 
-Status: in progress
+Status: complete
 Spec: [SPEC-runner-status.md](../specs/SPEC-runner-status.md)
 
 1. Probe core: parsers, masking, async probe with timeout, cache, probe table keyed by runner id (FR-3300..FR-3305, NFR-3311).

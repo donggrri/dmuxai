@@ -1,6 +1,6 @@
 # SPEC: runner-status
 
-Status: draft
+Status: Implemented
 
 Owner: dmuxai
 Created: 2026-11-27
@@ -107,6 +107,6 @@ Status row fields: `id`, `label`, `probe` (bool, false when no probe exists), `e
 
 ## 8. Review and test exit criteria
 
-- [ ] All Must requirements (FR-3300..FR-3311, NFR-3310, NFR-3311) map to passing tests.
-- [ ] `python3 scripts/check-spec.py --all` passes.
+- [x] All Must requirements (FR-3300..FR-3311, NFR-3310, NFR-3311) map to passing tests.
+- [x] `python3 scripts/check-spec.py --all` passes.
 - [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full gate and ignored web tests pass.
