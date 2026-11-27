@@ -4,6 +4,7 @@ pub const MEMORY_JS: &str = include_str!("assets/memory.js");
 pub const SKILLS_JS: &str = include_str!("assets/skills.js");
 pub const JIRA_TODOS_JS: &str = include_str!("assets/jira-todos.js");
 pub const AGENT_PROMPTS_JS: &str = include_str!("assets/agent-prompts.js");
+pub const RUNNERS_JS: &str = include_str!("assets/runners.js");
 pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
@@ -281,6 +282,7 @@ mod tests {
             SESSION_JS,
             SKILLS_JS,
             AGENT_PROMPTS_JS,
+            RUNNERS_JS,
             RUNS_JS,
             ALL_PROJECTS_JS,
             MD_VIEWER_JS,
@@ -291,6 +293,69 @@ mod tests {
             );
         }
         assert!(!APP_JS.contains("Missing access token"));
+    }
+
+    // TC-3310 / FR-3311: dashboard Runners panel loads on demand only.
+    #[test]
+    fn tc_3310_runners_panel_asset() {
+        for needle in [
+            "/api/runners/status",
+            "/api/runners/enabled",
+            "refresh=1",
+            "Ready",
+            "Not logged in",
+            "Not installed",
+            "Unknown",
+            "Error",
+            "Disabled",
+            "Checking",
+            "textContent",
+            "X-Dmuxai-Client",
+            "apiUrl",
+            "setAttribute('role', 'switch')",
+        ] {
+            assert!(RUNNERS_JS.contains(needle), "runners.js missing {needle:?}");
+        }
+        assert!(
+            !RUNNERS_JS.contains("innerHTML"),
+            "runners.js must not use innerHTML"
+        );
+        assert!(
+            !RUNNERS_JS.contains("setInterval"),
+            "runners.js must not poll on a timer"
+        );
+        // Only the api helper opens a fetch; status GETs come from the open
+        // handler and the Refresh handler (one each).
+        assert_eq!(RUNNERS_JS.matches("fetch(").count(), 1);
+        assert_eq!(RUNNERS_JS.matches("api('GET'").count(), 2);
+        for line in RUNNERS_JS.lines() {
+            assert_ne!(
+                line.trim_start(),
+                "load();",
+                "runners.js must not load status at page load"
+            );
+        }
+
+        assert!(INDEX_HTML.contains("id=\"runners-toggle\""));
+        assert!(INDEX_HTML.contains("id=\"runners-popover\""));
+        assert!(INDEX_HTML.contains("/assets/runners.js"));
+
+        assert!(APP_CSS.contains(".runners-popover"));
+        assert!(APP_CSS.contains(".runner-row"));
+        for kind in [
+            "ready",
+            "not-logged-in",
+            "not-installed",
+            "unknown",
+            "error",
+            "disabled",
+            "checking",
+        ] {
+            assert!(
+                APP_CSS.contains(&format!(".runner-badge-{kind}")),
+                "missing .runner-badge-{kind}"
+            );
+        }
     }
 
     // TC-543: static_page_has_todo_panel (SPEC-web-dashboard UX-540)
@@ -1987,6 +2052,7 @@ mod tests {
             ("MEMORY_JS", MEMORY_JS),
             ("SKILLS_JS", SKILLS_JS),
             ("AGENT_PROMPTS_JS", AGENT_PROMPTS_JS),
+            ("RUNNERS_JS", RUNNERS_JS),
             ("SESSION_JS", SESSION_JS),
             ("WORKSPACE_JS", WORKSPACE_JS),
             ("SIDEBAR_RESIZE_JS", SIDEBAR_RESIZE_JS),
@@ -2095,6 +2161,7 @@ mod tests {
             ("WORKSPACE_JS", WORKSPACE_JS),
             ("SKILLS_JS", SKILLS_JS),
             ("AGENT_PROMPTS_JS", AGENT_PROMPTS_JS),
+            ("RUNNERS_JS", RUNNERS_JS),
             ("MEMORY_JS", MEMORY_JS),
         ];
 

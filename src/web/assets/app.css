@@ -2542,6 +2542,30 @@ main {
   margin-top: 4px;
 }
 
+/* SPEC-runner-status FR-3311 */
+.runners-popover { width: min(38rem, 96vw); max-height: min(80vh, 40rem); }
+.runners-header { display: flex; align-items: center; gap: .4rem; margin: 0 0 .5rem; }
+.runners-header .memory-title { margin: 0; }
+.runners-header .btn { margin-left: auto; }
+.runners-list { display: flex; flex-direction: column; gap: .5rem; }
+.runner-row { border: 1px solid var(--line); border-radius: .5rem; padding: .5rem .6rem; background: var(--bg-chip); }
+.runner-row-head { display: flex; align-items: center; gap: .5rem; }
+.runner-name { display: flex; align-items: baseline; gap: .4rem; min-width: 0; }
+.runner-label { font-weight: 600; }
+.runner-id { color: var(--muted); font-size: .8rem; }
+.runner-badge { margin-left: auto; padding: 0 .4rem; border-radius: 999px; font-size: .7rem; font-weight: 600; border: 1px solid var(--line); background: var(--bg-panel); color: var(--muted); }
+.runner-badge-ready { color: var(--ok); border-color: var(--ok); }
+.runner-badge-not-logged-in { color: var(--warn); border-color: var(--warn); }
+.runner-badge-not-installed { color: var(--muted); border-color: var(--line); }
+.runner-badge-unknown { color: var(--badge-pending-text); background: var(--badge-pending-bg); border-color: var(--badge-pending-line); }
+.runner-badge-error { color: var(--err); border-color: var(--err); }
+.runner-badge-disabled { color: var(--muted); background: var(--bg-panel); border-color: var(--line); }
+.runner-badge-checking { color: var(--accent); border-color: var(--accent); }
+.runner-meta { display: flex; flex-wrap: wrap; gap: .5rem; color: var(--muted); font-size: .8rem; margin-top: .2rem; }
+.runner-hint { margin: .3rem 0 0; color: var(--muted); font-size: .85rem; }
+.runner-switch { display: flex; align-items: center; gap: .4rem; margin-top: .4rem; font-size: .85rem; }
+.runner-switch-input { margin: 0; }
+
 /* SPEC-stage-skills UX-1500 / UX-1501 */
 .skills-popover { width: min(46rem, 96vw); max-height: min(80vh, 40rem); }
 .skills-title-row { display: flex; align-items: center; gap: .4rem; margin: 0 0 .5rem; }

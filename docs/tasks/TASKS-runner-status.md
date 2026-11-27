@@ -6,4 +6,4 @@ Spec: [SPEC-runner-status.md](../specs/SPEC-runner-status.md) · Plan: [PLAN-run
 - [ ] T2 enabled setting, TOML editor, admission — FR-3307, FR-3308, NFR-3310 — `cargo test --lib settings agent_api`
 - [ ] T3 CLI — FR-3306, FR-3308 — `cargo test --lib cli::`
 - [ ] T4 HTTP and MCP — FR-3309, FR-3310 — `cargo test --lib web::server mcp_server`
-- [ ] T5 dashboard panel — FR-3311 — `cargo test --lib web::assets`
+- [x] T5 dashboard panel — FR-3311 — `cargo test --lib web::assets`

@@ -34,6 +34,7 @@
         <button id="memory-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="memory-popover" title="Memory vault status">Memory <span id="memory-badge" class="memory-badge" aria-hidden="true">Off</span></button>
         <button id="skills-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="skills-popover" title="Stage skills">Skills</button>
         <button id="agent-prompts-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="agent-prompts-popover" title="System prompts">System prompts</button>
+        <button id="runners-toggle" type="button" class="btn more-menu-item memory-top-btn" role="menuitem" aria-haspopup="dialog" aria-expanded="false" aria-pressed="false" aria-controls="runners-popover" title="Runners and connection status">Runners</button>
         <button id="graph-toggle" type="button" class="btn more-menu-item view-toggle" role="menuitem" data-view="graph" aria-controls="graph" aria-expanded="false" aria-pressed="false" title="Open the full graph view (Esc closes)" aria-label="Full graph">Full graph <span id="graph-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
         <button id="all-projects-toggle" type="button" class="btn more-menu-item view-toggle" role="menuitem" data-view="all-projects" aria-controls="all-projects" aria-expanded="false" aria-pressed="false" title="Browse all projects (Esc closes)" aria-label="All projects">All projects</button>
         <label class="more-menu-label theme-label" for="theme-select">Theme</label>
@@ -244,6 +245,7 @@
   <div id="memory-popover" class="memory-popover" role="dialog" aria-label="Memory" hidden></div>
 <div id="skills-popover" class="memory-popover skills-popover" role="dialog" aria-label="Stage skills" tabindex="-1" hidden></div>
 <div id="system-prompts" class="system-prompts-panel agent-prompts-panel"><div id="agent-prompts-popover" class="memory-popover agent-prompts-popover" role="dialog" aria-label="System prompts" tabindex="-1" hidden></div></div>
+<div id="runners-popover" class="memory-popover runners-popover" role="dialog" aria-label="Runners" tabindex="-1" hidden></div>
 </main>
 <nav id="sessions-sidebar" class="sessions-sidebar" aria-label="Sessions" data-parity="conversations" inert>
   <div class="sidebar-header sessions-header">
@@ -389,6 +391,7 @@
 <script src="/assets/skills.js" defer></script>
 <script src="/assets/jira-todos.js" defer></script>
 <script src="/assets/agent-prompts.js" defer></script>
+<script src="/assets/runners.js" defer></script>
 <script src="/assets/session.js" defer></script>
 <script src="/assets/workspace.js" defer></script>
 <script src="/assets/sidebar-resize.js" defer></script>

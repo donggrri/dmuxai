@@ -632,6 +632,22 @@ async fn get_agent_prompts_js() -> impl IntoResponse {
     )
 }
 
+async fn get_runners_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::RUNNERS_JS,
+    )
+}
+
 async fn get_skills_js() -> impl IntoResponse {
     (
         [
@@ -2498,6 +2514,7 @@ pub fn build_router_with_directory_access(
         .route("/assets/skills.js", get(get_skills_js))
         .route("/assets/jira-todos.js", get(get_jira_todos_js))
         .route("/assets/agent-prompts.js", get(get_agent_prompts_js))
+        .route("/assets/runners.js", get(get_runners_js))
         .route("/assets/session.js", get(get_session_js))
         .route("/assets/workspace.js", get(get_workspace_js))
         .route("/assets/runs.js", get(get_runs_js))
