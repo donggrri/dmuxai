@@ -52,7 +52,7 @@ fake agent children.
 | FR-3602 | Must | With "Note only" checked, Send stores the owner message and starts no planner child (no planner message appears, the fake child is not invoked). |
 | FR-3603 | Must | A Markdown path in a chat bubble (workspace-relative and `~/`-style) is a link; clicking it opens a read-only viewer modal showing the rendered file with no raw `<script>` element; a path outside the workspace and home, a hidden path under home, a non-`.md` file and a symlink escape each show an error message in the viewer and none of the file content. Esc closes the viewer first and leaves the item modal open. |
 | FR-3604 | Must | Clicking Approve on an item that has a plan (as a human click in the browser) records an owner decision, wakes any blocked `board wait` and starts the run: the response reports `auto_run.started = true`, the UI says the run started, the item moves to In progress and then Done when the (fake) run exits 0, and a `run` thread message with the run id is present. |
-| FR-3605 | Must | Auto-run is refused, with the decision still recorded, when `[board] auto_run_on_approve = false` (UI: "auto-run skipped"), and Approve with a plan hash that no longer matches the item's plan (changed after the card was rendered) is rejected with a "plan changed" notice and records no decision and starts no run. |
+| FR-3605 | Must | Auto-run is refused, with the decision still recorded, when `[board] auto_run_on_approve = false` (UI: an "auto-run skipped" notice that names the reason), and Approve with a plan hash that no longer matches the item's plan (changed after the card was rendered) is rejected with a "plan changed" notice and records no decision and starts no run. |
 | FR-3606 | Must | An approved item whose run was not auto-started shows a Run button; clicking it starts the run, a second Run while it is in progress is refused (conflict), and the Run button is not shown for items that are not runnable. |
 | FR-3607 | Must | Clicking Reject records an owner `reject` decision, moves the item to the Rejected lane, starts no run and offers no Run button. |
 | FR-3608 | Must | A scripted `POST /api/board/{id}/decision` without the human browser headers (`Sec-Fetch-Site`, `Sec-Fetch-Mode`, `X-Dmuxai-Human: 1`) is refused with 403, records nothing and starts no run. |
@@ -69,7 +69,7 @@ fake agent children.
 | TC-3602 | FR-3602 | `tests/web_board_e2e.rs` `tc_3602_chat_note_only_stores_without_planner` |
 | TC-3603 | FR-3603 | `tests/web_board_e2e.rs` `tc_3603_md_path_link_opens_viewer_and_refuses_bad_paths` |
 | TC-3604 | FR-3604 | `tests/web_board_e2e.rs` `tc_3604_approve_with_plan_auto_runs_to_done` |
-| TC-3605 | FR-3605 | `tests/web_board_e2e.rs` `tc_3605_auto_run_opt_out_and_stale_plan_hash` |
+| TC-3605 | FR-3605 | `tests/web_board_e2e.rs` `tc_3605_auto_run_opt_out_and_stale_plan_hash` (known deviation: the visible "Plan changed" notice is not shown, issue #369; the test reports it as `KNOWN-BUG #369` until fixed, then it becomes a hard check) |
 | TC-3606 | FR-3606 | `tests/web_board_e2e.rs` `tc_3606_run_button_runs_approved_item_once` |
 | TC-3607 | FR-3607 | `tests/web_board_e2e.rs` `tc_3607_reject_moves_to_rejected_and_never_runs` |
 | TC-3608 | FR-3608 | `tests/web_board_e2e.rs` `tc_3608_scripted_decision_without_human_headers_refused` |

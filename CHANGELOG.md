@@ -12,6 +12,10 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - **Runner status and enable switch (SPEC-runner-status).** `dmuxai runners status [--json] [--agent ID]` shows, for cursor-agent and agy, whether the CLI is installed, its version and whether it is signed in (account masked, login hint), using only `--version`, `status --format json`, `models` style probes that never start a model turn. `dmuxai runners enable|disable <id>` writes `[runners.<id>] enabled` to the user config; a disabled runner is refused by `run` and graph routing. The same status is available at `GET /api/runners/status`, the MCP tool `runners_status`, and a new Runners panel in the dashboard More menu (status badge, Refresh, enable switch). Nothing is probed at startup or during runs.
 
+### Tests
+
+- Board and dashboard acceptance spec (SPEC-board-dashboard-acceptance, FR/TC-3600..3610) with 11 headless-Chrome end-to-end tests (`tests/web_board_e2e.rs`, run with `--ignored`).
+
 ### Changed
 
 - Board item detail opens as a centered popup instead of a side drawer.
