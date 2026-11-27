@@ -10,15 +10,18 @@
 <link rel="stylesheet" href="/assets/app.css">
 <link rel="stylesheet" href="/assets/session.css">
 <link rel="stylesheet" href="/assets/docs.css">
+<link rel="stylesheet" href="/assets/board.css">
 <script src="/assets/app.js" defer></script>
 <script src="/assets/runs.js" defer></script>
 <script src="/assets/all-projects.js" defer></script>
+<script src="/assets/board.js" defer></script>
 <script src="/assets/docs.js" defer></script>
 </head>
 <body>
 <header class="top">
   <h1 class="brand">DmuxAI<span class="brand-sub">dashboard</span></h1>
   <nav class="top-views" aria-label="Dashboard views">
+    <button id="board-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="board" aria-controls="board" aria-expanded="false" aria-pressed="false" title="Decision board (Esc closes)" aria-label="Board">Board <span id="board-badge" class="board-badge view-indicator" aria-hidden="true" hidden></span></button>
     <button id="runs-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="runs" aria-controls="runs" aria-expanded="false" aria-pressed="false" title="Show headless runs (Esc closes)" aria-label="Runs">Runs <span id="runs-indicator" class="view-indicator" aria-hidden="true" hidden></span></button>
     <button id="diff-toggle" type="button" class="btn sidebar-toggle view-toggle" data-view="diff" aria-controls="docs" aria-expanded="false" aria-pressed="false" title="Show files changed by agents (Esc closes)" aria-label="Diff">Diff <span id="diff-count" class="todos-count" aria-hidden="true" hidden>0</span></button>
     <button id="chat-toggle" type="button" class="btn sidebar-toggle chat-toggle active" aria-pressed="true" aria-controls="session" title="Back to the chat (closes Diff, Graph, Memory and Skills)">Chat</button>
@@ -130,6 +133,36 @@
       <ol id="nodes" class="nodes"></ol>
     </div>
     <p id="gate-hint" class="gate" hidden></p>
+  </section>
+
+  <section id="board" class="panel center-view" aria-label="Board" hidden>
+    <div class="center-view-head">
+      <h2 class="panel-title center-view-title">Board</h2>
+      <button type="button" class="btn sidebar-close center-view-close" data-view="board" aria-label="Close Board">&times;</button>
+    </div>
+    <div id="board-body" class="board-panel">
+      <div class="board-toolbar">
+        <label for="board-workspace-filter">Workspace</label>
+        <select id="board-workspace-filter" class="board-workspace-filter">
+          <option value="">All</option>
+        </select>
+        <label><input id="board-show-closed" type="checkbox"> Show closed</label>
+        <button id="board-rules-toggle" type="button" class="btn btn-small">Rules</button>
+      </div>
+      <section id="board-my-decisions" class="board-my-decisions" aria-label="My decisions">
+        <h3>My decisions</h3>
+      </section>
+      <div id="board-kanban" class="board-kanban" aria-label="Board lanes"></div>
+      <section id="board-rules-panel" class="board-rules-panel" hidden>
+        <label for="board-rules-json">Rules JSON</label>
+        <textarea id="board-rules-json" rows="6" class="board-rules-json"></textarea>
+        <button id="board-rules-save" type="button" class="btn btn-small btn-primary">Save rules</button>
+      </section>
+    </div>
+    <div id="board-drawer-wrap" class="board-drawer-wrap" hidden>
+      <div id="board-drawer-backdrop" class="board-drawer-backdrop" role="presentation"></div>
+      <aside id="board-drawer" class="board-drawer" aria-label="Item drawer"></aside>
+    </div>
   </section>
 
   <section id="runs" class="panel center-view" aria-label="Runs" hidden>

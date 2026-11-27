@@ -645,7 +645,7 @@ fn tc_2828_system_prompt_preview_placeholder() {
     );
 }
 
-// TC-2820 / FR-2820: top bar shows exactly Runs, Diff, Chat, Workspace, More.
+// TC-2820 / FR-2820: top bar shows exactly Board, Runs, Diff, Chat, Workspace, More.
 #[test]
 #[ignore]
 fn tc_2820_top_bar_controls() {
@@ -660,8 +660,8 @@ fn tc_2820_top_bar_controls() {
 
     wait_for_truthy(
         &mut session,
-        "!!document.getElementById('runs-toggle')",
-        "runs toggle",
+        "!!document.getElementById('board-toggle')",
+        "board toggle",
         15,
     );
     let labels = session
@@ -672,12 +672,13 @@ fn tc_2820_top_bar_controls() {
         )
         .expect("top bar labels");
     let arr = labels.as_array().expect("array");
-    assert_eq!(arr.len(), 5, "expected five top-level controls");
-    assert_eq!(arr[0].as_str(), Some("Runs"));
-    assert_eq!(arr[1].as_str(), Some("Diff"));
-    assert_eq!(arr[2].as_str(), Some("Chat"));
-    assert_eq!(arr[3].as_str(), Some("Workspace"));
-    assert_eq!(arr[4].as_str(), Some("More"));
+    assert_eq!(arr.len(), 6, "expected six top-level controls");
+    assert_eq!(arr[0].as_str(), Some("Board"));
+    assert_eq!(arr[1].as_str(), Some("Runs"));
+    assert_eq!(arr[2].as_str(), Some("Diff"));
+    assert_eq!(arr[3].as_str(), Some("Chat"));
+    assert_eq!(arr[4].as_str(), Some("Workspace"));
+    assert_eq!(arr[5].as_str(), Some("More"));
 
     let stray = session
         .cdp

@@ -336,7 +336,8 @@ fn load_graph_view(workspace_root: &Path, graph_id: &str) -> Option<serde_json::
     {
         return None;
     }
-    let run: GraphRun = serde_json::from_slice(&bytes).ok()?;
+    let mut run: GraphRun = serde_json::from_slice(&bytes).ok()?;
+    run.normalize_legacy_runners();
     let mut value = serde_json::to_value(snapshot::snapshot_from_run(&run)).ok()?;
     mask_json_value(&mut value);
     Some(value)
@@ -520,7 +521,8 @@ fn tail_text_lines(path: &Path, offset: &mut u64, max_lines: usize) -> Vec<Strin
         let line = String::from_utf8_lossy(&bytes[line_start..line_end]);
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            lines.push(mask_sensitive_tokens(trimmed));
+            let normalized = crate::run_journal::normalize_progress_line(trimmed);
+            lines.push(mask_sensitive_tokens(&normalized));
         }
         line_start = line_end + 1;
         consumed = line_start as u64;

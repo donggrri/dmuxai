@@ -494,6 +494,7 @@ mod tests {
             edges: Vec::new(),
             limits: GraphLimits::default(),
             tasks,
+            dynamic_cap: None,
         }
     }
 
@@ -626,6 +627,62 @@ mod tests {
                 runner_allowed: self.runner_allowed.as_ref(),
                 effective_model: self.effective_model.as_ref(),
                 validate_model: &crate::model_policy::validate_model_for_runner,
+            }
+        }
+    }
+
+    // TC-3009 / FR-3008: graph validation accepts open runner models, rejects fast
+    #[test]
+    fn tc_3009_graph_nodes_accept_open_models_and_reject_fast() {
+        let ctx = PlanCtx::new(&["cursor", "agy"]);
+        let plan_ctx = ctx.context("build it");
+
+        fn step(runner: &str, model: &str) -> PlanStep {
+            PlanStep {
+                id: "a".to_owned(),
+                role: "implement".to_owned(),
+                job: "one".to_owned(),
+                runner: runner.to_owned(),
+                model: Some(model.to_owned()),
+                depends_on: Vec::new(),
+                sensitive: None,
+                task: None,
+                sensitive_invalid: false,
+                depends_on_invalid: false,
+                model_invalid: false,
+                id_invalid: false,
+                not_object: false,
+            }
+        }
+
+        let cases = [
+            ("cursor", "claude-sonnet-5-5-high", true),
+            ("cursor", "grok-4.7-high", true),
+            ("agy", "gemini-4-carbon-high", true),
+            ("cursor", "composer-2.5-fast", false),
+        ];
+        for (runner, model, ok) in cases {
+            let doc = PlanDoc {
+                steps: vec![step(runner, model)],
+                tasks: Vec::new(),
+                require_tasks: false,
+                task_errors: Vec::new(),
+            };
+            let result = validate_plan_with_limit(&doc, &plan_ctx, 8);
+            if ok {
+                assert!(
+                    result.is_ok(),
+                    "expected accept for {runner}:{model}: {result:?}"
+                );
+            } else {
+                assert!(result.is_err(), "expected reject for {runner}:{model}");
+                let errors = result.unwrap_err();
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.rule.contains("fast models are blocked")),
+                    "fast rejection missing: {errors:?}"
+                );
             }
         }
     }

@@ -792,12 +792,15 @@ pub async fn git_worktree_fingerprint(workspace: &Path) -> Option<String> {
 
 /// Returns true when the worktree fingerprint changed since `before` (FR-2540).
 pub async fn read_only_workspace_write_detected(before: Option<&str>, workspace: &Path) -> bool {
+    read_only_workspace_write_detected_sync(before, workspace)
+}
+
+/// Sync variant for graph node completion paths (FR-2905).
+pub fn read_only_workspace_write_detected_sync(before: Option<&str>, workspace: &Path) -> bool {
     let Some(before) = before else {
         return false;
     };
-    git_worktree_fingerprint(workspace)
-        .await
-        .is_some_and(|after| after != before)
+    git_worktree_fingerprint_sync(workspace).is_some_and(|after| after != before)
 }
 
 /// If `workspace` already has a live dashboard, return its URL.

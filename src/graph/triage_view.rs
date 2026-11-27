@@ -71,10 +71,13 @@ pub fn approval_panel_lines_with_skills(
     let steps = revision.steps.as_slice();
 
     let mut lines = Vec::new();
-    let header = format!(
+    let mut header = format!(
         "Plan rev {}/{} · {}",
         revision.n, MAX_PLAN_REVISIONS, revision.source
     );
+    if let Some(cap) = run.plan.dynamic_cap {
+        header.push_str(&format!(" · dynamic cap {cap}"));
+    }
     lines.push(panel_line(
         PanelLineKind::Header,
         ellipsize_to_width(&header, width),
@@ -572,6 +575,7 @@ mod tests {
             edges: Vec::new(),
             limits: GraphLimits::default(),
             tasks,
+            dynamic_cap: None,
         };
         if !plan.tasks.is_empty() {
             plan.nodes.push(GraphNode {
@@ -611,6 +615,8 @@ mod tests {
             plan_fixed_ms: None,
             pending_replan_plan: None,
             todo_id: None,
+            dynamic_cap: None,
+            dynamic_added: None,
         }
     }
 

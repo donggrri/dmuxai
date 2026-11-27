@@ -1,3 +1,4 @@
+mod dynamic;
 mod executor;
 mod judge;
 mod plan_doc;
@@ -9,11 +10,16 @@ mod tasks;
 mod triage_view;
 mod types;
 
+pub use dynamic::{
+    DynamicNodeSpec, parse_add_nodes_marker, strip_add_nodes_marker, validate_add_nodes,
+};
 pub use executor::{GraphAction, GraphRunSession, GraphSession, GraphStopReason, NodeAssignment};
 pub use judge::{
-    FallbackCause, JUDGE_PROMPT, OverrideKind, QUESTION_ANSWER_HINT, Route, TriageSource, Verdict,
-    build_judge_prompt, is_question_prompt, is_trivial_prompt, parse_verdict,
+    FallbackCause, JUDGE_PROMPT, OverrideKind, PromptBlocked, QUESTION_ANSWER_HINT, Route,
+    TriageSource, Verdict, build_judge_prompt, is_question_prompt, is_trivial_prompt,
+    parse_verdict,
 };
+pub(crate) use judge::{json_objects, reject_data};
 pub use plan_doc::{
     AllowedRunner, FallbackPlan, PLAN_PROMPT, PlanContext, PlanDoc, PlanError, PlanPromptMode,
     PlanPromptRequest, PlanStep, build_plan_prompt, diff_plan_steps, fallback_plan,
@@ -22,8 +28,8 @@ pub use plan_doc::{
 };
 pub use planner::{heuristic_route, sensitive_keyword_match};
 pub use policy::{
-    ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,
-    validate_model_id,
+    NodeTurnPolicy, ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed,
+    model_for_role, node_turn_policy, validate_model_id,
 };
 pub use replan::{
     NODE_REPLAN_HINT, REPLAN_PROMPT, ReplanDoc, ReplanTrigger, apply_replan, budget_allows,

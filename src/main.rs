@@ -67,6 +67,7 @@ impl WebOptions {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
     Help,
@@ -106,7 +107,7 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote] [--new]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--model M] [--approve-plan] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
+  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--write] [--keep-worktrees] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
   dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json] [--trust-workspace-config]
   dmuxai trust [--status] [--json] [--revoke] [--yes]
   dmuxai todo add <title> [--body TEXT] [--json]
@@ -121,6 +122,7 @@ Usage:
   dmuxai term send NAME <text|text --keys KEYS> | term read NAME [--since N] [--tail N] [--raw]
   dmuxai term wait NAME --match REGEX|--idle MS --timeout DUR [--since N] | term exec NAME <command> [--timeout DUR]
   dmuxai term approve <id> [--json] | term list|show|resize|close|reopen ...
+  dmuxai board add|list|show|…   Coordinator decision board (user-level)
   dmuxai mcp
   dmuxai init [--workspace] [--force]
 
@@ -151,6 +153,7 @@ Options:
   runners          List registered runners, admission, installation and model policy
   models           List available models and runner model policy
   runs             List or inspect recorded execution runs
+  fanout           Clean leftover write fan-out git worktrees
   events           Print state-change events from .dmuxai/events.jsonl
   term             Manage persistent named terminal sessions
   mcp              Serve DmuxAI as an MCP server over stdio
@@ -205,6 +208,13 @@ where
             let text = match args.get(1).map(String::as_str) {
                 Some(subcommand) => cli::term_subcommand_usage(subcommand),
                 None => cli::TERM_USAGE,
+            };
+            return CliAction::HelpTopic(text);
+        }
+        if wants_help && args.first().map(String::as_str) == Some("board") {
+            let text = match args.get(1).map(String::as_str) {
+                Some(subcommand) => cli::board_subcommand_usage(subcommand),
+                None => cli::BOARD_USAGE,
             };
             return CliAction::HelpTopic(text);
         }
@@ -642,6 +652,8 @@ fn load_settings_with_trust_prompt(workspace_root: &Path) -> DmuxSettings {
             }
         }
     }
+    // FR-3003: fast opt-in is user-config only and cannot vary per workspace.
+    dmuxai::settings::wire_model_policy_switch(&settings);
     settings
 }
 
@@ -722,6 +734,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
                 trust_env: None,
+                board_base: None,
             }
         }
         Err(error) => {
@@ -737,6 +750,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
                 trust_env: None,
+                board_base: None,
             }
         }
     };
@@ -1710,6 +1724,7 @@ mod tests {
     fn tc_2830_subcommand_help_is_local() {
         let subcommands = [
             "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models",
+            "fanout",
         ];
         for sub in subcommands {
             for flag in ["--help", "-h"] {

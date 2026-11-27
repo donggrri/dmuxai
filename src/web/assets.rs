@@ -8,6 +8,8 @@ pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
 pub const ALL_PROJECTS_JS: &str = include_str!("assets/all-projects.js");
+pub const BOARD_JS: &str = include_str!("assets/board.js");
+pub const BOARD_CSS: &str = include_str!("assets/board.css");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
 pub const SESSION_CSS: &str = include_str!("assets/session.css");
 pub const APP_CSS: &str = include_str!("assets/app.css");
@@ -2475,5 +2477,123 @@ mod tests {
             .nth(1)
             .expect("runs css section");
         assert!(!runs_css.contains("text-transform: lowercase;"));
+    }
+
+    // TC-3122 / FR-3122: board markup, toggle, lanes, decision cards.
+    #[test]
+    fn tc_3122_board_view_markup_toggle_lanes_and_decision_cards() {
+        assert!(INDEX_HTML.contains("id=\"board-toggle\""));
+        assert!(INDEX_HTML.contains("data-view=\"board\""));
+        assert!(INDEX_HTML.contains("id=\"board\""));
+        assert!(INDEX_HTML.contains("board-my-decisions"));
+        assert!(INDEX_HTML.contains("id=\"board-kanban\""));
+        assert!(BOARD_JS.contains("'board-lane-' + laneId"));
+        assert!(BOARD_JS.contains("Approve"));
+        assert!(BOARD_JS.contains("Request changes"));
+        assert!(BOARD_JS.contains("Reject"));
+        assert!(BOARD_JS.contains("boardUpdateBadge"));
+        assert!(BOARD_JS.contains("badge.textContent"));
+        assert!(INDEX_HTML.contains("/assets/board.js"));
+        assert!(INDEX_HTML.contains("/assets/board.css"));
+    }
+
+    // TC-3123 / FR-3123: drawer plan edit, chat, stale approve notice.
+    #[test]
+    fn tc_3123_board_drawer_plan_edit_chat_and_stale_approve_conflict() {
+        assert!(INDEX_HTML.contains("id=\"board-drawer\""));
+        assert!(BOARD_JS.contains("board-plan-steps"));
+        assert!(BOARD_JS.contains("board-save-plan"));
+        assert!(BOARD_JS.contains("board-add-step"));
+        assert!(BOARD_JS.contains("/plan"));
+        assert!(BOARD_JS.contains("board-chat-input"));
+        assert!(BOARD_JS.contains("board-chat-send"));
+        assert!(BOARD_JS.contains("plan_hash"));
+        assert!(BOARD_JS.contains("Plan changed"));
+        assert!(BOARD_JS.contains("previous_steps"));
+        assert!(BOARD_JS.contains("Send answer"));
+        assert!(BOARD_JS.contains("window.confirm"));
+        assert!(BOARD_JS.contains("No decision yet"));
+        assert!(BOARD_JS.contains("board-plan-table-wrap"));
+        assert!(BOARD_JS.contains("boardOnBodyClick"));
+        assert!(BOARD_JS.contains(".board-card, .board-decision-card, #board-drawer"));
+    }
+
+    // TC-3124 / FR-3124: board SSE only while the view is visible.
+    #[test]
+    fn tc_3124_board_stream_only_while_visible() {
+        assert!(BOARD_JS.contains("dmuxai:center-view"));
+        assert!(BOARD_JS.contains("boardOpenStream"));
+        assert!(BOARD_JS.contains("boardCloseStream"));
+        assert!(BOARD_JS.contains("boardUiOpen"));
+        assert!(BOARD_JS.contains("dmuxaiOpenEventSource"));
+    }
+
+    // TC-3125 / FR-3125: no innerHTML, no token literal, no-store assets.
+    #[test]
+    fn tc_3125_board_assets_no_innerhtml_no_token() {
+        assert!(!BOARD_JS.contains("innerHTML"));
+        assert!(!BOARD_JS.contains("token="));
+        assert!(BOARD_JS.contains("textContent"));
+        assert!(BOARD_JS.contains("Authorization"));
+        let mut pos = 0usize;
+        while let Some(rel) = BOARD_CSS[pos..].find("var(--") {
+            let start = pos + rel + 6;
+            let rest = &BOARD_CSS[start..];
+            let name_end = rest.find([')', ',', ' ']).unwrap_or(rest.len());
+            let name = &rest[..name_end];
+            assert!(
+                APP_CSS.contains(&format!("--{name}:")),
+                "board.css uses var(--{name}) but app.css has no --{name}: definition"
+            );
+            pos = start + name_end;
+        }
+    }
+
+    #[tokio::test]
+    async fn tc_3125_board_assets_served_no_store() {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        for path in ["/assets/board.js", "/assets/board.css"] {
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .header("Host", "localhost:7420")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::CACHE_CONTROL)
+                    .unwrap(),
+                "no-store"
+            );
+        }
+    }
+
+    // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
+    #[test]
+    fn tc_3134_drawer_ask_and_run_controls_hidden_in_serve() {
+        assert!(BOARD_JS.contains("board-ask-text"));
+        assert!(BOARD_JS.contains("board-ask"));
+        assert!(BOARD_JS.contains("board-ask-revise"));
+        assert!(BOARD_JS.contains("board-ask-busy"));
+        assert!(BOARD_JS.contains("aria-live"));
+        assert!(BOARD_JS.contains("Ask planner"));
+        assert!(BOARD_JS.contains("Ask & revise plan"));
+        assert!(BOARD_JS.contains("board-run"));
+        assert!(BOARD_JS.contains("boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("askSec.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("boardIsItemRunnable"));
+        assert!(BOARD_JS.contains("item.lane === 'auto'"));
+        assert!(BOARD_JS.contains("item.lane === 'approved'"));
+        assert!(BOARD_JS.contains("item.decision.plan_hash === item.plan.hash"));
+        assert!(BOARD_JS.contains("/ask"));
+        assert!(BOARD_JS.contains("/run"));
+        assert!(BOARD_JS.contains("X-Dmuxai-Human"));
+        assert!(BOARD_JS.contains("BOARD_MOVABLE_LANES"));
+        assert!(BOARD_JS.contains("Mark checked"));
+        assert!(BOARD_JS.contains("To check"));
+        assert!(BOARD_JS.contains("board-mark-checked"));
+        assert!(BOARD_JS.contains("/check"));
     }
 }

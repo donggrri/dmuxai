@@ -445,6 +445,7 @@ pub fn apply_replan(
             plan.orchestrator_model = run.plan.orchestrator_model.clone();
             plan.user_prompt = run.plan.user_prompt.clone();
             plan.limits = run.plan.limits.clone();
+            plan.dynamic_cap = run.plan.dynamic_cap;
 
             let mut nodes = Vec::new();
             for node in &run.plan.nodes {
@@ -899,7 +900,7 @@ mod tests {
             id: id.to_owned(),
             role,
             job: format!("job {id}"),
-            runner: "cursor".to_owned(),
+            runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             skill: None,
             requires_gate: false,
@@ -922,6 +923,7 @@ mod tests {
                 edges,
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             ..Default::default()
         }
@@ -977,7 +979,7 @@ mod tests {
                     id: "a".to_owned(),
                     role: NodeRole::Implement,
                     job: "job a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -991,7 +993,7 @@ mod tests {
                     id: "c".to_owned(),
                     role: NodeRole::Test,
                     job: "job c".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -1063,7 +1065,7 @@ mod tests {
                     id: "s1".to_owned(),
                     role: NodeRole::Implement,
                     job: "done".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -1077,7 +1079,7 @@ mod tests {
                     id: "s2".to_owned(),
                     role: NodeRole::Implement,
                     job: "running".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -1091,7 +1093,7 @@ mod tests {
                     id: "s3".to_owned(),
                     role: NodeRole::Test,
                     job: "pending".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -1308,7 +1310,7 @@ mod tests {
                     id: "f".to_owned(),
                     role: NodeRole::Implement,
                     job: "failed work".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -1322,7 +1324,7 @@ mod tests {
                     id: "s".to_owned(),
                     role: NodeRole::Test,
                     job: "skipped work".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -1341,7 +1343,7 @@ mod tests {
             id: "orchestrate".to_owned(),
             role: NodeRole::Orchestrate,
             job: "Judge and plan".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             skill: None,
             requires_gate: false,
@@ -1624,6 +1626,7 @@ mod tests {
             edges: Vec::new(),
             limits: GraphLimits::default(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
@@ -1632,7 +1635,7 @@ mod tests {
             id: id.to_owned(),
             role: NodeRole::Implement,
             job: job.to_owned(),
-            runner: "cursor".to_owned(),
+            runner: crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             skill: None,
             requires_gate: gated,

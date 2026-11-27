@@ -25,6 +25,15 @@ window.dmuxaiApiUrl = apiUrl;
 window.dmuxaiApiUrlFor = function (ws, path) {
   return appendWs(path, ws);
 };
+window.dmuxaiOpenEventSource = function (path) {
+  if (typeof EventSource === 'undefined' || !token) { return null; }
+  var sep = path.indexOf('?') >= 0 ? '&' : '?';
+  try {
+    return new EventSource(apiUrl(path + sep + 'token=' + encodeURIComponent(token)));
+  } catch (err) {
+    return null;
+  }
+};
 window.dmuxaiWorkspaceId = function () {
   return pageWs || '';
 };
@@ -1919,6 +1928,7 @@ var CENTER_VIEW_KEY = 'dmuxai.centerView';
 var CENTER_VIEWS = {
   diff: { panel: 'docs', toggle: 'diff-toggle' },
   graph: { panel: 'graph', toggle: 'graph-toggle' },
+  board: { panel: 'board', toggle: 'board-toggle' },
   runs: { panel: 'runs', toggle: 'runs-toggle' },
   'all-projects': { panel: 'all-projects', toggle: 'all-projects-toggle' }
 };

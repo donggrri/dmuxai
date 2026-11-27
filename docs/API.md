@@ -28,7 +28,7 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
@@ -37,6 +37,7 @@ The following flags can be used before or after subcommands, or with the interac
 | `dmuxai runners` | `[--json]` | Registered runners, admission, installation and model policy |
 | `dmuxai models` | `[--agent ID]`, `[--json]` | Available models and runner policy |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
+| `dmuxai board` | see [Decision board](#decision-board) | Coordinator items (user-level store) |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
 
 Notes:
@@ -71,7 +72,8 @@ Notes:
   model is rejected before any turn starts with exit `5` (usage errors such as a
   missing value exit `2`); the accepted model is echoed in `triage.model`.
 - `dmuxai run -` reads the prompt from stdin:
-  `echo "summarize the repo" | dmuxai run - --agent agy --json`.
+  `echo "summarize the repo" | dmuxai run - --agent agy --json`. For Cursor use
+  `--agent cursor-agent` (or the alias `cursor`).
 - With `--json`, stdout carries only the JSON document(s); warnings/diagnostics go
   to stderr.
 
@@ -162,7 +164,7 @@ dmuxai events --follow --json
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
 
 In `agents[]`:
-- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `id`: runner id (`cursor-agent`, `agy`, `codex`, or custom agent name)
 - `label`: display name
 - `allowed`: headless `run` admission under `[graph] allowed_runners` (true when unset)
 - `graph_allowed`: graph admission (built-in presets excluded when unset)
@@ -171,7 +173,7 @@ In `agents[]`:
 ### `runners` and `models` (SPEC-cli-runners-models)
 
 `dmuxai runners [--json]` lists registered runners in `status` order with:
-- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `id`: runner id (`cursor-agent`, `agy`, `codex`, or custom agent name; `cursor-agent` also reports `"aliases": ["cursor"]`)
 - `label`: display name
 - `kind`: `"builtin"`, `"preset"`, or `"custom"`
 - `allowed`: headless admission under `[graph] allowed_runners` (true when unset)
@@ -343,7 +345,7 @@ defaults to the selected agent:
 | `cancel` | `agent?` | Ctrl+C |
 | `new_conversation` | `title?` | `/new` |
 | `load_conversation` | `id` | `/resume`, F3 |
-| `share` | `target` (`codex`/`cursor`/`agy`) | `/share` |
+| `share` | `target` (`codex`/`cursor-agent`/`agy`; `cursor` alias) | `/share` |
 | `status`, `toggle_details`, `quit` | — | `/status`, `/details`, `/quit` |
 
 Busy agents refuse mode/model/effort changes (409); runners outside
@@ -420,6 +422,18 @@ Tools (`tools/list`):
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
 | `models` | `agent` (optional) | Available models and runner policy JSON (same as `dmuxai models --json`) |
+| `board_add` | `title`, `kind` (required); `summary`, `grade`, `lane`, `plan_hash`, `workspace`, `by`, … | Created board item JSON (`exit_code` in errors) |
+| `board_list` | `lane[]`, `all`, `workspace` | Item array |
+| `board_show` | `id` | One item |
+| `board_update` | `id`, optional fields, `if_version` | Updated item |
+| `board_move` | `id`, `lane` | Updated item |
+| `board_plan` | `id`, `hash` or `steps` (+ optional `tasks`) | Item with plan revision |
+| `board_pending` | `workspace` (optional) | `{items, count}` waiting for human action (`needs_decision`, `unknown`, unchecked `done`) |
+| `board_say` | `id`, `text`, `from` | Item with thread |
+| `board_wait` | `id` or global wait, `since_version`, `since_seq`, `timeout_secs` (≤300), `wait_for` | Item or `{timed_out:true,version}` |
+| `board_prompt` | `id`, optional `hash` | `{prompt}` unmasked text from `graph-pending/` |
+| `board_ask` | `id`, `text` (required); `revise`, `agent`, `model`, `by` | Item with planner answer or revised plan (blocks up to 900 s) |
+| `board_run` | `id` (required); `by` | `in_progress` item (detached; records run id and moves to `done`/`unknown` on exit) |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
 the forwarded flags, and blocks until it finishes, so the result is final. Tool
@@ -440,6 +454,88 @@ Most clients wrap it, for example:
 ```json
 { "mcpServers": { "dmuxai": { "command": "dmuxai", "args": ["mcp"], "cwd": "<repo>" } } }
 ```
+
+## Decision board
+
+The coordinator board is **user-level** state under `<state base>/board/`, not per
+repo. Items from every workspace appear together. Bots use the same operations as
+the owner through `dmuxai board …` or MCP `board_*` tools.
+
+Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
+
+1. `dmuxai -C <repo> run --graph --json -` — on exit `7`, take `plan_hash`.
+2. `dmuxai board add -C <repo> --title … --kind feature --plan-hash <hash> --bot coordinator --json`.
+3. Lane `auto`: `dmuxai board run <id>` (replaces the manual `board prompt` pipe).
+4. Lane `needs_decision`: `dmuxai board wait <id> --for any` (or `board wait --any`); on `approve`, run `dmuxai board run <id>`; on `request_changes` or messages, revise with `dmuxai board ask <id> --revise --text …` (or `board plan --edit`) and reply with `board say`. A failed run moves to `unknown` and can be retried with the same hash from `<state base>/board/plans/<hash>.json`.
+5. Bots poll with `dmuxai board events --since S`; plan prompts stay unmasked only under `graph-pending/<hash>.json` (and board plan copies `<state base>/board/plans/<hash>.json`).
+
+Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
+(`--if-version`), `plan`, `prompt`, `decide`, `check` (`--text`), `pending`
+(`--workspace`), `say`, `wait`, `events`, `rules`, `ask` (`--text`, `--revise`,
+`--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
+Approval is **always human-only**: `decide` (every verdict, in every lane),
+`check`, `move` into `auto`, and `rules --set` require `owner` (dashboard browser
+request, or CLI with stdin and stdout on a TTY, `DMUXAI_RUN_ID` unset, and typed
+item-id confirmation on `/dev/tty`). Nobody may `move` an item into `approved` or
+`rejected` (use `board decide`). MCP callers default to `by=bot:mcp`; `by=owner`
+over MCP or non-TTY CLI is rejected (exit `5`), and `board_decide` is not
+exposed over MCP. Bots may run only `auto` items or items approved by `owner`;
+`board run` and `board ask` never write `decision` or `checked`.
+
+User-only `[board]` configuration (`$XDG_CONFIG_HOME/dmuxai/dmuxai.toml`; ignored
+with a warning in workspace `dmuxai.toml`):
+
+```toml
+[board]
+planner = "codex:gpt-5.4"
+notify_command = ["notify-send", "dmuxai-board"]
+notify_webhook_url = "https://hooks.example.test/board"
+notify_webhook_secret_env = "DMUXAI_BOARD_SECRET"
+notify_events = ["needs_decision", "decision", "message", "run_finished"]
+```
+
+Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
+
+| Method | Path | Body / query | Success | Errors |
+| --- | --- | --- | --- | --- |
+| GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
+| GET | `/api/board/pending` | `?workspace=` | `200` `{items, count}` | 400, 401, 403 |
+| GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item | 400, 401, 403, 404, 409, 422 |
+| POST | `/api/board/{id}/check` | `{text?}` (human headers required) | `200` item | 400, 401, 403, 404, 409 |
+| POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |
+| POST | `/api/board/{id}/lane` | `{lane}` (human headers required) | `200` item | 400, 401, 403, 404 |
+| GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
+| PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
+| GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
+| POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
+| POST | `/api/board/{id}/run` | `{plan_hash?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
+
+Dashboard writes act as `owner`. Owner writes (`POST /decision`, `POST /check`,
+`POST /lane`) require `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode`, and
+`X-Dmuxai-Human: 1` (else `403`). Invalid item ids return `400` before any
+store access.
+
+Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
+
+| Method | Path | Body / query | Success | Errors |
+| --- | --- | --- | --- | --- |
+| GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items}` | 400, 401, 403 |
+| GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` | `200` item | 400, 401, 403, 404, 409, 422 |
+| POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |
+| POST | `/api/board/{id}/lane` | `{lane}` | `200` item | 400, 401, 403, 404 |
+| GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
+| PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
+| GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
+
+Dashboard writes act as `owner`. Invalid item ids return `400` before any store
+access.
+
+Exit codes match the headless agent API: usage `2`, not found `3`, conflict `4`,
+forbidden `5`, validation `1`, internal `6`.
 
 ### Memory MCP server
 
@@ -597,14 +693,22 @@ Per-runner and per-model system prompts. User config sets defaults; workspace `d
 | `stall_timeout_secs` | `240` | No-progress seconds that trigger a stall when the runner has a non-empty chain; `0` disables. |
 | `stall_api_retries` | `3` | Consecutive `API error (attempt N)` retry lines that trigger a stall; `0` disables. |
 
+Model policy (SPEC-open-model-lists): `cursor-agent` (`cursor`) and `agy` accept any non-fast model id their CLI reports (`dmuxai models --agent cursor-agent|agy`). Ids containing `fast` are blocked for every runner unless the **user** config sets:
+
+```toml
+[models]
+allow_fast = true   # user config only; a workspace dmuxai.toml [models] table is ignored
+```
+
+
 `[runners.<id>.models."<model>"]` accepts `system_prompt`, `system_prompt_file`, and `prompt_inject` with the same validation, 32 KiB cap, relative-path rules, and warnings as the runner table. Model ids match case-insensitively after trimming. An explicitly empty/whitespace prompt at the model or runner level means "no prompt" and stops resolution; it does not fall through to built-ins or `[runners.default]`.
 
 Resolution order for a turn's prompt (first match wins; built-ins only on write turns):
 
 1. `[runners.<runner>.models."<model>"]`
 2. `[runners.<runner>]`
-3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor` + `grok-4.7*` → Cursor Grok)
-4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor` → Cursor, `grok` → Grok Build)
+3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor-agent` + `grok-4.7*` → Cursor Grok)
+4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor-agent` → Cursor, `grok` → Grok Build)
 5. `[runners.default]`
 6. None
 
@@ -620,10 +724,10 @@ prompt_roles = ["chat", "worker"]
 [runners.codex]
 system_prompt_file = "prompts/codex.md"
 
-[runners.cursor]
+[runners.cursor-agent]
 builtin_prompt = false
 
-[runners.cursor.models."composer-2.5"]
+[runners.cursor-agent.models."composer-2.5"]
 system_prompt_file = "prompts/composer.md"
 prompt_inject = "session"
 ```

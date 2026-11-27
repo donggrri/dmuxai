@@ -31,6 +31,7 @@ const AGY_IDLE_TIMEOUT_DEFAULT_SECS: u64 = 300;
 const AGY_RESULT_GRACE_SECS: u64 = 3;
 const AGY_RESULT_GRACE: Duration = Duration::from_secs(AGY_RESULT_GRACE_SECS);
 const AGY_PLAN_ONLY_MAX_ATTEMPTS: usize = 2;
+const AGY_LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resolves the idle timeout from `DMUXAI_AGY_IDLE_TIMEOUT_SECS`.
 ///
@@ -114,6 +115,7 @@ fn current_timestamp_secs() -> u64 {
         .as_secs()
 }
 
+#[allow(clippy::large_enum_variant)]
 enum AgyCommand {
     Send(AgentRequest),
     Cancel,
@@ -226,7 +228,14 @@ async fn runtime_loop(
                             let cache_path_clone = cache_path.clone();
                             let memory_cache_clone = memory_models_cache.clone();
                             tokio::spawn(async move {
-                                if let Ok(fresh_models) = list_models(&cwd_clone).await {
+                                let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
+                                if let Some(fresh_models) = fetch_agy_models_from_cli(
+                                    &program,
+                                    &cwd_clone,
+                                    AGY_LIST_MODELS_TIMEOUT,
+                                )
+                                .await
+                                {
                                     *memory_cache_clone.lock().unwrap() =
                                         Some(fresh_models.clone());
                                     if let Some(ref path) = cache_path_clone {
@@ -256,45 +265,39 @@ async fn runtime_loop(
                         let cache_path_clone = cache_path.clone();
                         let memory_cache_clone = memory_models_cache.clone();
                         tokio::spawn(async move {
-                            match list_models(&cwd_clone).await {
-                                Ok(fresh_models) => {
-                                    *memory_cache_clone.lock().unwrap() =
-                                        Some(fresh_models.clone());
-                                    if let Some(ref path) = cache_path_clone {
-                                        let _ = write_disk_cache(
-                                            path,
-                                            &fresh_models,
-                                            current_timestamp_secs(),
-                                        );
-                                    }
-                                    send_event(
-                                        &event_tx_clone,
-                                        None,
-                                        AgentEvent::ModelsListed {
-                                            models: fresh_models,
-                                            selected: selected_model_clone,
-                                            selected_effort: None,
-                                        },
-                                    )
-                                    .await;
-                                }
-                                Err(error) => {
-                                    send_event(
-                                        &event_tx_clone,
-                                        None,
-                                        AgentEvent::Error(AgentError::model_unavailable(
-                                            error.to_string(),
-                                        )),
-                                    )
-                                    .await;
-                                }
+                            let fresh_models = list_models(&cwd_clone).await;
+                            *memory_cache_clone.lock().unwrap() = Some(fresh_models.clone());
+                            if let Some(ref path) = cache_path_clone {
+                                let _ =
+                                    write_disk_cache(path, &fresh_models, current_timestamp_secs());
                             }
+                            send_event(
+                                &event_tx_clone,
+                                None,
+                                AgentEvent::ModelsListed {
+                                    models: fresh_models,
+                                    selected: selected_model_clone,
+                                    selected_effort: None,
+                                },
+                            )
+                            .await;
                         });
                     }
                 }
                 AgyCommand::SelectModel(model) => {
-                    selected_model = Some(model.clone());
-                    send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                    if let Err(error) =
+                        dmuxai::model_policy::validate_model_for_runner("agy", &model)
+                    {
+                        send_event(
+                            &event_tx,
+                            None,
+                            AgentEvent::Error(AgentError::model_unavailable(error)),
+                        )
+                        .await;
+                    } else {
+                        selected_model = Some(model.clone());
+                        send_event(&event_tx, None, AgentEvent::ModelSelected(model)).await;
+                    }
                 }
             }
             continue;
@@ -354,10 +357,11 @@ fn spawn_turn(
     cwd: PathBuf,
     event_tx: mpsc::Sender<AgentOutput>,
 ) -> ActiveTurn {
+    let leg_cwd = super::request_cwd(&cwd, &request);
     let context = OutputContext::from(&request);
     let error_context = context.clone();
     let handle = tokio::spawn(async move {
-        if let Err(error) = run_turn(&request, selected_model, &cwd, &event_tx).await {
+        if let Err(error) = run_turn(&request, selected_model, &leg_cwd, &event_tx).await {
             send_event(&event_tx, Some(&error_context), AgentEvent::Error(error)).await;
         }
     });
@@ -1014,22 +1018,51 @@ fn normalize_event(
     events
 }
 
-async fn list_models(cwd: &Path) -> io::Result<Vec<ModelInfo>> {
-    let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
-    let mut command = headless_command(program);
+fn static_agy_catalog_models() -> Vec<ModelInfo> {
+    dmuxai::agent_api::static_agy_model_listing()
+        .models
+        .into_iter()
+        .map(|(id, label)| ModelInfo::new(id.clone(), label.unwrap_or(id)))
+        .collect()
+}
+
+async fn fetch_agy_models_from_cli(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> Option<Vec<ModelInfo>> {
+    let mut command = headless_command(program.to_path_buf());
     apply_child_cwd_tokio(&mut command, cwd);
     command
         .arg("models")
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let output = command.output().await?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "AGY model discovery failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let models = parse_model_list(&String::from_utf8_lossy(&output.stdout));
+            if models.is_empty() {
+                None
+            } else {
+                Some(models)
+            }
+        }
+        _ => None,
     }
-    Ok(parse_model_list(&String::from_utf8_lossy(&output.stdout)))
+}
+
+async fn list_models(cwd: &Path) -> Vec<ModelInfo> {
+    let program = resolve_program(AGY_BINARY_OVERRIDE, "agy");
+    list_models_with(&program, cwd, AGY_LIST_MODELS_TIMEOUT).await
+}
+
+pub(crate) async fn list_models_with(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> Vec<ModelInfo> {
+    fetch_agy_models_from_cli(program, cwd, timeout)
+        .await
+        .unwrap_or_else(static_agy_catalog_models)
 }
 
 fn parse_model_list(output: &str) -> Vec<ModelInfo> {
@@ -1132,6 +1165,33 @@ mod tests {
         }
     }
 
+    // TC-2930 / FR-2930: fan-out leg worktrees set AGY child cwd.
+    #[test]
+    fn tc_2930_agy_spawn_uses_working_directory() {
+        use dmuxai::process::apply_child_cwd_tokio;
+        let default_cwd = Path::new("/tmp/main-ws");
+        let leg = Path::new("/tmp/main-ws/.dmuxai/fanout/run1/agy");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c"),
+            turn_id: super::super::TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+            working_directory: Some(leg.to_path_buf()),
+        };
+        let leg_cwd = super::super::request_cwd(default_cwd, &request);
+        let mut command = tokio::process::Command::new("agy");
+        configure_command_for_resume(&mut command, &request, None, TurnPolicy::Agent, None);
+        apply_child_cwd_tokio(&mut command, &leg_cwd);
+        assert_eq!(
+            command.as_std().get_current_dir().map(PathBuf::from),
+            Some(leg.to_path_buf())
+        );
+    }
+
     #[test]
     fn agy_resume_session_is_passed_to_the_command() {
         let request = AgentRequest {
@@ -1143,6 +1203,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("agy");
 
@@ -1182,6 +1243,7 @@ mod tests {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("agy");
         configure_command(&mut command, None, TurnPolicy::ReadOnly);
@@ -1266,6 +1328,7 @@ mod tests {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let turn = tokio::spawn(async move { run_turn(&request, None, &cwd, &event_tx).await });
 
@@ -1321,6 +1384,60 @@ mod tests {
             &state.pending_terminal,
             Some(AgentEvent::Error(e)) if e.message.contains("without producing") && e.kind == AgentErrorKind::Provider
         ));
+    }
+
+    // TC-3013 / FR-3011, FR-3008
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3013_agy_list_models_bounded_and_select_validates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let write_script = |name: &str, body: &str| -> PathBuf {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let hang = write_script("hang", "#!/bin/sh\nsleep 30\n");
+        let fail = write_script("fail", "#!/bin/sh\nexit 1\n");
+        let list_timeout = Duration::from_millis(300);
+
+        let hang_models = list_models_with(&hang, dir.path(), list_timeout).await;
+        assert!(!hang_models.is_empty());
+        assert!(hang_models.iter().any(|m| m.id == "gemini-4-carbon-high"));
+
+        let fail_models = list_models_with(&fail, dir.path(), list_timeout).await;
+        assert!(fail_models.iter().any(|m| m.id == "gemini-4-carbon-high"));
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (adapter, _worker) = spawn_agy_adapter(event_tx, dir.path().to_path_buf());
+        adapter
+            .select_model("gemini-4-carbon-fast".to_owned())
+            .unwrap();
+        let rejected = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("adapter should answer")
+            .expect("channel open");
+        assert!(
+            matches!(
+                rejected.event,
+                AgentEvent::Error(ref error) if error.message.contains("fast")
+            ),
+            "{:?}",
+            rejected.event
+        );
+
+        adapter
+            .select_model("gemini-4-carbon-high".to_owned())
+            .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("adapter should answer")
+            .expect("channel open");
+        assert!(
+            matches!(accepted.event, AgentEvent::ModelSelected(ref id) if id == "gemini-4-carbon-high")
+        );
     }
 
     #[test]
@@ -1573,6 +1690,7 @@ mod tests {
             policy: mode,
             require_file_edits,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, _event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1765,6 +1883,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1844,6 +1963,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1950,6 +2070,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -1998,6 +2119,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2056,6 +2178,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2136,6 +2259,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
 
@@ -2214,6 +2338,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
 
@@ -2267,6 +2392,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: true,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2337,6 +2463,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: true,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2397,6 +2524,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = std::env::temp_dir();
@@ -2681,6 +2809,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2747,6 +2876,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2819,6 +2949,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2903,6 +3034,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -2975,6 +3107,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
@@ -3040,6 +3173,7 @@ mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         let outcome = with_agy_spawn_env(&fake, "0", async {
