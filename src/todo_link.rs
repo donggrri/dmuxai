@@ -289,6 +289,7 @@ mod tests {
                 edges: Vec::new(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             conversation_id: "c".to_owned(),
             phase: dmuxai::graph::GraphRunPhase::Active,
@@ -305,6 +306,8 @@ mod tests {
             pending_replan_plan: None,
             planner_io: Vec::new(),
             todo_id: None,
+            dynamic_cap: None,
+            dynamic_added: None,
         };
         links.commit_pending_graph("plan-1", &mut run);
         assert_eq!(run.todo_id, Some(todo_id.clone()));

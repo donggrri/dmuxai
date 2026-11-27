@@ -12,7 +12,7 @@
     { value: 'plan', label: 'Plan' },
     { value: 'direct', label: 'Direct' }
   ];
-  var SHARE_TARGETS = ['codex', 'cursor', 'agy'];
+  var SHARE_TARGETS = ['codex', 'cursor-agent', 'agy'];
 
   var SESSIONS_OPEN_PREFIX = 'dmuxai.sessions.open.';
 
@@ -1953,7 +1953,7 @@
 
   function agentDisplayLabel(id) {
     var key = String(id || '');
-    var known = { codex: 'Codex', cursor: 'Cursor', agy: 'AGY' };
+    var known = { codex: 'Codex', 'cursor-agent': 'Cursor', cursor: 'Cursor', agy: 'AGY' };
     return known[key.toLowerCase()] || key;
   }
 

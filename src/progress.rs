@@ -131,6 +131,7 @@ pub fn is_file_edit_activity(item: &ActivityItem) -> bool {
 /// TextDelta is handled via [`ProgressThrottle`].
 /// Ignored events return `None`.
 pub fn format_progress_event(agent: &str, event: &AgentEvent, now_ms: u64) -> Option<ProgressLine> {
+    let agent = dmuxai::runner_id::canonical_runner_id(agent);
     match event {
         AgentEvent::Started => Some(ProgressLine::new(now_ms, agent, "started", "started")),
         AgentEvent::ToolProgress { summary, state, .. } => {
@@ -390,7 +391,7 @@ impl ProgressTracker {
         }
         Some(ProgressLine::new(
             now_ms,
-            agent,
+            dmuxai::runner_id::canonical_runner_id(agent),
             "heartbeat",
             sanitize_summary(&summary, MAX_SUMMARY_CHARS),
         ))
@@ -475,7 +476,7 @@ mod tests {
                 .expect("event should produce progress line");
             assert_eq!(line.line_type, "progress");
             assert_eq!(line.ts_ms, 1729756800000);
-            assert_eq!(line.agent, "cursor");
+            assert_eq!(line.agent, dmuxai::runner_id::CURSOR_RUNNER_ID);
             assert_eq!(line.kind, expected_kind);
             assert!(
                 line.summary.starts_with(prefix_check),
@@ -509,7 +510,7 @@ mod tests {
             let val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
             assert_eq!(val["type"], "progress");
             assert_eq!(val["ts_ms"], 1729756800000u64);
-            assert_eq!(val["agent"], "cursor");
+            assert_eq!(val["agent"], dmuxai::runner_id::CURSOR_RUNNER_ID);
             assert_eq!(val["kind"], expected_kind);
             assert!(val["summary"].is_string());
         }
@@ -628,7 +629,7 @@ mod tests {
         tracker.observe("cursor", &AgentEvent::Started, 20_000);
         let lines = tracker.heartbeat_all(21_000);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].agent, "cursor");
+        assert_eq!(lines[0].agent, dmuxai::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(lines[0].summary, "running 1s; last output 1s ago");
     }
 }

@@ -913,8 +913,8 @@ pub fn render_inject(skills: &[ResolvedSkill]) -> String {
 /// Runner folder used for native delivery inside the per-run root (FR-1504).
 /// `None` = runner gets the injected text instead.
 pub fn native_dir_for(runner: &str) -> Option<&'static str> {
-    match runner {
-        "cursor" => Some(".cursor/skills"),
+    match crate::runner_id::canonical_runner_id(runner).as_str() {
+        crate::runner_id::CURSOR_RUNNER_ID => Some(".cursor/skills"),
         "grok" => Some(".grok/skills"),
         "opencode" | "codex" | "agy" => Some(".agents/skills"),
         _ => None,

@@ -1,8 +1,10 @@
 //! Shared helpers for the agent-facing surfaces: headless CLI, MCP server and
 //! HTTP API (SPEC-agent-api FR-760..FR-767).
 
-use std::path::Path;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -137,7 +139,10 @@ pub fn todo_list(store: &TodoStore, status: Option<TodoStatus>) -> Result<Vec<To
 /// Runner ids known to this workspace: built-ins plus `[[agents.custom]]`.
 pub fn runner_ids(settings: &DmuxSettings) -> Vec<(String, String)> {
     let mut ids = vec![
-        ("cursor".to_owned(), "Cursor".to_owned()),
+        (
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
+            "Cursor".to_owned(),
+        ),
         ("agy".to_owned(), "AGY".to_owned()),
         ("codex".to_owned(), "Codex".to_owned()),
     ];
@@ -156,11 +161,12 @@ pub fn runner_allowed(settings: &DmuxSettings, runner: &str) -> bool {
 /// (FR-2838). With the list unset, every registered runner is admitted (true).
 /// With the list set, membership decides admission (empty list = false).
 pub fn runner_run_admitted(settings: &DmuxSettings, runner: &str) -> bool {
+    let runner = crate::runner_id::canonical_runner_id(runner);
     match &settings.graph_allowed_runners {
         None => true,
         Some(allowed) => allowed
             .iter()
-            .any(|r| r.trim().eq_ignore_ascii_case(runner.trim())),
+            .any(|r| crate::runner_id::canonical_runner_id(r) == runner),
     }
 }
 
@@ -176,9 +182,13 @@ pub fn status_json(workspace_root: &Path) -> Value {
     let events_path = crate::events::events_path(workspace_root);
     if let Ok(records) = std::fs::read_to_string(&events_path) {
         for line in records.lines() {
-            if let Ok(rec) = serde_json::from_str::<crate::events::EventRecord>(line)
-                && let Some(runner) = rec.runner
+            if let Ok(mut rec) = serde_json::from_str::<crate::events::EventRecord>(line)
+                && let Some(runner) = rec
+                    .runner
+                    .take()
+                    .map(|r| crate::runner_id::canonical_runner_id(&r))
             {
+                rec.runner = Some(runner.clone());
                 if rec.kind == "activity" {
                     if let Some(prev) = last_agent_run.get_mut(&runner)
                         && prev.get("state").and_then(|s| s.as_str()) == Some("running")
@@ -315,7 +325,7 @@ pub fn status_json(workspace_root: &Path) -> Value {
 }
 
 fn runner_installed(id: &str, spec: Option<&CustomAgentSpec>) -> Option<bool> {
-    if id.eq_ignore_ascii_case("cursor") {
+    if id.eq_ignore_ascii_case(crate::runner_id::CURSOR_RUNNER_ID) {
         if let Some(bin) = std::env::var_os("DMUXAI_CURSOR_BIN") {
             let text = bin.to_string_lossy();
             if Path::new(&*text).is_absolute() || text.chars().any(std::path::is_separator) {
@@ -381,7 +391,7 @@ pub fn runners_json(settings: &DmuxSettings) -> Value {
                 .custom_agents
                 .iter()
                 .find(|s| s.name.eq_ignore_ascii_case(&id));
-            let kind = if id.eq_ignore_ascii_case("cursor")
+            let kind = if id.eq_ignore_ascii_case(crate::runner_id::CURSOR_RUNNER_ID)
                 || id.eq_ignore_ascii_case("agy")
                 || id.eq_ignore_ascii_case("codex")
             {
@@ -401,10 +411,10 @@ pub fn runners_json(settings: &DmuxSettings) -> Value {
                 .cloned()
                 .or_else(|| spec.and_then(|s| s.default_model.clone()))
                 .or_else(|| crate::model_policy::default_model_for_runner(&id).map(str::to_owned));
-            let model_policy = if id.eq_ignore_ascii_case("cursor") {
-                "any non-fast model (default composer-2.5)".to_owned()
+            let model_policy = if id.eq_ignore_ascii_case(crate::runner_id::CURSOR_RUNNER_ID) {
+                "any model reported by cursor-agent (default composer-2.5); fast blocked unless [models] allow_fast".to_owned()
             } else if id.eq_ignore_ascii_case("agy") {
-                "gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5; no fast".to_owned()
+                "any model reported by agy; fast blocked unless [models] allow_fast".to_owned()
             } else if id.eq_ignore_ascii_case("codex") {
                 "composer-2.5 only".to_owned()
             } else if id.eq_ignore_ascii_case("grok") {
@@ -421,6 +431,9 @@ pub fn runners_json(settings: &DmuxSettings) -> Value {
 
             let mut entry = serde_json::Map::new();
             entry.insert("id".to_owned(), json!(id));
+            if id == crate::runner_id::CURSOR_RUNNER_ID {
+                entry.insert("aliases".to_owned(), json!(["cursor"]));
+            }
             entry.insert("label".to_owned(), json!(label));
             entry.insert("kind".to_owned(), json!(kind));
             entry.insert("allowed".to_owned(), json!(allowed));
@@ -479,6 +492,350 @@ pub fn parse_agy_models(stdout: &str) -> Vec<(String, Option<String>)> {
     results
 }
 
+/// Parses `cursor-agent --list-models` stdout (`<id> - <label>` lines).
+pub fn parse_cursor_list_models(stdout: &str) -> Vec<(String, Option<String>)> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        let Some((raw_id, raw_label)) = trimmed.split_once(" - ") else {
+            continue;
+        };
+        let id = raw_id.trim();
+        if id.is_empty() {
+            continue;
+        }
+        let label = raw_label.trim();
+        let label = label.strip_suffix(" (default)").unwrap_or(label);
+        let label = if label.is_empty() {
+            None
+        } else {
+            Some(label.to_owned())
+        };
+        if seen.insert(id.to_owned()) {
+            results.push((id.to_owned(), label));
+        }
+    }
+
+    results
+}
+
+const MODEL_LISTING_COMMAND_TTL: Duration = Duration::from_secs(60);
+const MODEL_LISTING_STATIC_TTL: Duration = Duration::from_secs(5);
+const MODEL_LISTING_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct CachedModelListing {
+    fetched_at: Instant,
+    listing: ModelListing,
+}
+
+type ModelListingCacheMap = HashMap<(String, PathBuf, PathBuf), CachedModelListing>;
+
+static MODEL_LISTING_CACHE: OnceLock<Mutex<ModelListingCacheMap>> = OnceLock::new();
+
+fn model_listing_cache() -> &'static Mutex<ModelListingCacheMap> {
+    MODEL_LISTING_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clears the in-process model listing cache (tests).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn clear_model_listing_cache() {
+    model_listing_cache().lock().unwrap().clear();
+}
+
+fn listing_cache_ttl(source: &str) -> Duration {
+    if source == "command" {
+        MODEL_LISTING_COMMAND_TTL
+    } else {
+        MODEL_LISTING_STATIC_TTL
+    }
+}
+
+fn model_listing_cache_key(
+    runner: &str,
+    program: &Path,
+    workspace_root: &Path,
+) -> (String, PathBuf, PathBuf) {
+    (
+        runner.to_ascii_lowercase(),
+        program.to_path_buf(),
+        workspace_root.to_path_buf(),
+    )
+}
+
+fn get_cached_model_listing(
+    runner: &str,
+    program: &Path,
+    workspace_root: &Path,
+) -> Option<ModelListing> {
+    let key = model_listing_cache_key(runner, program, workspace_root);
+    let cache = model_listing_cache().lock().unwrap();
+    let entry = cache.get(&key)?;
+    let ttl = listing_cache_ttl(&entry.listing.source);
+    if entry.fetched_at.elapsed() < ttl {
+        Some(entry.listing.clone())
+    } else {
+        None
+    }
+}
+
+fn store_model_listing_cache(
+    runner: &str,
+    program: &Path,
+    workspace_root: &Path,
+    listing: ModelListing,
+) {
+    let key = model_listing_cache_key(runner, program, workspace_root);
+    model_listing_cache().lock().unwrap().insert(
+        key,
+        CachedModelListing {
+            fetched_at: Instant::now(),
+            listing,
+        },
+    );
+}
+
+fn resolve_cursor_program_path() -> PathBuf {
+    if let Some(bin) = std::env::var_os("DMUXAI_CURSOR_BIN") {
+        PathBuf::from(bin)
+    } else {
+        PathBuf::from("cursor-agent")
+    }
+}
+
+fn resolve_agy_program_path() -> PathBuf {
+    crate::process::resolve_program("DMUXAI_AGY_BIN", "agy")
+}
+
+pub fn static_cursor_model_listing() -> ModelListing {
+    ModelListing {
+        source: "static".to_owned(),
+        models: vec![
+            ("composer-2.5".to_owned(), None),
+            ("claude-sonnet-5-5-medium".to_owned(), None),
+            ("claude-sonnet-5-5-high".to_owned(), None),
+            ("claude-opus-5-5-high".to_owned(), None),
+            ("grok-4.7-medium".to_owned(), None),
+            ("grok-4.7-high".to_owned(), None),
+            ("gpt-5.5-high".to_owned(), None),
+        ],
+        error: None,
+        error_kind: None,
+    }
+}
+
+pub fn static_agy_model_listing() -> ModelListing {
+    let ids = [
+        "gemini-4-neon-low",
+        "gemini-4-neon-medium",
+        "gemini-4-neon-high",
+        "gemini-4-neon-xhigh",
+        "gemini-4-carbon-low",
+        "gemini-4-carbon-medium",
+        "gemini-4-carbon-high",
+        "gemini-4-argon-low",
+        "gemini-4-argon-medium",
+        "gemini-4-argon-high",
+        "gemini-4-hydrogen-low",
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh",
+        "gemini-pro-orchestrator",
+        "gemini-pro-orchestrator-neon",
+        "gemini-pro-orchestrator-argon",
+        "gemini-3.8-flash-low",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-high",
+        "claude-opus-5-5-low",
+        "claude-opus-5-5-medium",
+        "claude-opus-5-5-high",
+        "claude-sonnet-5-5-low",
+        "claude-sonnet-5-5-medium",
+        "claude-sonnet-5-5-high",
+        "gpt-oss-120b-medium",
+    ];
+    ModelListing {
+        source: "static".to_owned(),
+        models: ids.into_iter().map(|id| (id.to_owned(), None)).collect(),
+        error: None,
+        error_kind: None,
+    }
+}
+
+async fn run_cursor_list_models(
+    program: Option<&Path>,
+    timeout: Duration,
+    workspace_root: &Path,
+) -> ModelListing {
+    let program_path = program
+        .map(Path::to_path_buf)
+        .unwrap_or_else(resolve_cursor_program_path);
+    let mut cmd = crate::process::headless_command(program_path);
+    cmd.arg("--list-models");
+    crate::process::apply_child_cwd_tokio(&mut cmd, workspace_root);
+    cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let parsed = parse_cursor_list_models(&stdout);
+            if parsed.is_empty() {
+                static_cursor_model_listing()
+            } else {
+                ModelListing {
+                    source: "command".to_owned(),
+                    models: parsed,
+                    error: None,
+                    error_kind: None,
+                }
+            }
+        }
+        _ => static_cursor_model_listing(),
+    }
+}
+
+async fn run_agy_list_models(
+    program: Option<&Path>,
+    timeout: Duration,
+    workspace_root: &Path,
+) -> ModelListing {
+    let program_path = program
+        .map(Path::to_path_buf)
+        .unwrap_or_else(resolve_agy_program_path);
+    let mut cmd = crate::process::headless_command(program_path);
+    cmd.arg("models");
+    crate::process::apply_child_cwd_tokio(&mut cmd, workspace_root);
+    cmd.kill_on_drop(true);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let parsed = parse_agy_models(&stdout);
+            if parsed.is_empty() {
+                static_agy_model_listing()
+            } else {
+                ModelListing {
+                    source: "command".to_owned(),
+                    models: parsed,
+                    error: None,
+                    error_kind: None,
+                }
+            }
+        }
+        _ => static_agy_model_listing(),
+    }
+}
+
+/// Like [`collect_model_listing`] but with an explicit program path and timeout (tests).
+pub async fn collect_model_listing_with(
+    workspace_root: &Path,
+    runner: &str,
+    settings: &DmuxSettings,
+    program: Option<&Path>,
+    timeout: Duration,
+) -> ModelListing {
+    let runner = crate::runner_id::canonical_runner_id(runner);
+    if runner == crate::runner_id::CURSOR_RUNNER_ID {
+        let program_path = program
+            .map(Path::to_path_buf)
+            .unwrap_or_else(resolve_cursor_program_path);
+        if let Some(cached) = get_cached_model_listing(
+            crate::runner_id::CURSOR_RUNNER_ID,
+            &program_path,
+            workspace_root,
+        ) {
+            return cached;
+        }
+        let listing = run_cursor_list_models(program, timeout, workspace_root).await;
+        store_model_listing_cache(
+            crate::runner_id::CURSOR_RUNNER_ID,
+            &program_path,
+            workspace_root,
+            listing.clone(),
+        );
+        listing
+    } else if runner == "agy" {
+        let program_path = program
+            .map(Path::to_path_buf)
+            .unwrap_or_else(resolve_agy_program_path);
+        if let Some(cached) = get_cached_model_listing("agy", &program_path, workspace_root) {
+            return cached;
+        }
+        let listing = run_agy_list_models(program, timeout, workspace_root).await;
+        store_model_listing_cache("agy", &program_path, workspace_root, listing.clone());
+        listing
+    } else if runner == "codex" {
+        ModelListing {
+            source: "static".to_owned(),
+            models: vec![("composer-2.5".to_owned(), None)],
+            error: None,
+            error_kind: None,
+        }
+    } else if let Some(spec) = settings
+        .custom_agents
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(&runner))
+    {
+        if !spec.models_command.is_empty() {
+            match crate::custom_agent::list_listed_model_ids(spec, workspace_root, Some(timeout))
+                .await
+            {
+                Ok(ids) => ModelListing {
+                    source: "command".to_owned(),
+                    models: ids.into_iter().map(|id| (id, None)).collect(),
+                    error: None,
+                    error_kind: None,
+                },
+                Err(err) => {
+                    let error_kind = if spec.builtin
+                        && spec.name.eq_ignore_ascii_case("grok")
+                        && err == crate::custom_agent::grok_login_message()
+                    {
+                        Some("auth".to_owned())
+                    } else {
+                        None
+                    };
+                    ModelListing {
+                        source: "none".to_owned(),
+                        models: vec![],
+                        error: Some(err),
+                        error_kind,
+                    }
+                }
+            }
+        } else if let Some(default_model) = &spec.default_model {
+            ModelListing {
+                source: "static".to_owned(),
+                models: vec![(default_model.clone(), None)],
+                error: None,
+                error_kind: None,
+            }
+        } else {
+            ModelListing {
+                source: "none".to_owned(),
+                models: vec![],
+                error: None,
+                error_kind: None,
+            }
+        }
+    } else {
+        ModelListing {
+            source: "none".to_owned(),
+            models: vec![],
+            error: Some(format!("unknown runner: {runner}")),
+            error_kind: None,
+        }
+    }
+}
+
 /// A listing result for one runner's models (FR-2832).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelListing {
@@ -493,6 +850,7 @@ pub fn models_json(settings: &DmuxSettings, entries: Vec<(String, ModelListing)>
     let runners: Vec<Value> = entries
         .into_iter()
         .map(|(runner_id, listing)| {
+            let runner_id = crate::runner_id::canonical_runner_id(&runner_id);
             let allowed = runner_run_admitted(settings, &runner_id);
             let mut runner_obj = serde_json::Map::new();
             runner_obj.insert("id".to_owned(), json!(runner_id));
@@ -551,114 +909,14 @@ pub async fn collect_model_listing(
     runner: &str,
     settings: &DmuxSettings,
 ) -> ModelListing {
-    if runner.eq_ignore_ascii_case("agy") {
-        let static_agy = || ModelListing {
-            source: "static".to_owned(),
-            models: vec![
-                ("gemini-3.8-flash-low".to_owned(), None),
-                ("gemini-3.8-flash-medium".to_owned(), None),
-                ("gemini-3.8-flash-high".to_owned(), None),
-                ("gemini-4-hydrogen-low".to_owned(), None),
-                ("gemini-4-hydrogen-medium".to_owned(), None),
-                ("gemini-4-hydrogen-high".to_owned(), None),
-                ("gemini-4-hydrogen-xhigh".to_owned(), None),
-            ],
-            error: None,
-            error_kind: None,
-        };
-
-        let program = crate::process::resolve_program("DMUXAI_AGY_BIN", "agy");
-        let mut cmd = crate::process::headless_command(program);
-        cmd.arg("models");
-        crate::process::apply_child_cwd_tokio(&mut cmd, workspace_root);
-        cmd.kill_on_drop(true);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        match tokio::time::timeout(Duration::from_secs(10), cmd.output()).await {
-            Ok(Ok(output)) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let parsed = parse_agy_models(&stdout);
-                if parsed.is_empty() {
-                    static_agy()
-                } else {
-                    ModelListing {
-                        source: "command".to_owned(),
-                        models: parsed,
-                        error: None,
-                        error_kind: None,
-                    }
-                }
-            }
-            _ => static_agy(),
-        }
-    } else if runner.eq_ignore_ascii_case("cursor") || runner.eq_ignore_ascii_case("codex") {
-        ModelListing {
-            source: "static".to_owned(),
-            models: vec![("composer-2.5".to_owned(), None)],
-            error: None,
-            error_kind: None,
-        }
-    } else if let Some(spec) = settings
-        .custom_agents
-        .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(runner))
-    {
-        if !spec.models_command.is_empty() {
-            match crate::custom_agent::list_listed_model_ids(
-                spec,
-                workspace_root,
-                Some(Duration::from_secs(10)),
-            )
-            .await
-            {
-                Ok(ids) => ModelListing {
-                    source: "command".to_owned(),
-                    models: ids.into_iter().map(|id| (id, None)).collect(),
-                    error: None,
-                    error_kind: None,
-                },
-                Err(err) => {
-                    let error_kind = if spec.builtin
-                        && spec.name.eq_ignore_ascii_case("grok")
-                        && err == crate::custom_agent::grok_login_message()
-                    {
-                        Some("auth".to_owned())
-                    } else {
-                        None
-                    };
-                    ModelListing {
-                        source: "none".to_owned(),
-                        models: vec![],
-                        error: Some(err),
-                        error_kind,
-                    }
-                }
-            }
-        } else if let Some(default_model) = &spec.default_model {
-            ModelListing {
-                source: "static".to_owned(),
-                models: vec![(default_model.clone(), None)],
-                error: None,
-                error_kind: None,
-            }
-        } else {
-            ModelListing {
-                source: "none".to_owned(),
-                models: vec![],
-                error: None,
-                error_kind: None,
-            }
-        }
-    } else {
-        ModelListing {
-            source: "none".to_owned(),
-            models: vec![],
-            error: Some(format!("unknown runner: {runner}")),
-            error_kind: None,
-        }
-    }
+    collect_model_listing_with(
+        workspace_root,
+        runner,
+        settings,
+        None,
+        MODEL_LISTING_DEFAULT_TIMEOUT,
+    )
+    .await
 }
 
 /// Collects models for either all runners or a single target agent (FR-2832).
@@ -669,13 +927,14 @@ pub async fn collect_models_json(
 ) -> Result<Value, ApiError> {
     let known_runners = runner_ids(settings);
     if let Some(target) = target_agent {
+        let target_canon = crate::runner_id::canonical_runner_id(target);
         let matching = known_runners
             .iter()
-            .find(|(id, _)| id.eq_ignore_ascii_case(target.trim()));
+            .find(|(id, _)| crate::runner_id::canonical_runner_id(id) == target_canon);
         let Some((canonical_id, _)) = matching else {
             return Err(ApiError::new(
                 exit::NOT_FOUND,
-                format!("unknown agent '{target}'"),
+                crate::runner_id::format_unknown_agent_message(target),
             ));
         };
         let listing = collect_model_listing(workspace_root, canonical_id, settings).await;
@@ -693,6 +952,8 @@ pub async fn collect_models_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static MODEL_LISTING_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn parse_todo_status_accepts_known_values() {
@@ -790,7 +1051,9 @@ mod tests {
         let agents = val.get("agents").and_then(|a| a.as_array()).unwrap();
         let cursor = agents
             .iter()
-            .find(|a| a.get("id").and_then(|id| id.as_str()) == Some("cursor"))
+            .find(|a| {
+                a.get("id").and_then(|id| id.as_str()) == Some(crate::runner_id::CURSOR_RUNNER_ID)
+            })
             .expect("cursor agent found");
         let run = cursor.get("run").expect("run object found");
         assert_eq!(run.get("state").and_then(|s| s.as_str()), Some("running"));
@@ -816,7 +1079,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|a| a["id"] == "cursor")
+                .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
                 .map(|a| a["run"].clone())
                 .unwrap()
         };
@@ -836,7 +1099,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|a| a["id"] == "cursor")
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
             .map(|a| a["run"].clone())
             .unwrap();
         assert_eq!(run["state"], "running");
@@ -900,7 +1163,7 @@ mod tests {
         let agents1 = val1["agents"].as_array().unwrap();
         let cursor1 = agents1
             .iter()
-            .find(|a| a["id"] == "cursor")
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
             .expect("cursor agent found");
         let run1 = &cursor1["run"];
         assert_eq!(run1["state"], "running");
@@ -916,7 +1179,7 @@ mod tests {
         let agents2 = val2["agents"].as_array().unwrap();
         let cursor2 = agents2
             .iter()
-            .find(|a| a["id"] == "cursor")
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
             .expect("cursor agent found");
         let run2 = &cursor2["run"];
         assert_eq!(run2["state"], "running");
@@ -978,6 +1241,15 @@ mod tests {
         }
 
         // 4. status_json on temp workspace with no config, set config, and empty config
+        let _guard = crate::state_path::test_env_lock();
+        let isolated_xdg = tempfile::tempdir().unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_config = std::env::var_os("DMUXAI_CONFIG");
+        // SAFETY: test_env_lock() serializes env mutation across tests.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", isolated_xdg.path());
+            std::env::remove_var("DMUXAI_CONFIG");
+        }
         let dir_none = tempfile::tempdir().unwrap();
         let val_none = status_json(dir_none.path());
         let agents_none = val_none["agents"].as_array().expect("agents array");
@@ -987,7 +1259,10 @@ mod tests {
                 "all runners allowed with no config: {a}"
             );
         }
-        let cursor_none = agents_none.iter().find(|a| a["id"] == "cursor").unwrap();
+        let cursor_none = agents_none
+            .iter()
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
         assert_eq!(cursor_none["allowed"], true);
         assert_eq!(cursor_none["graph_allowed"], true);
         let agy_none = agents_none.iter().find(|a| a["id"] == "agy").unwrap();
@@ -1002,7 +1277,10 @@ mod tests {
         .unwrap();
         let val_set = status_json(dir_set.path());
         let agents_set = val_set["agents"].as_array().expect("agents array");
-        let cursor_set = agents_set.iter().find(|a| a["id"] == "cursor").unwrap();
+        let cursor_set = agents_set
+            .iter()
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
         assert_eq!(cursor_set["allowed"], false);
         assert_eq!(cursor_set["graph_allowed"], false);
         let agy_set = agents_set.iter().find(|a| a["id"] == "agy").unwrap();
@@ -1021,12 +1299,34 @@ mod tests {
             assert_eq!(a["allowed"], false);
             assert_eq!(a["graph_allowed"], false);
         }
-        let cursor_empty = agents_empty.iter().find(|a| a["id"] == "cursor").unwrap();
+        let cursor_empty = agents_empty
+            .iter()
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
         assert_eq!(cursor_empty["allowed"], false);
         assert_eq!(cursor_empty["graph_allowed"], false);
         let agy_empty = agents_empty.iter().find(|a| a["id"] == "agy").unwrap();
         assert_eq!(agy_empty["allowed"], false);
         assert_eq!(agy_empty["graph_allowed"], false);
+        if let Some(path) = prev_config {
+            // SAFETY: test_env_lock() serializes env mutation across tests.
+            unsafe {
+                std::env::set_var("DMUXAI_CONFIG", path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("DMUXAI_CONFIG");
+            }
+        }
+        if let Some(path) = prev_xdg {
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
     }
 
     // TC-2831 / FR-2831: runners_json fields and admission with unset/set allowed_runners
@@ -1055,7 +1355,7 @@ mod tests {
 
         let find = |name: &str| runners.iter().find(|r| r["id"] == name).unwrap();
 
-        let cursor = find("cursor");
+        let cursor = find(crate::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(cursor["label"], "Cursor");
         assert_eq!(cursor["kind"], "builtin");
         assert_eq!(cursor["allowed"], true);
@@ -1063,7 +1363,7 @@ mod tests {
         assert_eq!(cursor["default_model"], "composer-2.5");
         assert_eq!(
             cursor["model_policy"],
-            "any non-fast model (default composer-2.5)"
+            "any model reported by cursor-agent (default composer-2.5); fast blocked unless [models] allow_fast"
         );
 
         let agy = find("agy");
@@ -1074,7 +1374,7 @@ mod tests {
         assert_eq!(agy["default_model"], Value::Null);
         assert_eq!(
             agy["model_policy"],
-            "gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5; no fast"
+            "any model reported by agy; fast blocked unless [models] allow_fast"
         );
 
         let codex = find("codex");
@@ -1104,8 +1404,11 @@ mod tests {
         let val2 = runners_json(&settings);
         let runners2 = val2["runners"].as_array().expect("runners array");
         let find2 = |name: &str| runners2.iter().find(|r| r["id"] == name).unwrap();
-        assert_eq!(find2("cursor")["allowed"], true);
-        assert_eq!(find2("cursor")["graph_allowed"], true);
+        assert_eq!(find2(crate::runner_id::CURSOR_RUNNER_ID)["allowed"], true);
+        assert_eq!(
+            find2(crate::runner_id::CURSOR_RUNNER_ID)["graph_allowed"],
+            true
+        );
         assert_eq!(find2("agy")["allowed"], false);
         assert_eq!(find2("agy")["graph_allowed"], false);
         assert_eq!(find2("grok")["allowed"], true);
@@ -1176,11 +1479,11 @@ mod tests {
         assert_eq!(agy_models[0]["allowed"], true);
         assert_eq!(agy_models[1]["id"], "claude-sonnet-5-5-high");
         assert_eq!(agy_models[1]["label"], "Claude Sonnet 5.5 (High)");
-        assert_eq!(agy_models[1]["allowed"], false);
+        assert_eq!(agy_models[1]["allowed"], true);
 
         // cursor (failed listing)
         let cursor = &runners[1];
-        assert_eq!(cursor["id"], "cursor");
+        assert_eq!(cursor["id"], crate::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(cursor["source"], "none");
         assert_eq!(cursor["error"], "command timed out");
         assert!(cursor.get("error_kind").is_none());
@@ -1265,6 +1568,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tc_2833_models_listing_keeps_disallowed_ids() {
+        let _guard = MODEL_LISTING_TEST_SERIAL.lock().await;
+        clear_model_listing_cache();
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1342,5 +1647,381 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    // TC-3002 / FR-3006: static fallback ids pass policy
+    #[test]
+    fn tc_3002_static_fallback_ids_pass_policy() {
+        use crate::model_policy::validate_model_for_runner_with;
+
+        let cursor = static_cursor_model_listing();
+        let agy = static_agy_model_listing();
+        for (runner, listing) in [("cursor", &cursor), ("agy", &agy)] {
+            for (id, _) in &listing.models {
+                assert!(
+                    !id.to_ascii_lowercase().contains("fast"),
+                    "{runner} fallback {id} contains fast"
+                );
+                validate_model_for_runner_with(runner, id, false)
+                    .unwrap_or_else(|e| panic!("{runner} fallback {id}: {e}"));
+            }
+        }
+        let cursor_ids: Vec<_> = cursor.models.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(cursor_ids.contains(&"composer-2.5"));
+        assert!(cursor_ids.contains(&"claude-sonnet-5-5-high"));
+        assert!(cursor_ids.contains(&"grok-4.7-high"));
+    }
+
+    // TC-3012 / FR-3010: runners_json model_policy text
+    #[test]
+    fn tc_3012_status_model_policy_text() {
+        let settings = DmuxSettings::default();
+        let val = runners_json(&settings);
+        let runners = val["runners"].as_array().unwrap();
+        let cursor = runners
+            .iter()
+            .find(|r| r["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
+        assert_eq!(
+            cursor["model_policy"],
+            "any model reported by cursor-agent (default composer-2.5); fast blocked unless [models] allow_fast"
+        );
+        let agy = runners.iter().find(|r| r["id"] == "agy").unwrap();
+        assert_eq!(
+            agy["model_policy"],
+            "any model reported by agy; fast blocked unless [models] allow_fast"
+        );
+        let codex = runners.iter().find(|r| r["id"] == "codex").unwrap();
+        assert_eq!(codex["model_policy"], "composer-2.5 only");
+    }
+
+    #[cfg(unix)]
+    fn write_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    // TC-3003 / FR-3004
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3003_cursor_listing_uses_cli_and_marks_fast_disallowed() {
+        let _guard = MODEL_LISTING_TEST_SERIAL.lock().await;
+        clear_model_listing_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            dir.path(),
+            "cursor-agent-fake",
+            "#!/bin/sh\n\
+             printf 'Available models\\n'\n\
+             printf 'auto - Auto (default)\\n'\n\
+             printf 'claude-sonnet-5-5-high - Claude Sonnet 5.5 High\\n'\n\
+             printf 'grok-4.7-high - Grok 4.7 High\\n'\n\
+             printf 'composer-2.5-fast - Composer 2.5 Fast\\n'\n\
+             printf 'Tip: pick a model\\n'\n",
+        );
+        let settings = DmuxSettings::default();
+        let listing = collect_model_listing_with(
+            dir.path(),
+            "cursor",
+            &settings,
+            Some(&script),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(listing.source, "command");
+        assert_eq!(listing.error, None);
+        let ids: Vec<_> = listing.models.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains(&"claude-sonnet-5-5-high"));
+        assert!(ids.contains(&"grok-4.7-high"));
+        assert!(ids.contains(&"composer-2.5-fast"));
+        let auto = listing.models.iter().find(|(id, _)| id == "auto").unwrap();
+        assert_eq!(auto.1.as_deref(), Some("Auto"));
+
+        let json = models_json(&settings, vec![("cursor".to_owned(), listing)]);
+        let models = json["runners"][0]["models"].as_array().unwrap();
+        let fast = models
+            .iter()
+            .find(|m| m["id"] == "composer-2.5-fast")
+            .unwrap();
+        assert_eq!(fast["allowed"], false);
+    }
+
+    // TC-3004 / FR-3004, FR-3005
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3004_listing_falls_back_to_static() {
+        let _guard = MODEL_LISTING_TEST_SERIAL.lock().await;
+        clear_model_listing_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let settings = DmuxSettings::default();
+        let timeout = Duration::from_millis(300);
+
+        let fail = write_executable(dir.path(), "fail", "#!/bin/sh\nexit 1\n");
+        let hang = write_executable(dir.path(), "hang", "#!/bin/sh\nsleep 30\n");
+        let empty = write_executable(dir.path(), "empty", "#!/bin/sh\n");
+
+        for runner in ["cursor", "agy"] {
+            let listing =
+                collect_model_listing_with(dir.path(), runner, &settings, Some(&fail), timeout)
+                    .await;
+            assert_eq!(listing.source, "static");
+            assert!(listing.error.is_none());
+            assert!(!listing.models.is_empty());
+        }
+
+        clear_model_listing_cache();
+        for runner in ["cursor", "agy"] {
+            let listing =
+                collect_model_listing_with(dir.path(), runner, &settings, Some(&hang), timeout)
+                    .await;
+            assert_eq!(listing.source, "static");
+            assert!(listing.error.is_none());
+        }
+
+        clear_model_listing_cache();
+        for runner in ["cursor", "agy"] {
+            let listing =
+                collect_model_listing_with(dir.path(), runner, &settings, Some(&empty), timeout)
+                    .await;
+            assert_eq!(listing.source, "static");
+            assert!(listing.error.is_none());
+        }
+    }
+
+    // TC-3005 / FR-3007, NFR-3000
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3005_listing_is_cached() {
+        let _guard = MODEL_LISTING_TEST_SERIAL.lock().await;
+        clear_model_listing_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("spawn.count");
+        std::fs::write(&counter, "0").unwrap();
+        let script = write_executable(
+            dir.path(),
+            "cursor-count",
+            &format!(
+                "#!/bin/sh\n\
+                 count=$(cat '{}' 2>/dev/null || echo 0)\n\
+                 echo $((count + 1)) > '{}'\n\
+                 printf 'claude-sonnet-5-5-high - Sonnet\\n'\n",
+                counter.display(),
+                counter.display()
+            ),
+        );
+        let settings = DmuxSettings::default();
+        let timeout = Duration::from_millis(300);
+
+        let listing1 =
+            collect_model_listing_with(dir.path(), "cursor", &settings, Some(&script), timeout)
+                .await;
+        let listing2 =
+            collect_model_listing_with(dir.path(), "cursor", &settings, Some(&script), timeout)
+                .await;
+        assert_eq!(listing1.source, "command");
+        assert_eq!(listing2.source, "command");
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "1",
+            "expected one spawn for two cached command calls"
+        );
+
+        clear_model_listing_cache();
+        let _ = collect_model_listing_with(dir.path(), "cursor", &settings, Some(&script), timeout)
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "2",
+            "expected another spawn after cache clear"
+        );
+
+        clear_model_listing_cache();
+        std::fs::write(&counter, "0").unwrap();
+        let static_script = write_executable(
+            dir.path(),
+            "static-fail",
+            &format!(
+                "#!/bin/sh\n\
+                 count=$(cat '{}' 2>/dev/null || echo 0)\n\
+                 echo $((count + 1)) > '{}'\n\
+                 exit 1\n",
+                counter.display(),
+                counter.display()
+            ),
+        );
+        let _ = collect_model_listing_with(
+            dir.path(),
+            "cursor",
+            &settings,
+            Some(&static_script),
+            timeout,
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
+        let _ = collect_model_listing_with(
+            dir.path(),
+            "cursor",
+            &settings,
+            Some(&static_script),
+            timeout,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "1",
+            "static listing should be cached within TTL"
+        );
+        std::thread::sleep(Duration::from_secs(6));
+        let _ = collect_model_listing_with(
+            dir.path(),
+            "cursor",
+            &settings,
+            Some(&static_script),
+            timeout,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "2",
+            "static cache should expire after 5s"
+        );
+    }
+
+    // TC-3006 / FR-3005
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3006_agy_listing_is_unfiltered() {
+        let _guard = MODEL_LISTING_TEST_SERIAL.lock().await;
+        clear_model_listing_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let script = write_executable(
+            dir.path(),
+            "agy-fake",
+            "#!/bin/sh\n\
+             printf 'Fetching available models...\\n'\n\
+             printf 'gemini-4-carbon-high\\tGemini 4 Carbon (High)\\n'\n\
+             printf 'gemini-4-neon-xhigh\\tNeon XHigh\\n'\n\
+             printf 'claude-sonnet-5-5-high\\tClaude Sonnet\\n'\n\
+             printf 'gemini-pro-orchestrator\\tOrchestrator\\n'\n",
+        );
+        let settings = DmuxSettings::default();
+        let listing = collect_model_listing_with(
+            dir.path(),
+            "agy",
+            &settings,
+            Some(&script),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(listing.source, "command");
+        assert_eq!(
+            listing
+                .models
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gemini-4-carbon-high",
+                "gemini-4-neon-xhigh",
+                "claude-sonnet-5-5-high",
+                "gemini-pro-orchestrator",
+            ]
+        );
+        let json = models_json(&settings, vec![("agy".to_owned(), listing)]);
+        for model in json["runners"][0]["models"].as_array().unwrap() {
+            assert_eq!(model["allowed"], true);
+        }
+    }
+
+    // TC-3007 / FR-3007
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3007_cache_key_includes_program_path() {
+        let _guard = MODEL_LISTING_TEST_SERIAL.lock().await;
+        clear_model_listing_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("spawn.count");
+        std::fs::write(&counter, "0").unwrap();
+        let body = format!(
+            "#!/bin/sh\n\
+             count=$(cat '{}' 2>/dev/null || echo 0)\n\
+             echo $((count + 1)) > '{}'\n\
+             printf 'gemini-4-carbon-high\\tCarbon\\n'\n",
+            counter.display(),
+            counter.display()
+        );
+        let script_a = write_executable(dir.path(), "agy-a", &body);
+        let script_b = write_executable(dir.path(), "agy-b", &body);
+        let settings = DmuxSettings::default();
+        let timeout = Duration::from_millis(300);
+
+        let _ = collect_model_listing_with(dir.path(), "agy", &settings, Some(&script_a), timeout)
+            .await;
+        let _ = collect_model_listing_with(dir.path(), "agy", &settings, Some(&script_b), timeout)
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "2",
+            "different program paths should not share cache"
+        );
+
+        let _ = collect_model_listing_with(dir.path(), "agy", &settings, Some(&script_a), timeout)
+            .await;
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().trim(),
+            "2",
+            "repeat with same program path should hit cache"
+        );
+    }
+
+    // TC-3207 / FR-3206
+    #[test]
+    fn tc_3207_runners_json_lists_cursor_agent_alias() {
+        let settings = DmuxSettings::default();
+        let val = runners_json(&settings);
+        let runners = val["runners"].as_array().expect("runners array");
+        let cursor = runners
+            .iter()
+            .find(|r| r["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor entry");
+        assert_eq!(cursor["aliases"], json!(["cursor"]));
+    }
+
+    // TC-3211 / FR-3207
+    #[test]
+    fn tc_3211_json_outputs_use_cursor_agent_id() {
+        let settings = DmuxSettings::default();
+        let runners = runners_json(&settings);
+        let runners_arr = runners["runners"].as_array().unwrap();
+        assert!(runners_arr.iter().all(|r| r["id"] != "cursor"));
+        let cursor = runners_arr
+            .iter()
+            .find(|r| r["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
+        assert_eq!(cursor["id"], crate::runner_id::CURSOR_RUNNER_ID);
+        let listing = ModelListing {
+            source: "static".to_owned(),
+            models: vec![("composer-2.5".to_owned(), None)],
+            error: None,
+            error_kind: None,
+        };
+        let models = models_json(&settings, vec![("cursor".to_owned(), listing)]);
+        assert_eq!(
+            models["runners"][0]["id"],
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let val = status_json(dir.path());
+        let agents = val["agents"].as_array().expect("agents");
+        assert!(agents.iter().all(|a| a["id"] != "cursor"));
+        let cursor_status = agents
+            .iter()
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor in status");
+        assert_eq!(cursor_status["id"], crate::runner_id::CURSOR_RUNNER_ID);
     }
 }

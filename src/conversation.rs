@@ -590,7 +590,7 @@ impl AgentKey {
     fn as_db(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Cursor => "cursor",
+            Self::Cursor => crate::runner_id::CURSOR_RUNNER_ID,
             Self::Agy => "agy",
             Self::Custom(index) => crate::custom_agent::spec_at(index)
                 .map(|spec| spec.name.as_str())
@@ -598,16 +598,30 @@ impl AgentKey {
         }
     }
 
+    /// Canonical id plus any legacy spelling accepted on read (FR-3208).
+    fn db_aliases(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Cursor => (crate::runner_id::CURSOR_RUNNER_ID, "cursor"),
+            other => {
+                let s = other.as_db();
+                (s, s)
+            }
+        }
+    }
+
     fn from_db(value: &str) -> rusqlite::Result<Self> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "cursor" => Ok(Self::Cursor),
-            "agy" => Ok(Self::Agy),
-            "" => Err(rusqlite::Error::FromSqlConversionFailure(
+        if value.trim().is_empty() {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 Type::Text,
                 "empty agent name".into(),
-            )),
+            ));
+        }
+        let canon = crate::runner_id::canonical_runner_id(value);
+        match canon.as_str() {
+            "codex" => Ok(Self::Codex),
+            crate::runner_id::CURSOR_RUNNER_ID => Ok(Self::Cursor),
+            "agy" => Ok(Self::Agy),
             other => Ok(Self::Custom(
                 crate::custom_agent::index_of(other).unwrap_or(UNKNOWN_CUSTOM_AGENT),
             )),
@@ -1305,13 +1319,17 @@ impl ConversationEngine {
             .map_err(ConversationError::from)?;
 
         let mut spoken_statement = self.connection.prepare(
-            "SELECT t.conversation_id, t.requested_agent
+            "SELECT t.conversation_id,
+                    CASE WHEN LOWER(TRIM(t.requested_agent)) = 'cursor'
+                         THEN 'cursor-agent'
+                         ELSE t.requested_agent
+                    END AS canon_agent
                FROM turns t
                JOIN conversations c ON c.id = t.conversation_id
               WHERE t.status = 'completed'
                 AND c.workspace_root = ?1
                 AND c.archived_at_ms IS NULL
-              GROUP BY t.conversation_id, t.requested_agent
+              GROUP BY t.conversation_id, canon_agent
               ORDER BY t.conversation_id, MIN(t.seq)",
         )?;
         let mut spoken: HashMap<String, Vec<AgentKey>> = HashMap::new();
@@ -1319,7 +1337,10 @@ impl ConversationEngine {
         while let Some(row) = rows.next()? {
             let conversation_id: String = row.get(0)?;
             let agent = AgentKey::from_db(&row.get::<_, String>(1)?)?;
-            spoken.entry(conversation_id).or_default().push(agent);
+            let entry = spoken.entry(conversation_id).or_default();
+            if !entry.contains(&agent) {
+                entry.push(agent);
+            }
         }
         for card in &mut cards {
             card.spoken_agents = spoken.remove(card.id.as_str()).unwrap_or_default();
@@ -1337,11 +1358,20 @@ impl ConversationEngine {
             .as_ref()
             .ok_or(ConversationError::NoActiveConversation)?;
         let mut statement = self.connection.prepare(
-            "SELECT t.requested_agent,
+            "SELECT CASE WHEN LOWER(TRIM(t.requested_agent)) = 'cursor'
+                         THEN 'cursor-agent'
+                         ELSE t.requested_agent
+                    END AS canon_agent,
                     (SELECT latest.model_id
                        FROM turns latest
                       WHERE latest.conversation_id = t.conversation_id
-                        AND latest.requested_agent = t.requested_agent
+                        AND (CASE WHEN LOWER(TRIM(latest.requested_agent)) = 'cursor'
+                                  THEN 'cursor-agent'
+                                  ELSE latest.requested_agent
+                             END) = (CASE WHEN LOWER(TRIM(t.requested_agent)) = 'cursor'
+                                          THEN 'cursor-agent'
+                                          ELSE t.requested_agent
+                                     END)
                         AND latest.status = 'completed'
                       ORDER BY latest.seq DESC
                       LIMIT 1),
@@ -1350,12 +1380,18 @@ impl ConversationEngine {
                         SELECT 1
                           FROM provider_bindings binding
                          WHERE binding.conversation_id = t.conversation_id
-                           AND binding.agent = t.requested_agent
+                           AND (CASE WHEN LOWER(TRIM(binding.agent)) = 'cursor'
+                                     THEN 'cursor-agent'
+                                     ELSE binding.agent
+                                END) = (CASE WHEN LOWER(TRIM(t.requested_agent)) = 'cursor'
+                                             THEN 'cursor-agent'
+                                             ELSE t.requested_agent
+                                        END)
                            AND binding.status = 'active'
                     )
                FROM turns t
               WHERE t.conversation_id = ?1 AND t.status = 'completed'
-              GROUP BY t.requested_agent
+              GROUP BY canon_agent
               ORDER BY MIN(t.seq)",
         )?;
         let rows = statement.query_map([conversation_id.as_str()], |row| {
@@ -1583,10 +1619,11 @@ impl ConversationEngine {
         conversation_id: &ConversationId,
         agent: AgentKey,
     ) -> Result<bool, ConversationError> {
+        let (a1, a2) = agent.db_aliases();
         let changed = self.connection.execute(
-            "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?3
-              WHERE conversation_id = ?1 AND agent = ?2 AND status = 'active'",
-            params![conversation_id.as_str(), agent.as_db(), now_ms()?],
+            "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?4
+              WHERE conversation_id = ?1 AND agent IN (?2, ?3) AND status = 'active'",
+            params![conversation_id.as_str(), a1, a2, now_ms()?],
         )?;
         Ok(changed > 0)
     }
@@ -1724,13 +1761,14 @@ impl ConversationEngine {
         if !exists {
             return Err(ConversationError::ConversationNotFound(job.conversation_id));
         }
+        let (a1, a2) = job.agent.db_aliases();
         let busy: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM turns
-                 WHERE conversation_id = ?1 AND requested_agent = ?2
+                 WHERE conversation_id = ?1 AND requested_agent IN (?2, ?3)
                    AND status IN ('queued', 'running')
              )",
-            params![job.conversation_id.as_str(), job.agent.as_db()],
+            params![job.conversation_id.as_str(), a1, a2],
             |row| row.get(0),
         )?;
         if busy {
@@ -1769,9 +1807,9 @@ impl ConversationEngine {
         )?;
         transaction.execute(
             "UPDATE provider_bindings
-                SET status = 'stale', updated_at_ms = ?3
-              WHERE conversation_id = ?1 AND agent = ?2",
-            params![job.conversation_id.as_str(), job.agent.as_db(), now],
+                SET status = 'stale', updated_at_ms = ?4
+              WHERE conversation_id = ?1 AND agent IN (?2, ?3)",
+            params![job.conversation_id.as_str(), a1, a2, now],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1827,7 +1865,13 @@ impl ConversationEngine {
                             )
                        )
                        AND t.conversation_id = provider_bindings.conversation_id
-                       AND t.requested_agent = provider_bindings.agent
+                       AND (CASE WHEN LOWER(TRIM(t.requested_agent)) = 'cursor'
+                                 THEN 'cursor-agent'
+                                 ELSE t.requested_agent
+                            END) = (CASE WHEN LOWER(TRIM(provider_bindings.agent)) = 'cursor'
+                                         THEN 'cursor-agent'
+                                         ELSE provider_bindings.agent
+                                    END)
                 )",
             params![self.workspace_root, cutoff, now],
         )?;
@@ -1881,14 +1925,15 @@ impl ConversationEngine {
         conversation_id: &ConversationId,
         agent: AgentKey,
     ) -> Result<bool, ConversationError> {
+        let (a1, a2) = agent.db_aliases();
         self.connection
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM turns
-                     WHERE conversation_id = ?1 AND requested_agent = ?2
+                     WHERE conversation_id = ?1 AND requested_agent IN (?2, ?3)
                        AND status IN ('queued', 'running')
                  )",
-                params![conversation_id.as_str(), agent.as_db()],
+                params![conversation_id.as_str(), a1, a2],
                 |row| row.get(0),
             )
             .map_err(ConversationError::from)
@@ -1899,14 +1944,15 @@ impl ConversationEngine {
         conversation_id: &ConversationId,
         agent: AgentKey,
     ) -> Result<bool, ConversationError> {
+        let (a1, a2) = agent.db_aliases();
         transaction
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM turns
-                     WHERE conversation_id = ?1 AND requested_agent = ?2
+                     WHERE conversation_id = ?1 AND requested_agent IN (?2, ?3)
                        AND status IN ('queued', 'running')
                  )",
-                params![conversation_id.as_str(), agent.as_db()],
+                params![conversation_id.as_str(), a1, a2],
                 |row| row.get(0),
             )
             .map_err(ConversationError::from)
@@ -1917,12 +1963,15 @@ impl ConversationEngine {
         conversation_id: &ConversationId,
         agent: AgentKey,
     ) -> Result<Option<ProviderBinding>, ConversationError> {
+        let (a1, a2) = agent.db_aliases();
         self.connection
             .query_row(
                 "SELECT provider_session_id, status, known_through_seq
                    FROM provider_bindings
-                  WHERE conversation_id = ?1 AND agent = ?2",
-                params![conversation_id.as_str(), agent.as_db()],
+                  WHERE conversation_id = ?1 AND agent IN (?2, ?3)
+                  ORDER BY CASE WHEN agent = ?2 THEN 0 ELSE 1 END, updated_at_ms DESC
+                  LIMIT 1",
+                params![conversation_id.as_str(), a1, a2],
                 |row| {
                     Ok(ProviderBinding {
                         agent,
@@ -2073,15 +2122,17 @@ impl ConversationEngine {
         agent: AgentKey,
         turns: &[ProjectedTurn],
     ) -> Result<Option<Checkpoint>, ConversationError> {
+        let (a1, a2) = agent.db_aliases();
         let mut statement = self.connection.prepare(
             "SELECT covers_through_seq, source_hash, summary_json
                FROM context_checkpoints
-              WHERE conversation_id = ?1 AND agent = ?2 AND prompt_version = ?3
+              WHERE conversation_id = ?1 AND agent IN (?2, ?3) AND prompt_version = ?4
               ORDER BY covers_through_seq DESC",
         )?;
         let mut rows = statement.query(params![
             conversation_id.as_str(),
-            agent.as_db(),
+            a1,
+            a2,
             SUMMARY_PROMPT_VERSION,
         ])?;
         while let Some(row) = rows.next()? {
@@ -2423,6 +2474,13 @@ fn apply_turn_event(
                     now,
                 ],
             )?;
+            if output.agent == AgentKey::Cursor {
+                transaction.execute(
+                    "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?2
+                      WHERE conversation_id = ?1 AND agent = 'cursor' AND status = 'active'",
+                    params![output.conversation_id.as_str(), now],
+                )?;
+            }
             patches.push(TranscriptPatch::ProviderBound {
                 agent: output.agent,
                 provider_session_id: provider_session_id.clone(),
@@ -2468,16 +2526,12 @@ fn apply_turn_event(
         TurnEvent::Completed => {
             ensure_turn_state(turn, &[TurnStatus::Queued, TurnStatus::Running], "complete")?;
             finish_turn(transaction, output, turn, now, TurnStatus::Completed, None)?;
+            let (a1, a2) = output.agent.db_aliases();
             transaction.execute(
                 "UPDATE provider_bindings
-                    SET known_through_seq = MAX(known_through_seq, ?3), updated_at_ms = ?4
-                  WHERE conversation_id = ?1 AND agent = ?2 AND status = 'active'",
-                params![
-                    output.conversation_id.as_str(),
-                    output.agent.as_db(),
-                    turn.seq,
-                    now,
-                ],
+                    SET known_through_seq = MAX(known_through_seq, ?4), updated_at_ms = ?5
+                  WHERE conversation_id = ?1 AND agent IN (?2, ?3) AND status = 'active'",
+                params![output.conversation_id.as_str(), a1, a2, turn.seq, now],
             )?;
             patches.push(TranscriptPatch::TurnFinished {
                 turn_id: output.turn_id.clone(),
@@ -2584,10 +2638,11 @@ fn mark_binding_stale(
     output: &TurnOutput,
     now: i64,
 ) -> Result<(), ConversationError> {
+    let (a1, a2) = output.agent.db_aliases();
     transaction.execute(
-        "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?3
-          WHERE conversation_id = ?1 AND agent = ?2",
-        params![output.conversation_id.as_str(), output.agent.as_db(), now],
+        "UPDATE provider_bindings SET status = 'stale', updated_at_ms = ?4
+          WHERE conversation_id = ?1 AND agent IN (?2, ?3)",
+        params![output.conversation_id.as_str(), a1, a2, now],
     )?;
     Ok(())
 }
@@ -2865,6 +2920,136 @@ mod schema_v2_tests {
         assert_eq!(index_count, 1);
         // Re-opening a v2 database is a no-op.
         drop(ConversationEngine::open(&db, &workspace).unwrap());
+    }
+
+    // TC-3209 / FR-3207, FR-3208
+    #[test]
+    fn tc_3209_legacy_cursor_row_reads_as_cursor_agent() {
+        assert!(matches!(
+            AgentKey::from_db("cursor").expect("legacy cursor row"),
+            AgentKey::Cursor
+        ));
+        assert_eq!(AgentKey::Cursor.as_db(), crate::runner_id::CURSOR_RUNNER_ID);
+        assert!(matches!(
+            AgentKey::from_db(crate::runner_id::CURSOR_RUNNER_ID).expect("canonical row"),
+            AgentKey::Cursor
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = dir.path().join("conv.sqlite3");
+
+        // Create schema, then seed a legacy row with requested_agent = 'cursor'.
+        let mut engine = ConversationEngine::open(&db, &workspace).unwrap();
+        let snapshot = engine
+            .select(ConversationSelection::New {
+                title: Some("Legacy cursor".to_owned()),
+            })
+            .unwrap();
+        let conv_id = snapshot.id.clone();
+        drop(engine);
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO turns
+                (id, conversation_id, seq, requested_agent, model_id, status,
+                 context_through_seq, created_at_ms, completed_at_ms)
+             VALUES ('legacy-t1', ?1, 1, 'cursor', 'composer-2.5', 'completed', 0, 1, 2)",
+            rusqlite::params![conv_id.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (id, turn_id, ordinal, role, text, state, created_at_ms, updated_at_ms)
+             VALUES ('legacy-u1', 'legacy-t1', 0, 'user', 'hi', 'complete', 1, 1),
+                    ('legacy-a1', 'legacy-t1', 1, 'assistant', 'hello', 'complete', 2, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_bindings
+                (conversation_id, agent, provider_session_id, status, known_through_seq,
+                 bound_by_turn_id, created_at_ms, updated_at_ms)
+             VALUES (?1, 'cursor', 'sess-legacy', 'active', 1, 'legacy-t1', 1, 2)",
+            rusqlite::params![conv_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut engine = ConversationEngine::open(&db, &workspace).unwrap();
+        let loaded = engine
+            .select(ConversationSelection::Existing(conv_id.clone()))
+            .unwrap();
+        assert_eq!(loaded.turns.len(), 1);
+        assert_eq!(loaded.turns[0].agent, AgentKey::Cursor);
+        assert_eq!(
+            serde_json::to_value(loaded.turns[0].agent).unwrap(),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+
+        // Write a new turn for AgentKey::Cursor; it resumes the legacy binding
+        // and stores requested_agent = 'cursor-agent'.
+        let req = match engine
+            .begin_turn(BeginTurn {
+                agent: AgentKey::Cursor,
+                model_id: Some("composer-2.5".to_owned()),
+                prompt: "next".to_owned(),
+                display_text: None,
+            })
+            .unwrap()
+        {
+            BeginTurnOutcome::Ready(req) => req,
+            BeginTurnOutcome::NeedsSummary(_) => panic!("unexpected summary"),
+        };
+        assert_eq!(req.resume_session.as_deref(), Some("sess-legacy"));
+        for event in [
+            TurnEvent::Started,
+            TurnEvent::TextDelta("ok".to_owned()),
+            TurnEvent::Completed,
+        ] {
+            engine
+                .record_turn_outputs(&[TurnOutput {
+                    conversation_id: conv_id.clone(),
+                    turn_id: req.turn_id.clone(),
+                    agent: AgentKey::Cursor,
+                    event,
+                }])
+                .unwrap();
+        }
+
+        // Both rows list under the single Cursor agent in spoken_agents and list().
+        let spoken = engine.spoken_agents().unwrap();
+        assert_eq!(spoken.len(), 1);
+        assert_eq!(spoken[0].agent, AgentKey::Cursor);
+        assert_eq!(spoken[0].turns, 2);
+        assert!(spoken[0].live);
+        let cards = engine.list().unwrap();
+        assert_eq!(cards[0].spoken_agents, vec![AgentKey::Cursor]);
+        drop(engine);
+
+        // Legacy row on disk is not rewritten; new row is stored as cursor-agent.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, requested_agent FROM turns WHERE conversation_id = ?1 ORDER BY seq",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([conv_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("legacy-t1".to_owned(), "cursor".to_owned()),
+                (
+                    req.turn_id.as_str().to_owned(),
+                    crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+                ),
+            ]
+        );
     }
 }
 

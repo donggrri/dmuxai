@@ -155,6 +155,9 @@ pub struct GraphPlan {
     /// FR-963: task list for this plan; empty for old records.
     #[serde(default)]
     pub tasks: Vec<PlanTask>,
+    /// Dynamic node addition cap (SPEC-graph-dynamic-nodes FR-2942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,12 +218,40 @@ pub struct GraphRun {
     /// FR-947: dashboard to-do id when this run was started from a to-do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_id: Option<String>,
+    /// Approved dynamic node cap (SPEC-graph-dynamic-nodes FR-2942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
+    /// Count of dynamically added nodes so far (SPEC-graph-dynamic-nodes FR-2942).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_added: Option<usize>,
 }
 
 /// FR-943: at most five plan revisions per run.
 pub const MAX_PLAN_REVISIONS: u32 = 5;
 
 impl GraphRun {
+    /// Normalizes legacy `cursor` runner ids on read (FR-3208); does not rewrite files.
+    pub fn normalize_legacy_runners(&mut self) {
+        for node in &mut self.plan.nodes {
+            node.runner = crate::runner_id::canonical_runner_id(&node.runner);
+        }
+        if let Some(triage) = &mut self.triage {
+            triage.runner = crate::runner_id::canonical_runner_id(&triage.runner);
+        }
+        if let Some(plan) = &mut self.pending_replan_plan {
+            for node in &mut plan.nodes {
+                node.runner = crate::runner_id::canonical_runner_id(&node.runner);
+            }
+        }
+        if let Some(approval) = &mut self.approval {
+            for revision in &mut approval.revisions {
+                for step in &mut revision.steps {
+                    step.runner = crate::runner_id::canonical_runner_id(&step.runner);
+                }
+            }
+        }
+    }
+
     /// Keeps at most [`PLAN_HISTORY_MAX`] entries, dropping the oldest.
     pub fn push_plan_change(&mut self, change: PlanChange) {
         self.plan_history.push(change);
@@ -313,6 +344,7 @@ pub enum PlanChangeKind {
     Initial,
     Edit,
     Replan,
+    DynamicAdd,
 }
 
 /// Why the replan was triggered (FR-958).
@@ -322,6 +354,7 @@ pub enum PlanChangeTrigger {
     Failure,
     Marker,
     User,
+    DynamicAdd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

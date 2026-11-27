@@ -29,6 +29,11 @@ use crate::web::commands::{DashboardCommand, RunMode, RunTodoError, SessionComma
 use crate::web::directory::{WorkspaceDirectory, WorkspaceEntry};
 use crate::web::hub::DashboardHub;
 
+/// Normalizes a dashboard/API agent id at the request boundary (FR-3204).
+pub fn normalize_request_agent_id(raw: &str) -> String {
+    crate::runner_id::canonical_runner_id(raw)
+}
+
 /// Injectable re-execution hook for `POST /api/workspace/switch` (FR-874, TC-875).
 /// Arguments are `(executable, argv_after_arg0, dashboard_token)`.
 pub type ExecFn =
@@ -331,8 +336,11 @@ async fn get_agent_prompts(Ws(ws): Ws) -> Response {
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
-    let mut runner_ids: Vec<String> =
-        vec!["cursor".to_owned(), "agy".to_owned(), "codex".to_owned()];
+    let mut runner_ids: Vec<String> = vec![
+        crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
+        "agy".to_owned(),
+        "codex".to_owned(),
+    ];
     for spec in &settings.custom_agents {
         let id = spec.name.trim().to_ascii_lowercase();
         if !runner_ids.iter().any(|existing| existing == &id) {
@@ -426,9 +434,9 @@ async fn post_agent_prompts(Ws(ws): Ws, ApiJson(body): ApiJson<AgentPromptsPostB
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
-    let runner = body.runner.trim().to_ascii_lowercase();
+    let runner = normalize_request_agent_id(&body.runner);
     let mut known: Vec<String> = vec![
-        "cursor".to_owned(),
+        crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
         "agy".to_owned(),
         "codex".to_owned(),
         "default".to_owned(),
@@ -1250,7 +1258,7 @@ async fn run_todo(
     let mode = match body.mode.as_str() {
         "agent" => match body.agent {
             Some(agent) if !agent.trim().is_empty() => RunMode::Agent {
-                agent: agent.trim().to_owned(),
+                agent: normalize_request_agent_id(&agent),
             },
             _ => return error_json(StatusCode::BAD_REQUEST, "mode agent requires an agent id"),
         },
@@ -6754,7 +6762,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["runner"] == "cursor")
+            .find(|r| r["runner"] == crate::runner_id::CURSOR_RUNNER_ID)
             .unwrap();
         assert_eq!(cursor["delivery"], "prepend");
         let agy = v2["runners"]

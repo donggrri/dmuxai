@@ -3,7 +3,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde_json::Value;
@@ -30,6 +30,7 @@ const STDERR_HISTORY_CAPACITY: usize = 8;
 /// child that keeps its pipes open).
 const TERMINAL_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+#[allow(clippy::large_enum_variant)]
 enum CursorCommand {
     Send {
         request: AgentRequest,
@@ -358,6 +359,7 @@ async fn runtime_loop(
 
             match command {
                 CursorCommand::Send { request, is_graph } => {
+                    let leg_cwd = super::request_cwd(&cwd, &request);
                     if is_graph {
                         if let Some(warm) = warm_process.take() {
                             reap_warm_process(warm).await;
@@ -382,7 +384,7 @@ async fn runtime_loop(
                                 request.resume_session.as_deref(),
                                 selected_model.as_deref(),
                                 request.policy,
-                                &cwd,
+                                &leg_cwd,
                             );
                         }
                         let turn_program = check_cmd
@@ -410,7 +412,7 @@ async fn runtime_loop(
                                     Ok(None) => {
                                         let matches = Some(&warm.program) == turn_program.as_ref()
                                             && warm.argv == turn_argv
-                                            && warm.cwd == cwd
+                                            && warm.cwd == leg_cwd
                                             && warm.env_bin == turn_env_bin;
                                         if matches {
                                             // Drop the warm process group guard before adopting the
@@ -450,39 +452,31 @@ async fn runtime_loop(
                     }
                 }
                 CursorCommand::Cancel => {}
-                CursorCommand::ListModels => match list_models(&cwd).await {
-                    Ok((models, _advertised_default)) => {
-                        let selected = match &selected_model {
-                            Some(model)
-                                if dmuxai::model_policy::validate_model_for_runner(
-                                    "cursor", model,
-                                )
-                                .is_ok() =>
-                            {
-                                selected_model.clone()
-                            }
-                            _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
-                        };
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::ModelsListed {
-                                models,
-                                selected,
-                                selected_effort: None,
-                            },
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        send_event(
-                            &event_tx,
-                            None,
-                            AgentEvent::Error(AgentError::model_unavailable(error.to_string())),
-                        )
-                        .await;
-                    }
-                },
+                CursorCommand::ListModels => {
+                    let (models, _advertised_default) = list_models(&cwd).await;
+                    let selected = match &selected_model {
+                        Some(model)
+                            if dmuxai::model_policy::validate_model_for_runner(
+                                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                                model,
+                            )
+                            .is_ok() =>
+                        {
+                            selected_model.clone()
+                        }
+                        _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
+                    };
+                    send_event(
+                        &event_tx,
+                        None,
+                        AgentEvent::ModelsListed {
+                            models,
+                            selected,
+                            selected_effort: None,
+                        },
+                    )
+                    .await;
+                }
                 CursorCommand::SelectModel(model) => {
                     let changed = selected_model.as_ref() != Some(&model);
                     selected_model = Some(model.clone());
@@ -648,6 +642,7 @@ fn spawn_turn(
     let pgid = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
         warm_child.as_ref().and_then(|c| c.id()).unwrap_or(0),
     ));
+    let leg_cwd = super::request_cwd(&cwd, &request);
     let turn_pgid = pgid.clone();
     let context = OutputContext::from(&request);
     let error_context = context.clone();
@@ -664,7 +659,7 @@ fn spawn_turn(
             warm_child,
             selected_model,
             mode,
-            &cwd,
+            &leg_cwd,
             &event_tx,
             protocol,
             &turn_terminal_seen,
@@ -951,7 +946,13 @@ fn configure_command(
         ])
         .arg(cwd);
     let model = match selected_model {
-        Some(model) if dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok() => {
+        Some(model)
+            if dmuxai::model_policy::validate_model_for_runner(
+                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                model,
+            )
+            .is_ok() =>
+        {
             model
         }
         _ => dmuxai::model_policy::ALLOWED_MODEL,
@@ -1267,21 +1268,50 @@ fn normalize_event(message: &Value, state: &mut CursorStreamState) -> Vec<AgentE
     events
 }
 
-async fn list_models(cwd: &Path) -> io::Result<(Vec<ModelInfo>, Option<String>)> {
-    let mut command = cursor_command()?;
+const CURSOR_LIST_MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn resolve_cursor_list_program() -> PathBuf {
+    std::env::var_os("DMUXAI_CURSOR_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cursor-agent"))
+}
+
+fn static_cursor_catalog_models() -> (Vec<ModelInfo>, Option<String>) {
+    let models = dmuxai::agent_api::static_cursor_model_listing()
+        .models
+        .into_iter()
+        .map(|(id, label)| ModelInfo::new(id.clone(), label.unwrap_or(id)))
+        .collect();
+    (models, Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()))
+}
+
+async fn list_models(cwd: &Path) -> (Vec<ModelInfo>, Option<String>) {
+    let program = resolve_cursor_list_program();
+    list_models_with(&program, cwd, CURSOR_LIST_MODELS_TIMEOUT).await
+}
+
+pub(crate) async fn list_models_with(
+    program: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> (Vec<ModelInfo>, Option<String>) {
+    let mut command = dmuxai::process::headless_command(program.to_path_buf());
     apply_child_cwd_tokio(&mut command, cwd);
     command
         .arg("--list-models")
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let output = command.output().await?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Cursor model discovery failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    match tokio::time::timeout(timeout, command.output()).await {
+        Ok(Ok(output)) if output.status.success() => {
+            let parsed = parse_model_list(&String::from_utf8_lossy(&output.stdout));
+            if parsed.0.is_empty() {
+                static_cursor_catalog_models()
+            } else {
+                parsed
+            }
+        }
+        _ => static_cursor_catalog_models(),
     }
-    Ok(parse_model_list(&String::from_utf8_lossy(&output.stdout)))
 }
 
 fn parse_model_list(output: &str) -> (Vec<ModelInfo>, Option<String>) {
@@ -1933,6 +1963,43 @@ pub(crate) mod tests {
         assert_eq!(text, "II will");
     }
 
+    // TC-2930 / FR-2930: fan-out leg worktrees flow into cursor argv and cwd.
+    #[test]
+    fn tc_2930_cursor_spawn_uses_working_directory() {
+        use dmuxai::process::apply_child_cwd_tokio;
+        let default_cwd = Path::new("/tmp/main-ws");
+        let leg = Path::new("/tmp/main-ws/.dmuxai/fanout/run1/cursor");
+        let request = AgentRequest {
+            conversation_id: super::super::ConversationId::new("c"),
+            turn_id: super::super::TurnId::new("t"),
+            prompt: "hi".to_owned(),
+            resume_session: None,
+            image_paths: vec![],
+            policy: TurnPolicy::Agent,
+            require_file_edits: false,
+            system_prompt: None,
+            working_directory: Some(leg.to_path_buf()),
+        };
+        let leg_cwd = super::super::request_cwd(default_cwd, &request);
+        let mut command = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut command, None, None, TurnPolicy::Agent, &leg_cwd);
+        apply_child_cwd_tokio(&mut command, &leg_cwd);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--workspace" && pair[1] == leg.to_string_lossy()),
+            "cursor argv: {args:?}"
+        );
+        assert_eq!(
+            command.as_std().get_current_dir().map(PathBuf::from),
+            Some(leg.to_path_buf())
+        );
+    }
+
     #[test]
     fn cursor_resume_session_is_passed_to_the_command() {
         let cwd = Path::new("workspace");
@@ -1945,6 +2012,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
 
@@ -1984,6 +2052,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(
@@ -2019,6 +2088,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
 
         for disallowed in ["composer-2.5-fast", "claude-3-5-sonnet-fast", ""] {
@@ -2093,6 +2163,85 @@ pub(crate) mod tests {
         );
     }
 
+    // TC-3013 / FR-3011, FR-3008
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tc_3013_cursor_list_models_bounded_with_static_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let write_script = |name: &str, body: &str| -> PathBuf {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let hang = write_script("hang", "#!/bin/sh\nsleep 30\n");
+        let fail = write_script("fail", "#!/bin/sh\nexit 1\n");
+        let timeout = Duration::from_millis(300);
+
+        let (hang_models, _) = list_models_with(&hang, dir.path(), timeout).await;
+        assert!(!hang_models.is_empty());
+        assert!(hang_models.iter().any(|m| m.id == "claude-sonnet-5-5-high"));
+
+        let (fail_models, _) = list_models_with(&fail, dir.path(), timeout).await;
+        assert!(!fail_models.is_empty());
+        assert!(fail_models.iter().any(|m| m.id == "grok-4.7-high"));
+    }
+
+    // TC-3011 / FR-3008, FR-3009
+    #[test]
+    fn tc_3011_cursor_argv_passes_open_models_and_pins_default() {
+        let cwd = Path::new("workspace");
+        for model in ["claude-sonnet-5-5-high", "grok-4.7-high"] {
+            let mut cmd = tokio::process::Command::new("cursor-agent");
+            configure_command(&mut cmd, None, Some(model), TurnPolicy::ReadOnly, cwd);
+            let args = cmd
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(
+                args.windows(2).any(|w| w == ["--model", model]),
+                "open model {model} should reach argv: {args:?}"
+            );
+        }
+
+        let mut default_cmd = tokio::process::Command::new("cursor-agent");
+        configure_command(&mut default_cmd, None, None, TurnPolicy::ReadOnly, cwd);
+        let default_args = default_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            default_args
+                .windows(2)
+                .any(|w| w == ["--model", "composer-2.5"]),
+            "unset model should pin composer-2.5: {default_args:?}"
+        );
+
+        let mut fast_cmd = tokio::process::Command::new("cursor-agent");
+        configure_command(
+            &mut fast_cmd,
+            None,
+            Some("composer-2.5-fast"),
+            TurnPolicy::ReadOnly,
+            cwd,
+        );
+        let fast_args = fast_cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            fast_args
+                .windows(2)
+                .any(|w| w == ["--model", "composer-2.5"]),
+            "fast model should fall back to composer-2.5: {fast_args:?}"
+        );
+    }
+
     #[test]
     // FR-IMG-5: Cursor has no `--image` flag; image paths become `@path` tokens
     // appended to the prompt written to stdin.
@@ -2110,6 +2259,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let mut command = tokio::process::Command::new("cursor-agent");
         configure_command(
@@ -2142,6 +2292,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let cwd = Path::new("workspace");
 
@@ -2211,6 +2362,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let turn = tokio::spawn(async move {
             run_turn(
@@ -2467,6 +2619,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         adapter.send(req1).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2517,6 +2670,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         adapter.send(req2).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2589,6 +2743,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         adapter.send(request("turn-1", "first")).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -2699,6 +2854,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         }
     }
 
@@ -2955,6 +3111,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -3055,6 +3212,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         disabled_adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -3092,6 +3250,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         enabled_adapter.send_graph_node(graph_req).unwrap();
         assert!(
@@ -3181,6 +3340,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -3347,6 +3507,7 @@ pub(crate) mod tests {
                 policy,
                 require_file_edits: false,
                 system_prompt: None,
+                working_directory: None,
             }
         }
 
@@ -4014,6 +4175,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         adapter.send(req).unwrap();
         wait_for_turn_completion(&mut event_rx).await;
@@ -4190,6 +4352,7 @@ pub(crate) mod tests {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
         let cwd = dir.path().to_path_buf();
