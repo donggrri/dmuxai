@@ -28,7 +28,7 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
@@ -72,7 +72,8 @@ Notes:
   model is rejected before any turn starts with exit `5` (usage errors such as a
   missing value exit `2`); the accepted model is echoed in `triage.model`.
 - `dmuxai run -` reads the prompt from stdin:
-  `echo "summarize the repo" | dmuxai run - --agent agy --json`.
+  `echo "summarize the repo" | dmuxai run - --agent agy --json`. For Cursor use
+  `--agent cursor-agent` (or the alias `cursor`).
 - With `--json`, stdout carries only the JSON document(s); warnings/diagnostics go
   to stderr.
 
@@ -163,7 +164,7 @@ dmuxai events --follow --json
 `dashboard` (`{base_url, port, pid, token_file}` or `null`) and `warnings` (array).
 
 In `agents[]`:
-- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `id`: runner id (`cursor-agent`, `agy`, `codex`, or custom agent name)
 - `label`: display name
 - `allowed`: headless `run` admission under `[graph] allowed_runners` (true when unset)
 - `graph_allowed`: graph admission (built-in presets excluded when unset)
@@ -172,7 +173,7 @@ In `agents[]`:
 ### `runners` and `models` (SPEC-cli-runners-models)
 
 `dmuxai runners [--json]` lists registered runners in `status` order with:
-- `id`: runner id (`cursor`, `agy`, `codex`, or custom agent name)
+- `id`: runner id (`cursor-agent`, `agy`, `codex`, or custom agent name; `cursor-agent` also reports `"aliases": ["cursor"]`)
 - `label`: display name
 - `kind`: `"builtin"`, `"preset"`, or `"custom"`
 - `allowed`: headless admission under `[graph] allowed_runners` (true when unset)
@@ -347,7 +348,7 @@ defaults to the selected agent:
 | `cancel` | `agent?` | Ctrl+C |
 | `new_conversation` | `title?` | `/new` |
 | `load_conversation` | `id` | `/resume`, F3 |
-| `share` | `target` (`codex`/`cursor`/`agy`) | `/share` |
+| `share` | `target` (`codex`/`cursor-agent`/`agy`; `cursor` alias) | `/share` |
 | `status`, `toggle_details`, `quit` | — | `/status`, `/details`, `/quit` |
 
 Busy agents refuse mode/model/effort changes (409); runners outside
@@ -635,14 +636,22 @@ Per-runner and per-model system prompts. User config sets defaults; workspace `d
 | `stall_timeout_secs` | `240` | No-progress seconds that trigger a stall when the runner has a non-empty chain; `0` disables. |
 | `stall_api_retries` | `3` | Consecutive `API error (attempt N)` retry lines that trigger a stall; `0` disables. |
 
+Model policy (SPEC-open-model-lists): `cursor-agent` (`cursor`) and `agy` accept any non-fast model id their CLI reports (`dmuxai models --agent cursor-agent|agy`). Ids containing `fast` are blocked for every runner unless the **user** config sets:
+
+```toml
+[models]
+allow_fast = true   # user config only; a workspace dmuxai.toml [models] table is ignored
+```
+
+
 `[runners.<id>.models."<model>"]` accepts `system_prompt`, `system_prompt_file`, and `prompt_inject` with the same validation, 32 KiB cap, relative-path rules, and warnings as the runner table. Model ids match case-insensitively after trimming. An explicitly empty/whitespace prompt at the model or runner level means "no prompt" and stops resolution; it does not fall through to built-ins or `[runners.default]`.
 
 Resolution order for a turn's prompt (first match wins; built-ins only on write turns):
 
 1. `[runners.<runner>.models."<model>"]`
 2. `[runners.<runner>]`
-3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor` + `grok-4.7*` → Cursor Grok)
-4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor` → Cursor, `grok` → Grok Build)
+3. Built-in by model (`gemini-*` → AGY/Gemini Flash, `composer-2.5` → Cursor, runner `cursor-agent` + `grok-4.7*` → Cursor Grok)
+4. Built-in by runner (`agy` → AGY/Gemini Flash, `cursor-agent` → Cursor, `grok` → Grok Build)
 5. `[runners.default]`
 6. None
 
@@ -658,10 +667,10 @@ prompt_roles = ["chat", "worker"]
 [runners.codex]
 system_prompt_file = "prompts/codex.md"
 
-[runners.cursor]
+[runners.cursor-agent]
 builtin_prompt = false
 
-[runners.cursor.models."composer-2.5"]
+[runners.cursor-agent.models."composer-2.5"]
 system_prompt_file = "prompts/composer.md"
 prompt_inject = "session"
 ```

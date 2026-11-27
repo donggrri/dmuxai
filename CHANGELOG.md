@@ -8,6 +8,30 @@ All notable changes to dmuxai are listed here. Versions follow
 ### Added
 
 - **Decision board (v0.4.1, PR 1):** User-level coordinator board under `<state base>/board/` with lanes, rules, graph plan attach/edit, decisions, thread messages, blocking `board wait`, `dmuxai board` CLI, and MCP `board_*` tools (SPEC-decision-board FR-3100..FR-3115).
+- **Cursor runner id `cursor-agent` (SPEC-cursor-agent-keyword, FR-3200..FR-3209).** The canonical Cursor
+  runner id is now `cursor-agent` everywhere DmuxAI emits or stores an id (JSON, web API, events, run
+  journal, new conversation rows). The legacy spelling `cursor` is still accepted on read at every parse
+  boundary and normalizes to `cursor-agent`; existing on-disk data is not rewritten.
+  `dmuxai runners --json` reports `"id": "cursor-agent"` with `"aliases": ["cursor"]`. Config may use
+  `[runners.cursor-agent]` or legacy `[runners.cursor]`; when both tables set a key, `cursor-agent` wins
+  with one warning.
+
+### Changed
+
+- **Breaking-ish: Cursor runner id in output (SPEC-cursor-agent-keyword, FR-3207).** Consumers that parsed
+  the Cursor runner as `"cursor"` in `runners`/`models`/`status` JSON, headless outcome fields, events,
+  progress lines, run-journal manifests, web snapshots and graph plans must expect `cursor-agent` instead.
+  Input and config may still use `cursor`; downgrade note: binaries older than this change do not treat
+  `cursor-agent` conversation rows or manifests as the Cursor runner—keep a backup before downgrading.
+
+- **Open model lists for Cursor and AGY (SPEC-open-model-lists, FR-3000..FR-3011).** Cursor and AGY now accept
+  and list every model their CLIs report (for example `claude-sonnet-5-5-high`, `grok-4.7-high`,
+  `gemini-4-carbon-high`). `dmuxai models`, the MCP `models` tool and the pickers use
+  `cursor-agent --list-models` / `agy models` with a 10 s timeout, a 60 s cache and a verified static
+  fallback. The Cursor default stays `composer-2.5`. Models whose id contains `fast` stay blocked for every
+  runner unless the **user** config sets `[models] allow_fast = true` (a workspace `[models]` table is
+  ignored; the dashboard and F2 pickers never offer fast ids). AGY `SelectModel` now validates through the
+  policy. Opencode, Codex, Grok and custom-agent policies are unchanged.
 
 ## [0.4.0] - 2026-11-24
 

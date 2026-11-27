@@ -81,6 +81,11 @@ pub fn apply_child_env_policy_tokio(cmd: &mut Command) {
 pub fn apply_child_cwd(cmd: &mut std::process::Command, cwd: &Path) {
     cmd.current_dir(cwd);
     cmd.env("PWD", cwd);
+    if let Some(path) = cwd.to_str() {
+        cmd.env("DMUXAI_WORKSPACE", path);
+    } else {
+        cmd.env("DMUXAI_WORKSPACE", cwd.to_string_lossy().into_owned());
+    }
 }
 
 /// Tokio variant of [`apply_child_cwd`].

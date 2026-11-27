@@ -1169,7 +1169,7 @@ fn tc_2817_live_graph_and_approved_link() {
         .unwrap_or("")
         .to_owned();
     assert!(
-        header.contains("cursor") && header.contains("composer-2.5"),
+        header.contains("cursor-agent") && header.contains("composer-2.5"),
         "resolved runner/model in header: {header}"
     );
 

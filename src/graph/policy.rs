@@ -13,6 +13,26 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
     validate_policy_model(model_id)
 }
 
+/// Role-derived turn policy when `[graph] enforce_read_only_roles` is on (FR-2901).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeTurnPolicy {
+    ReadOnly,
+    Write,
+}
+
+/// Turn policy for a graph node when `[graph] enforce_read_only_roles` is on (FR-2901).
+pub fn node_turn_policy(role: NodeRole) -> Option<NodeTurnPolicy> {
+    match role {
+        NodeRole::Orchestrate => None,
+        NodeRole::Research
+        | NodeRole::Explore
+        | NodeRole::Plan
+        | NodeRole::Route
+        | NodeRole::Review => Some(NodeTurnPolicy::ReadOnly),
+        NodeRole::Implement | NodeRole::Draft | NodeRole::Test => Some(NodeTurnPolicy::Write),
+    }
+}
+
 pub fn model_for_role(role: NodeRole) -> &'static str {
     match role {
         NodeRole::Orchestrate => ORCHESTRATOR_MODEL,
@@ -38,21 +58,29 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
             return String::new();
         }
         if let Some(default) = settings.routing_default_agent.as_deref() {
-            let lower = default.trim().to_ascii_lowercase();
-            if allowed.contains(&lower) {
+            let lower = crate::runner_id::canonical_runner_id(default);
+            if allowed
+                .iter()
+                .any(|r| crate::runner_id::canonical_runner_id(r) == lower)
+            {
                 return lower;
             }
         }
-        if allowed.iter().any(|r| r == "cursor") {
-            return "cursor".to_owned();
+        if allowed
+            .iter()
+            .any(|r| crate::runner_id::canonical_runner_id(r) == crate::runner_id::CURSOR_RUNNER_ID)
+        {
+            return crate::runner_id::CURSOR_RUNNER_ID.to_owned();
         }
         return allowed[0].clone();
     }
 
     if let Some(default) = settings.routing_default_agent.as_deref() {
-        let lower = default.trim().to_ascii_lowercase();
-        let known = matches!(lower.as_str(), "agy" | "codex" | "cursor")
-            || crate::custom_agent::index_of(&lower).is_some()
+        let lower = crate::runner_id::canonical_runner_id(default);
+        let known = matches!(
+            lower.as_str(),
+            "agy" | "codex" | crate::runner_id::CURSOR_RUNNER_ID
+        ) || crate::custom_agent::index_of(&lower).is_some()
             || settings
                 .custom_agents
                 .iter()
@@ -61,7 +89,7 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
             return lower;
         }
     }
-    "cursor".to_owned()
+    crate::runner_id::CURSOR_RUNNER_ID.to_owned()
 }
 
 #[cfg(test)]
@@ -74,7 +102,10 @@ mod tests {
         let mut settings = DmuxSettings::default();
 
         // 1. None: baseline default is cursor
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         // 2. Routing default agent when allowed
         settings.routing_default_agent = Some("agy".to_owned());
@@ -84,7 +115,10 @@ mod tests {
         // 3. Routing default agent NOT allowed -> fallback to cursor if cursor is allowed
         settings.routing_default_agent = Some("codex".to_owned());
         settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         // 4. Neither default nor cursor allowed -> fallback to first allowed runner
         settings.routing_default_agent = Some("cursor".to_owned());
@@ -113,7 +147,10 @@ mod tests {
         let mut settings = DmuxSettings::default();
         settings.routing_default_agent = Some("codex".to_owned());
         settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "opencode".to_owned()]);
         assert_eq!(assign_runner(NodeRole::Implement, &settings), "agy");
@@ -129,11 +166,33 @@ mod tests {
             .push(crate::custom_agent::opencode_preset("opencode"));
         settings.routing_default_agent = Some("opencode".to_owned());
         assert!(!is_runner_allowed("opencode", &settings));
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         settings.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
         assert!(is_runner_allowed("opencode", &settings));
         assert_eq!(assign_runner(NodeRole::Implement, &settings), "opencode");
+    }
+
+    // TC-2901 / FR-2901
+    #[test]
+    fn tc_2901_role_policy_mapping_read_only_vs_write_roles() {
+        use super::NodeTurnPolicy;
+        for role in [
+            NodeRole::Research,
+            NodeRole::Explore,
+            NodeRole::Plan,
+            NodeRole::Route,
+            NodeRole::Review,
+        ] {
+            assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::ReadOnly));
+        }
+        for role in [NodeRole::Implement, NodeRole::Draft, NodeRole::Test] {
+            assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::Write));
+        }
+        assert_eq!(node_turn_policy(NodeRole::Orchestrate), None);
     }
 
     // TC-901 / FR-899
@@ -145,7 +204,10 @@ mod tests {
             .push(crate::custom_agent::grok_preset("grok"));
         settings.routing_default_agent = Some("grok".to_owned());
         assert!(!is_runner_allowed("grok", &settings));
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         settings.graph_allowed_runners = Some(vec!["grok".to_owned()]);
         assert!(is_runner_allowed("grok", &settings));

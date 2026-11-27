@@ -150,6 +150,41 @@ pub struct RunManifest {
     pub end_summary: Option<serde_json::Value>,
 }
 
+/// Normalizes legacy `"cursor"` `"agent"` / `"runner"` fields inside one JSONL
+/// progress line on read (FR-3208) without touching the file on disk.
+pub fn normalize_progress_line(line: &str) -> String {
+    let Ok(mut val) = serde_json::from_str::<serde_json::Value>(line) else {
+        return line.to_owned();
+    };
+    let Some(obj) = val.as_object_mut() else {
+        return line.to_owned();
+    };
+    let mut changed = false;
+    for key in ["agent", "runner"] {
+        if let Some(serde_json::Value::String(raw)) = obj.get(key) {
+            let canon = crate::runner_id::canonical_runner_id(raw);
+            if canon != *raw {
+                obj.insert(key.to_owned(), serde_json::Value::String(canon));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        serde_json::to_string(&val).unwrap_or_else(|_| line.to_owned())
+    } else {
+        line.to_owned()
+    }
+}
+
+fn normalize_manifest_runners(manifest: &mut RunManifest) {
+    if let Some(runner) = manifest.requested_runner.as_ref() {
+        manifest.requested_runner = Some(crate::runner_id::canonical_runner_id(runner));
+    }
+    if let Some(runner) = manifest.resolved_runner.as_ref() {
+        manifest.resolved_runner = Some(crate::runner_id::canonical_runner_id(runner));
+    }
+}
+
 /// Typed journal storage error.
 #[derive(Debug)]
 pub enum JournalError {
@@ -858,6 +893,8 @@ impl JournalStore {
             });
         }
 
+        let mut manifest = manifest;
+        normalize_manifest_runners(&mut manifest);
         Ok(manifest)
     }
 
@@ -1198,7 +1235,7 @@ impl JournalStore {
         let mut lines: Vec<String> = text
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| l.to_string())
+            .map(normalize_progress_line)
             .collect();
 
         // If we sought into the middle of the file (seek_pos > 0), the first line might be partial; drop it
@@ -1417,7 +1454,7 @@ fn safe_delete_run_dir(dir: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunStatus, mask_sensitive_tokens};
+    use super::{RunDiagnosticsRef, RunLinks, RunManifest, RunStatus, mask_sensitive_tokens};
 
     // TC-2816 / FR-2816: `approved` is a terminal status; FromStr, serde and
     // the manifest string all agree.
@@ -1473,5 +1510,98 @@ mod tests {
 
         let plain = r#"{"type":"progress","kind":"tool","summary":"read src/main.rs"}"#;
         assert_eq!(mask_sensitive_tokens(plain), plain);
+    }
+
+    // TC-3210 / FR-3208
+    #[test]
+    fn tc_3210_legacy_cursor_journal_runner_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::JournalStore::new(dir.path().to_path_buf());
+        let legacy_id = "0123456789abcdef";
+        let legacy_dir = dir.path().join(legacy_id);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_manifest = serde_json::json!({
+            "schema_version": 1,
+            "run_id": legacy_id,
+            "origin": "cli_headless",
+            "status": "completed",
+            "created_at_ms": 1,
+            "completed_at_ms": 2,
+            "duration_ms": 1,
+            "requested_runner": "cursor",
+            "resolved_runner": "cursor",
+            "links": {},
+            "diagnostics": { "stderr_bytes": 0 }
+        })
+        .to_string();
+        let manifest_path = legacy_dir.join("manifest.json");
+        std::fs::write(&manifest_path, &legacy_manifest).unwrap();
+        let legacy_progress = r#"{"type":"progress","ts_ms":1,"agent":"cursor","kind":"started","summary":"started"}"#;
+        let progress_path = legacy_dir.join("progress.jsonl");
+        std::fs::write(&progress_path, format!("{legacy_progress}\n")).unwrap();
+
+        let loaded = store.load(legacy_id).expect("load legacy manifest");
+        assert_eq!(
+            loaded.requested_runner.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        assert_eq!(
+            loaded.resolved_runner.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        let tail = store
+            .load_progress_tail(legacy_id, 10)
+            .expect("load legacy progress");
+        assert_eq!(tail.len(), 1);
+        let progress_val: serde_json::Value = serde_json::from_str(&tail[0]).unwrap();
+        assert_eq!(progress_val["agent"], crate::runner_id::CURSOR_RUNNER_ID);
+
+        // Files on disk are not rewritten.
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            legacy_manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(&progress_path).unwrap().trim(),
+            legacy_progress
+        );
+
+        let fresh_id = "fedcba9876543210";
+        let fresh = RunManifest {
+            schema_version: 1,
+            run_id: fresh_id.to_owned(),
+            origin: "cli_headless".to_owned(),
+            status: "completed".to_owned(),
+            created_at_ms: 1,
+            completed_at_ms: Some(2),
+            duration_ms: Some(1),
+            requested_runner: Some(crate::runner_id::CURSOR_RUNNER_ID.to_owned()),
+            resolved_runner: Some(crate::runner_id::CURSOR_RUNNER_ID.to_owned()),
+            requested_model: None,
+            resolved_model: None,
+            dmuxai_version: None,
+            build_commit: None,
+            pid: None,
+            dmuxai_exit_code: None,
+            child_exit_code: None,
+            child_signal: None,
+            error_kind: None,
+            error_summary: None,
+            links: RunLinks::default(),
+            diagnostics: RunDiagnosticsRef::default(),
+            end_summary: None,
+        };
+        store.save_relaxed(&fresh).unwrap();
+        let saved_raw = std::fs::read_to_string(dir.path().join(fresh_id).join("manifest.json"))
+            .expect("saved manifest");
+        let saved_json: serde_json::Value = serde_json::from_str(&saved_raw).unwrap();
+        assert_eq!(
+            saved_json["requested_runner"],
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+        assert_eq!(
+            saved_json["resolved_runner"],
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

@@ -26,7 +26,7 @@ impl FallbackTarget {
             Some(i) => (&raw[..i], Some(&raw[i + 1..])),
             None => (raw, None),
         };
-        let runner = runner_part.trim().to_ascii_lowercase();
+        let runner = crate::runner_id::canonical_runner_id(runner_part);
         if runner.is_empty() {
             return Err("empty runner".to_owned());
         }
@@ -104,6 +104,7 @@ impl FallbackSettings {
     ) -> Self {
         let mut settings = Self::default();
         for (id, toml) in tables {
+            let id = crate::runner_id::canonical_runner_id(id);
             let has_stall = toml.stall_timeout_secs.is_some() || toml.stall_api_retries.is_some();
             if toml.fallback.is_none() && !has_stall {
                 continue;
@@ -189,7 +190,7 @@ impl FallbackSettings {
     }
 
     pub fn config_for(&self, runner: &str) -> Option<&RunnerFallbackConfig> {
-        let id = runner.trim().to_ascii_lowercase();
+        let id = crate::runner_id::canonical_runner_id(runner);
         if let Some(c) = self.runners.get(&id) {
             return Some(c);
         }
@@ -200,7 +201,7 @@ impl FallbackSettings {
         let Some(cfg) = self.config_for(runner) else {
             return Vec::new();
         };
-        let runner_lc = runner.trim().to_ascii_lowercase();
+        let runner_lc = crate::runner_id::canonical_runner_id(runner);
         let cur = current_model.map(str::to_owned);
         cfg.chain()
             .iter()
