@@ -2600,9 +2600,9 @@ mod tests {
         assert!(BOARD_JS.contains("/check"));
     }
 
-    // TC-3312 (FR-3312, FR-3313)
+    // TC-3412 (FR-3412, FR-3413)
     #[test]
-    fn tc_3312_board_detail_is_centered_modal_with_close_and_esc() {
+    fn tc_3412_board_detail_is_centered_modal_with_close_and_esc() {
         assert!(INDEX_HTML.contains("id=\"board-drawer\""));
         assert!(INDEX_HTML.contains("role=\"dialog\""));
         assert!(INDEX_HTML.contains("aria-modal=\"true\""));
@@ -2628,9 +2628,9 @@ mod tests {
         assert!(!BOARD_CSS.contains("border-left: 1px solid var(--line)"));
     }
 
-    // TC-3318 (FR-3318, FR-3319, FR-3320)
+    // TC-3418 (FR-3418, FR-3419, FR-3420)
     #[test]
-    fn tc_3318_board_chat_send_asks_planner_unless_note_only() {
+    fn tc_3418_board_chat_send_asks_planner_unless_note_only() {
         assert!(!BOARD_JS.contains("board-ask-text"));
         assert!(BOARD_JS.contains("board-chat-input"));
         assert!(BOARD_JS.contains("board-chat-note-only"));
@@ -2654,9 +2654,9 @@ mod tests {
         assert!(BOARD_JS.contains("boardAskPlanner(item.id, true)"));
     }
 
-    // TC-3321 (FR-3321)
+    // TC-3421 (FR-3421)
     #[test]
-    fn tc_3321_readme_documents_board_chat_send() {
+    fn tc_3421_readme_documents_board_chat_send() {
         let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
         let readme = std::fs::read_to_string(&readme_path).expect("README.md readable");
         assert!(readme.contains("Decision board"));
@@ -2664,9 +2664,9 @@ mod tests {
         assert!(readme.contains("[board] planner"));
     }
 
-    // TC-3322 (FR-3322)
+    // TC-3422 (FR-3422)
     #[test]
-    fn tc_3322_tokenless_board_stream_and_client_header() {
+    fn tc_3422_tokenless_board_stream_and_client_header() {
         let open_es_fn = js_between(
             APP_JS,
             "window.dmuxaiOpenEventSource",
@@ -2689,9 +2689,9 @@ mod tests {
         assert!(BOARD_JS.contains("No answer yet"));
     }
 
-    // TC-3317 (FR-3316, FR-3317)
+    // TC-3417 (FR-3416, FR-3417)
     #[tokio::test]
-    async fn tc_3317_markdown_paths_linkified_and_open_viewer() {
+    async fn tc_3417_markdown_paths_linkified_and_open_viewer() {
         assert!(MD_VIEWER_JS.contains("md-path-link"));
         assert!(MD_VIEWER_JS.contains("data-md-path"));
         assert!(MD_VIEWER_JS.contains("/api/md/view"));

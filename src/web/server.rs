@@ -8574,10 +8574,10 @@ mod tests {
         assert!(crate::web::assets::JIRA_TODOS_JS.contains("window.dmuxaiStartDraft"));
     }
 
-    // TC-3322 / FR-3322: tokenless loopback GET /api/board/events is accepted,
+    // TC-3422 / FR-3422: tokenless loopback GET /api/board/events is accepted,
     // while a token-required server rejects it without a token.
     #[tokio::test]
-    async fn tc_3322_tokenless_loopback_board_events_accepted_and_token_required_rejected() {
+    async fn tc_3422_tokenless_loopback_board_events_accepted_and_token_required_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         let board = state.join("board");

@@ -1,6 +1,6 @@
 'use strict';
 
-/* Read-only Markdown file path linkifier and viewer modal (FR-3316, FR-3317). */
+/* Read-only Markdown file path linkifier and viewer modal (FR-3416, FR-3417). */
 (function () {
   var TOKEN_KEY = 'dmuxai.token';
   var SKIP_TAGS = { A: true, SCRIPT: true, STYLE: true, TEXTAREA: true, INPUT: true };
