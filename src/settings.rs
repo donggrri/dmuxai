@@ -48,15 +48,28 @@ fn parse_runners_tables(
 ) -> (
     BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
     BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
+    BTreeMap<String, bool>,
 ) {
     let cursor_conflict = runners_define_cursor_and_alias(&runners);
     let mut parsed_map = BTreeMap::new();
     let mut fallback_map = BTreeMap::new();
+    let mut enabled_map = BTreeMap::new();
     for (id, raw) in runners {
         let raw_norm = id.trim().to_ascii_lowercase();
         let canon_id = crate::runner_id::canonical_runner_id(&raw_norm);
         if cursor_conflict && raw_norm == "cursor-agent" {
             warnings.push(CURSOR_RUNNER_TABLE_CONFLICT.to_owned());
+        }
+        if let Some(enabled) = raw.enabled {
+            if scope == "user" {
+                if !canon_id.is_empty() && canon_id != "default" {
+                    enabled_map.insert(canon_id.clone(), enabled);
+                }
+            } else {
+                warnings.push(format!(
+                    "[runners.{canon_id}] enabled in workspace dmuxai.toml is ignored (user config only)"
+                ));
+            }
         }
         let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
             &canon_id, &raw, scope, base_dir, warnings,
@@ -71,7 +84,7 @@ fn parse_runners_tables(
             },
         );
     }
-    (parsed_map, fallback_map)
+    (parsed_map, fallback_map, enabled_map)
 }
 
 /// Web dashboard theme settings loaded from `[web]`.
@@ -339,6 +352,8 @@ pub struct DmuxSettings {
     /// Per-runner model profile from `[runners.<id>] model` (FR-1731), keys
     /// lowercased runner ids. `[runners.default] model` is ignored with a warning.
     pub runner_models: BTreeMap<String, String>,
+    /// User-config-only `[runners.<id>] enabled` overrides keyed by canonical runner id (FR-3307).
+    pub runner_enabled: BTreeMap<String, bool>,
     /// Runner fallback chains and stall policy from `[runners.<id>]`
     /// `fallback`/`stall_*` (SPEC-runner-fallback, FR-2101).
     pub runner_fallback: crate::runner_fallback::FallbackSettings,
@@ -711,6 +726,7 @@ impl DmuxSettings {
         let mut user_fallback_tables: Option<
             BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
         > = None;
+        let mut user_enabled: BTreeMap<String, bool> = BTreeMap::new();
         if let Some(user_path) = user_config_path
             && let Ok(contents) = std::fs::read_to_string(user_path)
         {
@@ -735,7 +751,7 @@ impl DmuxSettings {
                             Some(p) if !p.as_os_str().is_empty() => p,
                             _ => Path::new("."),
                         };
-                        let (parsed_map, fallback_map) = parse_runners_tables(
+                        let (parsed_map, fallback_map, enabled_map) = parse_runners_tables(
                             runners,
                             "user",
                             base_dir,
@@ -743,6 +759,7 @@ impl DmuxSettings {
                         );
                         user_runners = Some(parsed_map);
                         user_fallback_tables = Some(fallback_map);
+                        user_enabled = enabled_map;
                     }
                     configs.push(parsed);
                 }
@@ -835,7 +852,7 @@ impl DmuxSettings {
                     }
 
                     if let Some(runners) = parsed.runners.take() {
-                        let (parsed_map, fallback_map) = parse_runners_tables(
+                        let (parsed_map, fallback_map, _ignored_ws_enabled) = parse_runners_tables(
                             runners,
                             "workspace",
                             workspace,
@@ -857,6 +874,7 @@ impl DmuxSettings {
         settings.runner_prompts =
             crate::agent_prompt::merge_runner_prompts(user_runners, workspace_runners);
         settings.runner_models = BTreeMap::new();
+        settings.runner_enabled = user_enabled;
 
         // FR-810/FR-811 and FR-890/FR-891: a built-in preset is registered only
         // when its flag is not false, no config names that agent, and the
@@ -1593,12 +1611,19 @@ impl DmuxSettings {
 }
 
 impl DmuxSettings {
+    /// Whether `runner` is enabled in the user config (SPEC-runner-status FR-3307; default true).
+    pub fn runner_enabled(&self, id: &str) -> bool {
+        let canon = crate::runner_id::canonical_runner_id(id);
+        self.runner_enabled.get(&canon).copied().unwrap_or(true)
+    }
+
     /// Whether `runner` may take graph nodes (SPEC-first-run FR-813,
-    /// SPEC-grok-runner FR-899). An unset `allowed_runners` admits every runner
-    /// except built-in presets; a listed runner, including a preset, is admitted.
+    /// SPEC-grok-runner FR-899, SPEC-runner-status FR-3307). An unset
+    /// `allowed_runners` admits every enabled runner except built-in presets; a
+    /// listed runner, including a preset, is admitted only when also enabled.
     pub fn graph_runner_allowed(&self, runner: &str) -> bool {
         let runner = crate::runner_id::canonical_runner_id(runner);
-        if runner.is_empty() {
+        if runner.is_empty() || !self.runner_enabled(&runner) {
             return false;
         }
         match &self.graph_allowed_runners {
@@ -2291,6 +2316,7 @@ impl Default for DmuxSettings {
             jira_raw: JiraToml::default(),
             runner_prompts: BTreeMap::new(),
             runner_models: BTreeMap::new(),
+            runner_enabled: BTreeMap::new(),
             runner_fallback: Default::default(),
             runs: crate::run_journal::JournalConfig::default(),
             terminal: crate::term::policy::TerminalSettings::default(),
@@ -2623,6 +2649,498 @@ pub fn default_user_config_path_from(env: &RuntimeEnv) -> Option<PathBuf> {
         return Some(home_path.join(".config").join("dmuxai").join("dmuxai.toml"));
     }
     None
+}
+
+fn parse_toml_key_path(input: &str) -> Option<Vec<String>> {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut parts = Vec::new();
+    loop {
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let seg = if bytes[i] == b'"' {
+            i += 1;
+            let mut s = String::new();
+            let mut closed = false;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let esc = bytes[i + 1];
+                    match esc {
+                        b'"' => s.push('"'),
+                        b'\\' => s.push('\\'),
+                        b'n' => s.push('\n'),
+                        b't' => s.push('\t'),
+                        b'r' => s.push('\r'),
+                        other => s.push(other as char),
+                    }
+                    i += 2;
+                } else if bytes[i] == b'"' {
+                    i += 1;
+                    closed = true;
+                    break;
+                } else {
+                    let ch = input[i..].chars().next()?;
+                    s.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            if !closed {
+                return None;
+            }
+            s
+        } else if bytes[i] == b'\'' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                return None;
+            }
+            let s = input[start..i].to_owned();
+            i += 1;
+            s
+        } else {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+            {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            input[start..i].to_owned()
+        };
+        parts.push(seg);
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return Some(parts);
+        }
+        if bytes[i] == b'.' {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+}
+
+fn find_unquoted_eq(code: &str) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'=' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn scan_toml_line_code(line: &str, in_multiline: &mut Option<&'static str>) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    if let Some(delim) = *in_multiline {
+        while i < bytes.len() {
+            if delim == "\"\"\"" && bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if line[i..].starts_with(delim) {
+                *in_multiline = None;
+                break;
+            }
+            i += 1;
+        }
+        if in_multiline.is_some() {
+            return None;
+        }
+        // Rest of line after closing multiline delimiter (only comments/whitespace allowed in TOML).
+        return Some(String::new());
+    }
+
+    let mut code = String::new();
+    while i < bytes.len() {
+        if line[i..].starts_with("\"\"\"") {
+            *in_multiline = Some("\"\"\"");
+            code.push_str("\"\"\"");
+            i += 3;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    let ch_len = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+                    code.push_str(&line[i..i + 1 + ch_len]);
+                    i += 1 + ch_len;
+                    continue;
+                }
+                if line[i..].starts_with("\"\"\"") {
+                    code.push_str("\"\"\"");
+                    i += 3;
+                    *in_multiline = None;
+                    break;
+                }
+                let ch = line[i..].chars().next().unwrap();
+                code.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        if line[i..].starts_with("'''") {
+            *in_multiline = Some("'''");
+            code.push_str("'''");
+            i += 3;
+            while i < bytes.len() {
+                if line[i..].starts_with("'''") {
+                    code.push_str("'''");
+                    i += 3;
+                    *in_multiline = None;
+                    break;
+                }
+                let ch = line[i..].chars().next().unwrap();
+                code.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        match bytes[i] {
+            b'#' => break,
+            b'"' => {
+                code.push('"');
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        let ch_len = line[i + 1..].chars().next().map_or(1, char::len_utf8);
+                        code.push_str(&line[i..i + 1 + ch_len]);
+                        i += 1 + ch_len;
+                    } else if bytes[i] == b'"' {
+                        code.push('"');
+                        i += 1;
+                        break;
+                    } else {
+                        let ch = line[i..].chars().next().unwrap();
+                        code.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+            b'\'' => {
+                code.push('\'');
+                i += 1;
+                while i < bytes.len() {
+                    let ch = line[i..].chars().next().unwrap();
+                    code.push(ch);
+                    i += ch.len_utf8();
+                    if ch == '\'' {
+                        break;
+                    }
+                }
+            }
+            _ => {
+                let ch = line[i..].chars().next().unwrap();
+                code.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    Some(code.trim().to_owned())
+}
+
+fn format_toml_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        key.to_owned()
+    } else {
+        format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// Edits `[runners.<id>] enabled` in TOML text using a comment-preserving
+/// line-based edit (SPEC-runner-status FR-3308).
+pub fn set_runner_enabled_in_toml(
+    text: &str,
+    runner: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    let canon = crate::runner_id::canonical_runner_id(runner);
+    if canon.is_empty() || canon == "default" {
+        return Err(format!("invalid runner id '{runner}'"));
+    }
+
+    let parsed_val: toml::Value =
+        toml::from_str(text).map_err(|e| format!("user config is not valid TOML: {e}"))?;
+    if let Some(runners_val) = parsed_val.get("runners")
+        && !runners_val.is_table()
+    {
+        return Err("`runners` in user config is not a table".to_owned());
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    enum Section {
+        Root,
+        RunnersRoot,
+        Runner { key: String, header_line: usize },
+        Other,
+    }
+
+    struct FoundTable {
+        raw_key: String,
+        header_line: usize,
+        enabled_line: Option<usize>,
+    }
+
+    let ends_with_newline = text.ends_with('\n');
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut in_multiline: Option<&'static str> = None;
+    let mut section = Section::Root;
+    let mut found_tables: Vec<FoundTable> = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(code) = scan_toml_line_code(line, &mut in_multiline) else {
+            continue;
+        };
+        if code.is_empty() {
+            continue;
+        }
+        if code.starts_with("[[") && code.ends_with("]]") {
+            let inner = &code[2..code.len() - 2];
+            if let Some(segs) = parse_toml_key_path(inner)
+                && segs.first().is_some_and(|s| s == "runners")
+            {
+                return Err("`runners` array-of-tables cannot be edited safely".to_owned());
+            }
+            section = Section::Other;
+            continue;
+        }
+        if code.starts_with('[') && code.ends_with(']') {
+            let inner = &code[1..code.len() - 1];
+            let segs = parse_toml_key_path(inner)
+                .ok_or_else(|| format!("unrecognized TOML table header: {code}"))?;
+            if segs.as_slice() == ["runners"] {
+                section = Section::RunnersRoot;
+            } else if segs.len() == 2 && segs[0] == "runners" {
+                let raw_key = segs[1].clone();
+                if crate::runner_id::canonical_runner_id(&raw_key) == canon {
+                    found_tables.push(FoundTable {
+                        raw_key: raw_key.clone(),
+                        header_line: idx,
+                        enabled_line: None,
+                    });
+                }
+                section = Section::Runner {
+                    key: raw_key,
+                    header_line: idx,
+                };
+            } else {
+                section = Section::Other;
+            }
+            continue;
+        }
+
+        if let Some(eq_pos) = find_unquoted_eq(&code) {
+            let lhs = &code[..eq_pos];
+            let key_path = parse_toml_key_path(lhs)
+                .ok_or_else(|| format!("unrecognized TOML key assignment: {code}"))?;
+            match &section {
+                Section::Root => {
+                    if key_path.first().is_some_and(|k| k == "runners") {
+                        return Err("cannot safely edit inline or dotted `runners` key".to_owned());
+                    }
+                }
+                Section::RunnersRoot => {
+                    if key_path
+                        .first()
+                        .is_some_and(|k| crate::runner_id::canonical_runner_id(k) == canon)
+                    {
+                        return Err(format!(
+                            "cannot safely edit inline or dotted `runners.{canon}` key"
+                        ));
+                    }
+                }
+                Section::Runner { key, header_line } => {
+                    if crate::runner_id::canonical_runner_id(key) == canon {
+                        if key_path.len() == 1 && key_path[0] == "enabled" {
+                            if let Some(tbl) = found_tables
+                                .iter_mut()
+                                .find(|t| t.header_line == *header_line)
+                            {
+                                tbl.enabled_line = Some(idx);
+                            }
+                        } else if key_path.first().is_some_and(|k| k == "enabled") {
+                            return Err("`enabled` is not a boolean key".to_owned());
+                        }
+                    }
+                }
+                Section::Other => {}
+            }
+        }
+    }
+
+    // Prefer exact canonical table header when both `[runners.cursor]` and `[runners.cursor-agent]` exist;
+    // otherwise reuse existing alias header (e.g. `[runners.cursor]`).
+    let chosen_idx = found_tables
+        .iter()
+        .rposition(|t| t.raw_key == canon)
+        .or_else(|| found_tables.len().checked_sub(1));
+
+    let raw_key_used = if let Some(idx) = chosen_idx {
+        found_tables[idx].raw_key.clone()
+    } else {
+        canon.clone()
+    };
+
+    if let Some(runners_tbl) = parsed_val.get("runners").and_then(|v| v.as_table())
+        && let Some(entry) = runners_tbl.get(&raw_key_used)
+        && !entry.is_table()
+    {
+        return Err(format!("`runners.{raw_key_used}` is not a table"));
+    }
+
+    let mut out_ends_with_newline = ends_with_newline;
+    if enabled {
+        if let Some(idx) = chosen_idx
+            && let Some(line_idx) = found_tables[idx].enabled_line
+        {
+            lines.remove(line_idx);
+        } else {
+            return Ok(text.to_owned());
+        }
+    } else if let Some(idx) = chosen_idx {
+        let table = &found_tables[idx];
+        if let Some(line_idx) = table.enabled_line {
+            lines[line_idx] = "enabled = false".to_owned();
+        } else {
+            lines.insert(table.header_line + 1, "enabled = false".to_owned());
+        }
+    } else {
+        if !lines.is_empty() && lines.last().is_some_and(|l| !l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("[runners.{}]", format_toml_key(&canon)));
+        lines.push("enabled = false".to_owned());
+        out_ends_with_newline = true;
+    }
+
+    let mut updated = lines.join("\n");
+    if out_ends_with_newline && !lines.is_empty() {
+        updated.push('\n');
+    }
+
+    // Always re-parse and verify the expected `runners.<id>.enabled` value.
+    let verified: toml::Value = toml::from_str(&updated)
+        .map_err(|e| format!("edited TOML failed re-parse verification: {e}"))?;
+    let actual_enabled = verified
+        .get("runners")
+        .and_then(|r| r.as_table())
+        .and_then(|t| t.get(&raw_key_used))
+        .and_then(|r| r.as_table())
+        .and_then(|t| t.get("enabled"));
+
+    if enabled {
+        if actual_enabled.is_some() {
+            return Err("verification failed: `enabled` still present after enable".to_owned());
+        }
+    } else if actual_enabled != Some(&toml::Value::Boolean(false)) {
+        return Err("verification failed: `enabled` is not false after disable".to_owned());
+    }
+
+    Ok(updated)
+}
+
+fn user_config_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn atomic_write_user_config(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".dmuxai.toml.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            if let Ok(meta) = std::fs::metadata(path) {
+                options.mode(meta.permissions().mode() & 0o777);
+            } else {
+                options.mode(0o600);
+            }
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Updates `[runners.<id>] enabled` in the user config file atomically (FR-3308).
+/// Never modifies any workspace `dmuxai.toml`.
+pub fn set_runner_enabled_in_user_config(
+    env: &RuntimeEnv,
+    runner: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let path = default_user_config_path_from(env).ok_or_else(|| {
+        "cannot locate user config directory (HOME / XDG_CONFIG_HOME unset)".to_owned()
+    })?;
+    let _guard = user_config_write_lock();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let updated = set_runner_enabled_in_toml(&existing, runner, enabled)?;
+    atomic_write_user_config(&path, &updated)
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -6876,5 +7394,150 @@ fallback = ["agy:composer-2.5"]
         });
         run.normalize_legacy_runners();
         assert_eq!(run.plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
+    }
+
+    // TC-3306 / FR-3307
+    #[test]
+    fn tc_3306_runner_enabled_user_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let user_cfg = dir.path().join("user.toml");
+
+        // 1. User config disables `cursor` (alias -> cursor-agent) and allows `agy` in allowed_runners,
+        //    while workspace tries to disable `agy` -> workspace is ignored with warning, user honoured.
+        std::fs::write(
+            &user_cfg,
+            r#"
+[runners.cursor]
+enabled = false
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor-agent", "agy"]
+
+[runners.agy]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&ws, Some(&user_cfg));
+        assert!(!settings.runner_enabled("cursor"));
+        assert!(!settings.runner_enabled(crate::runner_id::CURSOR_RUNNER_ID));
+        assert!(settings.runner_enabled("agy"));
+        assert!(!settings.graph_runner_allowed("cursor"));
+        assert!(!settings.graph_runner_allowed(crate::runner_id::CURSOR_RUNNER_ID));
+        assert!(settings.graph_runner_allowed("agy"));
+        assert!(
+            settings.config_warnings.iter().any(|w| w.contains(
+                "[runners.agy] enabled in workspace dmuxai.toml is ignored (user config only)"
+            )),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+
+        // 2. Non-bool `enabled` in user config produces a warning and keeps enabled = true (no panic).
+        //    Note: serde rejects the malformed TOML file as a whole with a warning today.
+        std::fs::write(&user_cfg, "[runners.agy]\nenabled = \"nope\"\n").unwrap();
+        let bad_settings = DmuxSettings::load_with_user_config(&ws, Some(&user_cfg));
+        assert!(bad_settings.runner_enabled("agy"));
+        assert!(
+            bad_settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("ignored")),
+            "warnings: {:?}",
+            bad_settings.config_warnings
+        );
+    }
+
+    // TC-3307 / FR-3308
+    #[test]
+    fn tc_3307_set_runner_enabled_in_toml() {
+        // 1. Existing table + comments preserved + idempotent disable + enable removes key
+        let with_comments = "\
+# top comment
+[graph]
+max_parallel = 2 # keep inline
+
+# runner section
+[runners.agy]
+# keep model comment
+model = \"gemini-4-hydrogen-high\"
+";
+        let disabled = set_runner_enabled_in_toml(with_comments, "agy", false).unwrap();
+        assert!(disabled.contains("# top comment"));
+        assert!(disabled.contains("# keep inline"));
+        assert!(disabled.contains("# runner section"));
+        assert!(disabled.contains("# keep model comment"));
+        assert!(disabled.contains("[runners.agy]\nenabled = false\n"));
+        assert_eq!(
+            set_runner_enabled_in_toml(&disabled, "agy", false).unwrap(),
+            disabled
+        );
+
+        let re_enabled = set_runner_enabled_in_toml(&disabled, "agy", true).unwrap();
+        assert_eq!(re_enabled, with_comments);
+        // No-op when already enabled
+        assert_eq!(
+            set_runner_enabled_in_toml(&re_enabled, "agy", true).unwrap(),
+            re_enabled
+        );
+
+        // 2. Missing table appends `[runners.<id>]` with blank line separator
+        let appended =
+            set_runner_enabled_in_toml("[graph]\nmax_parallel = 2\n", "codex", false).unwrap();
+        assert_eq!(
+            appended,
+            "[graph]\nmax_parallel = 2\n\n[runners.codex]\nenabled = false\n"
+        );
+        let parsed: toml::Value = toml::from_str(&appended).unwrap();
+        assert_eq!(
+            parsed["runners"]["codex"]["enabled"],
+            toml::Value::Boolean(false)
+        );
+
+        // 3. Reuses existing `[runners.cursor]` header when normalizing `cursor-agent`
+        let cursor_alias = "[runners.cursor]\nmodel = \"composer-2.5\"\n";
+        let cursor_disabled =
+            set_runner_enabled_in_toml(cursor_alias, crate::runner_id::CURSOR_RUNNER_ID, false)
+                .unwrap();
+        assert!(!cursor_disabled.contains("[runners.cursor-agent]"));
+        assert!(cursor_disabled.contains("[runners.cursor]\nenabled = false\n"));
+
+        // 4. Inline `runners = {}` and invalid TOML are refused with input untouched
+        assert!(set_runner_enabled_in_toml("runners = {}\n", "agy", false).is_err());
+        assert!(set_runner_enabled_in_toml("runners.agy.enabled = true\n", "agy", false).is_err());
+        assert!(set_runner_enabled_in_toml("not valid = [ toml\n", "agy", false).is_err());
+
+        // 5. Atomic user config write keeps mode, sets 0600 on new file, never touches workspace
+        let dir = tempfile::tempdir().unwrap();
+        let ws_cfg = dir.path().join("dmuxai.toml");
+        std::fs::write(&ws_cfg, "[graph]\nmax_parallel = 2\n").unwrap();
+        let user_cfg = dir.path().join("cfg").join("user.toml");
+        let env = RuntimeEnv {
+            config_path: Some(user_cfg.clone()),
+            ..Default::default()
+        };
+        set_runner_enabled_in_user_config(&env, "agy", false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ws_cfg).unwrap(),
+            "[graph]\nmax_parallel = 2\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&user_cfg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            std::fs::set_permissions(&user_cfg, std::fs::Permissions::from_mode(0o640)).unwrap();
+            set_runner_enabled_in_user_config(&env, "agy", true).unwrap();
+            let mode_after = std::fs::metadata(&user_cfg).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode_after, 0o640);
+        }
     }
 }

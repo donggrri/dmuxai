@@ -3044,8 +3044,11 @@ impl App {
         }
     }
 
-    /// Whether `[graph] allowed_runners` permits a runner (unset = every runner).
+    /// Whether `[graph] allowed_runners` and `[runners.<id>] enabled` permit a runner.
     fn runner_is_allowed(&self, runner_id: &str) -> bool {
+        if !self.settings.runner_enabled(runner_id) {
+            return false;
+        }
         let canon = dmuxai::runner_id::canonical_runner_id(runner_id);
         match &self.settings.graph_allowed_runners {
             None => true,
@@ -3055,9 +3058,13 @@ impl App {
         }
     }
 
-    /// The refusal for a runner outside `allowed_runners`, worded like the
-    /// prompt route (FR-781).
+    /// The refusal for a disabled runner or a runner outside `allowed_runners` (FR-781, FR-3307).
     fn runner_forbidden(&self, runner_id: &str) -> RunTodoError {
+        if !self.settings.runner_enabled(runner_id) {
+            return RunTodoError::Forbidden(format!(
+                "runner '{runner_id}' is disabled; run `dmuxai runners enable {runner_id}`"
+            ));
+        }
         match &self.settings.graph_allowed_runners {
             Some(allowed) if allowed.is_empty() => {
                 RunTodoError::Forbidden("no allowed runners".to_owned())
@@ -15981,11 +15988,18 @@ impl App {
             let target_agent = adapter.agent();
             let runner_id = runner_name(target_agent);
             if !dmuxai::agent_api::runner_run_admitted(&self.settings, runner_id) {
+                let msg = if !self.settings.runner_enabled(runner_id) {
+                    format!(
+                        "runner '{runner_id}' is disabled; run `dmuxai runners enable {runner_id}`"
+                    )
+                } else {
+                    format!("runner '{runner_id}' is not in allowed_runners")
+                };
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::FORBIDDEN,
                     self.conversation_id.as_str().to_owned(),
                     Some(runner_id.to_owned()),
-                    format!("runner '{runner_id}' is not in allowed_runners"),
+                    msg,
                 )
                 .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }
@@ -16013,11 +16027,18 @@ impl App {
             let target_agent = self.adapters[self.selected].agent();
             let runner_id = runner_name(target_agent);
             if !dmuxai::agent_api::runner_run_admitted(&self.settings, runner_id) {
+                let msg = if !self.settings.runner_enabled(runner_id) {
+                    format!(
+                        "runner '{runner_id}' is disabled; run `dmuxai runners enable {runner_id}`"
+                    )
+                } else {
+                    format!("runner '{runner_id}' is not in allowed_runners")
+                };
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::FORBIDDEN,
                     self.conversation_id.as_str().to_owned(),
                     Some(runner_id.to_owned()),
-                    format!("runner '{runner_id}' is not in allowed_runners"),
+                    msg,
                 )
                 .with_error_kind(AgentErrorKind::Policy.as_str().to_owned());
             }

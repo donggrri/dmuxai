@@ -158,10 +158,14 @@ pub fn runner_allowed(settings: &DmuxSettings, runner: &str) -> bool {
 }
 
 /// Headless run admission: whether `runner` may run under `[graph] allowed_runners`
-/// (FR-2838). With the list unset, every registered runner is admitted (true).
-/// With the list set, membership decides admission (empty list = false).
+/// (FR-2838) and `[runners.<id>] enabled` (FR-3307). With `allowed_runners`
+/// unset, every enabled registered runner is admitted (true). With the list set,
+/// membership and `enabled` decide admission (empty list = false).
 pub fn runner_run_admitted(settings: &DmuxSettings, runner: &str) -> bool {
     let runner = crate::runner_id::canonical_runner_id(runner);
+    if !settings.runner_enabled(&runner) {
+        return false;
+    }
     match &settings.graph_allowed_runners {
         None => true,
         Some(allowed) => allowed
@@ -362,7 +366,7 @@ pub fn status_json(workspace_root: &Path) -> Value {
     })
 }
 
-fn runner_installed(id: &str, spec: Option<&CustomAgentSpec>) -> Option<bool> {
+pub(crate) fn runner_installed(id: &str, spec: Option<&CustomAgentSpec>) -> Option<bool> {
     if id.eq_ignore_ascii_case(crate::runner_id::CURSOR_RUNNER_ID) {
         if let Some(bin) = std::env::var_os("DMUXAI_CURSOR_BIN") {
             let text = bin.to_string_lossy();
@@ -439,6 +443,7 @@ pub fn runners_json(settings: &DmuxSettings) -> Value {
             } else {
                 "custom"
             };
+            let enabled = settings.runner_enabled(&id);
             let allowed = runner_run_admitted(settings, &id);
             let graph_allowed = settings.graph_runner_allowed(&id);
             let installed = runner_installed(&id, spec);
@@ -474,6 +479,7 @@ pub fn runners_json(settings: &DmuxSettings) -> Value {
             }
             entry.insert("label".to_owned(), json!(label));
             entry.insert("kind".to_owned(), json!(kind));
+            entry.insert("enabled".to_owned(), json!(enabled));
             entry.insert("allowed".to_owned(), json!(allowed));
             entry.insert("graph_allowed".to_owned(), json!(graph_allowed));
             entry.insert("installed".to_owned(), json!(installed));
@@ -635,7 +641,7 @@ fn store_model_listing_cache(
     );
 }
 
-fn resolve_cursor_program_path() -> PathBuf {
+pub(crate) fn resolve_cursor_program_path() -> PathBuf {
     if let Some(bin) = std::env::var_os("DMUXAI_CURSOR_BIN") {
         PathBuf::from(bin)
     } else {
@@ -643,7 +649,7 @@ fn resolve_cursor_program_path() -> PathBuf {
     }
 }
 
-fn resolve_agy_program_path() -> PathBuf {
+pub(crate) fn resolve_agy_program_path() -> PathBuf {
     crate::process::resolve_program("DMUXAI_AGY_BIN", "agy")
 }
 
@@ -2127,5 +2133,83 @@ mod tests {
             .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
             .expect("cursor in status");
         assert_eq!(cursor_status["id"], crate::runner_id::CURSOR_RUNNER_ID);
+    }
+
+    // TC-3311 / NFR-3310, FR-3307
+    #[test]
+    fn tc_3311_runners_listing_spawns_nothing() {
+        let _guard = crate::state_path::test_env_lock();
+        let prev_cursor = std::env::var_os("DMUXAI_CURSOR_BIN");
+        let prev_agy = std::env::var_os("DMUXAI_AGY_BIN");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_cfg = std::env::var_os("DMUXAI_CONFIG");
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("spawned.marker");
+        let fake_bin = dir.path().join("fake-runner");
+        std::fs::write(
+            &fake_bin,
+            format!("#!/usr/bin/env bash\ntouch \"{}\"\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let user_cfg = dir.path().join("user.toml");
+        std::fs::write(&user_cfg, "[runners.agy]\nenabled = false\n").unwrap();
+
+        // SAFETY: serialized by test_env_lock().
+        unsafe {
+            std::env::set_var("DMUXAI_CURSOR_BIN", &fake_bin);
+            std::env::set_var("DMUXAI_AGY_BIN", &fake_bin);
+            std::env::set_var("DMUXAI_CONFIG", &user_cfg);
+        }
+
+        let settings = DmuxSettings::load(dir.path());
+        let val = runners_json(&settings);
+        let runners = val["runners"].as_array().expect("runners array");
+        let agy = runners.iter().find(|r| r["id"] == "agy").unwrap();
+        assert_eq!(agy["enabled"], false);
+        assert_eq!(agy["allowed"], false);
+        let cursor = runners
+            .iter()
+            .find(|r| r["id"] == crate::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
+        assert_eq!(cursor["enabled"], true);
+        assert_eq!(cursor["allowed"], true);
+        assert!(
+            !marker.exists(),
+            "runners_json and DmuxSettings::load must not spawn any runner process"
+        );
+
+        // Regression (FR-3307): disabled runner is refused even when listed in allowed_runners.
+        let mut restricted = settings.clone();
+        restricted.graph_allowed_runners = Some(vec!["agy".to_owned(), "cursor-agent".to_owned()]);
+        assert!(!runner_run_admitted(&restricted, "agy"));
+        assert!(!restricted.graph_runner_allowed("agy"));
+        assert!(runner_run_admitted(&restricted, "cursor-agent"));
+        assert!(restricted.graph_runner_allowed("cursor-agent"));
+
+        // SAFETY: serialized by test_env_lock().
+        unsafe {
+            match prev_cursor {
+                Some(v) => std::env::set_var("DMUXAI_CURSOR_BIN", v),
+                None => std::env::remove_var("DMUXAI_CURSOR_BIN"),
+            }
+            match prev_agy {
+                Some(v) => std::env::set_var("DMUXAI_AGY_BIN", v),
+                None => std::env::remove_var("DMUXAI_AGY_BIN"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_cfg {
+                Some(v) => std::env::set_var("DMUXAI_CONFIG", v),
+                None => std::env::remove_var("DMUXAI_CONFIG"),
+            }
+        }
     }
 }
