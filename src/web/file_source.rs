@@ -106,6 +106,7 @@ mod tests {
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             },
             conversation_id: "conv-1".to_string(),
             phase: GraphRunPhase::Active,

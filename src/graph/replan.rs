@@ -8,11 +8,14 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::settings::SpecFirstMode;
+
 use super::judge::{PromptBlocked, json_objects, reject_data};
 use super::plan_doc::{
     PlanContext, PlanDoc, PlanError, PlanStep, optional_tasks_from_value, push_block,
     step_from_value, validate_plan_with_limit,
 };
+use super::spec_first::replan_prompt_for;
 use super::tasks::{TaskState, task_status};
 use super::types::{
     GraphNode, GraphNodeStatus, GraphPlan, GraphRun, NodeRole, PlanChange, PlanChangeKind, PlanTask,
@@ -90,6 +93,7 @@ const REASON_MAX_CHARS: usize = 300;
 /// Builds the replan turn prompt. Every data item is cut on a char boundary
 /// and placed in its own nonce DATA block; a body containing the closing
 /// marker rejects the turn (NFR-930).
+#[allow(clippy::too_many_arguments)]
 pub fn build_replan_prompt(
     run: &GraphRun,
     trigger: ReplanTrigger,
@@ -97,6 +101,8 @@ pub fn build_replan_prompt(
     summaries: &[(String, String)],
     ctx: &PlanContext<'_>,
     nonce: &str,
+    spec_first: SpecFirstMode,
+    spec_dir: &str,
 ) -> Result<String, PromptBlocked> {
     let goal = cut_chars(&run.plan.user_prompt, GOAL_MAX_CHARS);
     let reason = cut_chars(reason, REASON_MAX_CHARS);
@@ -114,7 +120,7 @@ pub fn build_replan_prompt(
     reject_data(nonce, &others)?;
 
     let mut out = String::new();
-    out.push_str(REPLAN_PROMPT);
+    out.push_str(&replan_prompt_for(spec_first, spec_dir));
     out.push('\n');
     out.push_str(&format!(
         "Replans left: {}\nExecutable nodes left: {}\n",
@@ -925,6 +931,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             },
             ..Default::default()
         }
@@ -1561,6 +1568,8 @@ mod tests {
             &[("a".to_owned(), long_summary)],
             &ctx.context("goal"),
             "nonce1",
+            SpecFirstMode::Off,
+            "docs/specs",
         )
         .unwrap();
         assert!(prompt.contains(&"a".repeat(2_000)));
@@ -1636,6 +1645,7 @@ mod tests {
             limits: GraphLimits::default(),
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         }
     }
 
@@ -1894,6 +1904,8 @@ Mark a step with \"sensitive\": true when it deploys, migrates, or touches auth,
             &[("a".to_owned(), hostile.to_owned())],
             &ctx.context("goal"),
             "nonce1",
+            SpecFirstMode::Off,
+            "docs/specs",
         );
         assert_eq!(blocked, Err(PromptBlocked));
 
@@ -1906,6 +1918,8 @@ Mark a step with \"sensitive\": true when it deploys, migrates, or touches auth,
             &[],
             &ctx.context("goal"),
             "nonce1",
+            SpecFirstMode::Off,
+            "docs/specs",
         );
         assert_eq!(blocked, Err(PromptBlocked));
     }

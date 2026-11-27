@@ -392,6 +392,7 @@ mod tests {
             },
             tasks: vec![],
             dynamic_cap: Some(3),
+            workflow: None,
         }
     }
 

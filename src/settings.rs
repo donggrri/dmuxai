@@ -2416,6 +2416,20 @@ pub fn inspect_workspace_trust_full(
     (true, content_hash(contents.as_bytes()), keys, details)
 }
 
+/// Append to a workspace or user test `dmuxai.toml` so headless runs keep the legacy single-step path.
+pub const WORKFLOW_SPEC_FIRST_OFF_TOML: &str = "[workflow]\nspec_first = \"off\"\n";
+
+impl DmuxSettings {
+    /// Test harness defaults (not for production): [`Default`] with `spec_first` off.
+    /// tc_35xx tests enable Full/Lite explicitly.
+    #[doc(hidden)]
+    pub fn for_unit_tests() -> Self {
+        let mut settings = Self::default();
+        settings.workflow.spec_first = SpecFirstMode::Off;
+        settings
+    }
+}
+
 impl Default for DmuxSettings {
     fn default() -> Self {
         Self {
@@ -7518,6 +7532,7 @@ fallback = ["agy:composer-2.5"]
                 edges: Vec::new(),
                 limits: Default::default(),
                 dynamic_cap: None,
+                workflow: None,
                 tasks: Vec::new(),
             },
             conversation_id: "c".to_owned(),

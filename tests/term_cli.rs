@@ -100,6 +100,11 @@ impl Sandbox {
         for dir in [&workspace, &data_home, &state_home, &runtime_dir, &home] {
             std::fs::create_dir_all(dir).unwrap();
         }
+        std::fs::write(
+            workspace.join("dmuxai.toml"),
+            dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
+        )
+        .unwrap();
         Self {
             _dir: dir,
             workspace,
@@ -125,7 +130,9 @@ impl Sandbox {
             .env("SHELL", "/bin/sh")
             .env("DMUXAI_WORKSPACE", &self.workspace)
             .env_remove("DMUXAI_STATE_DIR")
-            .env_remove("DMUXAI_WEB_TOKEN");
+            .env_remove("DMUXAI_WEB_TOKEN")
+            .env_remove("DMUXAI_RUN_ID")
+            .env_remove("DMUXAI_RUNNER");
         cmd
     }
 

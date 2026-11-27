@@ -1155,6 +1155,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     GraphNode {
                         id: "step-1".to_string(),
@@ -1296,6 +1297,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     make_node("a", "root"),
                     make_node("b", "left"),
@@ -1451,6 +1453,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -1534,6 +1537,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![make_node("node-a"), make_node("node-b")],
                 edges: Vec::new(),
             },
@@ -1648,6 +1652,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![make_node("node-a"), make_node("node-b")],
                 edges: Vec::new(),
             },
@@ -1730,6 +1735,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks,
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     GraphNode {
                         id: "s1".to_string(),
@@ -1823,6 +1829,7 @@ mod tests {
                     limits: GraphLimits::default(),
                     tasks: Vec::new(),
                     dynamic_cap: None,
+                    workflow: None,
                     nodes: vec![GraphNode {
                         id: node_id.to_string(),
                         role: NodeRole::Implement,
@@ -1970,6 +1977,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -2126,6 +2134,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![GraphNode {
                     id: "n1".to_string(),
                     role: NodeRole::Implement,

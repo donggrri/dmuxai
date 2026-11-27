@@ -496,6 +496,7 @@ mod tests {
             limits: GraphLimits::default(),
             tasks,
             dynamic_cap: None,
+            workflow: None,
         }
     }
 

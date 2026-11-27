@@ -1,6 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::settings::WorkflowSettings;
+
 use super::replan::node_send_prompt;
+use super::spec_first::{
+    implement_after_spec_directive, node_has_spec_ancestor, spec_node_directive,
+    test_node_directive,
+};
 use super::types::{GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, NodeRole};
 
 /// FR-2421: test and verify nodes must confirm external acceptance and bound waits.
@@ -10,8 +16,35 @@ Test and verify waits
 - Bound every wait or poll loop to about 10 minutes; never wait forever.
 - If the job was not accepted or a wait exceeds the bound, fail with a clear message naming the job and the timeout.";
 
-fn node_prompt(job: &str, plan: &GraphPlan, role: NodeRole) -> String {
-    let prompt = node_send_prompt(job, plan);
+fn workflow_settings_from_snapshot(snap: &super::types::WorkflowSnapshot) -> WorkflowSettings {
+    WorkflowSettings {
+        spec_dir: snap.spec_dir.clone(),
+        test_command: snap.test_command.clone(),
+        require_tests: snap.require_tests,
+        ..WorkflowSettings::default()
+    }
+}
+
+fn node_prompt(job: &str, plan: &GraphPlan, role: NodeRole, node_id: &str) -> String {
+    let mut prompt = node_send_prompt(job, plan);
+    if let Some(snap) = plan.workflow.as_ref() {
+        match role {
+            NodeRole::Spec => {
+                prompt.push_str("\n\n");
+                prompt.push_str(&spec_node_directive(&snap.spec_dir));
+            }
+            NodeRole::Implement | NodeRole::Draft if node_has_spec_ancestor(plan, node_id) => {
+                prompt.push_str("\n\n");
+                prompt.push_str(&implement_after_spec_directive());
+            }
+            NodeRole::Test => {
+                let wf = workflow_settings_from_snapshot(snap);
+                prompt.push_str("\n\n");
+                prompt.push_str(&test_node_directive(&wf));
+            }
+            _ => {}
+        }
+    }
     if role == NodeRole::Test {
         format!("{prompt}\n\n{TEST_NODE_WAIT_GUARD}")
     } else {
@@ -124,7 +157,7 @@ impl GraphRunSession {
             node_id: node.id.clone(),
             runner: node.runner.clone(),
             model_id: node.model_id.clone(),
-            prompt: node_prompt(&node.job, &self.run.plan, node.role),
+            prompt: node_prompt(&node.job, &self.run.plan, node.role, &node.id),
             role: node.role,
         })
     }
@@ -291,7 +324,7 @@ impl GraphRunSession {
                 node_id: node_id.clone(),
                 runner: self.run.plan.nodes[index].runner.clone(),
                 model_id: self.run.plan.nodes[index].model_id.clone(),
-                prompt: node_prompt(&job, &self.run.plan, role),
+                prompt: node_prompt(&job, &self.run.plan, role, &node_id),
                 role,
             };
 
@@ -595,6 +628,7 @@ mod tests {
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
 
         let run = GraphRun {
@@ -722,6 +756,7 @@ mod tests {
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
 
         let run = GraphRun {

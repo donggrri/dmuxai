@@ -108,7 +108,7 @@ fn is_ancestor(plan: &GraphPlan, from: &str, to: &str) -> bool {
     false
 }
 
-fn has_spec_ancestor(plan: &GraphPlan, write_id: &str) -> bool {
+pub fn node_has_spec_ancestor(plan: &GraphPlan, write_id: &str) -> bool {
     let index = node_index(plan);
     ancestors(plan, write_id).into_iter().any(|id| {
         index
@@ -221,7 +221,7 @@ pub fn apply_spec_first(plan: &mut GraphPlan, wf: &WorkflowSettings) -> Vec<Stri
 
     let uncovered: Vec<String> = write_ids
         .iter()
-        .filter(|id| !has_spec_ancestor(plan, id))
+        .filter(|id| !node_has_spec_ancestor(plan, id))
         .cloned()
         .collect();
 
@@ -641,6 +641,7 @@ mod tests {
             limits: Default::default(),
             tasks: vec![],
             dynamic_cap: None,
+            workflow: None,
         }
     }
 

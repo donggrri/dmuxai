@@ -576,6 +576,7 @@ mod tests {
             limits: GraphLimits::default(),
             tasks,
             dynamic_cap: None,
+            workflow: None,
         };
         if !plan.tasks.is_empty() {
             plan.nodes.push(GraphNode {

@@ -135,6 +135,15 @@ fn default_max_nodes() -> usize {
     12
 }
 
+/// Captured workflow settings for spec-first gates on a run (FR-3508..FR-3510).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    pub spec_dir: String,
+    pub test_command: String,
+    pub require_tests: bool,
+    pub lite: bool,
+}
+
 impl Default for GraphLimits {
     fn default() -> Self {
         Self {
@@ -162,6 +171,8 @@ pub struct GraphPlan {
     /// Dynamic node addition cap (SPEC-graph-dynamic-nodes FR-2942).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_cap: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
