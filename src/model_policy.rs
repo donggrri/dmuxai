@@ -1,5 +1,18 @@
 //! Enforces runner-aware model policies and defaults across DmuxAI.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ALLOW_FAST: AtomicBool = AtomicBool::new(false);
+
+/// Process-wide fast-model opt-in, set once from user config at startup (FR-3003).
+pub fn set_allow_fast(value: bool) {
+    ALLOW_FAST.store(value, Ordering::Relaxed);
+}
+
+pub fn allow_fast() -> bool {
+    ALLOW_FAST.load(Ordering::Relaxed)
+}
+
 pub const ALLOWED_MODEL: &str = "composer-2.5";
 
 /// Role bucket aliases (all resolve to the only permitted model).
@@ -30,15 +43,30 @@ pub fn validate_model_id(model_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Runner-aware validation: Cursor accepts any non-fast model id; AGY may use
-/// `gemini-*-flash-*` or `gemini-4-hydrogen-*` models or `composer-2.5`; opencode may use `*-free`;
-/// grok and cursor may use `grok-*` ids that do not contain `fast` (FR-910, FR-911, FR-2180..2182).
+/// Runner-aware validation: Cursor and AGY accept any non-fast model id unless
+/// `[models] allow_fast` opts in (open runners only); opencode may use `*-free`;
+/// grok and cursor may use `grok-*` ids that do not contain `fast` (FR-910, FR-911, FR-2180..2182, FR-3000..FR-3003).
 pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), String> {
+    validate_model_for_runner_with(runner, model_id, allow_fast())
+}
+
+pub fn validate_model_for_runner_with(
+    runner: &str,
+    model_id: &str,
+    allow_fast: bool,
+) -> Result<(), String> {
     let trimmed = model_id.trim();
+    let runner_key = crate::runner_id::canonical_runner_id(runner);
     if trimmed.to_ascii_lowercase().contains("fast") {
-        return Err(format!("fast models are blocked by policy: {trimmed}"));
+        let skip_fast = allow_fast
+            && matches!(
+                runner_key.as_str(),
+                crate::runner_id::CURSOR_RUNNER_ID | "agy"
+            );
+        if !skip_fast {
+            return Err(format!("fast models are blocked by policy: {trimmed}"));
+        }
     }
-    let runner_key = runner.trim().to_ascii_lowercase();
     // FR-1460: the provider-default sentinel (no `--model`) is every
     // non-Cursor runner's own default; Cursor stays pinned to composer-2.5.
     if trimmed.eq_ignore_ascii_case(PROVIDER_DEFAULT) {
@@ -51,7 +79,7 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
         };
     }
     if crate::custom_agent::is_grok_model_id(trimmed) {
-        return if runner_key == "grok" || runner_key == "cursor" {
+        return if runner_key == "grok" || runner_key == crate::runner_id::CURSOR_RUNNER_ID {
             Ok(())
         } else {
             Err(format!(
@@ -61,7 +89,7 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
     }
     let lower = trimmed.to_ascii_lowercase();
     match runner_key.as_str() {
-        "cursor" => {
+        crate::runner_id::CURSOR_RUNNER_ID => {
             if trimmed.is_empty() {
                 Err("model id must not be empty".to_owned())
             } else {
@@ -71,15 +99,8 @@ pub fn validate_model_for_runner(runner: &str, model_id: &str) -> Result<(), Str
         "agy" => {
             if trimmed.is_empty() {
                 Err("model id must not be empty".to_owned())
-            } else if (lower.starts_with("gemini-") && lower.contains("-flash"))
-                || lower.starts_with("gemini-4-hydrogen")
-                || is_allowed_model(trimmed)
-            {
-                Ok(())
             } else {
-                Err(format!(
-                    "model {trimmed} is not allowed for agy; only gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5 models are permitted"
-                ))
+                Ok(())
             }
         }
         "opencode" if lower.starts_with("opencode/") && lower.ends_with("-free") => Ok(()),
@@ -118,7 +139,7 @@ pub const PROVIDER_DEFAULT: &str = "provider default";
 /// the pinned non-fast `composer-2.5`; every other runner gets `None`
 /// (provider default). Never another runner's model, never a fast model.
 pub fn default_model_for_runner(runner: &str) -> Option<&'static str> {
-    if runner.trim().eq_ignore_ascii_case("cursor") {
+    if crate::runner_id::canonical_runner_id(runner) == crate::runner_id::CURSOR_RUNNER_ID {
         Some(ALLOWED_MODEL)
     } else {
         None
@@ -311,7 +332,8 @@ mod tests {
     fn tc_314_runner_aware_policy_allows_agy_flash_only_on_agy() {
         assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
-        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
+        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_ok());
+        assert!(validate_model_for_runner("agy", "gemini-4-argon-low").is_ok());
         assert!(validate_model_for_runner("cursor", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("opencode", "opencode/glm-5.3-flash-free").is_ok());
         assert!(validate_model_for_runner("cursor", "opencode/glm-5.3-flash-free").is_ok());
@@ -440,10 +462,11 @@ mod tests {
         assert!(validate_model_for_runner("agy", "grok-4.7").is_err());
         assert!(validate_model_for_runner("codex", "grok-4.7").is_err());
         assert!(validate_model_for_runner("opencode", "grok-4.7").is_err());
-        // AGY accepts gemini flash and composer-2.5
+        // AGY accepts any non-fast model id (FR-3000)
         assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
-        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
+        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_ok());
+        assert!(validate_model_for_runner("agy", "claude-sonnet-5-5-high").is_ok());
         // Opencode accepts opencode/*-free
         assert!(validate_model_for_runner("opencode", "opencode/glm-5.3-flash-free").is_ok());
         assert!(validate_model_for_runner("opencode", "opencode/glm-paid").is_err());
@@ -492,7 +515,7 @@ mod tests {
         let cursor_default = validate_model_for_runner("cursor", PROVIDER_DEFAULT).unwrap_err();
         assert_eq!(
             cursor_default,
-            "model provider default is not allowed for cursor; only composer-2.5 is permitted"
+            "model provider default is not allowed for cursor-agent; only composer-2.5 is permitted"
         );
     }
 
@@ -606,11 +629,22 @@ mod tests {
         assert_eq!(r.source, ModelSource::Explicit);
         assert_eq!(r.model.as_deref(), Some("gemini-3.8-flash-high"));
 
+        let argon = ModelResolution::resolve(
+            "agy",
+            ModelCandidates {
+                explicit: Some("gemini-4-argon-low"),
+                selected: None,
+                config_default: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(argon.source, ModelSource::Explicit);
+        assert_eq!(argon.model.as_deref(), Some("gemini-4-argon-low"));
         assert!(
             ModelResolution::resolve(
                 "agy",
                 ModelCandidates {
-                    explicit: Some("gemini-4-argon"),
+                    explicit: Some("gemini-4-argon-fast"),
                     selected: None,
                     config_default: None,
                 }
@@ -726,7 +760,7 @@ mod tests {
         }
     }
 
-    // TC-2835 / FR-2834: agy accepts gemini-4-hydrogen family, rejects argon/pro/claude/fast
+    // TC-2835 / FR-2834 + FR-3000: agy accepts open-model ids; fast and empty rejected
     #[test]
     fn tc_2835_agy_accepts_gemini_4_hydrogen() {
         for id in [
@@ -736,41 +770,113 @@ mod tests {
             "gemini-4-hydrogen-high",
             "gemini-4-hydrogen-xhigh",
             "GEMINI-4-HYDROGEN-HIGH",
+            "gemini-4-argon",
+            "gemini-4-argon-low",
+            "gemini-4-pro",
+            "claude-3-5-sonnet",
         ] {
             assert!(
                 validate_model_for_runner("agy", id).is_ok(),
                 "should accept {id}"
             );
         }
-        // Keeps gemini-*-flash* and composer-2.5 accepted
         assert!(validate_model_for_runner("agy", "gemini-3.8-flash-medium").is_ok());
         assert!(validate_model_for_runner("agy", "composer-2.5").is_ok());
 
-        // Fast rejected
         assert!(validate_model_for_runner("agy", "gemini-4-hydrogen-fast").is_err());
         assert!(validate_model_for_runner("agy", "gemini-3.8-flash-fast").is_err());
-
-        // Argon, pro, claude rejected
-        assert!(validate_model_for_runner("agy", "gemini-4-argon").is_err());
-        assert!(validate_model_for_runner("agy", "gemini-4-argon-low").is_err());
-        assert!(validate_model_for_runner("agy", "gemini-4-pro").is_err());
-        assert!(validate_model_for_runner("agy", "claude-3-5-sonnet").is_err());
+        assert_eq!(
+            validate_model_for_runner("agy", "").unwrap_err(),
+            "model id must not be empty"
+        );
     }
 
-    // TC-2836 / FR-2835: rejection message for agy reflects policy, codex keeps composer-2.5
+    // TC-2836 / FR-2835: rejection messages reflect open agy policy; codex keeps composer-2.5
     #[test]
     fn tc_2836_agy_rejection_message_reflects_policy() {
-        let err = validate_model_for_runner("agy", "gemini-4-pro").unwrap_err();
+        let fast_err = validate_model_for_runner("agy", "gemini-4-pro-fast").unwrap_err();
         assert_eq!(
-            err,
-            "model gemini-4-pro is not allowed for agy; only gemini-*-flash-*, gemini-4-hydrogen-* or composer-2.5 models are permitted"
+            fast_err,
+            "fast models are blocked by policy: gemini-4-pro-fast"
         );
-        assert!(!err.contains("only composer-2.5 is permitted"));
+
+        let grok_err = validate_model_for_runner("agy", "grok-4.7-high").unwrap_err();
+        assert_eq!(
+            grok_err,
+            "model grok-4.7-high is not allowed for agy; only grok and cursor runners accept grok models"
+        );
 
         let codex_err = validate_model_for_runner("codex", "x").unwrap_err();
         assert_eq!(
             codex_err,
             "model x is not allowed for codex; only composer-2.5 is permitted"
         );
+    }
+
+    // TC-3000 / FR-3000, FR-3001
+    #[test]
+    fn tc_3000_agy_and_cursor_accept_any_non_fast_model() {
+        for id in [
+            "gemini-4-carbon-high",
+            "gemini-4-neon-xhigh",
+            "gemini-4-argon-low",
+            "gemini-pro-orchestrator",
+            "claude-sonnet-5-5-high",
+            "gpt-oss-120b-medium",
+            "gemini-3.8-flash-low",
+            "composer-2.5",
+        ] {
+            assert!(validate_model_for_runner("agy", id).is_ok(), "agy {id}");
+        }
+        for id in [
+            "claude-sonnet-5-5-high",
+            "grok-4.7-high",
+            "gemini-4-carbon-high",
+            "auto",
+            "composer-2.5",
+        ] {
+            assert!(
+                validate_model_for_runner("cursor", id).is_ok(),
+                "cursor {id}"
+            );
+        }
+        assert_eq!(
+            validate_model_for_runner("agy", "").unwrap_err(),
+            "model id must not be empty"
+        );
+        assert_eq!(
+            validate_model_for_runner("cursor", "").unwrap_err(),
+            "model id must not be empty"
+        );
+        assert!(validate_model_for_runner("agy", "grok-4.7-high").is_err());
+    }
+
+    // TC-3001 / FR-3002, FR-3003
+    #[test]
+    fn tc_3001_fast_blocked_unless_user_opt_in() {
+        let fast_ids = [
+            "composer-2.5-fast",
+            "grok-4.7-build-fast",
+            "gemini-3-flash-fast",
+            "opencode/glm-fast-free",
+        ];
+        let runners = ["cursor", "agy", "opencode", "grok", "codex"];
+        for runner in runners {
+            for id in fast_ids {
+                let err = validate_model_for_runner_with(runner, id, false).unwrap_err();
+                assert!(
+                    err.contains("fast models are blocked by policy"),
+                    "{runner} {id}: {err}"
+                );
+            }
+        }
+        assert!(validate_model_for_runner_with("cursor", "composer-2.5-fast", true).is_ok());
+        assert!(validate_model_for_runner_with("agy", "gemini-4-carbon-fast", true).is_ok());
+        assert!(validate_model_for_runner_with("codex", "composer-2.5-fast", true).is_err());
+        assert!(
+            validate_model_for_runner_with("opencode", "opencode/glm-fast-free", true).is_err()
+        );
+        assert!(validate_model_for_runner_with("grok", "grok-4.7-build-fast", true).is_err());
+        assert!(!allow_fast());
     }
 }

@@ -550,7 +550,7 @@ mod tests {
                     activity: None,
                 },
                 AgentView {
-                    id: "cursor".to_string(),
+                    id: crate::runner_id::CURSOR_RUNNER_ID.to_string(),
                     label: "Cursor".to_string(),
                     busy: false,
                     phase: None,
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(codex["color"], "#123456");
         let cursor = agents
             .iter()
-            .find(|a| a["id"] == "cursor")
+            .find(|a| a["id"] == crate::runner_id::CURSOR_RUNNER_ID)
             .expect("cursor agent present");
         assert_eq!(cursor["color"], "#000080");
     }

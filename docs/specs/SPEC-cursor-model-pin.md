@@ -15,7 +15,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 ### In scope
 
 - Enforcing `--model composer-2.5` in Cursor adapter argv generation (`src/agent/cursor.rs`) when no model or an invalid/disallowed model is supplied.
-- Rejecting and replacing fast models (e.g. `composer-2.5-fast`, `*-fast`) and foreign models for Cursor across `effective_model_for`, `apply_runner_and_model`, and `submit_to_agent` in `src/app.rs`.
+- Rejecting and replacing fast models (e.g. `composer-2.5-fast`, `*-fast`) for Cursor; other non-fast models (e.g. `claude-sonnet-5-5-high`, `grok-4.7-high`) are accepted per SPEC-open-model-lists across `effective_model_for`, `apply_runner_and_model`, and `submit_to_agent` in `src/app.rs`.
 - Emitting a system notice whenever a disallowed model is replaced with `composer-2.5`.
 - Guaranteeing that slash-prefixed prompts (e.g., prompts starting with `/` that bypass graph auto-planning) sent to Cursor pin `composer-2.5`.
 - Displaying `composer-2.5` instead of `"provider default"` in the Cursor status bar.
@@ -23,7 +23,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 
 ### Out of scope / non-goals
 
-- Altering AGY, Codex, or custom agent model policies (AGY continues to allow `gemini-*-flash-*`, opencode allows `opencode/*-free`, Codex uses its catalog).
+- Altering AGY, Codex, or custom agent model policies (AGY policy is governed by SPEC-open-model-lists; opencode allows `opencode/*-free`, Codex uses its catalog).
 - Redesigning the F2 model picker UI layout.
 - Network calls or live provider smoke testing during unit tests.
 
@@ -46,7 +46,7 @@ Every Cursor turn in DmuxAI must pass `--model composer-2.5` to `cursor-agent` u
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
 | FR-410 | Must | Given the Cursor agent is active and no model has been selected in F2, when a turn is submitted via normal prompt, graph node, single plan, or resend | Then `submit_to_agent` pins `composer-2.5` as the model for the turn | If the catalog selection is None, it is initialized to `composer-2.5` | TC-413 |
-| FR-411 | Must | Given a model is set for Cursor that fails `validate_model_for_runner("cursor", ..)` (e.g., contains `fast` or is a foreign model), when evaluated or submitted | Then it is replaced with `composer-2.5` and a system notice is pushed to the chat | If the model string is empty or malformed, it is also replaced with `composer-2.5` | TC-411, TC-412 |
+| FR-411 | Must | Given a model is set for Cursor that fails `validate_model_for_runner("cursor", ..)` (e.g., contains `fast`), when evaluated or submitted | Then it is replaced with `composer-2.5` and a system notice is pushed to the chat | If the model string is empty or malformed, it is also replaced with `composer-2.5` | TC-411, TC-412 |
 | FR-412 | Must | Given a prompt starting with `/` (e.g. `/custom prompt`) submitted to Cursor outside graph auto-planning, when `submit_to_agent` executes | Then the request sent to Cursor agent has model pinned to `composer-2.5` | If previously unset, the model catalog selection becomes `composer-2.5` | TC-413 |
 | UX-410 | Must | Given Cursor is the selected agent, when the status bar is rendered | Then the model segment displays `composer-2.5` instead of `provider default` | If a disallowed model is currently selected in the catalog, `composer-2.5` is displayed | TC-414 |
 | INT-410 | Must | Given the Cursor adapter builds CLI arguments in `configure_command`, when `--model` is configured | Then the argv contains `--model composer-2.5` by default, and any disallowed or fast model is replaced with `composer-2.5` | If `selected_model` is `None`, `--model composer-2.5` is emitted | TC-410, TC-411 |

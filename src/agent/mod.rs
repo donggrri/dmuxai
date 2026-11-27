@@ -388,6 +388,15 @@ pub struct AgentRequest {
     /// Resolved system prompt for native delivery (opencode, codex). Prepended
     /// runners leave this `None` and prepend the block to `prompt` instead.
     pub system_prompt: Option<dmuxai::agent_prompt::ResolvedPrompt>,
+    /// Per-turn working directory override (write fan-out leg worktree).
+    pub working_directory: Option<std::path::PathBuf>,
+}
+
+pub(crate) fn request_cwd(default: &std::path::Path, request: &AgentRequest) -> std::path::PathBuf {
+    request
+        .working_directory
+        .clone()
+        .unwrap_or_else(|| default.to_path_buf())
 }
 
 #[derive(Debug, Clone)]

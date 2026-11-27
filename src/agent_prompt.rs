@@ -158,10 +158,10 @@ pub enum Delivery {
 /// Native for opencode and codex; Prepend for cursor, agy, grok and generic custom agents.
 /// Keep a hook so it can return Native when a custom spec opts in (later part).
 pub fn delivery(runner: &str, custom_spec: Option<&CustomAgentSpec>) -> Delivery {
-    let lower = runner.trim().to_ascii_lowercase();
+    let lower = crate::runner_id::canonical_runner_id(runner);
     match lower.as_str() {
         "opencode" | "codex" => Delivery::Native,
-        "cursor" | "agy" | "grok" => Delivery::Prepend,
+        crate::runner_id::CURSOR_RUNNER_ID | "agy" | "grok" => Delivery::Prepend,
         _ => {
             if let Some(spec) = custom_spec {
                 let contains =
@@ -476,7 +476,7 @@ fn builtin_prompt_for_model(
     if model.contains("fast") {
         return None;
     }
-    if runner.trim().eq_ignore_ascii_case("cursor")
+    if crate::runner_id::canonical_runner_id(runner) == crate::runner_id::CURSOR_RUNNER_ID
         && matches!(
             model.as_str(),
             "grok-4.7" | "grok-4.7-low" | "grok-4.7-medium" | "grok-4.7-high" | "grok-4.7-xhigh"
@@ -494,9 +494,11 @@ fn builtin_prompt_for_model(
 
 /// Built-in prompt selected by runner id (FR-2152, FR-2161).
 fn builtin_prompt_for_runner(runner: &str) -> Option<(&'static str, &'static str)> {
-    match runner.trim().to_ascii_lowercase().as_str() {
+    match crate::runner_id::canonical_runner_id(runner).as_str() {
         "agy" => Some((BUILTIN_AGY_PROMPT, "builtin:runner:agy")),
-        "cursor" => Some((BUILTIN_COMPOSER_PROMPT, "builtin:runner:cursor")),
+        crate::runner_id::CURSOR_RUNNER_ID => {
+            Some((BUILTIN_COMPOSER_PROMPT, "builtin:runner:cursor"))
+        }
         "grok" => Some((BUILTIN_GROK_BUILD_PROMPT, "builtin:runner:grok")),
         _ => None,
     }
@@ -544,7 +546,7 @@ pub fn resolve_for(
         | PromptRole::Interview => return None,
     }
 
-    let runner_id = runner.trim().to_ascii_lowercase();
+    let runner_id = crate::runner_id::canonical_runner_id(runner);
     let specific_config = settings.runner_prompts.get(&runner_id);
     let default_config = settings.runner_prompts.get("default");
 
@@ -756,6 +758,7 @@ mod tests {
             finish_reason_path: None,
             finish_ok: vec![],
             builtin: false,
+            free: false,
         };
         assert_eq!(delivery("custom", Some(&custom_spec)), Delivery::Prepend);
     }
@@ -843,7 +846,7 @@ mod tests {
     fn agent_prompt_resolve_empty_or_whitespace_returns_none() {
         let mut settings = Settings::default();
         settings.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 prompt: Some(PromptTextWithSource {
                     text: "   \n\t  ".to_owned(),
@@ -908,7 +911,7 @@ mod tests {
 
         let mut settings = Settings::default();
         settings.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 prompt: Some(runner_prompt.clone()),
                 inject: None,
@@ -998,7 +1001,7 @@ mod tests {
         // Config prompts still apply on read-only turns.
         let mut config_settings = Settings::default();
         config_settings.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 prompt: Some(PromptTextWithSource {
                     text: "read-only config prompt".to_owned(),
@@ -1018,7 +1021,7 @@ mod tests {
         // Runner builtin_prompt = false disables built-ins.
         let mut runner_off = Settings::default();
         runner_off.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 builtin_prompt: Some(false),
                 ..Default::default()
@@ -1040,7 +1043,7 @@ mod tests {
         // A runner value beats the default value.
         let mut runner_on = default_off.clone();
         runner_on.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 builtin_prompt: Some(true),
                 ..Default::default()
@@ -1080,7 +1083,7 @@ mod tests {
     fn tc_2155_model_inject_hash_and_source() {
         let mut settings = Settings::default();
         settings.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 prompt: None,
                 inject: Some(PromptInject::Session),
@@ -1255,7 +1258,7 @@ mod tests {
         // builtin_prompt = false disables them
         let mut disabled_settings = Settings::default();
         disabled_settings.runner_prompts.insert(
-            "cursor".to_owned(),
+            crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
             RunnerPromptConfig {
                 prompt: None,
                 inject: None,
@@ -1333,6 +1336,7 @@ mod tests {
             finish_reason_path: None,
             finish_ok: vec![],
             builtin: false,
+            free: false,
         };
         assert_eq!(delivery("custom", Some(&spec)), Delivery::Native);
 
