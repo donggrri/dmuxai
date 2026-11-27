@@ -16,6 +16,54 @@ use crate::workspace_trust::{
 #[doc(hidden)]
 pub use crate::state_path::test_env_lock;
 
+const CURSOR_RUNNER_TABLE_CONFLICT: &str =
+    "[runners.cursor] and [runners.cursor-agent] both define settings; [runners.cursor-agent] wins";
+
+fn runners_define_cursor_and_alias(
+    runners: &BTreeMap<String, crate::agent_prompt::RunnerPromptToml>,
+) -> bool {
+    runners
+        .keys()
+        .any(|k| k.trim().eq_ignore_ascii_case("cursor"))
+        && runners
+            .keys()
+            .any(|k| k.trim().eq_ignore_ascii_case("cursor-agent"))
+}
+
+fn parse_runners_tables(
+    runners: BTreeMap<String, crate::agent_prompt::RunnerPromptToml>,
+    scope: &str,
+    base_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> (
+    BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
+    BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
+) {
+    let cursor_conflict = runners_define_cursor_and_alias(&runners);
+    let mut parsed_map = BTreeMap::new();
+    let mut fallback_map = BTreeMap::new();
+    for (id, raw) in runners {
+        let raw_norm = id.trim().to_ascii_lowercase();
+        let canon_id = crate::runner_id::canonical_runner_id(&raw_norm);
+        if cursor_conflict && raw_norm == "cursor-agent" {
+            warnings.push(CURSOR_RUNNER_TABLE_CONFLICT.to_owned());
+        }
+        let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
+            &canon_id, &raw, scope, base_dir, warnings,
+        );
+        parsed_map.insert(canon_id.clone(), cfg);
+        fallback_map.insert(
+            canon_id,
+            crate::runner_fallback::RunnerFallbackToml {
+                fallback: raw.fallback.clone(),
+                stall_timeout_secs: raw.stall_timeout_secs,
+                stall_api_retries: raw.stall_api_retries,
+            },
+        );
+    }
+    (parsed_map, fallback_map)
+}
+
 /// Web dashboard theme settings loaded from `[web]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebThemeSettings {
@@ -497,27 +545,12 @@ impl DmuxSettings {
                             Some(p) if !p.as_os_str().is_empty() => p,
                             _ => Path::new("."),
                         };
-                        let mut parsed_map = BTreeMap::new();
-                        let mut fallback_map = BTreeMap::new();
-                        for (id, raw) in runners {
-                            let norm_id = id.trim().to_ascii_lowercase();
-                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
-                                &norm_id,
-                                &raw,
-                                "user",
-                                base_dir,
-                                &mut settings.config_warnings,
-                            );
-                            parsed_map.insert(norm_id.clone(), cfg);
-                            fallback_map.insert(
-                                norm_id,
-                                crate::runner_fallback::RunnerFallbackToml {
-                                    fallback: raw.fallback.clone(),
-                                    stall_timeout_secs: raw.stall_timeout_secs,
-                                    stall_api_retries: raw.stall_api_retries,
-                                },
-                            );
-                        }
+                        let (parsed_map, fallback_map) = parse_runners_tables(
+                            runners,
+                            "user",
+                            base_dir,
+                            &mut settings.config_warnings,
+                        );
                         user_runners = Some(parsed_map);
                         user_fallback_tables = Some(fallback_map);
                     }
@@ -595,27 +628,12 @@ impl DmuxSettings {
                     }
 
                     if let Some(runners) = parsed.runners.take() {
-                        let mut parsed_map = BTreeMap::new();
-                        let mut fallback_map = BTreeMap::new();
-                        for (id, raw) in runners {
-                            let norm_id = id.trim().to_ascii_lowercase();
-                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
-                                &norm_id,
-                                &raw,
-                                "workspace",
-                                workspace,
-                                &mut settings.config_warnings,
-                            );
-                            parsed_map.insert(norm_id.clone(), cfg);
-                            fallback_map.insert(
-                                norm_id,
-                                crate::runner_fallback::RunnerFallbackToml {
-                                    fallback: raw.fallback.clone(),
-                                    stall_timeout_secs: raw.stall_timeout_secs,
-                                    stall_api_retries: raw.stall_api_retries,
-                                },
-                            );
-                        }
+                        let (parsed_map, fallback_map) = parse_runners_tables(
+                            runners,
+                            "workspace",
+                            workspace,
+                            &mut settings.config_warnings,
+                        );
                         workspace_runners = Some(parsed_map);
                         workspace_fallback_tables = Some(fallback_map);
                     }
@@ -715,7 +733,10 @@ impl DmuxSettings {
             let custom_agents = &settings.custom_agents;
             let validate = |target: &crate::runner_fallback::FallbackTarget| -> Result<(), String> {
                 let runner = target.runner.as_str();
-                let is_builtin = matches!(runner, "cursor" | "agy" | "codex" | "opencode" | "grok");
+                let is_builtin = matches!(
+                    runner,
+                    crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex" | "opencode" | "grok"
+                );
                 let custom_spec = custom_agents
                     .iter()
                     .find(|spec| spec.name.eq_ignore_ascii_case(runner));
@@ -771,7 +792,7 @@ impl DmuxSettings {
             }
             let is_builtin = matches!(
                 id.as_str(),
-                "cursor" | "agy" | "codex" | "opencode" | "grok"
+                crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex" | "opencode" | "grok"
             );
             let custom_spec = settings
                 .custom_agents
@@ -819,7 +840,7 @@ impl DmuxSettings {
             }
         }
 
-        let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
+        let mut known: Vec<&str> = vec![crate::runner_id::CURSOR_RUNNER_ID, "agy", "codex"];
         known.extend(known_custom.iter().map(String::as_str));
         let unknown = settings.theme.unknown_agent_ids(&known);
         drop(known);
@@ -1105,7 +1126,10 @@ impl DmuxSettings {
         }
         if let Some(routing) = parsed.routing {
             if let Some(default_agent) = routing.default_agent {
-                self.routing_default_agent = Some(default_agent);
+                let canon = crate::runner_id::canonical_runner_id(&default_agent);
+                if !canon.is_empty() {
+                    self.routing_default_agent = Some(canon);
+                }
             }
             if let Some(cursor_models) = routing.cursor_models {
                 self.routing_cursor_models = cursor_models;
@@ -1175,14 +1199,16 @@ impl DmuxSettings {
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
                 for runner in runners {
-                    let lower = runner.trim().to_ascii_lowercase();
+                    let lower = crate::runner_id::canonical_runner_id(&runner);
                     if lower.is_empty() {
                         continue;
                     }
-                    if matches!(lower.as_str(), "agy" | "codex" | "cursor")
-                        || pending_presets
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(&lower))
+                    if matches!(
+                        lower.as_str(),
+                        "agy" | "codex" | crate::runner_id::CURSOR_RUNNER_ID
+                    ) || pending_presets
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&lower))
                         || self
                             .custom_agents
                             .iter()
@@ -1322,15 +1348,18 @@ impl DmuxSettings {
     /// SPEC-grok-runner FR-899). An unset `allowed_runners` admits every runner
     /// except built-in presets; a listed runner, including a preset, is admitted.
     pub fn graph_runner_allowed(&self, runner: &str) -> bool {
-        let runner = runner.trim();
+        let runner = crate::runner_id::canonical_runner_id(runner);
+        if runner.is_empty() {
+            return false;
+        }
         match &self.graph_allowed_runners {
             Some(allowed) => allowed
                 .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner)),
+                .any(|r| crate::runner_id::canonical_runner_id(r) == runner),
             None => !self
                 .custom_agents
                 .iter()
-                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(runner)),
+                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(&runner)),
         }
     }
 
@@ -2940,7 +2969,10 @@ allowed_runners = ["AGY", "bogus_agent", "cursor"]
         let settings = DmuxSettings::load_with_user_config(&dir, None);
         assert_eq!(
             settings.graph_allowed_runners,
-            Some(vec!["agy".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "agy".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             settings.config_warnings.iter().any(
@@ -3683,7 +3715,10 @@ mod builtin_opencode_tests {
         let listed = load(Some(bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
-            Some(vec!["opencode".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "opencode".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             listed.config_warnings.is_empty(),
@@ -4020,7 +4055,10 @@ mod builtin_grok_tests {
         let listed = load(Some(path_bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
-            Some(vec!["grok".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "grok".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             listed.config_warnings.is_empty(),
@@ -4760,7 +4798,10 @@ system_prompt = "ignored"
         .unwrap();
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
 
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         let model = cursor
             .models
             .as_ref()
@@ -4770,7 +4811,7 @@ system_prompt = "ignored"
         assert_eq!(prompt.text, "Model file prompt");
         assert_eq!(
             prompt.source,
-            "workspace:[runners.cursor.models.\"Composer-2.5\"] (model.txt)"
+            "workspace:[runners.cursor-agent.models.\"Composer-2.5\"] (model.txt)"
         );
         assert_eq!(model.inject, Some(PromptInject::Session));
 
@@ -4783,7 +4824,7 @@ system_prompt = "ignored"
         assert_eq!(inline.text, "Inline model prompt");
         assert_eq!(
             inline.source,
-            "workspace:[runners.cursor.models.\"inline-model\"]"
+            "workspace:[runners.cursor-agent.models.\"inline-model\"]"
         );
 
         let default = settings
@@ -4846,15 +4887,15 @@ prompt_inject = "immediately"
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
 
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"composer-2.5\"]")
+            w.contains("[runners.cursor-agent.models.\"composer-2.5\"]")
                 && w.contains("both system_prompt and system_prompt_file")
         }));
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"big\"]")
+            w.contains("[runners.cursor-agent.models.\"big\"]")
                 && w.contains("exceeds 32 KiB (32768 bytes)")
         }));
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"bad-inject\"]")
+            w.contains("[runners.cursor-agent.models.\"bad-inject\"]")
                 && w.contains("unknown prompt_inject 'immediately'")
         }));
     }
@@ -4898,7 +4939,10 @@ system_prompt = "workspace model"
         .unwrap();
 
         let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         assert_eq!(cursor.builtin_prompt, Some(true));
 
         let models = cursor.models.as_ref().expect("models");
@@ -4907,7 +4951,7 @@ system_prompt = "workspace model"
         assert_eq!(prompt.text, "workspace model");
         assert_eq!(
             prompt.source,
-            "workspace:[runners.cursor.models.\"composer-2.5\"]"
+            "workspace:[runners.cursor-agent.models.\"composer-2.5\"]"
         );
         // The workspace entry did not set prompt_inject, so the user value stays.
         assert_eq!(composer.inject, Some(PromptInject::Always));
@@ -6170,5 +6214,157 @@ usbipd_attach = false
             "workspace wins"
         );
         assert_eq!(settings.terminal_serial_usbipd_attach, Some(false));
+    }
+
+    // TC-3202 / FR-3202
+    #[test]
+    fn tc_3202_config_accepts_cursor_agent_keyword() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor-agent", "agy"]
+
+[routing]
+default_agent = "cursor-agent"
+
+[runners.cursor-agent]
+model = "composer-2.5"
+fallback = ["agy"]
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert!(settings.graph_runner_allowed("cursor"));
+        assert!(
+            settings
+                .graph_allowed_runners
+                .as_ref()
+                .is_some_and(|r| r.contains(&crate::runner_id::CURSOR_RUNNER_ID.to_owned()))
+        );
+        assert_eq!(
+            settings.routing_default_agent.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
+        assert_eq!(cursor.model.as_deref(), Some("composer-2.5"));
+        assert!(
+            !settings
+                .runner_fallback
+                .chain_for("cursor", None)
+                .is_empty()
+        );
+    }
+
+    // TC-3203 / FR-3202
+    #[test]
+    fn tc_3203_cursor_and_cursor_agent_tables_conflict_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[runners.cursor]
+model = "composer-2.5"
+
+[runners.cursor-agent]
+model = "grok-4.7-high"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert_eq!(
+            settings
+                .runner_models
+                .get(crate::runner_id::CURSOR_RUNNER_ID)
+                .map(String::as_str),
+            Some("grok-4.7-high")
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains(CURSOR_RUNNER_TABLE_CONFLICT)),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    // TC-3213 / FR-3208, FR-3209
+    #[test]
+    fn tc_3213_legacy_cursor_config_and_graph_store_normalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor", "agy"]
+
+[routing]
+default_agent = "cursor"
+
+[runners.cursor]
+model = "composer-2.5"
+fallback = ["agy:composer-2.5"]
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert!(settings.graph_runner_allowed(crate::runner_id::CURSOR_RUNNER_ID));
+        assert_eq!(
+            settings.routing_default_agent.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        assert!(
+            settings
+                .runner_prompts
+                .get(crate::runner_id::CURSOR_RUNNER_ID)
+                .and_then(|c| c.model.as_deref())
+                == Some("composer-2.5")
+        );
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("cursor") && w.contains("legacy"))
+        );
+        let mut run = crate::graph::GraphRun {
+            plan: crate::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "p1".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "p".to_owned(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: Default::default(),
+                dynamic_cap: None,
+                tasks: Vec::new(),
+            },
+            conversation_id: "c".to_owned(),
+            phase: crate::graph::GraphRunPhase::Active,
+            ..Default::default()
+        };
+        run.plan.nodes.push(crate::graph::GraphNode {
+            id: "n1".to_owned(),
+            role: crate::graph::NodeRole::Implement,
+            job: "j".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+            skill: None,
+            requires_gate: false,
+            status: crate::graph::GraphNodeStatus::Pending,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        });
+        run.normalize_legacy_runners();
+        assert_eq!(run.plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
     }
 }

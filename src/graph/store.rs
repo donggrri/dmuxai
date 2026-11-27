@@ -54,8 +54,9 @@ impl GraphStore {
                 continue;
             }
             if let Ok(contents) = fs::read_to_string(&path)
-                && let Ok(run) = serde_json::from_str::<GraphRun>(&contents)
+                && let Ok(mut run) = serde_json::from_str::<GraphRun>(&contents)
             {
+                run.normalize_legacy_runners();
                 runs.push(run);
             }
         }
@@ -95,7 +96,8 @@ impl GraphStore {
             if needs_reload {
                 match fs::read_to_string(&path) {
                     Ok(contents) => match serde_json::from_str::<GraphRun>(&contents) {
-                        Ok(run) => {
+                        Ok(mut run) => {
+                            run.normalize_legacy_runners();
                             cache
                                 .by_file
                                 .insert(path, CachedRunFile { mtime, len, run });
@@ -154,7 +156,11 @@ pub fn load_run(workspace: &Path, id: &str) -> io::Result<GraphRun> {
         .join("graphs")
         .join(format!("{id}.json"));
     let contents = fs::read_to_string(path)?;
-    serde_json::from_str(&contents)
+    serde_json::from_str::<GraphRun>(&contents)
+        .map(|mut run| {
+            run.normalize_legacy_runners();
+            run
+        })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 

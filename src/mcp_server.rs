@@ -111,7 +111,7 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "description": "Optional runner id (e.g. agy, cursor, codex, or a custom agent name)"
+                        "description": "Optional runner id (e.g. agy, cursor-agent, codex, or a custom agent name)"
                     }
                 }
             }
@@ -775,5 +775,32 @@ mod tests {
         assert_eq!(res["result"]["isError"], false);
         let calls = stub.models_calls.lock().unwrap();
         assert_eq!(calls.as_slice(), &[Some("agy".to_owned())]);
+    }
+
+    // TC-3205 / FR-3204
+    #[test]
+    fn tc_3205_mcp_accepts_cursor_agent_keyword() {
+        let stub = Stub::default();
+        let res = call(
+            &stub,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "models",
+                    "arguments": {
+                        "agent": "cursor-agent"
+                    }
+                }
+            }),
+        );
+        assert_eq!(res["result"]["isError"], false);
+        let calls = stub.models_calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[Some("cursor-agent".to_owned())]);
+        assert_eq!(
+            crate::runner_id::canonical_runner_id(" cursor-agent "),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

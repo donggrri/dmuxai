@@ -2650,11 +2650,10 @@ impl App {
             return Err(RunTodoError::Busy(PLAN_AWAITING_APPROVAL_MSG.to_owned()));
         }
         let target_agent = if let Some(ref agent_str) = agent {
-            let runner_clean = agent_str.trim().to_ascii_lowercase();
-            let adapter = self
-                .adapters
-                .iter()
-                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+            let runner_clean = dmuxai::runner_id::canonical_runner_id(agent_str);
+            let adapter = self.adapters.iter().find(|a| {
+                dmuxai::runner_id::canonical_runner_id(runner_name(a.agent())) == runner_clean
+            });
             let Some(adapter) = adapter else {
                 if runner_clean == "opencode"
                     && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
@@ -2673,10 +2672,7 @@ impl App {
             if allowed.is_empty() {
                 return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
             }
-            if !allowed
-                .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim()))
-            {
+            if !self.runner_is_allowed(runner_id) {
                 return Err(RunTodoError::Forbidden(format!(
                     "runner '{runner_id}' is not in allowed_runners"
                 )));
@@ -3046,11 +3042,12 @@ impl App {
 
     /// Whether `[graph] allowed_runners` permits a runner (unset = every runner).
     fn runner_is_allowed(&self, runner_id: &str) -> bool {
+        let canon = dmuxai::runner_id::canonical_runner_id(runner_id);
         match &self.settings.graph_allowed_runners {
             None => true,
             Some(allowed) => allowed
                 .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())),
+                .any(|r| dmuxai::runner_id::canonical_runner_id(r) == canon),
         }
     }
 
@@ -3069,7 +3066,9 @@ impl App {
         match &self.settings.graph_allowed_runners {
             None => self.registered_runner_names().into_iter().next(),
             Some(allowed) if allowed.is_empty() => None,
-            Some(allowed) => allowed.first().map(|r| r.trim().to_ascii_lowercase()),
+            Some(allowed) => allowed
+                .first()
+                .map(|r| dmuxai::runner_id::canonical_runner_id(r)),
         }
     }
 
@@ -3158,7 +3157,9 @@ impl App {
         let replacement_index = self.initial_runner_index(agent);
         let replacement = self.agent_runner_name(self.adapters[replacement_index].agent());
         self.selected = replacement_index;
-        if replacement.eq_ignore_ascii_case(runner) {
+        if dmuxai::runner_id::canonical_runner_id(&replacement)
+            == dmuxai::runner_id::canonical_runner_id(runner)
+        {
             return;
         }
         if registered {
@@ -3317,10 +3318,11 @@ impl App {
         let Some(raw) = agent.map(str::trim).filter(|raw| !raw.is_empty()) else {
             return Ok(self.adapters[self.selected].agent());
         };
+        let canon = dmuxai::runner_id::canonical_runner_id(raw);
         self.adapters
             .iter()
             .map(|adapter| adapter.agent())
-            .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
+            .find(|candidate| self.agent_runner_name(*candidate) == canon)
             .ok_or_else(|| {
                 if raw.eq_ignore_ascii_case("opencode")
                     && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
@@ -3344,7 +3346,7 @@ impl App {
     fn agent_key_runner_name(&self, key: AgentKey) -> String {
         match key {
             AgentKey::Codex => "codex".to_owned(),
-            AgentKey::Cursor => "cursor".to_owned(),
+            AgentKey::Cursor => dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             AgentKey::Agy => "agy".to_owned(),
             AgentKey::Custom(index) => self
                 .custom_spec(index)
@@ -3917,8 +3919,10 @@ impl App {
                 self.quiet_model_echo.remove(&target);
                 // Same Cursor model pin as the TUI picker (SPEC-cursor-model-pin).
                 if target == Agent::Cursor
-                    && let Err(error) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &info.id)
+                    && let Err(error) = dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &info.id,
+                    )
                 {
                     self.push_system(format!(
                         "Model {} rejected for Cursor ({error}); replaced with {}",
@@ -4019,7 +4023,7 @@ impl App {
                 let id = self.agent_runner_name(agent);
                 if parse_agent(&id).is_none() {
                     return Err(RunTodoError::Invalid(
-                        "share target must be codex, cursor or agy".to_owned(),
+                        "share target must be codex, cursor-agent or agy".to_owned(),
                     ));
                 }
                 if !self.runner_is_allowed(&id) {
@@ -5675,8 +5679,10 @@ impl App {
                     .expect("picker agent belongs to Agent::all()");
                 self.quiet_model_echo.remove(&agent);
                 if agent == Agent::Cursor
-                    && let Err(error) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &model.id)
+                    && let Err(error) = dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &model.id,
+                    )
                 {
                     self.push_system(format!(
                         "Model {} rejected for Cursor ({error}); replaced with {}",
@@ -6276,9 +6282,10 @@ impl App {
                 .and_then(|catalog| catalog.selected.clone());
             match current {
                 Some(selected) => {
-                    if let Err(err) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &selected)
-                    {
+                    if let Err(err) = dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &selected,
+                    ) {
                         self.push_system(format!(
                             "Disallowed model '{selected}' for Cursor replaced with {}: {err}",
                             dmuxai::model_policy::ALLOWED_MODEL
@@ -11900,10 +11907,14 @@ impl App {
     fn configured_cursor_model(settings: &DmuxSettings) -> Option<String> {
         settings
             .runner_models
-            .get("cursor")
+            .get(dmuxai::runner_id::CURSOR_RUNNER_ID)
             .map(|model| model.trim())
             .filter(|model| {
-                dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok()
+                dmuxai::model_policy::validate_model_for_runner(
+                    dmuxai::runner_id::CURSOR_RUNNER_ID,
+                    model,
+                )
+                .is_ok()
             })
             .map(str::to_owned)
     }
@@ -11934,7 +11945,7 @@ impl App {
         let config_default = self
             .settings
             .runner_models
-            .get(&runner.to_ascii_lowercase())
+            .get(&dmuxai::runner_id::canonical_runner_id(runner))
             .cloned();
         let resolution = Self::model_resolution_for(
             &self.model_catalogs,
@@ -12076,8 +12087,11 @@ impl App {
                 catalog.selected = if agent == Agent::Cursor {
                     match selected {
                         Some(ref m)
-                            if dmuxai::model_policy::validate_model_for_runner("cursor", m)
-                                .is_ok() =>
+                            if dmuxai::model_policy::validate_model_for_runner(
+                                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                                m,
+                            )
+                            .is_ok() =>
                         {
                             selected
                         }
@@ -12123,7 +12137,11 @@ impl App {
             AgentEvent::ModelSelected(model) => {
                 let runner = self.agent_runner_name(agent);
                 let model = if agent == Agent::Cursor
-                    && dmuxai::model_policy::validate_model_for_runner("cursor", &model).is_err()
+                    && dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &model,
+                    )
+                    .is_err()
                 {
                     self.push_system(format!(
                         "Disallowed model '{model}' for Cursor replaced with {}",
@@ -12723,7 +12741,11 @@ impl App {
 
         let runner = runner_name(agent);
         let config_default = settings
-            .and_then(|s| s.runner_models.get(&runner.to_ascii_lowercase()).cloned())
+            .and_then(|s| {
+                s.runner_models
+                    .get(&dmuxai::runner_id::canonical_runner_id(runner))
+                    .cloned()
+            })
             .or_else(|| match agent {
                 Agent::Custom(index) => {
                     dmuxai::custom_agent::spec_at(index).and_then(|spec| spec.default_model.clone())
@@ -12749,7 +12771,11 @@ impl App {
                 .get(&agent)
                 .and_then(|c| c.selected.as_deref())
             && prev != model_id
-            && dmuxai::model_policy::validate_model_for_runner("cursor", prev).is_err()
+            && dmuxai::model_policy::validate_model_for_runner(
+                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                prev,
+            )
+            .is_err()
         {
             self.push_system(format!(
                 "Disallowed model '{prev}' for Cursor replaced with {}: disallowed by policy",
@@ -14373,7 +14399,7 @@ impl App {
 
     pub(crate) fn agent_runner_name(&self, agent: Agent) -> String {
         match agent {
-            Agent::Cursor => "cursor".to_owned(),
+            Agent::Cursor => dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             Agent::Agy => "agy".to_owned(),
             Agent::Codex => "codex".to_owned(),
             Agent::Custom(index) => self
@@ -15905,17 +15931,17 @@ impl App {
         }
         let start_fallbacks_len = self.fallback_history.len();
         if let Some(ref agent_str) = req.agent {
-            let runner_clean = agent_str.trim().to_ascii_lowercase();
+            let runner_clean = dmuxai::runner_id::canonical_runner_id(agent_str);
             let adapter = self
                 .adapters
                 .iter()
-                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+                .find(|a| runner_name(a.agent()) == runner_clean);
             let Some(adapter) = adapter else {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::NOT_FOUND,
                     self.conversation_id.as_str().to_owned(),
                     Some(agent_str.clone()),
-                    format!("unknown agent '{agent_str}'"),
+                    dmuxai::runner_id::format_unknown_agent_message(agent_str),
                 );
             };
             let target_agent = adapter.agent();
@@ -15970,7 +15996,7 @@ impl App {
             let config_default = self
                 .settings
                 .runner_models
-                .get(&runner_id.to_ascii_lowercase())
+                .get(&dmuxai::runner_id::canonical_runner_id(&runner_id))
                 .cloned()
                 .or_else(|| match target_agent {
                     Agent::Custom(index) => dmuxai::custom_agent::spec_at(index)
@@ -16660,11 +16686,13 @@ impl App {
         runner_req: &str,
         prompt: String,
     ) -> Result<Todo, RunTodoError> {
-        let runner_clean = runner_req.trim().to_ascii_lowercase();
+        let runner_clean = dmuxai::runner_id::canonical_runner_id(runner_req);
         let adapter = self
             .adapters
             .iter()
-            .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean)
+            .find(|a| {
+                dmuxai::runner_id::canonical_runner_id(runner_name(a.agent())) == runner_clean
+            })
             .ok_or_else(|| RunTodoError::UnknownAgent(runner_req.to_owned()))?;
         let target_agent = adapter.agent();
         let runner_id = runner_name(target_agent);
@@ -17633,7 +17661,12 @@ impl App {
                 .get(&selected)
                 .and_then(|catalog| {
                     catalog.selected.as_ref().and_then(|sel| {
-                        if dmuxai::model_policy::validate_model_for_runner("cursor", sel).is_ok() {
+                        if dmuxai::model_policy::validate_model_for_runner(
+                            dmuxai::runner_id::CURSOR_RUNNER_ID,
+                            sel,
+                        )
+                        .is_ok()
+                        {
                             catalog
                                 .models
                                 .iter()
@@ -18683,7 +18716,7 @@ fn resolved_assignment_line(
 
 fn runner_name(agent: Agent) -> &'static str {
     match agent {
-        Agent::Cursor => "cursor",
+        Agent::Cursor => dmuxai::runner_id::CURSOR_RUNNER_ID,
         Agent::Agy => "agy",
         Agent::Codex => "codex",
         Agent::Custom(index) => dmuxai::custom_agent::spec_at(index)
@@ -18693,10 +18726,11 @@ fn runner_name(agent: Agent) -> &'static str {
 }
 
 fn runner_from_str(runner: &str) -> Option<Agent> {
-    match runner.trim().to_ascii_lowercase().as_str() {
-        "cursor" => Some(Agent::Cursor),
+    match dmuxai::runner_id::canonical_runner_id(runner).as_str() {
+        id if id == dmuxai::runner_id::CURSOR_RUNNER_ID => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
         "codex" => Some(Agent::Codex),
+        "" => None,
         other => dmuxai::custom_agent::index_of(other).map(Agent::Custom),
     }
 }
@@ -18952,9 +18986,9 @@ fn terminal_snapshot_notice(turn: &TurnSnapshot) -> Option<String> {
 }
 
 fn parse_agent(value: &str) -> Option<Agent> {
-    match value.to_ascii_lowercase().as_str() {
+    match dmuxai::runner_id::canonical_runner_id(value).as_str() {
         "codex" => Some(Agent::Codex),
-        "cursor" => Some(Agent::Cursor),
+        id if id == dmuxai::runner_id::CURSOR_RUNNER_ID => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
         _ => None,
     }
@@ -20143,7 +20177,7 @@ mod tests {
                     id: "step-1".to_owned(),
                     role: NodeRole::Research,
                     job: "first".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -20157,7 +20191,7 @@ mod tests {
                     id: "step-2".to_owned(),
                     role: NodeRole::Test,
                     job: "second".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -20704,7 +20738,7 @@ mod tests {
                     id: "step-a".to_owned(),
                     role: NodeRole::Research,
                     job: "a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -20718,7 +20752,7 @@ mod tests {
                     id: "step-b".to_owned(),
                     role: NodeRole::Test,
                     job: "b".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -20748,14 +20782,14 @@ mod tests {
 
         let first = NodeAssignment {
             node_id: "step-a".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "a".to_owned(),
             role: NodeRole::Research,
         };
         let second = NodeAssignment {
             node_id: "step-b".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "b".to_owned(),
             role: NodeRole::Test,
@@ -20930,7 +20964,7 @@ mod tests {
             id: "orchestrate".to_owned(),
             role: NodeRole::Orchestrate,
             job: "Build graph".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             skill: None,
             requires_gate: false,
@@ -21012,7 +21046,7 @@ mod tests {
                 id: "step-2".to_owned(),
                 role: NodeRole::Implement,
                 job: "Implement task".to_owned(),
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model_id: "composer-2.5".to_owned(),
                 skill: None,
                 requires_gate: false,
@@ -21023,17 +21057,20 @@ mod tests {
                 finished_at_ms: None,
             }],
         );
-        assert!(
-            app.graph_assignment_line
-                .contains("step-2:impl→cursor:composer-2.5")
-        );
+        assert!(app.graph_assignment_line.contains(&format!(
+            "step-2:impl→{}:composer-2.5",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
 
         // Disallowed F2 pick is replaced by the policy pin.
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
             Some("grok-4.7-medium-fast".to_owned());
         let session = app.graph_session.as_ref().unwrap();
         let resolved = resolved_assignment_line(&app.model_catalogs, Some(&app.settings), session);
-        assert!(resolved.contains("step-2:impl→cursor:composer-2.5"));
+        assert!(resolved.contains(&format!(
+            "step-2:impl→{}:composer-2.5",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
         assert!(!resolved.contains("grok-4.7-medium-fast"));
     }
 
@@ -22116,7 +22153,7 @@ out3
                         id: "node-b".to_owned(),
                         role: NodeRole::Review,
                         job: "work b".to_owned(),
-                        runner: "cursor".to_owned(),
+                        runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                         model_id: "m".to_owned(),
                         skill: None,
                         requires_gate: false,
@@ -22957,7 +22994,7 @@ out3
                     id: "node-a".to_owned(),
                     role: NodeRole::Implement,
                     job: "job a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -23006,7 +23043,7 @@ out3
                 node_id: "node-a".to_owned(),
                 role: NodeRole::Implement,
                 prompt: "prompt a".to_owned(),
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model_id: "composer-2.5".to_owned(),
             }),
             GraphAction::Failed("pipeline exploded mid-batch".to_owned()),
@@ -23039,7 +23076,7 @@ out3
             node_id: "node-c".to_owned(),
             role: NodeRole::Implement,
             prompt: "prompt c".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
         });
         assert!(noop_res.is_err());
@@ -23164,7 +23201,7 @@ out3
                     id: "orchestrate".to_owned(),
                     role: NodeRole::Orchestrate,
                     job: "Build graph".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -23178,7 +23215,7 @@ out3
                     id: "step-1".to_owned(),
                     role: NodeRole::Research,
                     job: "Research task".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -23206,7 +23243,7 @@ out3
                     id: "step-3".to_owned(),
                     role: NodeRole::Test,
                     job: "Test task".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -23220,7 +23257,7 @@ out3
                     id: "step-4".to_owned(),
                     role: NodeRole::Review,
                     job: "Review task".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -23276,7 +23313,10 @@ out3
         let areas = app.ui_areas(app.terminal_area);
         assert!(areas.graph_status.is_some());
         let rendered = render_text_at(&mut app, 100, 30);
-        assert!(rendered.contains("Graph 1/1 · single implement · cursor composer-2.5 · running"));
+        assert!(rendered.contains(&format!(
+            "Graph 1/1 · single implement · {} composer-2.5 · running",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
 
         // When turn finishes, single plan cleared
         app.finish_turn(Agent::Cursor);
@@ -23304,7 +23344,7 @@ out3
             source: TriageSource::Judge,
             cause: None,
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 12,
         };
@@ -23313,10 +23353,10 @@ out3
         assert!(areas.judge_line.is_some());
         assert_eq!(areas.judge_line.unwrap().bottom(), areas.input.y);
         let rendered = render_text_at(&mut app, 100, 30);
-        assert!(rendered.contains("Judge (cursor composer-2.5): simple — quick fix"));
-        assert_eq!(find_cell_fg(&mut app, "Judge (cursor"), Some(system));
+        assert!(rendered.contains("Judge (cursor-agent composer-2.5): simple — quick fix"));
+        assert_eq!(find_cell_fg(&mut app, "Judge (cursor-agent"), Some(system));
         assert!(
-            find_cell_modifier(&mut app, "Judge (cursor")
+            find_cell_modifier(&mut app, "Judge (cursor-agent")
                 .is_some_and(|m| m.contains(Modifier::DIM))
         );
 
@@ -23326,14 +23366,14 @@ out3
             source: TriageSource::Judge,
             cause: None,
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 12,
         };
         app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), complex));
         assert!(
             render_text_at(&mut app, 100, 30)
-                .contains("Judge (cursor composer-2.5): complex — needs plan")
+                .contains("Judge (cursor-agent composer-2.5): complex — needs plan")
         );
 
         let fallback = Triage {
@@ -23342,7 +23382,7 @@ out3
             source: TriageSource::Fallback,
             cause: Some(FallbackCause::Timeout),
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 12,
         };
@@ -23358,7 +23398,7 @@ out3
             source: TriageSource::Override,
             cause: None,
             override_kind: Some(OverrideKind::Plan),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 0,
         };
@@ -23371,7 +23411,7 @@ out3
             source: TriageSource::Override,
             cause: None,
             override_kind: Some(OverrideKind::Direct),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 0,
         };
@@ -23411,7 +23451,7 @@ out3
             source: TriageSource::Judge,
             cause: None,
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 1,
         };
@@ -23420,7 +23460,7 @@ out3
         let rendered = render_text_at(&mut app, 100, 30);
         let line = rendered
             .lines()
-            .find(|line| line.contains("Judge (cursor"))
+            .find(|line| line.contains("Judge (cursor-agent"))
             .expect("judge line");
         assert!(line.contains('…'));
         assert!(!line.contains(&"가".repeat(80)));
@@ -23444,7 +23484,10 @@ out3
         });
         let frame = spinner_frame(Duration::ZERO, app.reduced_motion());
         let rendered = render_text_at(&mut app, 100, 30);
-        assert!(rendered.contains(&format!("{frame} Judging with cursor composer-2.5…")));
+        assert!(rendered.contains(&format!(
+            "{frame} Judging with {} composer-2.5…",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
         assert_eq!(find_cell_fg(&mut app, "Judging with"), Some(system));
         assert!(
             find_cell_modifier(&mut app, "Judging with").is_some_and(|m| m.contains(Modifier::DIM))
@@ -23461,7 +23504,7 @@ out3
                 source: TriageSource::Judge,
                 cause: None,
                 override_kind: None,
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model: "composer-2.5".to_owned(),
                 elapsed_ms: 12,
             },
@@ -23673,7 +23716,7 @@ out3
 
         let cursor_view = agents
             .iter()
-            .find(|a| a["id"] == "cursor")
+            .find(|a| a["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
             .expect("cursor agent present");
         let expected_cursor_hex = dmuxai::theme::color_hex(app.settings.theme.cursor).unwrap();
         assert_eq!(cursor_view["color"], expected_cursor_hex);
@@ -30678,7 +30721,7 @@ out3
         assert!(app.drain_dashboard_commands());
 
         let accepted = rx_reply.await.unwrap().unwrap();
-        assert_eq!(accepted.agent, "cursor");
+        assert_eq!(accepted.agent, dmuxai::runner_id::CURSOR_RUNNER_ID);
 
         let mut prompts = Vec::new();
         for _ in 0..50 {
@@ -30860,7 +30903,11 @@ out3
         );
 
         let session = app.session_view();
-        let cursor = session.agents.iter().find(|a| a.id == "cursor").unwrap();
+        let cursor = session
+            .agents
+            .iter()
+            .find(|a| a.id == dmuxai::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
         let cursor_ids: Vec<&str> = cursor.models.iter().map(|m| m.id.as_str()).collect();
         assert!(cursor_ids.contains(&"claude-sonnet-5-5-high"));
         assert!(cursor_ids.contains(&"grok-4.7-high"));
@@ -30975,7 +31022,11 @@ out3
         assert_eq!(codex.models[0].efforts, vec!["low", "medium", "high"]);
         assert_eq!(codex.models[0].default_effort.as_deref(), Some("medium"));
 
-        let cursor = session.agents.iter().find(|a| a.id == "cursor").unwrap();
+        let cursor = session
+            .agents
+            .iter()
+            .find(|a| a.id == dmuxai::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
         assert_eq!(cursor.default_model.as_deref(), Some(allowed));
         assert_eq!(cursor.models.len(), 1);
         assert!(
@@ -31291,7 +31342,7 @@ out3
             !session
                 .agents
                 .iter()
-                .find(|a| a.id == "cursor")
+                .find(|a| a.id == dmuxai::runner_id::CURSOR_RUNNER_ID)
                 .unwrap()
                 .allowed
         );
@@ -32731,7 +32782,7 @@ out3
         agents.push(Agent::Custom(1));
         let app = app_with_runner_agents(agents, with_custom);
         let first = &app.messages[0].content;
-        let listed = "Runners: cursor, agy, codex, opencode, grok.";
+        let listed = "Runners: cursor-agent, agy, codex, opencode, grok.";
         assert!(first.starts_with(listed), "{first}");
         assert!(first.contains("F3 to load a conversation"), "{first}");
         assert!(first.contains("/agent"), "{first}");
@@ -32758,7 +32809,7 @@ out3
         let plain = app_with_runner_agents(Agent::BUILTIN.to_vec(), DmuxSettings::default());
         let plain_first = &plain.messages[0].content;
         assert!(
-            plain_first.starts_with("Runners: cursor, agy, codex."),
+            plain_first.starts_with("Runners: cursor-agent, agy, codex."),
             "{plain_first}"
         );
         assert!(!plain_first.contains("grok"), "{plain_first}");
@@ -33519,9 +33570,10 @@ out3
         harness.app.resume_conversation(conv.as_str());
         assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
         assert!(harness.app.messages.iter().any(|message| {
-            message
-                .content
-                .contains("Runner 'cursor' is not in allowed_runners; using 'agy'")
+            message.content.contains(&format!(
+                "Runner '{}' is not in allowed_runners; using 'agy'",
+                dmuxai::runner_id::CURSOR_RUNNER_ID
+            ))
         }));
     }
 
@@ -33591,7 +33643,7 @@ out3
                 id: "step-1".to_owned(),
                 role: dmuxai::graph::NodeRole::Implement,
                 job: "work".to_owned(),
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model_id: "composer-2.5".to_owned(),
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
@@ -34250,7 +34302,7 @@ out3
             .collect();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, "step-1");
-        assert_eq!(steps[0].runner, "cursor");
+        assert_eq!(steps[0].runner, dmuxai::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(steps[0].job, "please verify the release notes");
         assert_eq!(steps[0].model_id, "composer-2.5");
 
@@ -37270,9 +37322,10 @@ out3
     #[test]
     fn tc_1756_policy_unchanged() {
         let (mut app, _) = test_app();
-        app.settings
-            .runner_models
-            .insert("cursor".to_owned(), "composer-2.5-fast".to_owned());
+        app.settings.runner_models.insert(
+            dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
+            "composer-2.5-fast".to_owned(),
+        );
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
         assert_eq!(
             app.selected_run_model(Agent::Cursor),
@@ -39307,7 +39360,7 @@ out3
                     id: "step-a".to_owned(),
                     role: NodeRole::Research,
                     job: "a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -39321,7 +39374,7 @@ out3
                     id: "step-b".to_owned(),
                     role: NodeRole::Test,
                     job: "b".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -39350,14 +39403,14 @@ out3
         }));
         let first = NodeAssignment {
             node_id: "step-a".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "a".to_owned(),
             role: NodeRole::Research,
         };
         let second = NodeAssignment {
             node_id: "step-b".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "b".to_owned(),
             role: NodeRole::Test,
@@ -39395,7 +39448,7 @@ out3
         assert_eq!(sent.lock().unwrap().len(), 1);
         let assignment = NodeAssignment {
             node_id: "step-2".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "second".to_owned(),
             role: NodeRole::Implement,

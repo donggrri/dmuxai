@@ -481,15 +481,17 @@ mod tests {
         let err = validate_add_nodes(&plan, &empty_model, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("empty"));
 
-        // 9b. Runner-specific model (agy) accepted when valid
+        // 9b. Runner-specific model (agy) accepted when valid (FR-3000)
         let mut agy_spec = parsed_ok.clone();
         agy_spec[0].runner = "agy".to_string();
         agy_spec[0].model_id = Some("gemini-3.8-flash-high".to_string());
         assert!(validate_add_nodes(&plan, &agy_spec, 3, &settings, 5, false).is_ok());
+        // Fast ids stay blocked unless the user opts in (FR-3002, allow_fast off).
         let mut agy_bad = agy_spec.clone();
-        agy_bad[0].model_id = Some("not-a-real-model".to_string());
+        agy_bad[0].model_id = Some("gemini-4-carbon-fast".to_string());
         let err = validate_add_nodes(&plan, &agy_bad, 3, &settings, 5, false).unwrap_err();
         assert!(err.contains("invalid model"));
+        assert!(err.contains("fast models are blocked by policy"), "{err}");
 
         // 10. depends_on unknown id rejected
         let mut bad_dep = parsed_ok.clone();

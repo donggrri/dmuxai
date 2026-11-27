@@ -703,7 +703,7 @@ fn triage_view(triage: &Triage) -> TriageView {
         source: triage.source,
         cause: triage.cause,
         override_kind: triage.override_kind,
-        runner: triage.runner.clone(),
+        runner: crate::runner_id::canonical_runner_id(&triage.runner),
         model: triage.model.clone(),
         line: judge_line_text(triage),
     }
@@ -731,8 +731,8 @@ fn approval_fallback_note(run: &GraphRun, revision: &PlanRevision) -> Option<Str
     let runner = run
         .triage
         .as_ref()
-        .map(|triage| triage.runner.as_str())
-        .unwrap_or("agent");
+        .map(|triage| crate::runner_id::canonical_runner_id(&triage.runner))
+        .unwrap_or_else(|| "agent".to_owned());
     Some(format!(
         "Fallback plan (heuristic, {cause}), not written by {runner}"
     ))
@@ -743,7 +743,7 @@ fn approval_step_view(revision: &PlanRevision, step: &PlanStep) -> ApprovalStepV
     ApprovalStepView {
         id: step.id.clone(),
         role: step.role.clone(),
-        runner: step.runner.clone(),
+        runner: crate::runner_id::canonical_runner_id(&step.runner),
         model,
         job: truncate_with_ellipsis(&step.job, SNAPSHOT_STEP_JOB_LIMIT),
         depends_on: step.depends_on.clone(),
@@ -932,7 +932,7 @@ fn build_graph_view(
             id: node.id.clone(),
             role: node.role,
             job: truncate_with_ellipsis(&node.job, SNAPSHOT_NODE_JOB_LIMIT),
-            runner: node.runner.clone(),
+            runner: crate::runner_id::canonical_runner_id(&node.runner),
             model_id: node.model_id.clone(),
             status: node.status,
             attempt: node.attempt,
@@ -1031,7 +1031,7 @@ fn conversation_turn_fields(
                 .map(|node| TurnStepView {
                     id: node.id.clone(),
                     role: node.role,
-                    runner: node.runner.clone(),
+                    runner: crate::runner_id::canonical_runner_id(&node.runner),
                     status: node.status,
                     started_at_ms: node.started_at_ms,
                     finished_at_ms: node.finished_at_ms,
@@ -1473,7 +1473,7 @@ mod tests {
         let view = snapshot_from_run(&run);
         let triage_view = view.triage.as_ref().expect("triage");
         assert_eq!(triage_view.line, judge_line_text(&triage));
-        assert_eq!(triage_view.runner, "cursor");
+        assert_eq!(triage_view.runner, crate::runner_id::CURSOR_RUNNER_ID);
 
         let json = serde_json::to_string(&view).unwrap();
         assert!(json.contains("\"triage\""));
@@ -2085,5 +2085,66 @@ mod tests {
         assert_eq!(json, "\"app\"");
         let round: SnapshotSource = serde_json::from_str(&json).unwrap();
         assert_eq!(round, SnapshotSource::App);
+    }
+
+    // TC-3212 / FR-3207
+    #[test]
+    fn tc_3212_web_snapshot_uses_cursor_agent_id() {
+        let triage = crate::graph::Triage {
+            route: crate::graph::Route::Complex,
+            reason: "r".to_owned(),
+            source: crate::graph::TriageSource::Judge,
+            cause: None,
+            override_kind: None,
+            runner: "cursor".to_owned(),
+            model: "composer-2.5".to_owned(),
+            elapsed_ms: 1,
+        };
+        let view = triage_view(&triage);
+        assert_eq!(view.runner, crate::runner_id::CURSOR_RUNNER_ID);
+        assert_eq!(
+            crate::web::server::normalize_request_agent_id("cursor"),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+
+        let run = GraphRun {
+            plan: GraphPlan {
+                schema: "dmuxai.graph/v1".to_string(),
+                id: "run-legacy".to_string(),
+                orchestrator_model: "composer-2.5".to_string(),
+                user_prompt: "go".to_string(),
+                limits: GraphLimits::default(),
+                tasks: Vec::new(),
+                dynamic_cap: None,
+                nodes: vec![GraphNode {
+                    id: "n1".to_string(),
+                    role: NodeRole::Implement,
+                    job: "work".to_string(),
+                    runner: "cursor".to_string(),
+                    model_id: "composer-2.5".to_string(),
+                    skill: None,
+                    requires_gate: false,
+                    status: GraphNodeStatus::Completed,
+                    attempt: 1,
+                    task: None,
+                    started_at_ms: None,
+                    finished_at_ms: None,
+                }],
+                edges: Vec::new(),
+            },
+            conversation_id: "conv".to_string(),
+            phase: GraphRunPhase::Completed,
+            ..Default::default()
+        };
+        let graph_view =
+            snapshot_from_run_with_conversation(&run, std::slice::from_ref(&run), None);
+        assert_eq!(
+            graph_view.nodes[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+        assert_eq!(
+            graph_view.turns[0].steps[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

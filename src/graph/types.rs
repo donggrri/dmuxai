@@ -230,6 +230,28 @@ pub struct GraphRun {
 pub const MAX_PLAN_REVISIONS: u32 = 5;
 
 impl GraphRun {
+    /// Normalizes legacy `cursor` runner ids on read (FR-3208); does not rewrite files.
+    pub fn normalize_legacy_runners(&mut self) {
+        for node in &mut self.plan.nodes {
+            node.runner = crate::runner_id::canonical_runner_id(&node.runner);
+        }
+        if let Some(triage) = &mut self.triage {
+            triage.runner = crate::runner_id::canonical_runner_id(&triage.runner);
+        }
+        if let Some(plan) = &mut self.pending_replan_plan {
+            for node in &mut plan.nodes {
+                node.runner = crate::runner_id::canonical_runner_id(&node.runner);
+            }
+        }
+        if let Some(approval) = &mut self.approval {
+            for revision in &mut approval.revisions {
+                for step in &mut revision.steps {
+                    step.runner = crate::runner_id::canonical_runner_id(&step.runner);
+                }
+            }
+        }
+    }
+
     /// Keeps at most [`PLAN_HISTORY_MAX`] entries, dropping the oldest.
     pub fn push_plan_change(&mut self, change: PlanChange) {
         self.plan_history.push(change);

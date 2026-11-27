@@ -58,21 +58,29 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
             return String::new();
         }
         if let Some(default) = settings.routing_default_agent.as_deref() {
-            let lower = default.trim().to_ascii_lowercase();
-            if allowed.contains(&lower) {
+            let lower = crate::runner_id::canonical_runner_id(default);
+            if allowed
+                .iter()
+                .any(|r| crate::runner_id::canonical_runner_id(r) == lower)
+            {
                 return lower;
             }
         }
-        if allowed.iter().any(|r| r == "cursor") {
-            return "cursor".to_owned();
+        if allowed
+            .iter()
+            .any(|r| crate::runner_id::canonical_runner_id(r) == crate::runner_id::CURSOR_RUNNER_ID)
+        {
+            return crate::runner_id::CURSOR_RUNNER_ID.to_owned();
         }
         return allowed[0].clone();
     }
 
     if let Some(default) = settings.routing_default_agent.as_deref() {
-        let lower = default.trim().to_ascii_lowercase();
-        let known = matches!(lower.as_str(), "agy" | "codex" | "cursor")
-            || crate::custom_agent::index_of(&lower).is_some()
+        let lower = crate::runner_id::canonical_runner_id(default);
+        let known = matches!(
+            lower.as_str(),
+            "agy" | "codex" | crate::runner_id::CURSOR_RUNNER_ID
+        ) || crate::custom_agent::index_of(&lower).is_some()
             || settings
                 .custom_agents
                 .iter()
@@ -81,7 +89,7 @@ pub fn assign_runner(_role: NodeRole, settings: &DmuxSettings) -> String {
             return lower;
         }
     }
-    "cursor".to_owned()
+    crate::runner_id::CURSOR_RUNNER_ID.to_owned()
 }
 
 #[cfg(test)]
@@ -94,7 +102,10 @@ mod tests {
         let mut settings = DmuxSettings::default();
 
         // 1. None: baseline default is cursor
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         // 2. Routing default agent when allowed
         settings.routing_default_agent = Some("agy".to_owned());
@@ -104,7 +115,10 @@ mod tests {
         // 3. Routing default agent NOT allowed -> fallback to cursor if cursor is allowed
         settings.routing_default_agent = Some("codex".to_owned());
         settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         // 4. Neither default nor cursor allowed -> fallback to first allowed runner
         settings.routing_default_agent = Some("cursor".to_owned());
@@ -133,7 +147,10 @@ mod tests {
         let mut settings = DmuxSettings::default();
         settings.routing_default_agent = Some("codex".to_owned());
         settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "agy".to_owned()]);
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         settings.graph_allowed_runners = Some(vec!["agy".to_owned(), "opencode".to_owned()]);
         assert_eq!(assign_runner(NodeRole::Implement, &settings), "agy");
@@ -149,7 +166,10 @@ mod tests {
             .push(crate::custom_agent::opencode_preset("opencode"));
         settings.routing_default_agent = Some("opencode".to_owned());
         assert!(!is_runner_allowed("opencode", &settings));
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         settings.graph_allowed_runners = Some(vec!["opencode".to_owned()]);
         assert!(is_runner_allowed("opencode", &settings));
@@ -184,7 +204,10 @@ mod tests {
             .push(crate::custom_agent::grok_preset("grok"));
         settings.routing_default_agent = Some("grok".to_owned());
         assert!(!is_runner_allowed("grok", &settings));
-        assert_eq!(assign_runner(NodeRole::Implement, &settings), "cursor");
+        assert_eq!(
+            assign_runner(NodeRole::Implement, &settings),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
 
         settings.graph_allowed_runners = Some(vec!["grok".to_owned()]);
         assert!(is_runner_allowed("grok", &settings));

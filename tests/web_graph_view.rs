@@ -879,7 +879,12 @@ fn tc_882_graph_swimlane_renders_in_headless_chrome() {
     let lanes: Vec<String> = serde_json::from_value(layout["lanes"].clone()).unwrap();
     assert_eq!(
         lanes,
-        ["agy", "opencode-haiku", "opencode-deepseek", "cursor"],
+        [
+            "agy",
+            "opencode-haiku",
+            "opencode-deepseek",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        ],
         "lanes in first-use order"
     );
     let cards = layout["cards"].as_array().unwrap();
