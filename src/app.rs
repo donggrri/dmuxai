@@ -1608,7 +1608,7 @@ pub struct App {
     headless_plan_only_approval: bool,
     /// FR-2121: a plan-only agent reply was seen during this headless run.
     headless_plan_only_reply: bool,
-    /// FR-3300: true while `run_headless` executes a read-only turn (`--read-only` /
+    /// FR-3400: true while `run_headless` executes a read-only turn (`--read-only` /
     /// `mode = ask|plan`) so no path gates or upgrades any step to write tools.
     headless_read_only: bool,
     /// Graph ID of the last graph session started or finished during a headless run.
@@ -30486,10 +30486,10 @@ out3
         assert_eq!(requests[0].1.policy, TurnPolicy::ReadOnly);
     }
 
-    // TC-3300 / FR-3300 (#353): headless --read-only without --agent skips the
+    // TC-3400 / FR-3400 (#353): headless --read-only without --agent skips the
     // sensitive gate and stays read-only on every step.
     #[tokio::test]
-    async fn tc_3300_read_only_without_agent_skips_sensitive_gate() {
+    async fn tc_3400_read_only_without_agent_skips_sensitive_gate() {
         for enforce_roles in [false, true] {
             let (mut app, sent, event_tx) = test_app_with_event_sender();
             app.settings.graph_enforce_read_only_roles = enforce_roles;
@@ -30552,11 +30552,11 @@ out3
         }
     }
 
-    // TC-3301 / FR-3301 (#353): board ask without [board] planner for an item
+    // TC-3401 / FR-3401 (#353): board ask without [board] planner for an item
     // whose title/thread contains sensitive words runs read-only without --allow-sensitive
     // and returns an answer (exit 0), not exit 7.
     #[tokio::test]
-    async fn tc_3301_board_ask_without_planner_sensitive_prompt_not_exit_7() {
+    async fn tc_3401_board_ask_without_planner_sensitive_prompt_not_exit_7() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = dir.path().join("state");
         let board_base = state.join("board");
