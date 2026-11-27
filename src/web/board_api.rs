@@ -565,17 +565,23 @@ async fn board_rules_get(State(state): State<BoardApiState>) -> Response {
 
 async fn board_rules_put(
     State(state): State<BoardApiState>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<BoardRules>,
 ) -> Response {
+    if let Some(resp) = human_browser_rejection(&headers) {
+        return resp;
+    }
     if let Err(error) = body.validate() {
         return board_error_response(error);
     }
-    let base = state.board_base.clone();
     let saved = body.clone();
-    match tokio::task::spawn_blocking(move || RulesStore::new(&base).save(&body)).await {
-        Ok(Ok(())) => json_ok(StatusCode::OK, &saved),
-        Ok(Err(error)) => board_error_response(error),
-        Err(error) => board_error_response(BoardError::Internal(error.to_string())),
+    match with_store(state.board_base.clone(), move |store| {
+        store.with_rules_lock(|| RulesStore::new(store.base()).save(&body))
+    })
+    .await
+    {
+        Ok(()) => json_ok(StatusCode::OK, &saved),
+        Err(error) => board_error_response(error),
     }
 }
 
@@ -947,6 +953,9 @@ mod tests {
             .header("Host", "localhost:7420")
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("X-Dmuxai-Human", "1")
             .body(axum::body::Body::from(
                 r#"{"default_lane":"needs_decision","rules":[{"kind":"debug","lane":"auto"}]}"#,
             ))
@@ -960,6 +969,9 @@ mod tests {
             .header("Host", "localhost:7420")
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("X-Dmuxai-Human", "1")
             .body(axum::body::Body::from(
                 r#"{"default_lane":"nope","rules":[]}"#,
             ))
@@ -1409,6 +1421,44 @@ mod tests {
             router
                 .clone()
                 .oneshot(with_hdr_check)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let no_hdr_rules = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/board/rules")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"rules":[],"default_lane":"needs_decision"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(no_hdr_rules).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let with_hdr_rules = axum::http::Request::builder()
+            .method("PUT")
+            .uri("/api/board/rules")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("X-Dmuxai-Human", "1")
+            .body(axum::body::Body::from(
+                r#"{"rules":[],"default_lane":"needs_decision"}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(with_hdr_rules)
                 .await
                 .unwrap()
                 .status(),

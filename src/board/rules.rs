@@ -68,11 +68,21 @@ pub fn default_rules() -> BoardRules {
 
 impl BoardRules {
     pub fn validate(&self) -> Result<(), BoardError> {
-        Lane::parse(&self.default_lane)
+        let default_lane = Lane::parse(&self.default_lane)
             .ok_or_else(|| BoardError::Usage("invalid default_lane".to_owned()))?;
+        if matches!(default_lane, Lane::Approved | Lane::Rejected) {
+            return Err(BoardError::Usage(
+                "default_lane cannot be approved or rejected".to_owned(),
+            ));
+        }
         for rule in &self.rules {
-            Lane::parse(&rule.lane)
+            let rule_lane = Lane::parse(&rule.lane)
                 .ok_or_else(|| BoardError::Usage("invalid rule lane".to_owned()))?;
+            if matches!(rule_lane, Lane::Approved | Lane::Rejected) {
+                return Err(BoardError::Usage(
+                    "rule lane cannot be approved or rejected".to_owned(),
+                ));
+            }
             if let Some(kind) = &rule.kind
                 && Kind::parse(kind).is_none()
             {
@@ -250,6 +260,28 @@ mod tests {
                 .initial_lane(Kind::Feature, None, "normal fix")
                 .unwrap(),
             Lane::NeedsDecision
+        );
+
+        let bad_default = BoardRules {
+            rules: vec![],
+            default_lane: "approved".to_owned(),
+        };
+        assert_eq!(
+            bad_default.validate().unwrap_err().exit_code(),
+            crate::agent_api::exit::USAGE
+        );
+        let bad_rule = BoardRules {
+            rules: vec![RuleEntry {
+                kind: None,
+                grade: None,
+                title_regex: None,
+                lane: "rejected".to_owned(),
+            }],
+            default_lane: "needs_decision".to_owned(),
+        };
+        assert_eq!(
+            bad_rule.validate().unwrap_err().exit_code(),
+            crate::agent_api::exit::USAGE
         );
     }
 }

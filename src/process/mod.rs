@@ -118,6 +118,12 @@ fn resolve_program_value(
 pub fn headless_command(program: PathBuf) -> Command {
     let mut command = Command::new(program);
     apply_child_env_policy_tokio(&mut command);
+    if std::env::var_os(crate::term::policy::RUN_ID_ENV).is_none_or(|v| v.is_empty()) {
+        command.env(
+            crate::term::policy::RUN_ID_ENV,
+            crate::run_journal::generate_run_id(),
+        );
+    }
     command
 }
 
@@ -292,5 +298,16 @@ mod tests {
                 "expected headless_command to remove {var}"
             );
         }
+        let run_id = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(k, v)| {
+                (k == crate::term::policy::RUN_ID_ENV).then(|| v.and_then(|s| s.to_str()))
+            })
+            .flatten();
+        assert!(
+            run_id.is_some_and(|v| !v.is_empty()),
+            "expected headless_command to set DMUXAI_RUN_ID"
+        );
     }
 }

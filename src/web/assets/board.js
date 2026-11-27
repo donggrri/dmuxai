@@ -190,16 +190,23 @@ function boardRenderMyDecisions(container, items) {
   }
   container.appendChild(row);
 
+  var cutoffMs = Date.now() - 30 * 86400 * 1000;
   var toCheck = [];
   for (var ci = 0; ci < boardItems.length; ci++) {
     var cItem = boardItems[ci];
     if ((cItem.lane !== 'done' && cItem.lane !== 'unknown') || cItem.checked) { continue; }
+    if (!cItem.updated_ms || cItem.updated_ms < cutoffMs) { continue; }
     if (boardWorkspaceFilter) {
       var cWs = cItem.workspace && cItem.workspace.path ? cItem.workspace.path : '';
       if (cWs.indexOf(boardWorkspaceFilter) < 0) { continue; }
     }
     toCheck.push(cItem);
   }
+  toCheck.sort(function (a, b) {
+    var diff = (a.updated_ms || 0) - (b.updated_ms || 0);
+    if (diff !== 0) { return diff; }
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
   if (toCheck.length) {
     var checkGroup = boardEl('div', 'board-to-check-group');
     checkGroup.id = 'board-to-check-group';
@@ -900,7 +907,7 @@ function boardSaveRules(panel) {
   if (!area) { return; }
   try {
     var body = JSON.parse(area.value);
-    boardFetchJson('PUT', '/api/board/rules', body).then(function () {
+    boardFetchJson('PUT', '/api/board/rules', body, true).then(function () {
       area.classList.remove('board-rules-error');
     }).catch(function () {
       area.classList.add('board-rules-error');

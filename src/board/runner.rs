@@ -263,6 +263,11 @@ pub fn spawn_child_dmuxai(
     apply_child_cwd(&mut cmd, workspace);
     apply_child_env_policy(&mut cmd);
     apply_state_dir_env(&mut cmd, state_root);
+    let run_id = std::env::var(crate::term::policy::RUN_ID_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(crate::run_journal::generate_run_id);
+    cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -431,7 +436,10 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
             "cannot --revise an item without a plan".to_owned(),
         ));
     }
-    if params.revise && BoardLockGuard::is_active(store.base(), "runs", &params.id) {
+    if params.revise
+        && (existing.lane == Lane::InProgress
+            || BoardLockGuard::is_active(store.base(), "runs", &params.id))
+    {
         return Err(BoardError::Conflict(
             "cannot --revise while a run is in progress for this item".to_owned(),
         ));
@@ -602,6 +610,11 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
     if params.by == "planner" {
         return Err(BoardError::Forbidden("planner cannot run items".to_owned()));
     }
+    if BoardLockGuard::is_active(store.base(), "asks", &params.id) {
+        return Err(BoardError::Conflict(
+            "an ask is currently in progress for this item".to_owned(),
+        ));
+    }
     let guard = BoardLockGuard::acquire(
         store.base(),
         "runs",
@@ -763,6 +776,11 @@ pub fn launch_detached_board_run(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     apply_state_dir_env(&mut cmd, &prepared.state_root);
+    let run_id = std::env::var(crate::term::policy::RUN_ID_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(crate::run_journal::generate_run_id);
+    cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1382,5 +1400,75 @@ exit 0
             std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
             std::env::remove_var("DMUXAI_BOARD_SELF_BIN");
         }
+    }
+
+    #[test]
+    fn tc_3138_spawn_child_exports_run_id_and_run_respects_ask_lock() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let workspace = dir.path().join("ws");
+        ensure_dir(&workspace).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+
+        let env_out = dir.path().join("child-run-id.txt");
+        let fake_bin = write_fake_runner(
+            dir.path(),
+            "capture-run-id.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s' \"$DMUXAI_RUN_ID\" > \"{}\"\nprintf '{{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}}\\n'\nexit 0\n",
+                env_out.display()
+            ),
+        );
+        unsafe {
+            std::env::remove_var(crate::term::policy::RUN_ID_ENV);
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin);
+        }
+        let outcome =
+            spawn_child_dmuxai(&workspace, &[], "hello", Duration::from_secs(5), &state).unwrap();
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        assert_eq!(outcome.exit_code, 0);
+        let exported = fs::read_to_string(&env_out).unwrap();
+        assert!(
+            !exported.trim().is_empty(),
+            "expected DMUXAI_RUN_ID in child"
+        );
+
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"t","done_check":"d","size":"small","depends_on":[]}],"steps":[{"id":"s1","role":"implement","job":"j","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&workspace, &state, "ship", plan_json, None).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "Ask lock test".to_owned(),
+                summary: String::new(),
+                kind: Kind::Debug,
+                grade: None,
+                lane: None,
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash),
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let _ask_lock = BoardLockGuard::acquire(&board, "asks", &item.id, "asking").unwrap();
+        let err = match run_item_prepare(
+            &store,
+            RunParams {
+                id: item.id,
+                expected_plan_hash: None,
+                by: "bot:coordinator".to_owned(),
+                state_root: state,
+            },
+        ) {
+            Ok(_) => panic!("expected Conflict when asks lock is active"),
+            Err(err) => err,
+        };
+        assert_eq!(err.exit_code(), crate::agent_api::exit::CONFLICT);
     }
 }

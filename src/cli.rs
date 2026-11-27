@@ -3032,6 +3032,29 @@ fn confirm_owner_action_cli(id: &str, verb: &str, title: &str) -> Result<(), Api
         .map_err(ApiError::from)
 }
 
+fn run_board_move(
+    store: &dmuxai::board::BoardStore,
+    id: &str,
+    lane: dmuxai::board::Lane,
+    by: &str,
+    if_version: Option<u32>,
+    confirm: impl FnOnce(&str, &str, &str) -> Result<(), ApiError>,
+) -> Result<dmuxai::board::BoardItem, ApiError> {
+    if by == "planner" {
+        return Err(ApiError::new(
+            exit::FORBIDDEN,
+            "planner cannot move items".to_owned(),
+        ));
+    }
+    if lane == dmuxai::board::Lane::Auto && by == "owner" {
+        let existing = store.get(id).map_err(ApiError::from)?;
+        confirm(id, "move to auto", &existing.title)?;
+    }
+    store
+        .move_lane(id, lane, by, if_version)
+        .map_err(ApiError::from)
+}
+
 fn format_pending_age(age_ms: u64) -> String {
     let mins = age_ms / 60_000;
     if mins < 60 {
@@ -3052,21 +3075,30 @@ fn truncate_chars(text: &str, max: usize) -> String {
 }
 
 fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
-    use dmuxai::board::{
-        AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
-        UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, default_actor_by,
-        resolve_actor, wait_ready_json,
-    };
-    use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
     use std::io::IsTerminal;
 
-    let json_out = command.json;
     let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let caller = if is_tty {
-        BoardCaller::CliTty
+        dmuxai::board::BoardCaller::CliTty
     } else {
-        BoardCaller::CliNonTty
+        dmuxai::board::BoardCaller::CliNonTty
     };
+    execute_board_with_caller(workspace_root, command, caller)
+}
+
+fn execute_board_with_caller(
+    workspace_root: &Path,
+    command: BoardCommand,
+    caller: dmuxai::board::BoardCaller,
+) -> i32 {
+    use dmuxai::board::{
+        AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
+        UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, resolve_actor,
+        wait_ready_json,
+    };
+    use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
+
+    let json_out = command.json;
     let state_root = match dmuxai::state_path::state_base() {
         Ok(path) => path,
         Err(error) => {
@@ -3117,7 +3149,10 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     summary
                 };
                 let ws = workspace.unwrap_or_else(|| workspace_root.to_path_buf());
-                let by = default_actor_by(caller);
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
+                if lane == Some(Lane::Auto) && by == "owner" {
+                    confirm_owner_action_cli("auto", "add to auto lane", &title)?;
+                }
                 let item = store
                     .add(AddItemRequest {
                         title,
@@ -3204,7 +3239,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 run_id,
                 if_version,
             } => {
-                let by = default_actor_by(caller);
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
                 let summary = summary.map(|s| read_prompt(&s)).transpose()?;
                 let grade = grade
                     .map(|g| {
@@ -3255,19 +3290,8 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 let lane = Lane::parse(&lane)
                     .ok_or_else(|| ApiError::new(exit::USAGE, "invalid lane".to_owned()))?;
                 let by = resolve_actor(None, caller).map_err(ApiError::from)?;
-                if dmuxai::board::actor_may_use_planner(&by) {
-                    return Err(ApiError::new(
-                        exit::FORBIDDEN,
-                        "planner cannot move items".to_owned(),
-                    ));
-                }
-                if lane == Lane::Auto && by == "owner" {
-                    let existing = store.get(&id).map_err(ApiError::from)?;
-                    confirm_owner_action_cli(&id, "move to auto", &existing.title)?;
-                }
-                let item = store
-                    .move_lane(&id, lane, &by, if_version)
-                    .map_err(ApiError::from)?;
+                let item =
+                    run_board_move(&store, &id, lane, &by, if_version, confirm_owner_action_cli)?;
                 if json_out {
                     print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 }
@@ -3352,18 +3376,17 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                         "planner cannot record decisions".to_owned(),
                     ));
                 }
+                let mut plan_hash = plan_hash;
                 if by == "owner" {
                     let existing = store.get(&id).map_err(ApiError::from)?;
+                    if matches!(verdict, Verdict::Approve)
+                        && plan_hash.is_none()
+                        && caller == BoardCaller::CliTty
+                        && let Some(plan) = existing.plan.as_ref()
+                    {
+                        plan_hash = Some(plan.hash.clone());
+                    }
                     confirm_owner_action_cli(&id, verdict.as_str(), &existing.title)?;
-                }
-                let mut plan_hash = plan_hash;
-                if matches!(verdict, Verdict::Approve)
-                    && plan_hash.is_none()
-                    && caller == BoardCaller::CliTty
-                    && let Ok(item) = store.get(&id)
-                    && let Some(plan) = item.plan.as_ref()
-                {
-                    plan_hash = Some(plan.hash.clone());
                 }
                 let item = store
                     .decide(
@@ -3515,6 +3538,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     let text =
                         dmuxai::board::read_path_or_stdin(&source).map_err(ApiError::from)?;
                     let rules = compile_rules_from_set_text(&text).map_err(ApiError::from)?;
+                    confirm_owner_action_cli("rules", "set board rules", "rules")?;
                     store
                         .with_rules_lock(|| rules_store.save(&rules))
                         .map_err(ApiError::from)?;
@@ -3571,7 +3595,29 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 exec_prepared,
                 plan_hash,
             } => {
-                let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
+                let by = if exec_prepared {
+                    let actor = by
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("bot:coordinator")
+                        .to_owned();
+                    if actor == "planner" {
+                        return Err(ApiError::new(
+                            exit::FORBIDDEN,
+                            "planner cannot run items".to_owned(),
+                        ));
+                    }
+                    if actor != "owner" && !actor.starts_with("bot:") {
+                        return Err(ApiError::new(
+                            exit::USAGE,
+                            format!("invalid --by '{actor}' (expected owner or bot:NAME)"),
+                        ));
+                    }
+                    actor
+                } else {
+                    resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?
+                };
                 let item = if exec_prepared {
                     let hash = plan_hash.ok_or_else(|| {
                         ApiError::new(
@@ -4032,16 +4078,25 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             argv,
             serial,
             ..
-        } => RequestOp::Open {
-            name: name.clone(),
-            kind: *kind,
-            cwd: cwd.as_ref().map(|path| path.display().to_string()),
-            env: env.clone(),
-            cols: *cols,
-            rows: *rows,
-            argv: argv.clone(),
-            serial: serial.clone(),
-        },
+        } => {
+            let mut env = env.clone();
+            if let Ok(run_id) = std::env::var(dmuxai::term::policy::RUN_ID_ENV)
+                && !run_id.trim().is_empty()
+            {
+                env.retain(|(k, _)| k != dmuxai::term::policy::RUN_ID_ENV);
+                env.push((dmuxai::term::policy::RUN_ID_ENV.to_owned(), run_id));
+            }
+            RequestOp::Open {
+                name: name.clone(),
+                kind: *kind,
+                cwd: cwd.as_ref().map(|path| path.display().to_string()),
+                env,
+                cols: *cols,
+                rows: *rows,
+                argv: argv.clone(),
+                serial: serial.clone(),
+            }
+        }
         TermOp::Send {
             name,
             text,
@@ -4626,6 +4681,17 @@ async fn run_headless(
     }
     let sink = build_event_sink(workspace_root, &settings);
     let run_id = dmuxai::run_journal::generate_run_id();
+    struct RunIdEnvGuard(Option<std::ffi::OsString>);
+    impl Drop for RunIdEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prev) => unsafe { std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, prev) },
+                None => unsafe { std::env::remove_var(dmuxai::term::policy::RUN_ID_ENV) },
+            }
+        }
+    }
+    let _run_id_env_guard = RunIdEnvGuard(std::env::var_os(dmuxai::term::policy::RUN_ID_ENV));
+    unsafe { std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, &run_id) };
     sink.log().set_run_id(Some(run_id.clone()));
     let first_seq = sink.log().last_seq() + 1;
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
@@ -6154,5 +6220,152 @@ mod tests {
         assert!(board_subcommand_usage("wait").contains("--timeout"));
         assert!(board_subcommand_usage("pending").contains("--workspace"));
         assert!(board_subcommand_usage("check").contains("--text"));
+    }
+
+    // TC-3138 / FR-3105, FR-3110, FR-3133, FR-3138: CLI non-TTY add --lane auto -> 5,
+    // TTY move reaches confirmation, and exec-prepared works without TTY.
+    #[test]
+    fn tc_3138_cli_add_auto_move_confirm_and_exec_prepared_non_tty() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+
+        // 1. Non-TTY board add --lane auto -> exit 5 (Forbidden).
+        let add_auto_exit = execute_board_with_caller(
+            &ws,
+            BoardCommand {
+                op: BoardOp::Add {
+                    title: "Auto from non-tty".to_owned(),
+                    summary: String::new(),
+                    kind: "feature".to_owned(),
+                    grade: None,
+                    lane: Some("auto".to_owned()),
+                    bot: None,
+                    channel: None,
+                    ref_url: None,
+                    workspace: Some(ws.clone()),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                },
+                json: true,
+            },
+            dmuxai::board::BoardCaller::CliNonTty,
+        );
+        assert_eq!(add_auto_exit, exit::FORBIDDEN);
+
+        // 2. TTY move to auto reaches confirmation prompt (injectable prompt).
+        let store = dmuxai::board::BoardStore::open(state.join("board")).unwrap();
+        let item = store
+            .add(dmuxai::board::AddItemRequest {
+                title: "Move me".to_owned(),
+                summary: String::new(),
+                kind: dmuxai::board::Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let mut prompted = false;
+        let mismatch = run_board_move(
+            &store,
+            &item.id,
+            dmuxai::board::Lane::Auto,
+            "owner",
+            None,
+            |id, verb, title| {
+                prompted = true;
+                dmuxai::board::confirm_owner_action(id, verb, title, |_| Ok("wrong".to_owned()))
+                    .map_err(ApiError::from)
+            },
+        )
+        .unwrap_err();
+        assert!(prompted, "TTY move to auto must reach confirmation");
+        assert_eq!(mismatch.code, exit::FORBIDDEN);
+
+        let moved = run_board_move(
+            &store,
+            &item.id,
+            dmuxai::board::Lane::Auto,
+            "owner",
+            None,
+            |id, verb, title| {
+                dmuxai::board::confirm_owner_action(id, verb, title, |_| Ok(id.to_owned()))
+                    .map_err(ApiError::from)
+            },
+        )
+        .unwrap();
+        assert_eq!(moved.lane, dmuxai::board::Lane::Auto);
+
+        // 3. --exec-prepared --by owner works without TTY even when DMUXAI_RUN_ID is set.
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"t","done_check":"d","size":"small","depends_on":[]}],"steps":[{"id":"s1","role":"implement","job":"j","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) =
+            dmuxai::board::edit_plan_from_json(&ws, &state, "ship", plan_json, None).unwrap();
+        store
+            .attach_plan(&item.id, &hash, &state, "bot:test")
+            .unwrap();
+        let prepared = dmuxai::board::runner::run_item_prepare(
+            &store,
+            dmuxai::board::runner::RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(hash.clone()),
+                by: "owner".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        prepared.guard.disarm();
+
+        let fake_bin = dir.path().join("fake-exec.sh");
+        std::fs::write(
+            &fake_bin,
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}\\n'\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).unwrap();
+        }
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin);
+            std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, "run-123");
+        }
+        let exec_exit = execute_board_with_caller(
+            &ws,
+            BoardCommand {
+                op: BoardOp::Run {
+                    id: item.id.clone(),
+                    detach: false,
+                    by: Some("owner".to_owned()),
+                    exec_prepared: true,
+                    plan_hash: Some(hash),
+                },
+                json: true,
+            },
+            dmuxai::board::BoardCaller::CliNonTty,
+        );
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var(dmuxai::term::policy::RUN_ID_ENV);
+            std::env::remove_var("DMUXAI_STATE_DIR");
+        }
+        assert_eq!(exec_exit, exit::OK);
+        assert_eq!(store.get(&item.id).unwrap().lane, dmuxai::board::Lane::Done);
     }
 }

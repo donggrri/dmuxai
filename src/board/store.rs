@@ -681,6 +681,9 @@ impl BoardStore {
             }
             let prev_lane = item.lane;
             item.lane = lane;
+            if prev_lane != lane || matches!(lane, Lane::Done | Lane::Unknown) {
+                item.checked = None;
+            }
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
@@ -957,7 +960,11 @@ impl BoardStore {
             if matches!(req.verdict, Verdict::Approve)
                 && let Some(plan) = &item.plan
             {
-                let hash = req.plan_hash.as_deref().unwrap_or(plan.hash.as_str());
+                let Some(hash) = req.plan_hash.as_deref() else {
+                    return Err(BoardError::Conflict(
+                        "plan_hash is required to approve an item with a plan".to_owned(),
+                    ));
+                };
                 if hash != plan.hash {
                     return Err(BoardError::Conflict(
                         "plan hash does not match the current plan".to_owned(),
@@ -1504,6 +1511,19 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(stale.exit_code(), crate::agent_api::exit::CONFLICT);
+        let missing_hash = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(missing_hash.exit_code(), crate::agent_api::exit::CONFLICT);
         let bot_forbidden = store
             .decide(
                 &item.id,
@@ -2175,5 +2195,14 @@ mod tests {
         let after = store.pending(None).unwrap();
         assert_eq!(after.count, 2);
         assert!(!after.items.iter().any(|p| p.id == i_done.id));
+
+        let reopened = store
+            .move_lane(&i_done.id, Lane::NeedsDecision, "owner", None)
+            .unwrap();
+        assert!(reopened.checked.is_none());
+        let re_done = store
+            .move_lane(&i_done.id, Lane::Done, "bot:coord", None)
+            .unwrap();
+        assert!(re_done.checked.is_none());
     }
 }
