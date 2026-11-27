@@ -90,7 +90,7 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
+  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--write] [--keep-worktrees] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
   dmuxai todo run <id> [--agent ID | --graph] [--model M] [--progress] [--json] [--trust-workspace-config]
   dmuxai trust [--status] [--json] [--revoke] [--yes]
   dmuxai todo add <title> [--body TEXT] [--json]
@@ -133,6 +133,7 @@ Options:
   runners          List registered runners, admission, installation and model policy
   models           List available models and runner model policy
   runs             List or inspect recorded execution runs
+  fanout           Clean leftover write fan-out git worktrees
   events           Print state-change events from .dmuxai/events.jsonl
   term             Manage persistent named terminal sessions
   mcp              Serve DmuxAI as an MCP server over stdio
@@ -1391,6 +1392,7 @@ mod tests {
     fn tc_2830_subcommand_help_is_local() {
         let subcommands = [
             "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models",
+            "fanout",
         ];
         for sub in subcommands {
             for flag in ["--help", "-h"] {

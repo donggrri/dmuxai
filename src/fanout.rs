@@ -80,7 +80,7 @@ pub enum LegStatus {
     Skipped,
 }
 
-/// One leg in the headless JSON/text output (FR-2915).
+/// One leg in the headless JSON/text output (FR-2915, FR-2932).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FanoutLegReport {
     pub agent: String,
@@ -93,6 +93,33 @@ pub struct FanoutLegReport {
     #[serde(default)]
     pub blocked: bool,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub diff_stat: Option<crate::fanout_worktree::FanoutDiffStat>,
+    #[serde(default)]
+    pub patch_path: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub changed: Option<bool>,
+}
+
+impl Default for FanoutLegReport {
+    fn default() -> Self {
+        Self {
+            agent: String::new(),
+            model: None,
+            status: LegStatus::Queued,
+            text: String::new(),
+            error: None,
+            error_kind: None,
+            duration_ms: 0,
+            diff_stat: None,
+            patch_path: None,
+            worktree_path: None,
+            changed: None,
+            blocked: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -584,6 +611,7 @@ mod tests {
                 error_kind: None,
                 blocked: false,
                 duration_ms: 0,
+                ..Default::default()
             },
             FanoutLegReport {
                 agent: "codex".into(),
@@ -594,6 +622,7 @@ mod tests {
                 error_kind: Some("provider".into()),
                 blocked: false,
                 duration_ms: 20,
+                ..Default::default()
             },
         ];
         let serialized = serde_json::to_value(&legs[1]).expect("leg json");

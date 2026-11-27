@@ -77,6 +77,11 @@ pub enum AgentCommand {
     },
     /// Persistent named terminal sessions (SPEC-terminal-sessions).
     Term(TermCommand),
+    /// `fanout clean [<run_id>|--all]` (FR-2934).
+    FanoutClean {
+        run_id: Option<String>,
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,11 +177,14 @@ pub struct RunOptions {
     pub agents: Option<String>,
     pub min_ok: Option<usize>,
     pub judge: Option<String>,
+    pub write: bool,
+    pub keep_worktrees: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 11] = [
+pub const SUBCOMMANDS: [&str; 12] = [
     "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models", "term",
+    "fanout",
 ];
 
 pub const RUN_USAGE: &str = "\
@@ -189,7 +197,9 @@ Arguments:
 
 Options:
   --agent ID               Runner id (e.g. cursor, agy, codex, or a custom agent)
-  --agents RUNNERS         Comma-separated runners for read-only fan-out (a,b[:model],...)
+  --agents RUNNERS         Comma-separated runners for fan-out (a,b[:model],...)
+  --write                  Write fan-out: each leg runs in its own git worktree (needs --agents)
+  --keep-worktrees         Keep leg worktrees after a write fan-out (needs --write)
   --judge RUNNER           Read-only judge runner after fan-out (agent[:model]; needs --agents)
   --min-ok N               Minimum successful legs required (default 1; fan-out only)
   --model M                Model id for the runner
@@ -307,6 +317,25 @@ Options:
   -h, --help               Print help information
 ";
 
+pub const FANOUT_USAGE: &str = "\
+Usage: dmuxai fanout clean [<run_id>|--all]
+
+Remove leftover write fan-out git worktrees under .dmuxai/fanout/.
+
+Subcommands:
+  clean [<run_id>|--all]   Remove worktrees for one run or all runs
+
+Options:
+  --all                    Clean every run under .dmuxai/fanout/
+  -h, --help               Print help information
+";
+
+pub const FANOUT_CLEAN_FLAGS: &[FlagSpec] = &[FlagSpec {
+    names: &["--all"],
+    takes_value: false,
+    hidden: false,
+}];
+
 pub const MODELS_USAGE: &str = "\
 Usage: dmuxai models [options]
 
@@ -331,6 +360,7 @@ pub fn subcommand_usage(name: &str) -> Option<&'static str> {
         "runs" => Some(RUNS_USAGE),
         "runners" => Some(RUNNERS_USAGE),
         "models" => Some(MODELS_USAGE),
+        "fanout" => Some(FANOUT_USAGE),
         _ => None,
     }
 }
@@ -658,6 +688,16 @@ pub const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--write"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--keep-worktrees"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
         names: &["--min-ok"],
         takes_value: true,
         hidden: false,
@@ -966,7 +1006,18 @@ fn parse_run_options_with_flags(
         agents,
         min_ok,
         judge: parsed.flags.get("--judge").cloned().flatten(),
+        write: parsed.flags.contains_key("--write"),
+        keep_worktrees: parsed.flags.contains_key("--keep-worktrees"),
     };
+    if options.write && options.agents.is_none() {
+        return Err("--write requires --agents".to_owned());
+    }
+    if options.keep_worktrees && !options.write {
+        return Err("--keep-worktrees requires --write".to_owned());
+    }
+    if options.write && options.read_only {
+        return Err("--write cannot be used with --read-only".to_owned());
+    }
     if options.judge.is_some() && options.agents.is_none() {
         return Err("--judge requires --agents".to_owned());
     }
@@ -1182,6 +1233,24 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             })
         }
         "term" => parse_term(rest).map(AgentCommand::Term),
+        "fanout" => {
+            let Some(sub) = rest.first() else {
+                return Err("fanout needs clean".to_owned());
+            };
+            if sub != "clean" {
+                return Err(format!("unknown fanout subcommand '{sub}'"));
+            }
+            let parsed = parse_flags(&rest[1..], FANOUT_CLEAN_FLAGS, true)?;
+            let all = parsed.flags.contains_key("--all");
+            let run_id = parsed.positionals.first().cloned();
+            if all && run_id.is_some() {
+                return Err("fanout clean: use either a run id or --all, not both".to_owned());
+            }
+            if !all && run_id.is_none() {
+                return Err("fanout clean needs a run id or --all".to_owned());
+            }
+            Ok(AgentCommand::FanoutClean { run_id, all })
+        }
         other => Err(format!("unknown subcommand '{other}'")),
     }
 }
@@ -2099,6 +2168,12 @@ pub async fn execute(command: AgentCommand) -> i32 {
             }
         }
         AgentCommand::Term(command) => execute_term(&workspace_root, command),
+        AgentCommand::FanoutClean { run_id, all } => {
+            match dmuxai::fanout_worktree::fanout_clean(&workspace_root, run_id.as_deref(), all) {
+                Ok(()) => exit::OK,
+                Err(error) => fail(ApiError::new(exit::USAGE, error.to_string()), false),
+            }
+        }
         AgentCommand::Mcp => {
             let backend = CliMcpBackend {
                 workspace_root: workspace_root.clone(),
@@ -2889,24 +2964,7 @@ async fn run_fanout_headless(
     for warning in &settings.config_warnings {
         eprintln!("warning: {warning}");
     }
-    let (db_path, _) =
-        dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
-    let engine = ConversationEngine::open(&db_path, workspace_root)
-        .map_err(|error| conversation_open_error(&error))?;
-    for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
-        eprintln!("warning: {warning}");
-    }
-    let sink = build_event_sink(workspace_root, &settings);
-    let first_seq = sink.log().last_seq() + 1;
-    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
-        .unwrap_or_else(|_| workspace_root.display().to_string());
-    let hub = headless_dashboard_hub(workspace, sink.clone());
     let company_workspace = settings.fanout_company_workspace;
-    let mut app = App::new(engine, workspace_root.to_path_buf(), settings.clone())
-        .map_err(|error| conversation_open_error(&error))?;
-    app.attach_dashboard(hub);
-    app.set_headless(true);
-
     let agents_raw = options.agents.as_deref().unwrap_or_default();
     let all_specs = dmuxai::fanout::parse_agents_flag(agents_raw)
         .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
@@ -2928,6 +2986,7 @@ async fn run_fanout_headless(
                 error_kind: None,
                 blocked: false,
                 duration_ms: 0,
+                ..Default::default()
             });
         } else {
             specs.push(leg);
@@ -2963,10 +3022,61 @@ async fn run_fanout_headless(
     )
     .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
 
+    let user_prompt = prompt.unwrap_or_default();
+    if options.write
+        && dmuxai::graph::sensitive_keyword_match(&user_prompt)
+        && !options.allow_sensitive
+        && !options.approve_plan
+    {
+        return Err(ApiError::new(
+            exit::APPROVAL_REQUIRED,
+            "sensitive step needs approval: rerun with --allow-sensitive (or --agent <name> --approve-plan)"
+                .to_owned(),
+        ));
+    }
+    let write = if options.write {
+        dmuxai::fanout_worktree::validate_write_fanout_workspace(workspace_root)
+            .map_err(|e| ApiError::new(dmuxai::agent_api::exit::USAGE, e.to_string()))?;
+        dmuxai::fanout_worktree::disk_guard_check(
+            workspace_root,
+            specs.len(),
+            settings.fanout_min_free_gb,
+        )
+        .map_err(|e| ApiError::new(dmuxai::agent_api::exit::USAGE, e.to_string()))?;
+        Some(dmuxai::fanout_worktree::FanoutWriteRunConfig {
+            run_id: dmuxai::run_journal::generate_run_id(),
+            keep_worktrees: options.keep_worktrees,
+        })
+    } else {
+        None
+    };
+
+    let (db_path, _) =
+        dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
+    let engine = ConversationEngine::open(&db_path, workspace_root)
+        .map_err(|error| conversation_open_error(&error))?;
+    for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
+        eprintln!("warning: {warning}");
+    }
+    let sink = build_event_sink(workspace_root, &settings);
+    let first_seq = sink.log().last_seq() + 1;
+    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
+        .unwrap_or_else(|_| workspace_root.display().to_string());
+    let hub = headless_dashboard_hub(workspace, sink.clone());
+    let mut app = App::new(engine, workspace_root.to_path_buf(), settings.clone())
+        .map_err(|error| conversation_open_error(&error))?;
+    app.attach_dashboard(hub);
+    app.set_headless(true);
+
+    let write_cleanup = Arc::new(std::sync::Mutex::new(None::<(PathBuf, String)>));
+    if let Some(ref cfg) = write {
+        *write_cleanup.lock().unwrap() = Some((workspace_root.to_path_buf(), cfg.run_id.clone()));
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_signal = cancel.clone();
     let finished = Arc::new(AtomicBool::new(false));
     let finished_signal = finished.clone();
+    let write_cleanup_signal = write_cleanup.clone();
     let signal_task = tokio::spawn(async move {
         wait_for_stop_signal().await;
         cancel_signal.store(true, Ordering::SeqCst);
@@ -2975,6 +3085,9 @@ async fn run_fanout_headless(
             _ = wait_for_stop_signal() => {}
         }
         if !finished_signal.load(Ordering::SeqCst) {
+            if let Some((ws, run_id)) = write_cleanup_signal.lock().unwrap().take() {
+                let _ = dmuxai::fanout_worktree::fanout_clean(&ws, Some(&run_id), false);
+            }
             dmuxai::process::supervisor::stop_live_groups_of(
                 dmuxai::process::supervisor::GroupOwner::DEFAULT,
                 Duration::from_secs(2),
@@ -2983,7 +3096,6 @@ async fn run_fanout_headless(
             std::process::exit(130);
         }
     });
-    let user_prompt = prompt.unwrap_or_default();
     let outcome = app
         .run_fanout_headless(
             user_prompt,
@@ -2993,10 +3105,12 @@ async fn run_fanout_headless(
             cli_order,
             judge,
             cancel,
+            write,
         )
         .await;
     app.shutdown().await;
     finished.store(true, Ordering::SeqCst);
+    write_cleanup.lock().unwrap().take();
     signal_task.abort();
     let last_seq = sink.log().last_seq();
     Ok((outcome, first_seq, last_seq))
@@ -3682,6 +3796,7 @@ mod tests {
                 agents: None,
                 min_ok: None,
                 judge: None,
+                ..Default::default()
             }))
         );
         assert_eq!(
@@ -3820,6 +3935,7 @@ mod tests {
                         error_kind: None,
                         blocked: false,
                         duration_ms: 1,
+                        ..Default::default()
                     },
                     dmuxai::fanout::FanoutLegReport {
                         agent: "codex".into(),
@@ -3830,6 +3946,7 @@ mod tests {
                         error_kind: Some("provider".into()),
                         blocked: false,
                         duration_ms: 2,
+                        ..Default::default()
                     },
                 ],
             }),
@@ -3913,6 +4030,7 @@ mod tests {
                         error_kind: None,
                         blocked: false,
                         duration_ms: 1,
+                        ..Default::default()
                     },
                     dmuxai::fanout::FanoutLegReport {
                         agent: "codex".into(),
@@ -3923,6 +4041,7 @@ mod tests {
                         error_kind: None,
                         blocked: false,
                         duration_ms: 2,
+                        ..Default::default()
                     },
                 ],
             }),
@@ -3948,6 +4067,38 @@ mod tests {
     }
 
     // TC-2926 / FR-2926
+    #[test]
+    fn tc_2935_sensitive_prompt_requires_approve_plan() {
+        assert!(
+            parse(&[
+                "run".into(),
+                "rotate password".into(),
+                "--agents".into(),
+                "cursor,codex".into(),
+                "--write".into(),
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["run".into(), "hi".into(), "--write".into(),]).is_err());
+    }
+
+    // TC-2936 / FR-2936
+    #[test]
+    fn tc_2936_company_workspace_skips_free_runners_in_write_mode() {
+        let mut settings = DmuxSettings::default();
+        settings.fanout_company_workspace = true;
+        let free = dmuxai::fanout::FanoutLegSpec {
+            runner: "codex".into(),
+            model: Some("kimi-k2.5-free".into()),
+        };
+        assert!(dmuxai::fanout::fanout_runner_is_free(&free, &settings));
+        let paid = dmuxai::fanout::FanoutLegSpec {
+            runner: "cursor".into(),
+            model: None,
+        };
+        assert!(!dmuxai::fanout::fanout_runner_is_free(&paid, &settings));
+    }
+
     #[test]
     fn tc_2926_company_workspace_rejects_free_judge() {
         let mut settings = DmuxSettings::default();
@@ -4074,6 +4225,7 @@ mod tests {
                 agents: None,
                 min_ok: None,
                 judge: None,
+                ..Default::default()
             }))
         );
         assert!(parse(&args(&["run", "x", "--agent", "agy", "--model"])).is_err());
@@ -4148,6 +4300,7 @@ mod tests {
                 agents: None,
                 min_ok: None,
                 judge: None,
+                ..Default::default()
             }))
         );
         assert_eq!(
