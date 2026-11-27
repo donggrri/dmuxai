@@ -8,6 +8,7 @@ pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
 pub const ALL_PROJECTS_JS: &str = include_str!("assets/all-projects.js");
+pub const MD_VIEWER_JS: &str = include_str!("assets/md-viewer.js");
 pub const BOARD_JS: &str = include_str!("assets/board.js");
 pub const BOARD_CSS: &str = include_str!("assets/board.css");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
@@ -282,6 +283,7 @@ mod tests {
             AGENT_PROMPTS_JS,
             RUNS_JS,
             ALL_PROJECTS_JS,
+            MD_VIEWER_JS,
         ] {
             assert!(
                 source.contains("X-Dmuxai-Client") || source.contains("'x-dmuxai-client'"),
@@ -2573,16 +2575,17 @@ mod tests {
     // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
     #[test]
     fn tc_3134_drawer_ask_and_run_controls_hidden_in_serve() {
-        assert!(BOARD_JS.contains("board-ask-text"));
-        assert!(BOARD_JS.contains("board-ask"));
+        assert!(!BOARD_JS.contains("board-ask-text"));
+        assert!(BOARD_JS.contains("board-chat-note-only"));
+        assert!(BOARD_JS.contains("Note only (no planner answer)"));
         assert!(BOARD_JS.contains("board-ask-revise"));
         assert!(BOARD_JS.contains("board-ask-busy"));
         assert!(BOARD_JS.contains("aria-live"));
-        assert!(BOARD_JS.contains("Ask planner"));
         assert!(BOARD_JS.contains("Ask & revise plan"));
         assert!(BOARD_JS.contains("board-run"));
         assert!(BOARD_JS.contains("boardLaunchAllowed"));
-        assert!(BOARD_JS.contains("askSec.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("reviseBtn.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("noteLabel.hidden = !boardLaunchAllowed"));
         assert!(BOARD_JS.contains("boardIsItemRunnable"));
         assert!(BOARD_JS.contains("item.lane === 'auto'"));
         assert!(BOARD_JS.contains("item.lane === 'approved'"));
@@ -2595,5 +2598,141 @@ mod tests {
         assert!(BOARD_JS.contains("To check"));
         assert!(BOARD_JS.contains("board-mark-checked"));
         assert!(BOARD_JS.contains("/check"));
+    }
+
+    // TC-3412 (FR-3412, FR-3413)
+    #[test]
+    fn tc_3412_board_detail_is_centered_modal_with_close_and_esc() {
+        assert!(INDEX_HTML.contains("id=\"board-drawer\""));
+        assert!(INDEX_HTML.contains("role=\"dialog\""));
+        assert!(INDEX_HTML.contains("aria-modal=\"true\""));
+        assert!(INDEX_HTML.contains("aria-labelledby=\"board-drawer-title\""));
+
+        assert!(BOARD_JS.contains("board-modal-close"));
+        assert!(BOARD_JS.contains("'aria-label', 'Close'"));
+        assert!(BOARD_JS.contains("board-drawer-title"));
+        assert!(BOARD_JS.contains("Escape"));
+        assert!(BOARD_JS.contains("md-viewer-backdrop"));
+        assert!(BOARD_JS.contains("board-modal-open"));
+        assert!(BOARD_JS.contains("boardLastFocus"));
+        assert!(BOARD_JS.contains("_boardInsideDrawer"));
+        assert!(APP_JS.contains("board-drawer-wrap"));
+
+        assert!(BOARD_CSS.contains("align-items: center"));
+        assert!(BOARD_CSS.contains("justify-content: center"));
+        assert!(BOARD_CSS.contains("min(960px, 92vw)"));
+        assert!(BOARD_CSS.contains("max-height: 90vh"));
+        assert!(BOARD_CSS.contains("overflow: auto"));
+        assert!(BOARD_CSS.contains("body.board-modal-open"));
+        assert!(!BOARD_CSS.contains("justify-content: flex-end"));
+        assert!(!BOARD_CSS.contains("border-left: 1px solid var(--line)"));
+    }
+
+    // TC-3418 (FR-3418, FR-3419, FR-3420)
+    #[test]
+    fn tc_3418_board_chat_send_asks_planner_unless_note_only() {
+        assert!(!BOARD_JS.contains("board-ask-text"));
+        assert!(BOARD_JS.contains("board-chat-input"));
+        assert!(BOARD_JS.contains("board-chat-note-only"));
+        assert!(BOARD_JS.contains("Note only (no planner answer)"));
+        assert!(BOARD_JS.contains("board-ask-revise"));
+        assert!(BOARD_JS.contains("board-ask-busy"));
+        assert!(BOARD_JS.contains("Asking planner\\u2026"));
+
+        let send_chat_fn = js_between(
+            BOARD_JS,
+            "function boardSendChat",
+            "function boardOpenDrawer",
+        );
+        assert!(send_chat_fn.contains("board-chat-note-only"));
+        assert!(send_chat_fn.contains("if (boardLaunchAllowed && !noteOnly)"));
+        assert!(send_chat_fn.contains("boardAskPlanner(id, false)"));
+        assert!(send_chat_fn.contains("/messages"));
+
+        assert!(BOARD_JS.contains("reviseBtn.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("noteLabel.hidden = !boardLaunchAllowed"));
+        assert!(BOARD_JS.contains("boardAskPlanner(item.id, true)"));
+    }
+
+    // TC-3421 (FR-3421)
+    #[test]
+    fn tc_3421_readme_documents_board_chat_send() {
+        let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = std::fs::read_to_string(&readme_path).expect("README.md readable");
+        assert!(readme.contains("Decision board"));
+        assert!(readme.contains("Note only"));
+        assert!(readme.contains("[board] planner"));
+    }
+
+    // TC-3422 (FR-3422)
+    #[test]
+    fn tc_3422_tokenless_board_stream_and_client_header() {
+        let open_es_fn = js_between(
+            APP_JS,
+            "window.dmuxaiOpenEventSource",
+            "window.dmuxaiWorkspaceId",
+        );
+        assert!(!open_es_fn.contains("|| !token"));
+        assert!(open_es_fn.contains("token ?"));
+
+        let fetch_fn = js_between(
+            BOARD_JS,
+            "function boardFetchJson",
+            "function boardBasename",
+        );
+        assert!(fetch_fn.contains("X-Dmuxai-Client"));
+
+        assert!(BOARD_JS.contains("BOARD_ASK_POLL_MS = 3000"));
+        assert!(BOARD_JS.contains("BOARD_ASK_TIMEOUT_MS = 15 * 60 * 1000"));
+        assert!(BOARD_JS.contains("boardStartAskPoll"));
+        assert!(BOARD_JS.contains("boardStopAskPoll"));
+        assert!(BOARD_JS.contains("No answer yet"));
+    }
+
+    // TC-3417 (FR-3416, FR-3417)
+    #[tokio::test]
+    async fn tc_3417_markdown_paths_linkified_and_open_viewer() {
+        assert!(MD_VIEWER_JS.contains("md-path-link"));
+        assert!(MD_VIEWER_JS.contains("data-md-path"));
+        assert!(MD_VIEWER_JS.contains("/api/md/view"));
+        assert!(MD_VIEWER_JS.contains("aria-modal"));
+        assert!(MD_VIEWER_JS.contains("dmuxaiOpenMdViewer"));
+        assert!(MD_VIEWER_JS.contains("dmuxaiLinkifyMdPaths"));
+        assert!(MD_VIEWER_JS.contains("createTreeWalker"));
+        assert!(MD_VIEWER_JS.contains("'aria-label', 'Close'"));
+        assert!(MD_VIEWER_JS.contains("link.textContent = clean"));
+        // Only the server-sanitized payload.html may assign innerHTML.
+        assert_eq!(MD_VIEWER_JS.matches("innerHTML").count(), 1);
+        assert!(MD_VIEWER_JS.contains("bodyEl.innerHTML ="));
+
+        let md_viewer_pos = INDEX_HTML
+            .find("/assets/md-viewer.js")
+            .expect("index.html must include /assets/md-viewer.js");
+        let board_pos = INDEX_HTML
+            .find("/assets/board.js")
+            .expect("index.html must include /assets/board.js");
+        assert!(md_viewer_pos < board_pos);
+
+        assert!(BOARD_JS.contains("dmuxaiLinkifyMdPaths(summaryEl)"));
+        assert!(BOARD_JS.contains("dmuxaiLinkifyMdPaths(bubble)"));
+        assert!(SESSION_JS.contains("dmuxaiLinkifyMdPaths(target)"));
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        let req = axum::http::Request::builder()
+            .uri("/assets/md-viewer.js")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), MD_VIEWER_JS.as_bytes());
     }
 }

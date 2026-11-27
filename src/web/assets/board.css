@@ -185,12 +185,18 @@
   border-radius: 4px;
 }
 
+body.board-modal-open {
+  overflow: hidden;
+}
+
 .board-drawer-wrap {
   position: fixed;
   inset: 0;
   display: none;
-  justify-content: flex-end;
-  z-index: 40;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 1200;
 }
 
 .board-drawer-wrap[hidden] {
@@ -202,24 +208,40 @@
 }
 
 .board-drawer-backdrop {
-  flex: 1;
-  background: color-mix(in srgb, var(--bg) 35%, transparent);
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
 }
 
 .board-drawer {
-  width: min(720px, 60vw);
+  position: relative;
+  z-index: 1;
+  width: min(960px, 92vw);
   max-width: 100%;
-  height: 100%;
+  max-height: 90vh;
   overflow: auto;
   overflow-x: hidden;
+  box-sizing: border-box;
   background: var(--bg-panel);
-  border-left: 1px solid var(--line);
-  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.9rem 1.1rem;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
   color: var(--text);
-  box-shadow: -8px 0 24px color-mix(in srgb, var(--bg) 50%, transparent);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+}
+
+.board-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.board-modal-close {
+  flex-shrink: 0;
 }
 
 .board-drawer-title {
@@ -440,7 +462,8 @@
 }
 
 .board-run-actions[hidden],
-.board-ask[hidden],
+.board-chat-note-only[hidden],
+#board-ask-revise[hidden],
 .board-ask-busy[hidden],
 #board-run[hidden] {
   display: none !important;
@@ -451,36 +474,20 @@
   color: var(--error-text);
 }
 
-.board-ask {
-  border-top: 1px solid var(--line);
-  padding-top: 0.5rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-}
-
-.board-ask-label {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: var(--muted);
-}
-
-.board-ask-text {
-  width: 100%;
-  box-sizing: border-box;
-  font: inherit;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 0.4rem 0.5rem;
-  resize: vertical;
-}
-
-.board-ask-actions {
+.board-chat-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.board-chat-note-only {
+  display: inline-flex;
+  align-items: center;
   gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
 }
 
 .board-ask-busy {
@@ -493,7 +500,12 @@
 }
 
 @media (max-width: 900px) {
+  .board-drawer-wrap {
+    padding: 8px;
+  }
+
   .board-drawer {
-    width: 100%;
+    width: 96vw;
+    max-height: 94vh;
   }
 }

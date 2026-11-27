@@ -141,6 +141,26 @@ agent is busy or another graph is active, and they respect
 `dmuxai serve` is view-only: you can manage to-dos but the run buttons are
 disabled with a hint. Start `dmuxai --web` to run to-dos from the browser.
 
+### Decision board
+
+The **Board** view shows the user-level coordinator decision board across all
+workspaces (cards needing your decision, items to check, and kanban lanes).
+Click any card to open its detail popup with the plan steps, decision history,
+and side chat.
+
+In `dmuxai --web`, pressing **Send** (or Ctrl/Cmd+Enter) in the item chat posts
+your message and asks the planner read-only, posting the answer in the thread
+(or use **Ask & revise plan** to generate a revised plan). Check **Note only
+(no planner answer)** to leave a store-only message for a waiting bot
+(`dmuxai board wait`) without running an agent; in view-only `dmuxai serve`,
+**Send** is always store-only.
+
+Configure `[board] planner = "<agent>"` (or `"<agent>:<model>"`) in your user
+`dmuxai.toml` to choose which planner agent answers board questions; otherwise
+the workspace's default routing is used. See
+[docs/API.md](docs/API.md#decision-board) for CLI, MCP, and `[board]`
+notification settings.
+
 ### Themes and colors
 
 ![Dashboard in the light theme with a custom accent](docs/images/web-dashboard-light.png)

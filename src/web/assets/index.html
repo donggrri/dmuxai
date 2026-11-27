@@ -14,6 +14,7 @@
 <script src="/assets/app.js" defer></script>
 <script src="/assets/runs.js" defer></script>
 <script src="/assets/all-projects.js" defer></script>
+<script src="/assets/md-viewer.js" defer></script>
 <script src="/assets/board.js" defer></script>
 <script src="/assets/docs.js" defer></script>
 </head>
@@ -161,7 +162,7 @@
     </div>
     <div id="board-drawer-wrap" class="board-drawer-wrap" hidden>
       <div id="board-drawer-backdrop" class="board-drawer-backdrop" role="presentation"></div>
-      <aside id="board-drawer" class="board-drawer" aria-label="Item drawer"></aside>
+      <aside id="board-drawer" class="board-drawer" role="dialog" aria-modal="true" aria-labelledby="board-drawer-title" tabindex="-1"></aside>
     </div>
   </section>
 

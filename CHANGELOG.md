@@ -5,9 +5,19 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- Dashboard: Markdown file paths in agent and board messages open in a read-only viewer (workspace files, and `.md` files under your home folder).
+
+### Changed
+
+- Board item detail opens as a centered popup instead of a side drawer.
+
 ### Fixed
 
 - `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
+- Board item chat: Send now asks the planner and posts its answer ("Note only" keeps the old store-only message).
+- Board: live updates and planner answers now work on tokenless dashboards; Ask no longer sticks on "Asking planner…" (#357).
 
 ## [0.4.1] - 2026-11-27
 

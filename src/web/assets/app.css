@@ -3079,3 +3079,81 @@ main {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* FR-3416, FR-3417: Markdown file path links and read-only viewer modal */
+.md-path-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.md-path-link:hover {
+  opacity: 0.85;
+}
+
+body.md-viewer-open {
+  overflow: hidden;
+}
+
+.md-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1300;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.md-viewer-backdrop[hidden] {
+  display: none !important;
+}
+
+.md-viewer-card {
+  background: var(--bg-panel, var(--bg));
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.45);
+  width: min(960px, 92vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.md-viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.md-viewer-title {
+  margin: 0;
+  font-size: 0.95em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.md-viewer-body {
+  padding: 16px 20px;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.md-viewer-status {
+  margin: 0;
+  color: var(--muted);
+}
+
+.md-viewer-error {
+  margin: 0;
+  color: var(--error-text);
+}

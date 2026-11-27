@@ -26,10 +26,11 @@ window.dmuxaiApiUrlFor = function (ws, path) {
   return appendWs(path, ws);
 };
 window.dmuxaiOpenEventSource = function (path) {
-  if (typeof EventSource === 'undefined' || !token) { return null; }
+  if (typeof EventSource === 'undefined') { return null; }
   var sep = path.indexOf('?') >= 0 ? '&' : '?';
+  var url = token ? (path + sep + 'token=' + encodeURIComponent(token)) : path;
   try {
-    return new EventSource(apiUrl(path + sep + 'token=' + encodeURIComponent(token)));
+    return new EventSource(apiUrl(url));
   } catch (err) {
     return null;
   }
@@ -2247,6 +2248,10 @@ function bindCenterViews() {
     // command palette and the plan edit box keep their own Esc.
     var preview = document.querySelector('.doc-overlay');
     if (preview && !preview.hidden) { return; }
+    var mdViewer = $('md-viewer-backdrop');
+    if (mdViewer && !mdViewer.hidden) { return; }
+    var boardModal = $('board-drawer-wrap');
+    if (boardModal && !boardModal.hidden) { return; }
     if (centerView === 'graph' && graphSelectedId) { return; }
     if (document.querySelector('.session-overlay')) { return; }
     var t = e.target;

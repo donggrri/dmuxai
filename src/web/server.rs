@@ -864,6 +864,22 @@ async fn get_board_js() -> impl IntoResponse {
     )
 }
 
+async fn get_md_viewer_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::MD_VIEWER_JS,
+    )
+}
+
 async fn get_board_css() -> impl IntoResponse {
     (
         [
@@ -2454,6 +2470,7 @@ pub fn build_router_with_directory_access(
             "/api/global/projects/{repo_key}/runs/{run_id}/stream",
             get(crate::web::global_api::run_stream),
         )
+        .route("/assets/md-viewer.js", get(get_md_viewer_js))
         .route("/assets/board.js", get(get_board_js))
         .route("/assets/board.css", get(get_board_css))
         .route("/api/todos", get(list_todos).post(create_todo))
@@ -8555,5 +8572,82 @@ mod tests {
             "Start task must never submit: {start_draft}"
         );
         assert!(crate::web::assets::JIRA_TODOS_JS.contains("window.dmuxaiStartDraft"));
+    }
+
+    // TC-3422 / FR-3422: tokenless loopback GET /api/board/events is accepted,
+    // while a token-required server rejects it without a token.
+    #[tokio::test]
+    async fn tc_3422_tokenless_loopback_board_events_accepted_and_token_required_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let _ = crate::board::BoardStore::open(board.clone()).unwrap();
+        let token = "board-sse-token-3222".to_string();
+
+        let services_tokenless = DashboardServices {
+            board_base: Some(board.clone()),
+            ..Default::default()
+        };
+        let tokenless_access = WebAccess::loopback(
+            token.clone(),
+            false,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7420,
+            crate::web::local_peer::shared_peer_source(),
+        );
+        let tokenless_router = build_router_with_directory_access(
+            Arc::new(WorkspaceDirectory::single(test_hub(), services_tokenless)),
+            tokenless_access,
+        );
+        let req = axum::http::Request::builder()
+            .uri("/api/board/events?since=0")
+            .header("Host", "localhost:7420")
+            .header("Accept", "text/event-stream")
+            .header("Sec-Fetch-Site", "same-origin")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = tokenless_router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("text/event-stream")
+        );
+
+        let services_required = DashboardServices {
+            board_base: Some(board),
+            ..Default::default()
+        };
+        let required_access = WebAccess::loopback(
+            token.clone(),
+            true,
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            7420,
+            crate::web::local_peer::shared_peer_source(),
+        );
+        let required_router = build_router_with_directory_access(
+            Arc::new(WorkspaceDirectory::single(test_hub(), services_required)),
+            required_access,
+        );
+        let req_missing = axum::http::Request::builder()
+            .uri("/api/board/events?since=0")
+            .header("Host", "localhost:7420")
+            .header("Accept", "text/event-stream")
+            .header("Sec-Fetch-Site", "same-origin")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_missing = required_router.clone().oneshot(req_missing).await.unwrap();
+        assert_eq!(resp_missing.status(), StatusCode::UNAUTHORIZED);
+
+        let req_with_token = axum::http::Request::builder()
+            .uri(format!("/api/board/events?since=0&token={token}"))
+            .header("Host", "localhost:7420")
+            .header("Accept", "text/event-stream")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_with_token = required_router.oneshot(req_with_token).await.unwrap();
+        assert_eq!(resp_with_token.status(), StatusCode::OK);
     }
 }

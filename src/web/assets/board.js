@@ -31,6 +31,13 @@ var boardRulesOpen = false;
 var boardPlanConflict = false;
 var boardLaunchAllowed = false;
 var boardAskPending = {};
+var BOARD_ASK_POLL_MS = 3000;
+var BOARD_ASK_TIMEOUT_MS = 15 * 60 * 1000;
+var boardAskPollTimer = null;
+var boardAskPollId = null;
+var boardLastFocus = null;
+var boardLastFocusItemId = null;
+var boardNeedsFocus = false;
 
 function boardToken() {
   try { return window.sessionStorage.getItem(BOARD_TOKEN_KEY); } catch (err) { return null; }
@@ -54,7 +61,10 @@ function boardEl(tag, className, text) {
 
 function boardFetchJson(method, path, body, humanAction) {
   var tok = boardToken();
-  var headers = tok ? { Authorization: 'Bearer ' + tok } : {};
+  var headers = { 'X-Dmuxai-Client': '1' };
+  if (tok) {
+    headers.Authorization = 'Bearer ' + tok;
+  }
   if (humanAction === true) {
     headers['X-Dmuxai-Human'] = '1';
   }
@@ -353,14 +363,105 @@ function boardSyncViewState() {
   }
 }
 
+function boardStopAskPoll(id) {
+  if (id !== undefined && boardAskPollId !== id) { return; }
+  if (boardAskPollTimer !== null) {
+    window.clearInterval(boardAskPollTimer);
+    boardAskPollTimer = null;
+  }
+  boardAskPollId = null;
+}
+
+function boardStartAskPoll(id) {
+  boardStopAskPoll();
+  boardAskPollId = id;
+  var inFlight = false;
+  boardAskPollTimer = window.setInterval(function () {
+    var wrap = document.getElementById('board-drawer-wrap');
+    if (!boardUiOpen || boardSelectedId !== id || !wrap || wrap.hidden || !wrap.classList.contains('open')) {
+      boardStopAskPoll(id);
+      return;
+    }
+    var pending = boardAskPending[id];
+    if (!pending || pending.error) {
+      boardStopAskPoll(id);
+      return;
+    }
+    if (Date.now() - pending.startedAtMs >= BOARD_ASK_TIMEOUT_MS) {
+      boardStopAskPoll(id);
+      pending.error = 'No answer yet \u2014 check the thread later';
+      if (boardSelectedItem && boardSelectedItem.id === id) {
+        boardRenderDrawer(boardSelectedItem);
+      } else {
+        var curBusy = document.getElementById('board-ask-busy');
+        if (curBusy) {
+          curBusy.classList.add('board-ask-error');
+          curBusy.hidden = false;
+          curBusy.textContent = pending.error;
+        }
+      }
+      return;
+    }
+    if (inFlight) { return; }
+    inFlight = true;
+    boardFetchJson('GET', '/api/board/' + encodeURIComponent(id)).then(function (item) {
+      inFlight = false;
+      if (boardSelectedId !== id) {
+        boardStopAskPoll(id);
+        return;
+      }
+      boardSelectedItem = item;
+      if (boardCountPlannerMessages(item) > pending.baselineCount) {
+        delete boardAskPending[id];
+        boardStopAskPoll(id);
+        boardRenderDrawer(item);
+        boardRefreshList();
+      } else if (Date.now() - pending.startedAtMs >= BOARD_ASK_TIMEOUT_MS) {
+        boardStopAskPoll(id);
+        pending.error = 'No answer yet \u2014 check the thread later';
+        boardRenderDrawer(item);
+      }
+    }).catch(function () {
+      inFlight = false;
+    });
+  }, BOARD_ASK_POLL_MS);
+}
+
+function boardFindCardForItem(id) {
+  if (!id) { return null; }
+  var cards = document.querySelectorAll('[data-item-id]');
+  for (var i = 0; i < cards.length; i++) {
+    if (cards[i].getAttribute('data-item-id') === id &&
+        (cards[i].classList.contains('board-decision-card') || cards[i].classList.contains('board-card'))) {
+      return cards[i];
+    }
+  }
+  return null;
+}
+
 function boardCloseDrawer() {
+  boardStopAskPoll();
   var wrap = document.getElementById('board-drawer-wrap');
   if (wrap) {
     wrap.classList.remove('open');
     wrap.hidden = true;
   }
+  document.body.classList.remove('board-modal-open');
+  var focusTarget = boardLastFocus;
+  var fallbackId = boardLastFocusItemId;
+  boardLastFocus = null;
+  boardLastFocusItemId = null;
+  boardNeedsFocus = false;
   boardSelectedId = null;
   boardSelectedItem = null;
+  if (focusTarget && focusTarget.isConnected && typeof focusTarget.focus === 'function') {
+    try { focusTarget.focus(); } catch (err) { /* ignore */ }
+  } else if (fallbackId) {
+    var card = boardFindCardForItem(fallbackId);
+    if (card && typeof card.focus === 'function') {
+      try { card.focus(); } catch (err) { /* ignore */ }
+    }
+  }
 }
 
 function boardPlanFieldInput(field, val) {
@@ -445,14 +546,49 @@ function boardRenderDrawer(item) {
   if (!wrap || !drawer) { return; }
   wrap.hidden = false;
   wrap.classList.add('open');
+  document.body.classList.add('board-modal-open');
+
+  var existingInput = document.getElementById('board-chat-input');
+  var prevItemId = boardSelectedItem ? boardSelectedItem.id : null;
+  var preserveDraft = !!(existingInput && prevItemId === item.id);
+  var draftText = preserveDraft ? existingInput.value : '';
+  var existingNote = document.getElementById('board-chat-note-only');
+  var draftNoteOnly = preserveDraft && existingNote ? !!existingNote.checked : false;
+  var focusWasInput = preserveDraft && document.activeElement === existingInput;
+
   var pendingAsk = boardAskPending[item.id];
-  if (pendingAsk && !pendingAsk.error && boardCountPlannerMessages(item) > pendingAsk.baselineCount) {
-    delete boardAskPending[item.id];
-    pendingAsk = null;
+  if (pendingAsk && !pendingAsk.error) {
+    if (boardCountPlannerMessages(item) > pendingAsk.baselineCount) {
+      delete boardAskPending[item.id];
+      boardStopAskPoll(item.id);
+      pendingAsk = null;
+    } else if (Date.now() - pendingAsk.startedAtMs >= BOARD_ASK_TIMEOUT_MS) {
+      boardStopAskPoll(item.id);
+      pendingAsk.error = 'No answer yet \u2014 check the thread later';
+    } else if (boardUiOpen && boardSelectedId === item.id && boardAskPollId !== item.id) {
+      boardStartAskPoll(item.id);
+    }
   }
   drawer.textContent = '';
-  drawer.appendChild(boardEl('h3', 'board-drawer-title', item.title));
-  drawer.appendChild(boardEl('p', 'board-drawer-summary', item.summary || ''));
+  var header = boardEl('div', 'board-modal-header');
+  var titleEl = boardEl('h3', 'board-drawer-title', item.title);
+  titleEl.id = 'board-drawer-title';
+  header.appendChild(titleEl);
+  var closeBtn = boardEl('button', 'btn sidebar-close board-modal-close', '\u00D7');
+  closeBtn.type = 'button';
+  closeBtn.id = 'board-modal-close';
+  closeBtn.setAttribute('aria-label', 'Close');
+  closeBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    boardCloseDrawer();
+  });
+  header.appendChild(closeBtn);
+  drawer.appendChild(header);
+  var summaryEl = boardEl('p', 'board-drawer-summary', item.summary || '');
+  drawer.appendChild(summaryEl);
+  if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
+    window.dmuxaiLinkifyMdPaths(summaryEl);
+  }
   if (item.plan) {
     drawer.appendChild(boardEl('p', 'board-plan-meta',
       (item.plan.hash || '—') + ' · revision ' + item.plan.revision));
@@ -584,64 +720,61 @@ function boardRenderDrawer(item) {
       }
       line.appendChild(boardEl('div', 'board-chat-sender', msg.from || 'unknown'));
       line.appendChild(boardEl('div', 'board-chat-time', boardFormatChatTime(msg.at_ms)));
-      line.appendChild(boardEl('div', 'board-chat-bubble', msg.text || ''));
+      var bubble = boardEl('div', 'board-chat-bubble', msg.text || '');
+      line.appendChild(bubble);
+      if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
+        window.dmuxaiLinkifyMdPaths(bubble);
+      }
       thread.appendChild(line);
     }
   }
   chat.appendChild(thread);
   var ta = document.createElement('textarea');
   ta.id = 'board-chat-input';
+  ta.className = 'board-chat-input';
   ta.rows = 3;
   ta.setAttribute('aria-label', 'Message');
+  if (draftText) { ta.value = draftText; }
   chat.appendChild(ta);
+
+  var chatActions = boardEl('div', 'board-chat-actions');
   var send = boardEl('button', 'btn btn-small btn-primary', 'Send');
   send.type = 'button';
   send.id = 'board-chat-send';
-  chat.appendChild(send);
-  drawer.appendChild(chat);
+  chatActions.appendChild(send);
 
-  send.addEventListener('click', function () { boardSendChat(item.id); });
-  ta.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      boardSendChat(item.id);
-    }
-  });
-
-  var askSec = boardEl('section', 'board-ask');
-  askSec.id = 'board-ask-section';
-  askSec.setAttribute('aria-label', 'Ask planner');
-  askSec.hidden = !boardLaunchAllowed;
-  var askLabel = boardEl('label', 'board-ask-label', 'Ask planner');
-  askLabel.setAttribute('for', 'board-ask-text');
-  askSec.appendChild(askLabel);
-  var askTa = document.createElement('textarea');
-  askTa.id = 'board-ask-text';
-  askTa.className = 'board-ask-text';
-  askTa.rows = 2;
-  askTa.setAttribute('aria-label', 'Ask planner');
-  askSec.appendChild(askTa);
-  var askActions = boardEl('div', 'board-ask-actions');
-  var askBtn = boardEl('button', 'btn btn-small', 'Ask');
-  askBtn.type = 'button';
-  askBtn.id = 'board-ask';
-  var reviseBtn = boardEl('button', 'btn btn-small btn-primary', 'Ask & revise plan');
+  var reviseBtn = boardEl('button', 'btn btn-small', 'Ask & revise plan');
   reviseBtn.type = 'button';
   reviseBtn.id = 'board-ask-revise';
-  if (!item.plan) { reviseBtn.disabled = true; }
-  var isBusy = !!(pendingAsk && !pendingAsk.error);
+  reviseBtn.hidden = !boardLaunchAllowed;
+  chatActions.appendChild(reviseBtn);
+
+  var noteLabel = boardEl('label', 'board-chat-note-only');
+  noteLabel.hidden = !boardLaunchAllowed;
+  var noteChk = document.createElement('input');
+  noteChk.type = 'checkbox';
+  noteChk.id = 'board-chat-note-only';
+  noteChk.checked = draftNoteOnly;
+  noteLabel.appendChild(noteChk);
+  noteLabel.appendChild(document.createTextNode('Note only (no planner answer)'));
+  chatActions.appendChild(noteLabel);
+  chat.appendChild(chatActions);
+
+  var isBusy = !!(boardLaunchAllowed && pendingAsk && !pendingAsk.error);
   if (isBusy) {
-    askBtn.disabled = true;
+    send.disabled = true;
+    reviseBtn.disabled = true;
+  } else if (!item.plan) {
     reviseBtn.disabled = true;
   }
-  askActions.appendChild(askBtn);
-  askActions.appendChild(reviseBtn);
-  askSec.appendChild(askActions);
+
   var askBusy = boardEl('div', 'board-ask-busy');
   askBusy.id = 'board-ask-busy';
   askBusy.setAttribute('aria-live', 'polite');
   askBusy.setAttribute('role', 'status');
-  if (pendingAsk && pendingAsk.error) {
+  if (!boardLaunchAllowed) {
+    askBusy.hidden = true;
+  } else if (pendingAsk && pendingAsk.error) {
     askBusy.hidden = false;
     askBusy.classList.add('board-ask-error');
     askBusy.textContent = pendingAsk.error;
@@ -651,43 +784,73 @@ function boardRenderDrawer(item) {
   } else {
     askBusy.hidden = true;
   }
-  askSec.appendChild(askBusy);
-  drawer.appendChild(askSec);
-  askBtn.addEventListener('click', function () { boardAskPlanner(item.id, false); });
+  chat.appendChild(askBusy);
+  drawer.appendChild(chat);
+
+  send.addEventListener('click', function () { boardSendChat(item.id); });
   reviseBtn.addEventListener('click', function () { boardAskPlanner(item.id, true); });
+  ta.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      boardSendChat(item.id);
+    }
+  });
+
+  if (boardNeedsFocus) {
+    boardNeedsFocus = false;
+    if (typeof closeBtn.focus === 'function') {
+      try { closeBtn.focus(); } catch (err) { /* ignore */ }
+    }
+  } else if (focusWasInput) {
+    try { ta.focus(); } catch (err) { /* ignore */ }
+  }
 }
 
 function boardAskPlanner(id, revise) {
   if (!boardLaunchAllowed) { return; }
-  var ta = document.getElementById('board-ask-text');
+  if (boardAskPending[id] && !boardAskPending[id].error) { return; }
+  var ta = document.getElementById('board-chat-input');
   if (!ta || !ta.value.trim()) { return; }
   var text = ta.value.trim();
   var item = boardFindItem(id);
   var baselineCount = boardCountPlannerMessages(item);
-  boardAskPending[id] = { baselineCount: baselineCount, error: null };
+  boardAskPending[id] = {
+    baselineCount: baselineCount,
+    error: null,
+    startedAtMs: Date.now()
+  };
   var busy = document.getElementById('board-ask-busy');
-  var askBtn = document.getElementById('board-ask');
+  var sendBtn = document.getElementById('board-chat-send');
   var reviseBtn = document.getElementById('board-ask-revise');
-  if (askBtn) { askBtn.disabled = true; }
+  if (sendBtn) { sendBtn.disabled = true; }
   if (reviseBtn) { reviseBtn.disabled = true; }
   if (busy) {
     busy.classList.remove('board-ask-error');
     busy.hidden = false;
     busy.textContent = 'Asking planner\u2026';
   }
+  boardStartAskPoll(id);
   boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', {
     text: text,
     revise: !!revise
   }).then(function () {
-    var curTa = document.getElementById('board-ask-text');
+    var curTa = document.getElementById('board-chat-input');
     if (curTa) { curTa.value = ''; }
+    if (boardSelectedId === id) {
+      boardOpenDrawer(id, true);
+    }
   }).catch(function (err) {
+    boardStopAskPoll(id);
     var msg = (err && err.message) ? err.message : 'Ask failed';
-    boardAskPending[id] = { baselineCount: baselineCount, error: msg };
+    boardAskPending[id] = {
+      baselineCount: baselineCount,
+      error: msg,
+      startedAtMs: Date.now()
+    };
     var curBusy = document.getElementById('board-ask-busy');
-    var curAsk = document.getElementById('board-ask');
+    var curSend = document.getElementById('board-chat-send');
     var curRevise = document.getElementById('board-ask-revise');
-    if (curAsk) { curAsk.disabled = false; }
+    if (curSend) { curSend.disabled = false; }
     if (curRevise) {
       var curItem = boardFindItem(id);
       curRevise.disabled = !(curItem && curItem.plan);
@@ -787,6 +950,12 @@ function boardRemovePlanStep(index) {
 function boardSendChat(id) {
   var ta = document.getElementById('board-chat-input');
   if (!ta || !ta.value.trim()) { return; }
+  var noteChk = document.getElementById('board-chat-note-only');
+  var noteOnly = !!(noteChk && noteChk.checked);
+  if (boardLaunchAllowed && !noteOnly) {
+    boardAskPlanner(id, false);
+    return;
+  }
   var text = ta.value.trim();
   boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/messages', { text: text })
     .then(function () {
@@ -797,12 +966,19 @@ function boardSendChat(id) {
 }
 
 function boardOpenDrawer(id, skipPush) {
-  boardSelectedId = id;
   var wrap = document.getElementById('board-drawer-wrap');
+  var wasOpen = !!(wrap && !wrap.hidden && wrap.classList.contains('open'));
+  if (!wasOpen) {
+    boardLastFocus = document.activeElement;
+    boardLastFocusItemId = id;
+    boardNeedsFocus = true;
+  }
+  boardSelectedId = id;
   if (wrap) {
     wrap.hidden = false;
     wrap.classList.add('open');
   }
+  document.body.classList.add('board-modal-open');
   var cached = !skipPush ? boardFindItem(id) : null;
   if (cached) {
     boardRenderDrawer(cached);
@@ -1058,6 +1234,7 @@ function boardInit() {
   var drawer = document.getElementById('board-drawer');
   if (drawer) {
     drawer.addEventListener('click', function (e) {
+      e._boardInsideDrawer = true;
       var btn = e.target && e.target.closest ? e.target.closest('[data-board-remove-step]') : null;
       if (btn) {
         boardRemovePlanStep(btn.getAttribute('data-board-remove-step'));
@@ -1069,6 +1246,9 @@ function boardInit() {
     backdrop.addEventListener('click', boardCloseDrawer);
   }
   document.addEventListener('click', function (e) {
+    if (e._boardInsideDrawer) { return; }
+    var mdBackdrop = document.getElementById('md-viewer-backdrop');
+    if (mdBackdrop && !mdBackdrop.hidden) { return; }
     var wrap = document.getElementById('board-drawer-wrap');
     if (!wrap || wrap.hidden || !wrap.classList.contains('open')) { return; }
     var target = e.target;
@@ -1079,8 +1259,12 @@ function boardInit() {
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') { return; }
+    var mdBackdrop = document.getElementById('md-viewer-backdrop');
+    if (mdBackdrop && !mdBackdrop.hidden) { return; }
     var wrap = document.getElementById('board-drawer-wrap');
     if (wrap && !wrap.hidden && wrap.classList.contains('open')) {
+      e.preventDefault();
+      e.stopPropagation();
       boardCloseDrawer();
     }
   });
