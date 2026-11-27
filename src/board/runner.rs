@@ -370,7 +370,7 @@ fn format_recent_thread(item: &BoardItem) -> String {
     out
 }
 
-fn build_ask_prompt(item: &BoardItem, question: &str) -> String {
+pub fn build_ask_prompt(item: &BoardItem, question: &str) -> String {
     let mut prompt = format!("Title: {}\n", item.title);
     if !item.summary.trim().is_empty() {
         prompt.push_str(&format!("Summary: {}\n", item.summary));
@@ -465,6 +465,26 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
     })
 }
 
+pub fn ask_run_args(workspace: &Path, agent: Option<&str>, model: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--read-only".to_owned(),
+        "--json".to_owned(),
+    ];
+    if let Some(a) = agent {
+        args.push("--agent".to_owned());
+        args.push(a.to_owned());
+    }
+    if let Some(m) = model {
+        args.push("--model".to_owned());
+        args.push(m.to_owned());
+    }
+    args.push("-".to_owned());
+    args
+}
+
 pub fn ask_item_execute(
     store: &BoardStore,
     prepared: PreparedAsk,
@@ -484,22 +504,7 @@ pub fn ask_item_execute(
         let (cfg_agent, cfg_model) = board_cfg.planner_agent_and_model();
         let agent = params.agent.or(cfg_agent);
         let model = params.model.or(cfg_model);
-        let mut args = vec![
-            "-C".to_owned(),
-            ws_str,
-            "run".to_owned(),
-            "--read-only".to_owned(),
-            "--json".to_owned(),
-        ];
-        if let Some(a) = agent {
-            args.push("--agent".to_owned());
-            args.push(a);
-        }
-        if let Some(m) = model {
-            args.push("--model".to_owned());
-            args.push(m);
-        }
-        args.push("-".to_owned());
+        let args = ask_run_args(&workspace, agent.as_deref(), model.as_deref());
 
         let prompt = build_ask_prompt(&item, &params.text);
         let outcome = spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;

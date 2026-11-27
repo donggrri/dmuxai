@@ -5,6 +5,10 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Fixed
+
+- `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
+
 ## [0.4.1] - 2026-11-27
 
 ### Added
