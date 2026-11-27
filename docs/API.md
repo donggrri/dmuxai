@@ -600,6 +600,14 @@ Per-runner and per-model system prompts. User config sets defaults; workspace `d
 | `stall_timeout_secs` | `240` | No-progress seconds that trigger a stall when the runner has a non-empty chain; `0` disables. |
 | `stall_api_retries` | `3` | Consecutive `API error (attempt N)` retry lines that trigger a stall; `0` disables. |
 
+Model policy (SPEC-open-model-lists): `cursor` and `agy` accept any non-fast model id their CLI reports (`dmuxai models --agent cursor|agy`). Ids containing `fast` are blocked for every runner unless the **user** config sets:
+
+```toml
+[models]
+allow_fast = true   # user config only; a workspace dmuxai.toml [models] table is ignored
+```
+
+
 `[runners.<id>.models."<model>"]` accepts `system_prompt`, `system_prompt_file`, and `prompt_inject` with the same validation, 32 KiB cap, relative-path rules, and warnings as the runner table. Model ids match case-insensitively after trimming. An explicitly empty/whitespace prompt at the model or runner level means "no prompt" and stops resolution; it does not fall through to built-ins or `[runners.default]`.
 
 Resolution order for a turn's prompt (first match wins; built-ins only on write turns):

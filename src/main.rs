@@ -582,6 +582,8 @@ fn load_settings_with_trust_prompt(workspace_root: &Path) -> DmuxSettings {
             }
         }
     }
+    // FR-3003: fast opt-in is user-config only and cannot vary per workspace.
+    dmuxai::settings::wire_model_policy_switch(&settings);
     settings
 }
 

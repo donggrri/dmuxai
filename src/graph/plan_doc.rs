@@ -1366,10 +1366,11 @@ mod tests {
                 false,
             ),
             (
-                r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"agy","model":"gemini-4-pro","depends_on":[]}]}"#
+                r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"agy","model":"gemini-4-argon-fast","depends_on":[]}]}"#
                     .to_owned(),
                 "a",
-                crate::model_policy::validate_model_for_runner("agy", "gemini-4-pro").unwrap_err(),
+                crate::model_policy::validate_model_for_runner("agy", "gemini-4-argon-fast")
+                    .unwrap_err(),
                 false,
             ),
             (

@@ -5,6 +5,17 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Changed
+
+- **Open model lists for Cursor and AGY (SPEC-open-model-lists, FR-3000..FR-3011).** Cursor and AGY now accept
+  and list every model their CLIs report (for example `claude-sonnet-5-5-high`, `grok-4.7-high`,
+  `gemini-4-carbon-high`). `dmuxai models`, the MCP `models` tool and the pickers use
+  `cursor-agent --list-models` / `agy models` with a 10 s timeout, a 60 s cache and a verified static
+  fallback. The Cursor default stays `composer-2.5`. Models whose id contains `fast` stay blocked for every
+  runner unless the **user** config sets `[models] allow_fast = true` (a workspace `[models]` table is
+  ignored; the dashboard and F2 pickers never offer fast ids). AGY `SelectModel` now validates through the
+  policy. Opencode, Codex, Grok and custom-agent policies are unchanged.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
