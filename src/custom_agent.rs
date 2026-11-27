@@ -211,6 +211,9 @@ pub struct CustomAgentSpec {
     /// True for a built-in preset (opencode, grok). Not configurable.
     #[serde(skip)]
     pub builtin: bool,
+    /// When true, treat this agent as a free runner (FR-2916).
+    #[serde(default)]
+    pub free: bool,
 }
 
 /// The built-in `opencode` runner (SPEC-first-run FR-810..FR-812, SPEC-custom-agent-provider
@@ -487,6 +490,28 @@ impl CustomAgentSpec {
     /// Returns the display label, defaulting to the agent name.
     pub fn label(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Whether fan-out can enforce read-only for this agent (FR-2911).
+    pub fn has_read_only_mode(&self) -> bool {
+        if !self.modes.ask.is_empty() {
+            return true;
+        }
+        let supports_placeholders = |text: &str| text.contains("{mode}") || text.contains("{edit}");
+        if self.command.iter().any(|part| supports_placeholders(part)) {
+            return true;
+        }
+        if self.env.values().any(|value| supports_placeholders(value)) {
+            return true;
+        }
+        if self
+            .temp_config_template
+            .as_deref()
+            .is_some_and(supports_placeholders)
+        {
+            return true;
+        }
+        false
     }
 
     /// Returns the UI theme color, defaulting to "white".

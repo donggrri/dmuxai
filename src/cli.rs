@@ -169,6 +169,8 @@ pub struct RunOptions {
     pub model: Option<String>,
     pub progress: bool,
     pub trust_workspace_config: bool,
+    pub agents: Option<String>,
+    pub min_ok: Option<usize>,
 }
 
 /// First arguments that select an agent-facing subcommand.
@@ -186,6 +188,8 @@ Arguments:
 
 Options:
   --agent ID               Runner id (e.g. cursor, agy, codex, or a custom agent)
+  --agents RUNNERS         Comma-separated runners for read-only fan-out (a,b[:model],...)
+  --min-ok N               Minimum successful legs required (default 1; fan-out only)
   --model M                Model id for the runner
   --approve-plan           Approve a pending plan and confirm sensitive gates
   --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
@@ -647,6 +651,75 @@ pub const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--agents"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--min-ok"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--mode"],
+        takes_value: true,
+        hidden: true,
+    },
+    FlagSpec {
+        names: &["--graph"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--read-only"],
+        takes_value: false,
+        hidden: true,
+    },
+    FlagSpec {
+        names: &["--approve-plan"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--approve-plan-id"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--allow-sensitive"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--model"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--progress"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--trust-workspace-config"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+/// `todo run` flags: same as [`RUN_FLAGS`] except fan-out-only options.
+pub const TODO_RUN_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--agent"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
         names: &["--mode"],
         takes_value: true,
         hidden: true,
@@ -834,7 +907,15 @@ pub const MODELS_FLAGS: &[FlagSpec] = &[
 
 /// Parses run-style flags; positional words become the prompt.
 fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, String> {
-    let parsed = parse_flags(args, RUN_FLAGS, allow_prompt)?;
+    parse_run_options_with_flags(args, allow_prompt, RUN_FLAGS)
+}
+
+fn parse_run_options_with_flags(
+    args: &[String],
+    allow_prompt: bool,
+    flag_specs: &[FlagSpec],
+) -> Result<RunOptions, String> {
+    let parsed = parse_flags(args, flag_specs, allow_prompt)?;
     if parsed.flags.contains_key("--mode") {
         return Err(
             "--mode was removed; DmuxAI runs a single agent mode (write-capable). Omit --mode."
@@ -848,6 +929,16 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
         return Err(format!("unexpected argument '{word}'"));
     }
     let approve_plan_id = parsed.flags.get("--approve-plan-id").cloned().flatten();
+    let agents = parsed.flags.get("--agents").cloned().flatten();
+    let min_ok = if let Some(raw) = parsed.flags.get("--min-ok").cloned().flatten() {
+        Some(
+            raw.trim()
+                .parse::<usize>()
+                .map_err(|_| "--min-ok must be a positive integer".to_owned())?,
+        )
+    } else {
+        None
+    };
     let options = RunOptions {
         prompt: if allow_prompt {
             parsed.positionals.join(" ")
@@ -865,7 +956,28 @@ fn parse_run_options(args: &[String], allow_prompt: bool) -> Result<RunOptions, 
         model: parsed.flags.get("--model").cloned().flatten(),
         progress: parsed.flags.contains_key("--progress"),
         trust_workspace_config: parsed.flags.contains_key("--trust-workspace-config"),
+        agents,
+        min_ok,
     };
+    if options.agents.is_some() {
+        if options.agent.is_some() {
+            return Err("--agents cannot be used with --agent".to_owned());
+        }
+        if options.graph {
+            return Err("--agents cannot be used with --graph".to_owned());
+        }
+        if options.model.is_some() {
+            return Err("--agents cannot be used with --model".to_owned());
+        }
+        if let Some(raw) = options.agents.as_deref() {
+            let legs = dmuxai::fanout::parse_agents_flag(raw)?;
+            if let Some(min_ok) = options.min_ok {
+                dmuxai::fanout::parse_min_ok(Some(&min_ok.to_string()), legs.len())?;
+            }
+        }
+    } else if options.min_ok.is_some() {
+        return Err("--min-ok requires --agents".to_owned());
+    }
     if options.graph && options.agent.is_some() {
         return Err("use either --agent or --graph, not both".to_owned());
     }
@@ -938,7 +1050,7 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                     let Some(id) = rest.first().filter(|id| !id.starts_with("--")) else {
                         return Err("todo run needs a to-do id".to_owned());
                     };
-                    let run = parse_run_options(&rest[1..], false)?;
+                    let run = parse_run_options_with_flags(&rest[1..], false, TODO_RUN_FLAGS)?;
                     Ok(AgentCommand::TodoRun {
                         id: id.clone(),
                         run,
@@ -2603,6 +2715,22 @@ async fn print_events(root: &Path, since: u64, limit: Option<usize>, follow: boo
 }
 
 fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Value {
+    if let Some(report) = &outcome.fanout {
+        let legs: Vec<Value> = report
+            .legs
+            .iter()
+            .map(|leg| serde_json::to_value(leg).unwrap_or(Value::Null))
+            .collect();
+        return json!({
+            "ok": outcome.ok,
+            "error": outcome.error,
+            "error_kind": outcome.error_kind,
+            "fanout": {
+                "min_ok": report.min_ok,
+                "legs": legs,
+            },
+        });
+    }
     let mut value = json!({
         "ok": outcome.ok,
         "exit_code": outcome.exit_code,
@@ -2734,6 +2862,114 @@ fn start_headless_journal(
     Some((store, manifest))
 }
 
+async fn run_fanout_headless(
+    workspace_root: &Path,
+    options: &RunOptions,
+    prompt: Option<String>,
+) -> Result<(HeadlessOutcome, u64, u64), ApiError> {
+    let internal = |e: &dyn std::fmt::Display| ApiError::new(exit::INTERNAL, e.to_string());
+    dmuxai::workspace::ensure_directory_writable(workspace_root).map_err(|e| internal(&e))?;
+    let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
+    if options.trust_workspace_config {
+        env.trust_workspace_config = true;
+    }
+    let settings = DmuxSettings::load_with_env(workspace_root, &env);
+    for warning in &settings.config_warnings {
+        eprintln!("warning: {warning}");
+    }
+    let (db_path, _) =
+        dmuxai::state_path::prepare_repo_db(workspace_root).map_err(|e| internal(&e))?;
+    let engine = ConversationEngine::open(&db_path, workspace_root)
+        .map_err(|error| conversation_open_error(&error))?;
+    for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
+        eprintln!("warning: {warning}");
+    }
+    let sink = build_event_sink(workspace_root, &settings);
+    let first_seq = sink.log().last_seq() + 1;
+    let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
+        .unwrap_or_else(|_| workspace_root.display().to_string());
+    let hub = headless_dashboard_hub(workspace, sink.clone());
+    let company_workspace = settings.fanout_company_workspace;
+    let mut app = App::new(engine, workspace_root.to_path_buf(), settings.clone())
+        .map_err(|error| conversation_open_error(&error))?;
+    app.attach_dashboard(hub);
+    app.set_headless(true);
+
+    let agents_raw = options.agents.as_deref().unwrap_or_default();
+    let all_specs = dmuxai::fanout::parse_agents_flag(agents_raw)
+        .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
+    let cli_order: Vec<String> = all_specs.iter().map(|leg| leg.runner.clone()).collect();
+    let mut specs = Vec::new();
+    let mut skipped_reports: Vec<dmuxai::fanout::FanoutLegReport> = Vec::new();
+    for leg in all_specs {
+        if company_workspace && dmuxai::fanout::fanout_runner_is_free(&leg, &settings) {
+            eprintln!(
+                "warning: skipping free runner '{}' in company workspace",
+                leg.runner
+            );
+            skipped_reports.push(dmuxai::fanout::FanoutLegReport {
+                agent: leg.runner.clone(),
+                model: dmuxai::fanout::resolved_fanout_leg_model(&leg, &settings),
+                status: dmuxai::fanout::LegStatus::Skipped,
+                text: String::new(),
+                error: None,
+                error_kind: None,
+                duration_ms: 0,
+            });
+        } else {
+            specs.push(leg);
+        }
+    }
+    if specs.len() < 2 {
+        return Err(ApiError::new(
+            dmuxai::agent_api::exit::USAGE,
+            "fan-out needs at least two runners after filtering".to_owned(),
+        ));
+    }
+    let min_ok = dmuxai::fanout::parse_min_ok(
+        options.min_ok.map(|n| n.to_string()).as_deref(),
+        specs.len(),
+    )
+    .map_err(|message| ApiError::new(dmuxai::agent_api::exit::USAGE, message))?;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_signal = cancel.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_signal = finished.clone();
+    let signal_task = tokio::spawn(async move {
+        wait_for_stop_signal().await;
+        cancel_signal.store(true, Ordering::SeqCst);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = wait_for_stop_signal() => {}
+        }
+        if !finished_signal.load(Ordering::SeqCst) {
+            dmuxai::process::supervisor::stop_live_groups_of(
+                dmuxai::process::supervisor::GroupOwner::DEFAULT,
+                Duration::from_secs(2),
+            );
+            eprintln!("error: stopped after signal");
+            std::process::exit(130);
+        }
+    });
+    let user_prompt = prompt.unwrap_or_default();
+    let outcome = app
+        .run_fanout_headless(
+            user_prompt,
+            specs,
+            min_ok,
+            skipped_reports,
+            cli_order,
+            cancel,
+        )
+        .await;
+    app.shutdown().await;
+    finished.store(true, Ordering::SeqCst);
+    signal_task.abort();
+    let last_seq = sink.log().last_seq();
+    Ok((outcome, first_seq, last_seq))
+}
+
 async fn run_headless(
     workspace_root: &Path,
     options: &RunOptions,
@@ -2741,6 +2977,15 @@ async fn run_headless(
     todo_id: Option<String>,
 ) -> Result<(HeadlessOutcome, u64, u64), ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(exit::INTERNAL, e.to_string());
+    if options.agents.is_some() {
+        if todo_id.is_some() {
+            return Err(ApiError::new(
+                exit::USAGE,
+                "todo run does not support --agents".to_owned(),
+            ));
+        }
+        return run_fanout_headless(workspace_root, options, prompt).await;
+    }
     dmuxai::workspace::ensure_directory_writable(workspace_root).map_err(|e| internal(&e))?;
     let mut env = dmuxai::runtime_env::RuntimeEnv::from_process();
     if options.trust_workspace_config {
@@ -3335,6 +3580,41 @@ mod tests {
         list.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    // TC-2910 / FR-2910
+    #[test]
+    fn tc_2910_agents_flag_parse_and_conflicts() {
+        let legs = dmuxai::fanout::parse_agents_flag("cursor,codex").expect("parse");
+        assert_eq!(legs.len(), 2);
+        assert!(dmuxai::fanout::parse_agents_flag("cursor,cursor").is_err());
+        assert!(dmuxai::fanout::parse_agents_flag("cursor").is_err());
+        assert!(parse(&args(&["run", "x", "--agents", "cursor,codex"])).is_ok());
+        assert!(
+            parse(&args(&[
+                "run",
+                "x",
+                "--agents",
+                "cursor,codex",
+                "--agent",
+                "agy"
+            ]))
+            .is_err()
+        );
+        assert!(parse(&args(&["run", "x", "--agents", "cursor,codex", "--graph"])).is_err());
+        assert!(
+            parse(&args(&[
+                "run",
+                "x",
+                "--agents",
+                "cursor,codex",
+                "--model",
+                "m"
+            ]))
+            .is_err()
+        );
+        assert!(parse(&args(&["run", "x", "--min-ok", "2"])).is_err());
+        assert!(parse(&args(&["todo", "run", "abc", "--agents", "a,b"])).is_err());
+    }
+
     // TC-1492 / FR-1318: --mode is rejected with a parse error, not silently ignored.
     #[test]
     fn tc_1492_mode_flag_is_rejected_with_error() {
@@ -3367,6 +3647,8 @@ mod tests {
                 model: None,
                 progress: false,
                 trust_workspace_config: false,
+                agents: None,
+                min_ok: None,
             }))
         );
         assert_eq!(
@@ -3468,6 +3750,82 @@ mod tests {
         assert!(parse(&args(&["init", "extra"])).is_err());
     }
 
+    // TC-2915 / FR-2915: fan-out JSON leg order and stable leg fields via outcome_json.
+    #[test]
+    fn tc_2915_json_output_shape_and_leg_order() {
+        let outcome = HeadlessOutcome {
+            ok: false,
+            exit_code: 1,
+            conversation_id: "c".to_owned(),
+            agent: None,
+            graph_id: None,
+            text: String::new(),
+            messages: Vec::new(),
+            error: Some("fan-out quorum not met".to_owned()),
+            error_kind: Some("policy".to_owned()),
+            todo: None,
+            triage: None,
+            plan: None,
+            plan_hash: None,
+            system_prompt: None,
+            run_id: None,
+            fallbacks: Vec::new(),
+            fanout: Some(dmuxai::fanout::FanoutReport {
+                min_ok: 2,
+                legs: vec![
+                    dmuxai::fanout::FanoutLegReport {
+                        agent: "cursor".into(),
+                        model: Some("m1".into()),
+                        status: dmuxai::fanout::LegStatus::Ok,
+                        text: "a".into(),
+                        error: None,
+                        error_kind: None,
+                        duration_ms: 1,
+                    },
+                    dmuxai::fanout::FanoutLegReport {
+                        agent: "codex".into(),
+                        model: None,
+                        status: dmuxai::fanout::LegStatus::Failed,
+                        text: String::new(),
+                        error: Some("err".into()),
+                        error_kind: Some("provider".into()),
+                        duration_ms: 2,
+                    },
+                ],
+            }),
+        };
+        let json = outcome_json(&outcome, 0, 0);
+        assert_eq!(json["error_kind"], "policy");
+        let legs = json["fanout"]["legs"].as_array().expect("legs");
+        assert_eq!(legs[0]["agent"], "cursor");
+        assert_eq!(legs[1]["agent"], "codex");
+        assert!(legs[1].get("text").is_some());
+        assert!(legs[1].get("error").is_some());
+        assert!(legs[1].get("error_kind").is_some());
+    }
+
+    // TC-2916 / FR-2916: resolved-model free detection for company workspace.
+    #[test]
+    fn tc_2916_company_workspace_skips_free_runners_with_warning() {
+        let mut settings = DmuxSettings::default();
+        settings
+            .runner_models
+            .insert("codex".into(), "gpt-x-free".into());
+        let leg = dmuxai::fanout::FanoutLegSpec {
+            runner: "codex".into(),
+            model: None,
+        };
+        assert!(dmuxai::fanout::fanout_runner_is_free(&leg, &settings));
+        let leg_explicit = dmuxai::fanout::FanoutLegSpec {
+            runner: "cursor".into(),
+            model: Some("composer-2.5".into()),
+        };
+        assert!(!dmuxai::fanout::fanout_runner_is_free(
+            &leg_explicit,
+            &settings
+        ));
+    }
+
     // TC-1695 / FR-1682: headless JSON includes error_kind next to error.
     #[test]
     fn tc_1695_outcome_json_includes_error_kind() {
@@ -3488,6 +3846,7 @@ mod tests {
             system_prompt: None,
             run_id: Some("0123456789abcdef".to_owned()),
             fallbacks: Vec::new(),
+            fanout: None,
         };
         let json = outcome_json(&outcome, 1, 2);
         assert_eq!(json["error"], "boom");
@@ -3511,6 +3870,7 @@ mod tests {
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
+            fanout: None,
         };
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());
@@ -3544,6 +3904,8 @@ mod tests {
                 model: Some("gemini-3.8-flash-high".into()),
                 progress: false,
                 trust_workspace_config: false,
+                agents: None,
+                min_ok: None,
             }))
         );
         assert!(parse(&args(&["run", "x", "--agent", "agy", "--model"])).is_err());
@@ -3615,6 +3977,8 @@ mod tests {
                 model: Some("m".into()),
                 progress: true,
                 trust_workspace_config: false,
+                agents: None,
+                min_ok: None,
             }))
         );
         assert_eq!(
@@ -4137,7 +4501,7 @@ mod tests {
     fn tc_2830_help_lists_parser_flags() {
         let cases: &[(&str, &[FlagSpec])] = &[
             (RUN_USAGE, RUN_FLAGS),
-            (TODO_USAGE, RUN_FLAGS),
+            (TODO_USAGE, TODO_RUN_FLAGS),
             (STATUS_USAGE, STATUS_FLAGS),
             (EVENTS_USAGE, EVENTS_FLAGS),
             (INIT_USAGE, INIT_FLAGS),

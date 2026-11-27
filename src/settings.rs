@@ -68,6 +68,8 @@ pub struct DmuxSettings {
     pub graph_tasks_file: bool,
     /// `[graph] enforce_read_only_roles` (FR-2900): role-derived turn policy per graph node.
     pub graph_enforce_read_only_roles: bool,
+    /// `[fanout] company_workspace` (FR-2916): skip free runners in fan-out legs.
+    pub fanout_company_workspace: bool,
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
@@ -149,6 +151,7 @@ struct DmuxToml {
     cursor: Option<CursorToml>,
     routing: Option<RoutingToml>,
     graph: Option<GraphToml>,
+    fanout: Option<FanoutToml>,
     theme: Option<ThemeToml>,
     agents: Option<AgentsToml>,
     ui: Option<UiSettings>,
@@ -262,6 +265,11 @@ struct AgentsToml {
 struct McpToml {
     #[serde(default)]
     servers: Vec<crate::mcp::McpServerSpec>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FanoutToml {
+    company_workspace: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1151,6 +1159,11 @@ impl DmuxSettings {
                 self.graph_allowed_runners = Some(valid);
             }
         }
+        if let Some(fanout) = parsed.fanout
+            && let Some(company_workspace) = fanout.company_workspace
+        {
+            self.fanout_company_workspace = company_workspace;
+        }
         if let Some(ui) = parsed.ui {
             self.ui = ui;
         }
@@ -1454,6 +1467,14 @@ fn restricted_workspace_keys_with_user(
     if parsed.terminal.is_some() {
         keys.push("terminal".to_owned());
     }
+    if parsed
+        .fanout
+        .as_ref()
+        .and_then(|fanout| fanout.company_workspace)
+        .is_some()
+    {
+        keys.push("fanout.company_workspace".to_owned());
+    }
     if let Some(runners) = &parsed.runners {
         for (id, raw) in runners {
             if let Some(file) = &raw.system_prompt_file
@@ -1605,6 +1626,9 @@ fn strip_restricted_workspace_keys_with_user(
     }
     parsed.jira = None;
     parsed.terminal = None;
+    if let Some(fanout) = &mut parsed.fanout {
+        fanout.company_workspace = None;
+    }
     if let Some(runners) = &mut parsed.runners {
         for raw in runners.values_mut() {
             if let Some(file) = &raw.system_prompt_file
@@ -1915,6 +1939,7 @@ impl Default for DmuxSettings {
             graph_max_nodes: DEFAULT_GRAPH_MAX_NODES,
             graph_tasks_file: false,
             graph_enforce_read_only_roles: false,
+            fanout_company_workspace: false,
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,

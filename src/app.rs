@@ -790,6 +790,20 @@ impl InternalTurn for PendingSummary {
     }
 }
 
+#[derive(Clone)]
+struct FanoutLegTracker {
+    runner: String,
+    conversation_id: StoredConversationId,
+    turn_id: StoredTurnId,
+    buffer: TurnBuffer,
+    started: Instant,
+    model: Option<String>,
+    finished: bool,
+    ok: bool,
+    error: Option<String>,
+    error_kind: Option<String>,
+}
+
 /// FR-932: an internal read-only judge turn. Its streamed text is buffered and
 /// never shown; the agent is busy for its duration and its mode is restored on
 /// every ending.
@@ -1107,6 +1121,8 @@ pub struct HeadlessOutcome {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<dmuxai::runner_fallback::FallbackRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<dmuxai::fanout::FanoutReport>,
 }
 
 impl HeadlessOutcome {
@@ -1133,6 +1149,7 @@ impl HeadlessOutcome {
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
+            fanout: None,
         }
     }
 
@@ -1510,6 +1527,10 @@ pub struct App {
     /// Typed error reported by the failing node held for replan (FR-956 / #134).
     graph_failure_replan_error: Option<String>,
     deferred_internal_turn: Option<DeferredInternalTurnWait>,
+    /// Runners reserved by other fan-out legs (FR-2914).
+    fanout_reserved_runners: HashSet<String>,
+    in_fanout_run: bool,
+    fanout_trackers: HashMap<Agent, FanoutLegTracker>,
     /// FR-1008: planner_io recorded before the run row exists (e.g. judge).
     deferred_planner_io: HashMap<String, Vec<PlannerIo>>,
     deferred_turns: Vec<DeferredTurn>,
@@ -1974,6 +1995,9 @@ impl App {
             graph_failure_replan: None,
             graph_failure_replan_error: None,
             deferred_internal_turn: None,
+            fanout_reserved_runners: HashSet::new(),
+            in_fanout_run: false,
+            fanout_trackers: HashMap::new(),
             deferred_planner_io: HashMap::new(),
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
@@ -4322,6 +4346,43 @@ impl App {
 
     fn apply_agent_output(&mut self, mut output: AgentOutput) -> bool {
         self.attach_model_catalog_hint(&mut output);
+        if self.in_fanout_run {
+            let leg_event = match (&output.conversation_id, &output.turn_id) {
+                (Some(conversation_id), Some(turn_id)) => self
+                    .fanout_trackers
+                    .get(&output.agent)
+                    .is_some_and(|track| {
+                        track.conversation_id.as_str() == conversation_id.as_str()
+                            && track.turn_id.as_str() == turn_id.as_str()
+                    }),
+                _ => false,
+            };
+            if leg_event {
+                if let Some(track) = self.fanout_trackers.get_mut(&output.agent) {
+                    match &output.event {
+                        AgentEvent::TextDelta(delta) => track.buffer.push(delta),
+                        AgentEvent::Error(err) => {
+                            track.error = Some(err.to_string());
+                            track.error_kind = Some(err.kind.as_str().to_owned());
+                        }
+                        AgentEvent::Cancelled => {
+                            track.error = Some("cancelled".to_owned());
+                            track.error_kind = Some(AgentErrorKind::Cancelled.as_str().to_owned());
+                        }
+                        AgentEvent::Completed => track.ok = true,
+                        _ => {}
+                    }
+                }
+                if matches!(
+                    output.event,
+                    AgentEvent::Completed | AgentEvent::Error(_) | AgentEvent::Cancelled
+                ) {
+                    self.busy_agents.remove(&output.agent);
+                    self.active_turns.remove(&output.agent);
+                }
+                return true;
+            }
+        }
         if output
             .turn_id
             .as_ref()
@@ -4497,6 +4558,9 @@ impl App {
     /// change. Other adapters are covered only when their error text matches
     /// the same patterns.
     fn try_fresh_resume_retry(&mut self, agent: Agent, err: &AgentError) -> bool {
+        if self.in_fanout_run {
+            return false;
+        }
         if !is_resume_rejection_message(&err.message) {
             return false;
         }
@@ -4553,6 +4617,9 @@ impl App {
     /// that fails to start leaves the original error to the normal error path
     /// (FR-2130..FR-2133).
     fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
+        if self.in_fanout_run {
+            return false;
+        }
         // FR-2130 / TC-2130: a pending handover from an earlier attempt must never leak
         // into this one.
         self.pending_fallback = None;
@@ -4596,6 +4663,9 @@ impl App {
             }
         };
 
+        let fanout_reserved = self.fanout_reserved_runners.clone();
+        let fanout_company = self.in_fanout_run && self.settings.fanout_company_workspace;
+        let fanout_settings = self.settings.clone();
         let is_usable = |t: &dmuxai::runner_fallback::FallbackTarget,
                          adapters: &[Box<dyn AgentAdapter>],
                          busy_agents: &HashSet<Agent>,
@@ -4611,6 +4681,18 @@ impl App {
             }
             if busy_agents.contains(&cand_agent) && cand_agent != agent {
                 return false;
+            }
+            if fanout_reserved.contains(&t.runner.to_ascii_lowercase()) {
+                return false;
+            }
+            if fanout_company {
+                let leg = dmuxai::fanout::FanoutLegSpec {
+                    runner: t.runner.to_ascii_lowercase(),
+                    model: t.model.clone(),
+                };
+                if dmuxai::fanout::fanout_runner_is_free(&leg, &fanout_settings) {
+                    return false;
+                }
             }
             if !allowed_fn(&t.runner) {
                 return false;
@@ -14764,6 +14846,301 @@ impl App {
         agent_texts.join("\n\n")
     }
 
+    fn fanout_restore_main_conversation(&mut self, saved: &StoredConversationId) {
+        if let Ok(snapshot) = self
+            .engine
+            .select(ConversationSelection::Existing(saved.clone()))
+        {
+            self.conversation_id = snapshot.id;
+        }
+    }
+
+    fn fanout_start_leg(
+        &mut self,
+        user_prompt: &str,
+        leg: &dmuxai::fanout::FanoutLegSpec,
+        title: &str,
+    ) -> FanoutLegTracker {
+        let started = Instant::now();
+        let fail = |runner: &str, error: String, kind: &str| FanoutLegTracker {
+            runner: runner.to_owned(),
+            conversation_id: StoredConversationId::new("fanout-failed"),
+            turn_id: StoredTurnId::new("fanout-failed"),
+            buffer: TurnBuffer::new(),
+            started,
+            model: leg.model.clone(),
+            finished: true,
+            ok: false,
+            error: Some(error),
+            error_kind: Some(kind.to_owned()),
+        };
+        let Some(agent) = runner_from_str(&leg.runner) else {
+            return fail(
+                &leg.runner,
+                format!("unknown agent '{}'", leg.runner),
+                "not_found",
+            );
+        };
+        if !self.runner_is_allowed(&leg.runner) {
+            return fail(
+                &leg.runner,
+                format!("runner '{}' is not in allowed_runners", leg.runner),
+                "policy",
+            );
+        }
+        let index = adapter_index(agent);
+        if index >= self.adapters.len() {
+            return fail(
+                &leg.runner,
+                format!("unknown agent '{}'", leg.runner),
+                "not_found",
+            );
+        }
+        if let Agent::Custom(custom_index) = agent
+            && let Some(spec) = dmuxai::custom_agent::spec_at(custom_index)
+            && !spec.has_read_only_mode()
+        {
+            return fail(
+                &leg.runner,
+                format!("{agent} does not support read-only mode"),
+                "no_read_only_mode",
+            );
+        }
+        if let Some(model_value) = leg.model.clone() {
+            if let Err(err) = Self::model_resolution_for(
+                &self.model_catalogs,
+                agent,
+                Some(&model_value),
+                self.settings
+                    .runner_models
+                    .get(&leg.runner)
+                    .map(String::as_str),
+            ) {
+                return fail(&leg.runner, err, "policy");
+            }
+            if let Err(err) = self.adapters[index].select_model(model_value) {
+                return fail(&leg.runner, err.to_string(), "internal");
+            }
+        }
+        let saved_main = self.conversation_id.clone();
+        let Ok(snapshot) = self.engine.select(ConversationSelection::New {
+            title: Some(title.to_owned()),
+        }) else {
+            return fail(
+                &leg.runner,
+                "could not create fan-out conversation".to_owned(),
+                "internal",
+            );
+        };
+        let leg_conversation_id = snapshot.id.clone();
+        let Ok(BeginTurnOutcome::Ready(request)) = self.engine.begin_turn(BeginTurn {
+            agent: agent_key(agent),
+            model_id: leg.model.clone(),
+            prompt: user_prompt.to_owned(),
+            display_text: None,
+        }) else {
+            self.fanout_restore_main_conversation(&saved_main);
+            return fail(
+                &leg.runner,
+                "could not start fan-out turn".to_owned(),
+                "internal",
+            );
+        };
+        let turn_id = request.turn_id.clone();
+        let adapter_request = adapter_request(request, Vec::new(), TurnPolicy::ReadOnly, false);
+        let send_result = self.adapters[index].send(adapter_request);
+        self.fanout_restore_main_conversation(&saved_main);
+        if let Err(error) = send_result {
+            return fail(
+                &leg.runner,
+                format!("Could not start {agent}: {error}"),
+                "internal",
+            );
+        }
+        self.busy_agents.insert(agent);
+        self.active_turns.insert(
+            agent,
+            ActiveTurn {
+                conversation_id: leg_conversation_id.clone(),
+                turn_id: StoredTurnId::new(turn_id.as_str()),
+                started_ms: unix_ms_now(),
+                workspace_scan: Arc::new(Mutex::new(None)),
+                graph_node_id: None,
+                offscreen_activity: Vec::new(),
+                model_catalog_hint: None,
+                fallback_original_prompt: user_prompt.to_owned(),
+                fallback_display_text: None,
+                fallback_policy: Some(TurnPolicy::ReadOnly),
+                fallback_chain: None,
+                retry_fresh_request: None,
+            },
+        );
+        let model = leg
+            .model
+            .clone()
+            .or_else(|| self.selected_run_model(agent).ok().flatten());
+        FanoutLegTracker {
+            runner: leg.runner.clone(),
+            conversation_id: leg_conversation_id,
+            turn_id: StoredTurnId::new(turn_id.as_str()),
+            buffer: TurnBuffer::new(),
+            started,
+            model,
+            finished: false,
+            ok: false,
+            error: None,
+            error_kind: None,
+        }
+    }
+
+    /// Headless read-only fan-out across distinct runners (FR-2910..FR-2917).
+    pub async fn run_fanout_headless(
+        &mut self,
+        user_prompt: String,
+        legs: Vec<dmuxai::fanout::FanoutLegSpec>,
+        min_ok: usize,
+        skipped: Vec<dmuxai::fanout::FanoutLegReport>,
+        cli_order: Vec<String>,
+        cancel: Arc<AtomicBool>,
+    ) -> HeadlessOutcome {
+        let prompt_prefix = user_prompt.trim().chars().take(40).collect::<String>();
+        let before_fp = dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await;
+        self.in_fanout_run = true;
+        self.fanout_reserved_runners = cli_order
+            .iter()
+            .map(|runner| runner.to_ascii_lowercase())
+            .collect();
+        let order = cli_order;
+        let mut trackers: HashMap<String, FanoutLegTracker> = HashMap::new();
+        for leg in &legs {
+            let title = format!("fanout: {prompt_prefix} [{}]", leg.runner);
+            let track = self.fanout_start_leg(&user_prompt, leg, &title);
+            let runner = leg.runner.clone();
+            if track.finished {
+                trackers.insert(runner, track);
+            } else {
+                let agent = runner_from_str(&leg.runner).expect("validated");
+                self.fanout_trackers.insert(agent, track.clone());
+                trackers.insert(runner, track);
+            }
+        }
+        while self
+            .busy_agents
+            .iter()
+            .any(|agent| self.fanout_trackers.contains_key(agent))
+        {
+            if cancel.load(Ordering::Relaxed) {
+                for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                    let idx = adapter_index(agent);
+                    if idx < self.adapters.len() {
+                        let _ = self.adapters[idx].cancel();
+                    }
+                }
+                break;
+            }
+            let _ = self.drain_agent_events();
+            self.tick();
+            for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                if !self.busy_agents.contains(&agent)
+                    && let Some(mut track) = self.fanout_trackers.remove(&agent)
+                {
+                    track.finished = true;
+                    if track.error.is_some() {
+                        track.ok = false;
+                    }
+                    trackers.insert(track.runner.clone(), track);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.in_fanout_run = false;
+        self.fanout_reserved_runners.clear();
+        self.fanout_trackers.clear();
+
+        let policy_violation = dmuxai::workspace::read_only_workspace_write_detected(
+            before_fp.as_deref(),
+            &self.workspace_root,
+        )
+        .await;
+
+        let mut reports: Vec<dmuxai::fanout::FanoutLegReport> = Vec::new();
+        for key in order {
+            if let Some(skip) = skipped.iter().find(|s| s.agent == key) {
+                reports.push(skip.clone());
+            } else if let Some(track) = trackers.get(&key) {
+                let status = if track.finished && track.ok {
+                    dmuxai::fanout::LegStatus::Ok
+                } else {
+                    dmuxai::fanout::LegStatus::Failed
+                };
+                reports.push(dmuxai::fanout::FanoutLegReport {
+                    agent: track.runner.clone(),
+                    model: track.model.clone(),
+                    status,
+                    text: track.buffer.as_str().to_owned(),
+                    error: track.error.clone(),
+                    error_kind: track.error_kind.clone(),
+                    duration_ms: track.started.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        let ok_count = reports
+            .iter()
+            .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
+            .count();
+        let mut ok = dmuxai::fanout::fanout_run_ok(ok_count, min_ok) && !policy_violation;
+        let mut exit_code = dmuxai::fanout::fanout_exit_code(ok, false);
+        let mut error = if policy_violation {
+            Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned())
+        } else {
+            None
+        };
+        let mut error_kind = if policy_violation {
+            Some(AgentErrorKind::Policy.as_str().to_owned())
+        } else {
+            None
+        };
+        if !ok && error.is_none() {
+            error = Some("fan-out quorum not met".to_owned());
+            error_kind = Some(AgentErrorKind::Policy.as_str().to_owned());
+        }
+        if policy_violation {
+            ok = false;
+            exit_code = dmuxai::agent_api::exit::FAILED;
+            for leg in &mut reports {
+                if leg.status == dmuxai::fanout::LegStatus::Ok {
+                    leg.status = dmuxai::fanout::LegStatus::Failed;
+                    leg.error = error.clone();
+                    leg.error_kind = error_kind.clone();
+                }
+            }
+        }
+        let text = dmuxai::fanout::fanout_text_output(&reports);
+        HeadlessOutcome {
+            ok,
+            exit_code,
+            conversation_id: self.conversation_id.as_str().to_owned(),
+            agent: None,
+            graph_id: None,
+            text,
+            messages: Vec::new(),
+            error,
+            error_kind,
+            todo: None,
+            triage: None,
+            plan: None,
+            plan_hash: None,
+            system_prompt: None,
+            run_id: None,
+            fallbacks: Vec::new(),
+            fanout: Some(dmuxai::fanout::FanoutReport {
+                min_ok,
+                legs: reports,
+            }),
+        }
+    }
+
     /// Runs a prompt or to-do headlessly without terminal I/O (SPEC-agent-api FR-761, FR-762).
     pub async fn run_headless(
         &mut self,
@@ -15356,6 +15733,7 @@ impl App {
             system_prompt: self.system_prompt_applied.clone(),
             run_id: None,
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
+            fanout: None,
         }
     }
 
@@ -18432,14 +18810,20 @@ mod tests {
     type CancelRequests = Arc<Mutex<Vec<Agent>>>;
     type SelectedModels = Arc<Mutex<Vec<(Agent, String)>>>;
 
-    fn install_shared_test_registry() -> Vec<String> {
+    fn install_test_custom_agents() -> Vec<String> {
         let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
+        let nowrite = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
         dmuxai::custom_agent::install_registry(vec![
             dmuxai::custom_agent::grok_preset("grok"),
             spec,
+            nowrite,
         ])
     }
     struct RecordingAdapter {
@@ -24185,8 +24569,8 @@ out3
     // adapter Cancelled does not write a second one.
     #[test]
     fn tc_984_cancel_appends_one_cancelled_notice_for_every_runner() {
-        // First install wins process-wide; the other test installs the same grok preset.
-        let _ = install_shared_test_registry();
+        // First install wins process-wide; every test installs the same shared list.
+        let _ = install_test_custom_agents();
         assert!(dmuxai::custom_agent::index_of("grok").is_some());
         let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
@@ -26939,6 +27323,461 @@ out3
         let requests = sent.lock().unwrap();
         assert_eq!(requests.len(), 1, "{agent:?} should send one request");
         (requests[0].0, requests[0].1.policy)
+    }
+
+    fn fanout_recording_app(
+        fail_agents: &[Agent],
+        read_only_blocked: &[Agent],
+    ) -> (App, SentRequests, mpsc::Sender<AgentOutput>) {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_models = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                    fail_send: fail_agents.contains(&agent),
+                    fail_select_model: false,
+                    unsupported_modes: if read_only_blocked.contains(&agent) {
+                        vec![TurnPolicy::ReadOnly]
+                    } else {
+                        Vec::new()
+                    },
+                    selected_models: Arc::clone(&selected_models),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace,
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.selected = adapter_index(Agent::Codex);
+        app.skip_judge_for_tests = true;
+        app.set_headless(true);
+        (app, sent, event_tx)
+    }
+
+    fn complete_fanout_requests(sent: &SentRequests, event_tx: mpsc::Sender<AgentOutput>) {
+        let sent = Arc::clone(sent);
+        tokio::spawn(async move {
+            let mut done = HashSet::new();
+            for _ in 0..400 {
+                let pending: Vec<(Agent, AgentRequest)> = {
+                    let lock = sent.lock().unwrap();
+                    lock.iter()
+                        .filter(|(agent, _)| !done.contains(agent))
+                        .cloned()
+                        .collect()
+                };
+                for (agent, req) in pending {
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("fanout-answer".into()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    done.insert(agent);
+                }
+                if done.len() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    // TC-2911 / FR-2911
+    #[tokio::test]
+    async fn tc_2911_leg_without_read_only_mode_fails_not_writes() {
+        let write_only = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
+        assert!(!write_only.has_read_only_mode());
+        let _ = install_test_custom_agents();
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let order = vec!["cursor".into(), "nowrite".into()];
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "nowrite".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                order,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        let custom = outcome
+            .fanout
+            .as_ref()
+            .unwrap()
+            .legs
+            .iter()
+            .find(|leg| leg.agent == "nowrite")
+            .expect("nowrite leg");
+        assert_eq!(custom.status, dmuxai::fanout::LegStatus::Failed);
+        assert_eq!(custom.error_kind.as_deref(), Some("no_read_only_mode"));
+        let requests = sent.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, r)| r.policy == TurnPolicy::ReadOnly)
+                .count(),
+            1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(agent, _)| { runner_name(*agent).eq_ignore_ascii_case("nowrite") }),
+            "custom agent without read-only mode must never be sent"
+        );
+    }
+
+    // TC-2912 / FR-2912
+    #[tokio::test]
+    async fn tc_2912_leg_prompt_and_conversation_are_isolated() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let prompt = "exact user prompt".to_owned();
+        let _ = app
+            .run_fanout_headless(
+                prompt.clone(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(_, r)| r.prompt == prompt));
+        assert!(
+            requests
+                .iter()
+                .all(|(_, r)| r.policy == TurnPolicy::ReadOnly)
+        );
+        let c0 = requests[0].1.conversation_id.as_str();
+        let c1 = requests[1].1.conversation_id.as_str();
+        assert_ne!(c0, c1);
+    }
+
+    // TC-2913 / FR-2913
+    #[tokio::test]
+    async fn tc_2913_failed_leg_tolerated_by_quorum() {
+        let legs = vec![
+            dmuxai::fanout::FanoutLegSpec {
+                runner: "cursor".into(),
+                model: None,
+            },
+            dmuxai::fanout::FanoutLegSpec {
+                runner: "codex".into(),
+                model: None,
+            },
+        ];
+        let order = vec!["cursor".into(), "codex".into()];
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                legs.clone(),
+                1,
+                Vec::new(),
+                order.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::OK);
+
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex, Agent::Cursor], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                legs,
+                2,
+                Vec::new(),
+                order,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::FAILED);
+        assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
+    }
+
+    // TC-2914 / FR-2914
+    #[tokio::test]
+    async fn tc_2914_fallback_never_uses_runner_of_another_leg() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "cursor".to_owned(),
+                    model: None,
+                }]),
+                stall_timeout_secs: None,
+                stall_api_retries: None,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        let event_tx2 = event_tx.clone();
+        let sent2 = Arc::clone(&sent);
+        let event_tx3 = event_tx.clone();
+        let sent3 = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let req = {
+                    let lock = sent3.lock().unwrap();
+                    lock.iter()
+                        .find(|(a, _)| *a == Agent::Cursor)
+                        .map(|(_, r)| (r.conversation_id.clone(), r.turn_id.clone()))
+                };
+                if let Some((conversation_id, turn_id)) = req {
+                    let _ = event_tx3
+                        .send(AgentOutput {
+                            agent: Agent::Cursor,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let req = {
+                    let lock = sent2.lock().unwrap();
+                    lock.iter()
+                        .find(|(a, _)| *a == Agent::Agy)
+                        .map(|(_, r)| (r.conversation_id.clone(), r.turn_id.clone()))
+                };
+                if let Some((conversation_id, turn_id)) = req {
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent: Agent::Agy,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Error(AgentError::provider(
+                                "API error: model unavailable",
+                            )),
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "agy".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["agy".into(), "cursor".into()],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        let agy = outcome
+            .fanout
+            .as_ref()
+            .unwrap()
+            .legs
+            .iter()
+            .find(|leg| leg.agent == "agy")
+            .expect("agy leg");
+        assert_eq!(agy.status, dmuxai::fanout::LegStatus::Failed);
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .filter(|(a, _)| *a == Agent::Cursor)
+                .count(),
+            1
+        );
+    }
+
+    // TC-2917 / FR-2917
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2917_fanout_write_in_worktree_is_policy_error() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "fanout@test"][..],
+            &["config", "user.name", "fanout"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&workspace)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(workspace.join("tracked.txt"), "a").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::new(Mutex::new(Vec::new())),
+                    fail_send: false,
+                    fail_select_model: false,
+                    unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace.clone(),
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.set_headless(true);
+        let event_tx_bg = event_tx.clone();
+        let sent_bg = Arc::clone(&sent);
+        let workspace_bg = workspace.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if !sent_bg.lock().unwrap().is_empty() {
+                    std::fs::write(workspace_bg.join("dirty.txt"), "x").unwrap();
+                    complete_fanout_requests(&sent_bg, event_tx_bg);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
+    }
+
+    // TC-2918 / NFR-2910
+    #[tokio::test]
+    async fn tc_2918_no_agents_flag_takes_existing_path() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        complete_first_headless_request(&sent, event_tx, "done");
+        let req = HeadlessRequest {
+            prompt: "hello".into(),
+            agent: Some("codex".into()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            approve_plan_id: None,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app
+            .run_headless(req, Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(outcome.fanout.is_none());
     }
 
     // TC-1824 / FR-1824 (#212): a headless --read-only turn reaches every runner with
@@ -30119,7 +30958,7 @@ out3
     // TC-904 / FR-896
     #[test]
     fn tc_904_selecting_grok_requests_a_model_probe() {
-        let warnings = install_shared_test_registry();
+        let warnings = install_test_custom_agents();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -30842,7 +31681,7 @@ out3
         assert!(tiny.ends_with("just now"), "{tiny}");
         assert!(UnicodeWidthStr::width(tiny.as_str()) <= 10, "{tiny}");
 
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let (mut app, _sent) = test_app();
         app.settings.custom_agents = vec![dmuxai::custom_agent::CustomAgentSpec {
             name: "grok".to_owned(),
@@ -34445,7 +35284,7 @@ out3
     // pinned to Cursor's composer-2.5; it plans and runs on provider default.
     #[test]
     fn tc_1460_grok_follow_up_without_model_uses_provider_default() {
-        let warnings = install_shared_test_registry();
+        let warnings = install_test_custom_agents();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -34518,7 +35357,7 @@ out3
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34585,7 +35424,7 @@ out3
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34631,7 +35470,7 @@ out3
     // TC-1746 / FR-1729: catalog missing default_model pushes exact hint and turn is still sent
     #[test]
     fn tc_1746_catalog_missing_pushes_warning() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34657,7 +35496,7 @@ out3
     // TC-1747 / FR-1729: listed model and empty/not-loaded catalog produce no message
     #[test]
     fn tc_1747_catalog_listed_or_empty_no_message() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34688,7 +35527,7 @@ out3
     // TC-1748 / FR-1729: failing turn after NotListed warning gets hint
     #[test]
     fn tc_1748_notlisted_error_gets_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34718,7 +35557,7 @@ out3
     // turn had a catalog warning; only the hint is attached.
     #[test]
     fn tc_2129_generic_provider_error_keeps_provider_kind_with_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34752,7 +35591,7 @@ out3
     // TC-1749 / FR-1729 (#214): idle timeout for a listed model carries no "not offered" hint.
     #[test]
     fn tc_1749_idle_timeout_has_no_not_offered_hint_for_listed_model() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34787,7 +35626,7 @@ out3
     // TC-1749 / FR-1729 (#214): a model truly absent from a loaded list still gets the hint.
     #[test]
     fn tc_1749_absent_model_still_gets_not_offered_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34820,7 +35659,7 @@ out3
     // TC-1748 / FR-1729: drain path captures model_unavailable kind
     #[test]
     fn tc_1748_drain_error_kind_is_model_unavailable() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34855,7 +35694,7 @@ out3
     // TC-1755 / FR-1731: resolver precedence explicit > selected > config > custom default > runner default
     #[test]
     fn tc_1755_resolver_precedence_config_model() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
