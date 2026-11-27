@@ -29,6 +29,13 @@ is stored and no one reads it. The separate "Ask planner" box (FR-3132/3134)
 is the only control that runs an agent, and having two text boxes with
 different behaviour is confusing.
 
+A second cause (#357): on a tokenless dashboard (the default since v0.4.1)
+`dmuxaiOpenEventSource` returns `null` when there is no token, so the board
+never receives SSE updates; an ask gets 202 and the UI stays on "Asking
+planner…" forever because `boardAskPending` is cleared only by an SSE event.
+`boardFetchJson` also omits the `X-Dmuxai-Client: 1` header other dashboard
+fetchers send.
+
 ## 2. Decisions
 
 | ID | Topic | Decision |
@@ -50,6 +57,7 @@ different behaviour is confusing.
 | FR-3218 | Must | Board side chat in `--web`: one textarea; `Send` (and Ctrl/Cmd+Enter) calls `POST /api/board/{id}/ask` `{text, revise:false}` unless "Note only" is checked, in which case it calls `POST /api/board/{id}/messages` as before. While the ask runs, a busy line "Asking planner…" shows under the chat and Send is disabled; the answer arrives as a `planner` message through SSE; an ask error is shown in the same line. `Ask & revise plan` uses the same textarea (disabled without a plan). The separate "Ask planner" textarea is removed. |
 | FR-3219 | Must | Board side chat in view-only `serve` (`boardLaunchAllowed` false): only `Send` (store-only `/messages`) and no ask/revise controls, as today. |
 | FR-3220 | Must | FR-3218 adds no new approval path: `ask` keeps FR-3138 (never writes a decision or check, never moves to approved/rejected); `Send` is triggered only from a click or key handler. |
+| FR-3222 | Must | Tokenless dashboards (#357): `dmuxaiOpenEventSource` opens the stream without a token (adds `token=` only when one exists) and the server accepts that stream under the same tokenless rules as other `/api/*` reads (SPEC-web-local-access); `boardFetchJson` sends `X-Dmuxai-Client: 1` on every request; while an ask is pending the board polls `GET /api/board/{id}` every 3 s (stops when a new `planner` message arrives, the drawer closes, or after 15 min, then shows "No answer yet — check the thread later"), so a missing stream can never leave the UI stuck. |
 | FR-3221 | Should | README board section documents: Send asks the planner (read-only) and posts the answer in the thread, "Note only" just leaves a message for a waiting bot, and `[board] planner = "<agent>"` picks the agent. |
 | NFR-3212 | Must | No new dependencies. The viewer endpoint reads at most 1 MiB per request; linkify adds no work when the board/chat is not rendering. |
 
@@ -63,4 +71,5 @@ different behaviour is confusing.
 | TC-3216 | FR-3214 | `tc_3216_md_view_requires_same_auth_as_api` |
 | TC-3217 | FR-3216, FR-3217 | `tc_3217_markdown_paths_linkified_and_open_viewer` |
 | TC-3218 | FR-3218, FR-3219, FR-3220 | `tc_3218_board_chat_send_asks_planner_unless_note_only` |
+| TC-3222 | FR-3222 | `tc_3222_tokenless_board_stream_and_client_header` |
 | TC-3221 | FR-3221 | `tc_3221_readme_documents_board_chat_send` |
