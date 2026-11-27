@@ -5,8 +5,15 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+## [0.4.1] - 2026-11-27
+
 ### Added
 
+- **Per-node turn policy by role (SPEC-node-turn-policy, opt-in).** `[graph] enforce_read_only_roles = true` runs planning/research/review graph nodes read-only regardless of the App-wide turn policy.
+- **Read-only fan-out: `dmuxai run <prompt> --agents a,b[:model],c [--min-ok N]` (SPEC-fanout-readonly).** Runs the same prompt on several distinct runners concurrently, each leg read-only in a fresh conversation, with per-leg status in `--json`.
+- **Fan-out judge: `--judge <agent[:model]>` (SPEC-fanout-judge).** One extra read-only turn compares the leg answers (passed as nonce-delimited DATA blocks) and writes the aggregate.
+- **Write fan-out: `--write [--keep-worktrees]` and `dmuxai fanout clean [<run_id>|--all]` (SPEC-fanout-worktree).** Each leg runs with write access in its own git worktree under `.dmuxai/fanout/<run_id>/<agent>/`; patches are collected per leg.
+- **Dynamic graph nodes (SPEC-graph-dynamic-nodes, opt-in).** A running node may request extra nodes with a `DMUXAI_ADD_NODES` marker within a cap approved with the plan.
 - **Decision board (v0.4.1, PR 1):** User-level coordinator board under `<state base>/board/` with lanes, rules, graph plan attach/edit, decisions, thread messages, blocking `board wait`, `dmuxai board` CLI, and MCP `board_*` tools (SPEC-decision-board FR-3100..FR-3115).
 - **Decision board dashboard (v0.4.1, PR 2):** Board center view (My decisions cards, kanban lanes, item drawer with plan editor, diff, chat, rules panel), HTTP `/api/board*` routes and live `GET /api/board/events` SSE on `dmuxai serve` and `dmuxai --web` (SPEC-decision-board FR-3120..FR-3126).
 - **Decision board runner & notifications (v0.4.1, PR 3 part A):** `board ask` / `board_ask`, `board run` / `board_run`, HTTP `POST /api/board/{id}/ask` and `/run` (`--web` only), board plan copies under `<state base>/board/plans/<hash>.json`, user-only `[board]` config, and background board notifications (`dmuxai.board.event.v1`) (SPEC-decision-board FR-3130..FR-3133, FR-3135, NFR-3130).
@@ -862,6 +869,7 @@ Changes since v0.1.1 (2026-08-24), PRs #1-#38.
   - the non-Windows `dmuxai-launcher` stub (#17)
   - bash-only spec-index tests are gated on Windows (#24)
 
+[0.4.1]: https://github.com/donggrri/dmuxai/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/donggrri/dmuxai/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/donggrri/dmuxai/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/donggrri/dmuxai/compare/v0.2.2...v0.3.0
