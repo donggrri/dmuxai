@@ -1,6 +1,7 @@
 //! Confinement, size-capped reading, and HTML rendering for `/api/md/view`
 //! (SPEC-board-ux-042 FR-3414, FR-3415, NFR-3412).
 
+use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -73,6 +74,16 @@ fn is_under_home_visible(canonical: &Path, canonical_home: &Path) -> bool {
         }
     }
     has_component
+}
+
+fn within_allowed_roots(
+    canonical: &Path,
+    canonical_ws: &Path,
+    canonical_home: Option<&Path>,
+) -> bool {
+    let in_ws = canonical.starts_with(canonical_ws);
+    let in_home = canonical_home.is_some_and(|h| is_under_home_visible(canonical, h));
+    in_ws || in_home
 }
 
 fn lexical_escapes_root(raw: &str) -> bool {
@@ -169,11 +180,7 @@ pub fn resolve_md_view_path(
         Err(_) => return Err(MdViewError::Io),
     };
 
-    let in_ws = canonical.starts_with(&canonical_ws);
-    let in_home = canonical_home
-        .as_deref()
-        .is_some_and(|h| is_under_home_visible(&canonical, h));
-    if !in_ws && !in_home {
+    if !within_allowed_roots(&canonical, &canonical_ws, canonical_home.as_deref()) {
         return Err(MdViewError::Forbidden("path outside allowed roots"));
     }
 
@@ -234,6 +241,42 @@ fn format_display_path(
     raw.trim().to_owned()
 }
 
+/// Re-checks the file actually opened, narrowing the FR-3415 TOCTOU window.
+fn verify_opened_file(
+    file: &File,
+    expected: &Path,
+    ws: &Path,
+    home: Option<&Path>,
+) -> Result<(), MdViewError> {
+    let metadata = file.metadata().map_err(|_| MdViewError::Io)?;
+    if !metadata.is_file() {
+        return Err(MdViewError::Forbidden("not a regular file"));
+    }
+
+    #[cfg(target_os = "linux")]
+    let opened = {
+        use std::os::fd::AsRawFd;
+        std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let opened = std::fs::canonicalize(expected);
+
+    let opened = opened.map_err(|_| MdViewError::Forbidden("path outside allowed roots"))?;
+    if opened != expected || !within_allowed_roots(&opened, ws, home) {
+        return Err(MdViewError::Forbidden("path outside allowed roots"));
+    }
+
+    let is_md = opened
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_md {
+        return Err(MdViewError::Forbidden("path outside allowed roots"));
+    }
+
+    Ok(())
+}
+
 /// Resolves, reads (capped at 1 MiB), and renders a Markdown file for `/api/md/view`.
 pub fn view_markdown(
     raw: &str,
@@ -244,13 +287,18 @@ pub fn view_markdown(
     let canonical_ws = std::fs::canonicalize(workspace_root).map_err(|_| MdViewError::Io)?;
     let canonical_home = valid_home(home);
 
-    let file = std::fs::File::open(&canonical).map_err(|err| {
+    let file = File::open(&canonical).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             MdViewError::NotFound
         } else {
             MdViewError::Io
         }
     })?;
+    verify_opened_file(&file, &canonical, &canonical_ws, canonical_home.as_deref())?;
+    let metadata = file.metadata().map_err(|_| MdViewError::Io)?;
+    if metadata.len() > MAX_MD_VIEW_BYTES {
+        return Err(MdViewError::TooLarge);
+    }
     let mut bytes = Vec::new();
     file.take(MAX_MD_VIEW_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -410,5 +458,54 @@ mod tests {
         assert_eq!(home_resp.path, "~/notes/X.md");
         assert!(home_resp.html.contains("Note"));
         assert_eq!(home_resp.bytes, 6);
+    }
+
+    // TC-3415
+    #[test]
+    fn tc_3415_md_view_rechecks_opened_file_after_swap() {
+        let ws = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let ws = std::fs::canonicalize(ws.path()).unwrap();
+        let outside = std::fs::canonicalize(outside.path()).unwrap();
+
+        // (1) A file inside the workspace passes.
+        let inside = ws.join("inside.md");
+        std::fs::write(&inside, "# Inside").unwrap();
+        let file = File::open(&inside).unwrap();
+        verify_opened_file(&file, &inside, &ws, None).unwrap();
+
+        // (2) An outside `.md` opened while expecting a workspace path is refused.
+        let outside_md = outside.join("outside.md");
+        std::fs::write(&outside_md, "secret").unwrap();
+        let file = File::open(&outside_md).unwrap();
+        assert!(matches!(
+            verify_opened_file(&file, &inside, &ws, None),
+            Err(MdViewError::Forbidden(_))
+        ));
+
+        // (3) A symlink inside the workspace pointing to an outside `.md` is refused
+        // because the opened file's real path is outside the allowed roots.
+        #[cfg(unix)]
+        {
+            let link = ws.join("escape.md");
+            std::os::unix::fs::symlink(&outside_md, &link).unwrap();
+            let file = File::open(&link).unwrap();
+            assert!(matches!(
+                verify_opened_file(&file, &link, &ws, None),
+                Err(MdViewError::Forbidden(_))
+            ));
+        }
+
+        // (4) A directory handle / non-regular file is refused.
+        #[cfg(unix)]
+        {
+            let dir = ws.join("dir.md");
+            std::fs::create_dir_all(&dir).unwrap();
+            let handle = File::open(&dir).unwrap();
+            assert!(matches!(
+                verify_opened_file(&handle, &dir, &ws, None),
+                Err(MdViewError::Forbidden(_))
+            ));
+        }
     }
 }
