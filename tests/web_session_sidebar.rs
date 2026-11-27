@@ -62,7 +62,10 @@ fn tc_863_session_sidebar_renders_in_headless_chrome() {
     let home = tempfile::tempdir().expect("temp home");
     let config_home = tempfile::tempdir().expect("temp config");
     let state = tempfile::tempdir().expect("temp state");
-    let config = r#"[graph]
+    let config = format!(
+        "{}{}",
+        dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
+        r#"[graph]
 enabled = false
 
 [routing]
@@ -73,7 +76,8 @@ name = "fake"
 label = "demo-agent"
 command = ["sh", "-c", "echo done", "sh", "{prompt}"]
 prompt_via = "arg"
-"#;
+"#
+    );
     std::fs::write(workspace.path().join("dmuxai.toml"), config).expect("write dmuxai.toml");
 
     let bin = env!("CARGO_BIN_EXE_dmuxai");
