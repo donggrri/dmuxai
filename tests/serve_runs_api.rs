@@ -50,6 +50,8 @@ impl ServeFixture {
             .args(["serve", "--port", "0"])
             .current_dir(&ws_path)
             .env_remove("DMUXAI_WORKSPACE")
+            .env("DMUXAI_WEB_REQUIRE_TOKEN", "1")
+            .env("DMUXAI_STATE_DIR", &state_home)
             .env("XDG_DATA_HOME", &data_home)
             .env("XDG_STATE_HOME", &state_home)
             .env("XDG_CONFIG_HOME", &cfg_home)

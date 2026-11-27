@@ -21,13 +21,17 @@ impl Drop for ChildGuard {
     }
 }
 
-fn http(port: u16, method: &str, path: &str, token: &str, body: &str) -> String {
+fn http(port: u16, method: &str, path: &str, token: Option<&str>, body: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+    let auth = token.filter(|t| !t.is_empty()).map_or_else(
+        || "X-Dmuxai-Client: 1\r\n".to_owned(),
+        |t| format!("Authorization: Bearer {t}\r\n"),
+    );
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).unwrap();
@@ -132,14 +136,18 @@ timeout_secs = 60
         std::thread::sleep(Duration::from_millis(100));
     };
     let port = discovery["port"].as_u64().unwrap() as u16;
-    let token = discovery["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        discovery.get("token_required").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let token = discovery.get("token").and_then(|v| v.as_str());
 
     // Start a slow direct turn in the first folder.
     let prompt = http(
         port,
         "POST",
         "/api/prompt",
-        &token,
+        token,
         r#"{"text":"hello","agent":"slow","route":"direct"}"#,
     );
     assert!(prompt.starts_with("HTTP/1.1 202"), "{prompt}");
@@ -147,7 +155,7 @@ timeout_secs = 60
     // FR-2301: the default folder reports a running turn while it is hosted.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let list = http(port, "GET", "/api/workspaces", &token, "");
+        let list = http(port, "GET", "/api/workspaces", token, "");
         assert!(list.starts_with("HTTP/1.1 200"), "{list}");
         let list = json_body(&list);
         let default = list["workspaces"]
@@ -168,7 +176,7 @@ timeout_secs = 60
 
     let ws2_canonical = std::fs::canonicalize(&ws2).unwrap();
     let switch_body = serde_json::json!({ "path": ws2_canonical.to_string_lossy() }).to_string();
-    let switched = http(port, "POST", "/api/workspace/switch", &token, &switch_body);
+    let switched = http(port, "POST", "/api/workspace/switch", token, &switch_body);
     assert!(switched.starts_with("HTTP/1.1 200"), "{switched}");
     let switched = json_body(&switched);
     assert_eq!(switched["ok"], true);
@@ -180,7 +188,7 @@ timeout_secs = 60
         port,
         "POST",
         &format!("/api/command?ws={ws2_id}"),
-        &token,
+        token,
         r#"{"command":"new_conversation"}"#,
     );
     assert!(
@@ -188,7 +196,7 @@ timeout_secs = 60
         "{new_conversation}"
     );
 
-    let state2 = http(port, "GET", &format!("/api/state?ws={ws2_id}"), &token, "");
+    let state2 = http(port, "GET", &format!("/api/state?ws={ws2_id}"), token, "");
     assert!(state2.starts_with("HTTP/1.1 200"), "{state2}");
     let state2 = json_body(&state2);
     let state2_workspace = state2["workspace"].as_str().unwrap();
@@ -199,7 +207,7 @@ timeout_secs = 60
     );
 
     // The first folder is still running even though focus moved to the second.
-    let list = http(port, "GET", "/api/workspaces", &token, "");
+    let list = http(port, "GET", "/api/workspaces", token, "");
     assert!(list.starts_with("HTTP/1.1 200"), "{list}");
     let list = json_body(&list);
     let entries = list["workspaces"].as_array().unwrap();
@@ -215,7 +223,7 @@ timeout_secs = 60
         .expect("new workspace entry");
     assert_eq!(opened["focused"], true, "{list}");
 
-    let state1 = http(port, "GET", "/api/state?ws=default", &token, "");
+    let state1 = http(port, "GET", "/api/state?ws=default", token, "");
     assert!(state1.starts_with("HTTP/1.1 200"), "{state1}");
     let state1 = json_body(&state1);
     assert_eq!(
@@ -230,23 +238,17 @@ timeout_secs = 60
 
     let ws1_canonical = std::fs::canonicalize(&ws1).unwrap();
     let switch_back = serde_json::json!({ "path": ws1_canonical.to_string_lossy() }).to_string();
-    let focused = http(port, "POST", "/api/workspace/switch", &token, &switch_back);
+    let focused = http(port, "POST", "/api/workspace/switch", token, &switch_back);
     assert!(focused.starts_with("HTTP/1.1 200"), "{focused}");
     let focused = json_body(&focused);
     assert_eq!(focused["opened"], false);
     assert_eq!(focused["id"], "default");
 
-    let missing = http(port, "GET", "/api/state?ws=nope", &token, "");
+    let missing = http(port, "GET", "/api/state?ws=nope", token, "");
     assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
     assert_eq!(json_body(&missing)["error"], "no such open folder");
 
-    let quit = http(
-        port,
-        "POST",
-        "/api/command",
-        &token,
-        r#"{"command":"quit"}"#,
-    );
+    let quit = http(port, "POST", "/api/command", token, r#"{"command":"quit"}"#);
     assert!(quit.starts_with("HTTP/1.1 200"), "{quit}");
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut child = guard.0.take().unwrap();

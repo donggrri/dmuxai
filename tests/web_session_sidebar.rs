@@ -60,6 +60,8 @@ fn tc_863_session_sidebar_renders_in_headless_chrome() {
 
     let workspace = tempfile::tempdir().expect("temp workspace");
     let home = tempfile::tempdir().expect("temp home");
+    let config_home = tempfile::tempdir().expect("temp config");
+    let state = tempfile::tempdir().expect("temp state");
     let config = r#"[graph]
 enabled = false
 
@@ -81,7 +83,10 @@ prompt_via = "arg"
             .args(["run", prompt, "--agent", "fake"])
             .current_dir(workspace.path())
             .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", config_home.path())
+            .env("DMUXAI_STATE_DIR", state.path())
             .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1")
+            .env_remove("DMUXAI_CONFIG")
             .env_remove("DMUXAI_WORKSPACE")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -106,16 +111,21 @@ chrome_bin = sys.argv[1]
 dmuxai_bin = sys.argv[2]
 workspace_dir = sys.argv[3]
 home_dir = sys.argv[4]
-port = int(sys.argv[5])
-token = sys.argv[6]
-screenshot_path = sys.argv[7]
+config_home = sys.argv[5]
+state_dir = sys.argv[6]
+port = int(sys.argv[7])
+token = sys.argv[8]
+screenshot_path = sys.argv[9]
 
 pid, master_fd = pty.fork()
 if pid == 0:
     os.chdir(workspace_dir)
     os.environ["HOME"] = home_dir
+    os.environ["XDG_CONFIG_HOME"] = config_home
+    os.environ["DMUXAI_STATE_DIR"] = state_dir
     os.environ["TERM"] = "xterm-256color"
     os.environ["DMUXAI_WEB_TOKEN"] = token
+    os.environ.pop("DMUXAI_CONFIG", None)
     os.environ.pop("DMUXAI_WORKSPACE", None)
     winsize = struct.pack("HHHH", 40, 120, 0, 0)
     try:
@@ -272,10 +282,16 @@ print(json.dumps(out))
         .arg(bin)
         .arg(workspace.path())
         .arg(home.path())
+        .arg(config_home.path())
+        .arg(state.path())
         .arg(port.to_string())
         .arg(token)
         .arg(&screenshot_file)
         .env("DMUXAI_TRUST_WORKSPACE_CONFIG", "1")
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env("DMUXAI_STATE_DIR", state.path())
+        .env_remove("DMUXAI_CONFIG")
+        .env_remove("DMUXAI_WORKSPACE")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

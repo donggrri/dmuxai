@@ -41,6 +41,12 @@
     return storageGet(TOKEN_KEY);
   })();
 
+  function authHeaders(extra) {
+    var h = Object.assign({ 'X-Dmuxai-Client': '1' }, extra || {});
+    if (token) { h.Authorization = 'Bearer ' + token; }
+    return h;
+  }
+
   var root = null;
   var ui = {};
   var session = null;
@@ -260,10 +266,7 @@
   function api(path, body) {
     return fetch(apiUrl(path), {
       method: 'POST',
-      headers: {
-        Authorization: 'Bearer ' + token,
-        'Content-Type': 'application/json'
-      },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       cache: 'no-store',
       body: JSON.stringify(body)
     }).then(function (resp) {
@@ -392,7 +395,7 @@
   function uploadAttachment(item) {
     fetch(apiUrl('/api/attachments'), {
       method: 'POST',
-      headers: { Authorization: 'Bearer ' + token, 'Content-Type': item.file.type },
+      headers: authHeaders({ 'Content-Type': item.file.type }),
       cache: 'no-store',
       body: item.file
     }).then(function (resp) {
@@ -521,7 +524,7 @@
     ui.quit = button('Quit', 'quit', function () {
       var cachedFolders = (openFolders || []).slice();
       fetch(apiUrl('/api/workspaces'), {
-        headers: { Authorization: 'Bearer ' + token },
+        headers: authHeaders(),
         cache: 'no-store'
       }).then(function (resp) {
         if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
@@ -2293,7 +2296,8 @@
               img.src = imageUrlCache[name];
             } else {
               fetch(apiUrl('/api/attachments/' + encodeURIComponent(name)), {
-                headers: { Authorization: 'Bearer ' + token }
+                headers: authHeaders(),
+                cache: 'no-store'
               }).then(function (resp) {
                 if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
                 return resp.blob();
@@ -2438,7 +2442,7 @@
   function refreshOpenFolders() {
     var previous = JSON.stringify(openFolders);
     fetch(apiUrl('/api/workspaces'), {
-      headers: { Authorization: 'Bearer ' + token },
+      headers: authHeaders(),
       cache: 'no-store'
     }).then(function (resp) {
       if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
@@ -2679,7 +2683,7 @@
               e.stopPropagation();
               fetch(apiUrl('/api/workspaces/' + encodeURIComponent(id) + '/close'), {
                 method: 'POST',
-                headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                headers: authHeaders({ 'Content-Type': 'application/json' }),
                 cache: 'no-store',
                 body: JSON.stringify({})
               }).then(function (resp) {
@@ -2690,7 +2694,7 @@
                     if (window.confirm('Turns are running in ' + name + '. Close it and stop them?')) {
                       return fetch(apiUrl('/api/workspaces/' + encodeURIComponent(id) + '/close'), {
                         method: 'POST',
-                        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                        headers: authHeaders({ 'Content-Type': 'application/json' }),
                         cache: 'no-store',
                         body: JSON.stringify({ force: true })
                       }).then(function (resp2) {

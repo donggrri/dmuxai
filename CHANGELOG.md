@@ -22,6 +22,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Changed
 
+- **Loopback dashboard is tokenless by default (SPEC-web-local-access).** Local
+  agents and curl can call `/api/*` without `?token=`; CSRF guards, Host checks,
+  and optional `[web] require_token` / WSL host trust restore stricter modes.
+  User-level `web.json` discovery under the state directory; `status --json`
+  reports `token_required` and `source`.
+
 - **Breaking-ish: Cursor runner id in output (SPEC-cursor-agent-keyword, FR-3207).** Consumers that parsed
   the Cursor runner as `"cursor"` in `runners`/`models`/`status` JSON, headless outcome fields, events,
   progress lines, run-journal manifests, web snapshots and graph plans must expect `cursor-agent` instead.

@@ -36,7 +36,8 @@
   }
 
   function api(method, path, body) {
-    var headers = { Authorization: 'Bearer ' + token };
+    var headers = { 'X-Dmuxai-Client': '1' };
+    if (token) { headers.Authorization = 'Bearer ' + token; }
     var init = { method: method, headers: headers, cache: 'no-store' };
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -411,12 +412,6 @@
   }
 
   function refresh() {
-    if (!token) {
-      if (uiMode !== 'no-token') {
-        renderNoToken();
-      }
-      return Promise.resolve();
-    }
     return api('GET', '/api/memory')
       .then(function (data) {
         if (!data || data.enabled !== true) {
@@ -450,11 +445,7 @@
   }
 
   function start() {
-    if (!token) {
-      renderNoToken();
-    } else {
-      refresh();
-    }
+    refresh();
     if (refreshTimer) { window.clearInterval(refreshTimer); }
     refreshTimer = window.setInterval(tickRefresh, REFRESH_MS);
   }

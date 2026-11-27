@@ -80,6 +80,7 @@
 
   function authHeaders(extra) {
     var h = extra ? Object.assign({}, extra) : {};
+    h['X-Dmuxai-Client'] = '1';
     if (token) {
       h['Authorization'] = 'Bearer ' + token;
     }
@@ -315,10 +316,6 @@
   }
 
   function fetchWorkspaceInfo(onDone) {
-    if (!token) {
-      if (onDone) { onDone(); }
-      return;
-    }
     apiGet('/api/workspace').then(function (res) {
       if (res.ok && res.body) {
         if (typeof res.body.current === 'string' && res.body.current) {

@@ -156,7 +156,7 @@ function runsStreamRunNeedsRefetch(streamRun, prev) {
 function runsFetchJson(path) {
   var tok = runsToken();
   return fetch(runsApiUrl(path), {
-    headers: tok ? { Authorization: 'Bearer ' + tok } : {},
+    headers: tok ? { Authorization: 'Bearer ' + tok, 'X-Dmuxai-Client': '1' } : { 'X-Dmuxai-Client': '1' },
     cache: 'no-store'
   }).then(function (res) {
     if (!res.ok) {
@@ -782,8 +782,8 @@ function runsConnectStream(id) {
   runsStreamStickBottom = true;
   if (typeof EventSource === 'undefined') { return; }
   var tok = runsToken();
-  if (!tok) { return; }
-  var path = '/api/runs/' + encodeURIComponent(id) + '/stream?token=' + encodeURIComponent(tok);
+  var path = '/api/runs/' + encodeURIComponent(id) + '/stream';
+  if (tok) { path += '?token=' + encodeURIComponent(tok); }
   try {
     runsStreamSse = new EventSource(runsApiUrl(path));
   } catch (err) {

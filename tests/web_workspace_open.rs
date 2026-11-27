@@ -22,13 +22,17 @@ impl Drop for ChildGuard {
     }
 }
 
-fn http(port: u16, method: &str, path: &str, token: &str, body: &str) -> String {
+fn http(port: u16, method: &str, path: &str, token: Option<&str>, body: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
+    let auth = token.filter(|t| !t.is_empty()).map_or_else(
+        || "X-Dmuxai-Client: 1\r\n".to_owned(),
+        |t| format!("Authorization: Bearer {t}\r\n"),
+    );
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(req.as_bytes()).unwrap();
@@ -81,19 +85,17 @@ fn tc_1471_open_in_new_window_starts_headless_dashboard() {
         std::thread::sleep(Duration::from_millis(100));
     };
     let port = discovery["port"].as_u64().unwrap() as u16;
-    let token = discovery["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        discovery.get("token_required").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let token = discovery.get("token").and_then(|v| v.as_str());
 
-    let state_resp = http(port, "GET", "/api/state", &token, "");
+    let state_resp = http(port, "GET", "/api/state", token, "");
     assert!(state_resp.starts_with("HTTP/1.1 200"), "{state_resp}");
     assert!(state_resp.contains("\"workspace\""), "{state_resp}");
 
-    let quit = http(
-        port,
-        "POST",
-        "/api/command",
-        &token,
-        r#"{"command":"quit"}"#,
-    );
+    let quit = http(port, "POST", "/api/command", token, r#"{"command":"quit"}"#);
     assert!(quit.starts_with("HTTP/1.1 200"), "{quit}");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut child = guard.0.take().unwrap();
@@ -136,13 +138,17 @@ fn tc_1985_graph_continue_without_waiting_gate_errors() {
         std::thread::sleep(Duration::from_millis(100));
     };
     let port = discovery["port"].as_u64().unwrap() as u16;
-    let token = discovery["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        discovery.get("token_required").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    let token = discovery.get("token").and_then(|v| v.as_str());
 
     let cont = http(
         port,
         "POST",
         "/api/command",
-        &token,
+        token,
         r#"{"command":"graph_continue"}"#,
     );
     assert!(
@@ -154,19 +160,13 @@ fn tc_1985_graph_continue_without_waiting_gate_errors() {
         "error body must mention 'waiting', got: {cont}"
     );
 
-    let prompts_resp = http(port, "GET", "/api/state", &token, "");
+    let prompts_resp = http(port, "GET", "/api/state", token, "");
     assert!(
         !prompts_resp.contains("graph_continue"),
         "graph_continue must not be accepted as prompt: {prompts_resp}"
     );
 
-    let quit = http(
-        port,
-        "POST",
-        "/api/command",
-        &token,
-        r#"{"command":"quit"}"#,
-    );
+    let quit = http(port, "POST", "/api/command", token, r#"{"command":"quit"}"#);
     assert!(quit.starts_with("HTTP/1.1 200"), "{quit}");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut child = guard.0.take().unwrap();

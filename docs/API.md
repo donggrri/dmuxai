@@ -274,32 +274,29 @@ dmuxai serve --port 0   # pick a free port
 
 ### Auth
 
-Every `/api/*` request needs the token, via either:
+On the default loopback bind, `/api/*` is **tokenless**. Send `X-Dmuxai-Client: 1`
+on writes from non-browser clients (curl, agents). Browsers use same-origin
+`Origin` / `Sec-Fetch-Site` checks. Optional `Authorization: Bearer <token>` or
+`?token=<token>` still works and is required when `token_required` is true
+(`[web] require_token`, `DMUXAI_WEB_REQUIRE_TOKEN=1`, `DMUXAI_WEB_TOKEN`, or
+non-loopback `--allow-remote`).
 
-- `Authorization: Bearer <token>`, or
-- `?token=<token>`.
-
-The token is a per-start random value (printed in the startup URL) unless
-`DMUXAI_WEB_TOKEN` is set. It must be 32–128 characters of `[A-Za-z0-9_-]`; an
-invalid value is ignored with a warning and a random token is used.
-
-A running dashboard writes its endpoint and token to the discovery file:
+Discovery:
 
 ```json
-{ "base_url": "http://127.0.0.1:7420", "port": 7420, "pid": 12345, "token": "<token>" }
+{ "base_url": "http://127.0.0.1:7420", "port": 7420, "pid": 12345, "token_required": false }
 ```
 
-Path: `<workspace>/.dmuxai/web.json`. Owner-only (`0600`) on Unix, removed on
-clean exit. Read it instead of parsing logs.
+Workspace: `<workspace>/.dmuxai/web.json`. User-level: `<state base>/web.json`
+(`$DMUXAI_STATE_DIR` or `~/.local/state/dmuxai/web.json`), owner-only on Unix.
 
 ### Host and Origin rules (#27)
 
-- For loopback binds the `Host` header must be one of
-  `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>`. A non-loopback bind
-  (`--bind ADDR --allow-remote`) disables this allowlist.
-- When an `Origin` header is present it must equal `http://<Host>`.
-- A missing/disallowed `Host` or a foreign `Origin` is `403`. A missing or wrong
-  token is `401`.
+- Loopback (and WSL NAT listener): `Host` must match the bound address and port
+  (port 80 also allows hostnames without `:80`).
+- State-changing methods need matching `Origin` or `X-Dmuxai-Client: 1`.
+- Tokenless cross-site GET on `/api/*` is `403`. Wrong or missing token when
+  required is `401`.
 
 ### Routes
 

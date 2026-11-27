@@ -267,6 +267,27 @@ mod tests {
         }
     }
 
+    // TC-2964 / FR-2964
+    #[test]
+    fn tc_2964_dashboard_assets_work_without_token_and_send_client_header() {
+        for source in [
+            APP_JS,
+            WORKSPACE_JS,
+            MEMORY_JS,
+            DOCS_JS,
+            JIRA_TODOS_JS,
+            SESSION_JS,
+            SKILLS_JS,
+            AGENT_PROMPTS_JS,
+        ] {
+            assert!(
+                source.contains("X-Dmuxai-Client") || source.contains("'x-dmuxai-client'"),
+                "missing client header in embedded asset"
+            );
+        }
+        assert!(!APP_JS.contains("Missing access token"));
+    }
+
     // TC-543: static_page_has_todo_panel (SPEC-web-dashboard UX-540)
     #[test]
     fn tc_543_static_page_has_todo_panel() {
@@ -875,11 +896,10 @@ mod tests {
                 );
             }
         }
-        // app.js only mentions http twice: the inert SVG namespace and the
-        // localhost example in the missing-token message.
+        // app.js only mentions http:// once: the inert SVG namespace.
         assert_eq!(
             APP_JS.matches("http://").count(),
-            2,
+            1,
             "unexpected http:// URLs in app.js"
         );
     }

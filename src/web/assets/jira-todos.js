@@ -39,7 +39,8 @@
   }
 
   function request(method, path, payload) {
-    var headers = { Authorization: 'Bearer ' + token };
+    var headers = { 'X-Dmuxai-Client': '1' };
+    if (token) { headers.Authorization = 'Bearer ' + token; }
     var init = { method: method, headers: headers, cache: 'no-store' };
     if (payload !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -172,7 +173,7 @@
   }
 
   function load(force) {
-    if (!token || inFlight) { return; }
+    if (inFlight) { return; }
     var now = Date.now();
     if (!force && lastFetchAt && now - lastFetchAt < MIN_FETCH_MS) { return; }
     lastFetchAt = now;

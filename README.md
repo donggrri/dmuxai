@@ -60,24 +60,34 @@ Details: [SPEC-web-dashboard](docs/specs/SPEC-web-dashboard.md).
 
 ### Dashboard token
 
-`dmuxai --web` and `dmuxai serve` print a line such as
-`dmuxai dashboard: http://127.0.0.1:7420/?token=…`. The **per-start access
-token** in that URL is a session credential: anyone who can reach the bind
-address and knows the token can use the dashboard API (run agents, change
-settings, and so on). Treat it like a password.
+On the default **loopback** bind (`127.0.0.1:7420`), `dmuxai --web` and
+`dmuxai serve` print a URL **without** `?token=` (for example
+`dmuxai dashboard: http://127.0.0.1:7420/`). Any local process on the same machine can call the dashboard API without a
+token. On Linux, peers whose TCP socket is visible in `/proc/net/tcp` with a
+uid other than yours (and not root) are rejected. That is the default tradeoff so agents and curl can read `/api/*`
+without copying a secret.
+
+To restore the old behaviour (token on every `/api/*` request), set
+`[web] require_token = true` in `dmuxai.toml`, export `DMUXAI_WEB_REQUIRE_TOKEN=1`,
+set `DMUXAI_WEB_TOKEN`, or bind to a non-loopback address with `--allow-remote`.
+When a token is required, the printed URL includes `?token=…`; treat that token
+like a password.
+
+**WSL2:** open `http://localhost:<port>/` from a Windows browser, or use the
+second line `dmuxai dashboard (Windows): http://<wsl-ip>:<port>/` in WSL2 NAT
+mode. Processes on the Windows host (and anything Windows forwards from the NAT
+gateway) can use the API without a token; other peers on the WSL IP need the
+token. Set `[web] trust_wsl_host = false` to disable the extra listener.
 
 - The printed line can remain in **terminal scrollback**, tmux or screen logs,
   CI job output, and your shell's copy-paste buffer.
-- Opening the URL in a normal browser tab stores the full address, including
-  the token, in **browser history** (use a private window if you want to avoid
-  that, or clear the query string from the address bar after load).
-- **Redact** `?token=…` and the token value before sharing logs, screenshots,
-  or bug reports.
+- When a token is present, opening the URL in a browser can store it in
+  **browser history** (use a private window or clear `?token=` after load).
+- **Redact** `?token=…` before sharing logs, screenshots, or bug reports.
 
-`DMUXAI_WEB_TOKEN` pins a fixed token (32–128 characters of `A-Za-z0-9_-`)
-instead of a random one. Use it only on a machine you trust; the value is still
-a secret and must not be committed to git or pasted into public issues. If the
-value is invalid, DmuxAI prints a warning and uses a random token instead.
+`DMUXAI_WEB_TOKEN` pins a fixed token (32–128 characters of `A-Za-z0-9_-`) and
+implies token-required mode. Use it only on a machine you trust; do not commit it
+or paste it into public issues.
 
 ### Graph view
 

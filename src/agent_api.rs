@@ -170,6 +170,53 @@ pub fn runner_run_admitted(settings: &DmuxSettings, runner: &str) -> bool {
     }
 }
 
+fn resolve_status_dashboard(workspace_root: &Path) -> Value {
+    if let Some(d) = crate::web::discovery::read_discovery(workspace_root)
+        && crate::web::discovery::process_alive(d.pid)
+    {
+        let url = d.base_url.trim_end_matches('/').to_string();
+        let mut val = json!({
+            "url": url,
+            "port": d.port,
+            "pid": d.pid,
+            "process_alive": true,
+            "token_required": d.token_required,
+            "source": "workspace",
+        });
+        if d.token_required {
+            val["token_file"] = json!(
+                crate::web::discovery::discovery_path(workspace_root)
+                    .display()
+                    .to_string()
+            );
+        }
+        return val;
+    }
+    if let Some(d) = crate::web::discovery::read_user_discovery() {
+        let url = d.base_url.trim_end_matches('/').to_string();
+        let mut val = json!({
+            "url": url,
+            "port": d.port,
+            "pid": d.pid,
+            "process_alive": true,
+            "token_required": d.token_required,
+            "source": "user",
+        });
+        if d.token_required
+            && let Some(tok) = d.token
+        {
+            val["token_file"] = json!(
+                crate::web::discovery::user_discovery_path()
+                    .ok()
+                    .map(|p| p.display().to_string())
+            );
+            let _ = tok;
+        }
+        return val;
+    }
+    Value::Null
+}
+
 /// `dmuxai status --json` (FR-763).
 pub fn status_json(workspace_root: &Path) -> Value {
     let settings = DmuxSettings::load(workspace_root);
@@ -298,16 +345,7 @@ pub fn status_json(workspace_root: &Path) -> Value {
     let events_path = crate::events::events_path(workspace_root);
     let last_seq = crate::events::EventLog::open(workspace_root, workspace.clone()).last_seq();
 
-    let dashboard = crate::web::discovery::read_discovery(workspace_root)
-        .map(|d| {
-            json!({
-                "base_url": d.base_url,
-                "port": d.port,
-                "pid": d.pid,
-                "token_file": crate::web::discovery::discovery_path(workspace_root).display().to_string(),
-            })
-        })
-        .unwrap_or(Value::Null);
+    let dashboard = resolve_status_dashboard(workspace_root);
 
     json!({
         "workspace": workspace,
@@ -1649,6 +1687,72 @@ mod tests {
         );
     }
 
+    // TC-2958 / FR-2958
+    #[test]
+    fn tc_2958_status_reports_one_dashboard_schema_from_workspace_or_user_file() {
+        let _guard = crate::state_path::test_env_lock();
+        let workspace = tempfile::tempdir().unwrap();
+        let d = crate::web::discovery::Discovery {
+            base_url: "http://127.0.0.1:7420".to_owned(),
+            port: 7420,
+            pid: std::process::id(),
+            token_required: false,
+            token_required_explicit: false,
+            token: None,
+        };
+        crate::web::discovery::write_discovery(workspace.path(), &d).unwrap();
+        let val = status_json(workspace.path());
+        let dash = val.get("dashboard").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(
+            dash.get("source").and_then(|s| s.as_str()),
+            Some("workspace")
+        );
+        assert_eq!(
+            dash.get("token_required").and_then(|t| t.as_bool()),
+            Some(false)
+        );
+        assert!(
+            !dash
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .contains("token=")
+        );
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("DMUXAI_STATE_DIR");
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", state_dir.path()) };
+        let token = "a".repeat(64);
+        let user = crate::web::discovery::UserDiscovery {
+            base_url: "http://127.0.0.1:7420".to_owned(),
+            windows_url: None,
+            port: 7420,
+            pid: std::process::id(),
+            uid: crate::web::access::effective_server_uid(),
+            mode: "web".to_owned(),
+            token_required: true,
+            token: Some(token),
+            workspaces: vec![],
+            started_at_ms: 1,
+        };
+        crate::web::discovery::write_user_discovery(&user).unwrap();
+        let fallback_ws = tempfile::tempdir().unwrap();
+        let val = status_json(fallback_ws.path());
+        let dash = val.get("dashboard").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(dash.get("source").and_then(|s| s.as_str()), Some("user"));
+        assert_eq!(
+            dash.get("token_required").and_then(|t| t.as_bool()),
+            Some(true)
+        );
+        let url = dash.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        assert!(!url.contains("token="));
+        assert!(dash.get("token_file").is_some());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DMUXAI_STATE_DIR", v) },
+            None => unsafe { std::env::remove_var("DMUXAI_STATE_DIR") },
+        }
+    }
     // TC-3002 / FR-3006: static fallback ids pass policy
     #[test]
     fn tc_3002_static_fallback_ids_pass_policy() {

@@ -97,9 +97,12 @@ fn tc_531_serve_prints_token_url_and_serves_state() {
     let workspace = tempfile::tempdir().expect("temp workspace");
     write_graph_fixture(workspace.path());
 
+    let state_dir = tempfile::tempdir().expect("state dir");
     let mut child = Command::new(env!("CARGO_BIN_EXE_dmuxai"))
         .args(["serve", "--port", "0"])
         .current_dir(workspace.path())
+        .env("DMUXAI_WEB_REQUIRE_TOKEN", "1")
+        .env("DMUXAI_STATE_DIR", state_dir.path())
         .env_remove("DMUXAI_WORKSPACE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

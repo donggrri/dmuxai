@@ -595,11 +595,13 @@ pub fn open_dashboard_args(workspace: &Path) -> Vec<String> {
 
 /// Browser URL for a discovery record (`base_url` has no token).
 pub fn discovery_dashboard_url(discovery: &crate::web::discovery::Discovery) -> String {
-    format!(
-        "{}/?token={}",
-        discovery.base_url.trim_end_matches('/'),
-        discovery.token
-    )
+    let base = discovery.base_url.trim_end_matches('/');
+    if discovery.token_required
+        && let Some(token) = &discovery.token
+    {
+        return format!("{base}/?token={token}");
+    }
+    format!("{base}/")
 }
 
 /// Spawn `exe --web -C workspace --port 0` in its own process group.

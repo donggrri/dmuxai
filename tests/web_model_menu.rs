@@ -287,12 +287,11 @@ async fn model_menu_search_keyboard_and_no_fast_in_headless_chrome() {
         });
     }
 
-    let config = ServerConfig {
-        bind: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        allow_remote: false,
-        token: "test-token-model-menu".to_owned(),
-        services: DashboardServices {
+    let config = ServerConfig::for_tests(
+        "127.0.0.1".parse().unwrap(),
+        0,
+        "test-token-model-menu".to_owned(),
+        DashboardServices {
             events_path: None,
             todos: None,
             commands: Some(tx),
@@ -304,7 +303,7 @@ async fn model_menu_search_keyboard_and_no_fast_in_headless_chrome() {
             trust_env: None,
             board_base: None,
         },
-    };
+    );
     let server = start_server(config, hub).await.expect("start server");
     let url = server.url.clone();
 

@@ -71,6 +71,10 @@ pub struct WebThemeSettings {
     pub theme: String,
     /// Normalized lowercase `#rrggbb` accent, if configured.
     pub accent: Option<String>,
+    /// When true, `/api/*` requires the bearer token even on loopback (FR-2950).
+    pub require_token: bool,
+    /// WSL2 NAT: trust the Windows host peer without a token (FR-2960).
+    pub trust_wsl_host: bool,
 }
 
 impl Default for WebThemeSettings {
@@ -78,6 +82,8 @@ impl Default for WebThemeSettings {
         Self {
             theme: "system".to_owned(),
             accent: None,
+            require_token: false,
+            trust_wsl_host: true,
         }
     }
 }
@@ -444,6 +450,8 @@ struct MemoryToml {
 struct WebToml {
     theme: Option<String>,
     accent: Option<String>,
+    require_token: Option<bool>,
+    trust_wsl_host: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1011,6 +1019,12 @@ impl DmuxSettings {
             settings.reduced_motion = true;
             settings.theme.reduced_motion = true;
         }
+        if matches!(
+            std::env::var("DMUXAI_WEB_REQUIRE_TOKEN").ok().as_deref(),
+            Some("1")
+        ) {
+            settings.web_theme.require_token = true;
+        }
         settings.dedupe_warnings();
         settings
     }
@@ -1400,6 +1414,12 @@ impl DmuxSettings {
                         self.web_theme.accent = None;
                     }
                 }
+            }
+            if let Some(require_token) = web.require_token {
+                self.web_theme.require_token = require_token;
+            }
+            if let Some(trust_wsl_host) = web.trust_wsl_host {
+                self.web_theme.trust_wsl_host = trust_wsl_host;
             }
         }
         if let Some(notify) = parsed.notify {
@@ -2533,6 +2553,30 @@ mod theme_config_tests {
         assert_eq!(settings.theme.cursor, Color::Rgb(0, 255, 0));
         assert_eq!(settings.theme.agy, Theme::default().agy);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tc_2951_web_require_token_parsed_from_toml_and_env() {
+        let _guard = test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("dmuxai.toml");
+        std::fs::write(
+            &cfg,
+            "[web]\nrequire_token = true\ntrust_wsl_host = false\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(dir.path());
+        assert!(settings.web_theme.require_token);
+        assert!(!settings.web_theme.trust_wsl_host);
+
+        let prev = std::env::var_os("DMUXAI_WEB_REQUIRE_TOKEN");
+        unsafe { std::env::set_var("DMUXAI_WEB_REQUIRE_TOKEN", "1") };
+        let with_env = DmuxSettings::load(dir.path());
+        assert!(with_env.web_theme.require_token);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("DMUXAI_WEB_REQUIRE_TOKEN", v) },
+            None => unsafe { std::env::remove_var("DMUXAI_WEB_REQUIRE_TOKEN") },
+        }
     }
 
     #[test]

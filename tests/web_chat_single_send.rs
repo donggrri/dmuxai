@@ -131,12 +131,11 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
         0,
     )));
     let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
-    let config = ServerConfig {
-        bind: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        allow_remote: false,
-        token: "test-token-single-send".to_owned(),
-        services: DashboardServices {
+    let config = ServerConfig::for_tests(
+        "127.0.0.1".parse().unwrap(),
+        0,
+        "test-token-single-send".to_owned(),
+        DashboardServices {
             events_path: None,
             todos: None,
             commands: Some(command_tx),
@@ -148,7 +147,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
             trust_env: None,
             board_base: None,
         },
-    };
+    );
     let server = start_server(config, hub.clone())
         .await
         .expect("start server");

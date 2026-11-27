@@ -316,12 +316,11 @@ async fn tc_824_running_indicator_renders_in_headless_chrome() {
     );
 
     let token = "test-token-running".to_string();
-    let config = ServerConfig {
-        bind: "127.0.0.1".parse().unwrap(),
-        port: 0,
-        allow_remote: false,
-        token: token.clone(),
-        services: DashboardServices {
+    let config = ServerConfig::for_tests(
+        "127.0.0.1".parse().unwrap(),
+        0,
+        token.clone(),
+        DashboardServices {
             events_path: None,
             todos: None,
             commands: None,
@@ -333,7 +332,7 @@ async fn tc_824_running_indicator_renders_in_headless_chrome() {
             trust_env: None,
             board_base: None,
         },
-    };
+    );
 
     let server = start_server(config, hub).await.expect("start server");
     let url = server.url.clone();

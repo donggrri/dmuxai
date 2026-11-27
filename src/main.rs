@@ -42,6 +42,7 @@ struct WebOptions {
     port: u16,
     bind: IpAddr,
     allow_remote: bool,
+    bind_explicit: bool,
 }
 
 impl Default for WebOptions {
@@ -50,6 +51,7 @@ impl Default for WebOptions {
             port: DEFAULT_PORT,
             bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
             allow_remote: false,
+            bind_explicit: false,
         }
     }
 }
@@ -152,6 +154,7 @@ Environment variables:
   NO_COLOR            Disable color output unless forced
   XDG_STATE_HOME      Directory for application state and conversation history
   DMUXAI_WEB_TOKEN    Fixed dashboard token (32-128 chars of A-Z a-z 0-9 _ -)
+  DMUXAI_WEB_REQUIRE_TOKEN=1  Require token on loopback (same as [web] require_token)
 ";
 
 fn parse_cli<I, S>(args: I) -> CliAction
@@ -283,7 +286,10 @@ where
                     })
                     .and_then(Result::ok);
                 match bind {
-                    Some(bind) => options.bind = bind,
+                    Some(bind) => {
+                        options.bind = bind;
+                        options.bind_explicit = true;
+                    }
                     None => return CliAction::Unknown("--bind".to_owned()),
                 }
             }
@@ -620,7 +626,10 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|config| dmuxai::memory::MemoryHandle::from_config(config, &workspace_root));
     let ws = dmuxai::docs::confine::Workspace::new(&workspace_root).ok();
-    let token = dashboard_token(|warning| eprintln!("warning: {warning}"));
+    let (token, token_required, _) =
+        resolve_dashboard_credentials(&settings, &options, |warning| {
+            eprintln!("warning: {warning}")
+        });
     let open_tickets = Arc::new(std::sync::Mutex::new(dmuxai::web::OpenTickets::new()));
     let docs = ws.map(|workspace| {
         let changes = dmuxai::docs::changes::ChangeLog::default();
@@ -702,7 +711,12 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
+        bind_explicit: options.bind_explicit,
         token: token.clone(),
+        token_required,
+        trust_wsl_host: settings.web_theme.trust_wsl_host,
+        discovery_mode: "serve".to_owned(),
+        peer_source: None,
         services,
     };
     let token = config.token.clone();
@@ -714,9 +728,17 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    println!("dmuxai dashboard: {}", server.url);
+    print_dashboard_urls(&server);
     io::stdout().flush()?;
     if let Some(warning) = publish_discovery(&workspace_root, &server, &token) {
+        eprintln!("warning: {warning}");
+    }
+    if let Some(warning) = publish_user_discovery(
+        &server,
+        &token,
+        "serve",
+        &[("default", workspace_root.as_path())],
+    ) {
         eprintln!("warning: {warning}");
     }
     if let Some(warning) = &server.warning {
@@ -736,10 +758,46 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
     }
 
     dmuxai::web::discovery::remove_discovery(&workspace_root);
+    dmuxai::web::discovery::remove_user_discovery_owned();
     Ok(())
 }
 
+fn resolve_dashboard_credentials(
+    settings: &dmuxai::settings::DmuxSettings,
+    options: &WebOptions,
+    mut warn: impl FnMut(String),
+) -> (String, bool, bool) {
+    let env_token = std::env::var("DMUXAI_WEB_TOKEN").ok();
+    let explicit = matches!(
+        dmuxai::web::discovery::token_from_env(env_token.as_deref()),
+        Ok(Some(_))
+    );
+    let token = match dmuxai::web::discovery::token_from_env(env_token.as_deref()) {
+        Ok(Some(token)) => token,
+        Ok(None) => dmuxai::web::generate_token(),
+        Err(warning) => {
+            warn(warning);
+            dmuxai::web::generate_token()
+        }
+    };
+    let token_required = dmuxai::web::resolve_token_required(
+        settings.web_theme.require_token,
+        options.bind,
+        options.allow_remote,
+        explicit,
+    );
+    (token, token_required, explicit)
+}
+
+fn print_dashboard_urls(server: &dmuxai::web::DashboardServer) {
+    println!("dmuxai dashboard: {}", server.url);
+    if let Some(url) = server.windows_url.as_ref() {
+        println!("dmuxai dashboard (Windows): {url}");
+    }
+}
+
 /// The dashboard token: `DMUXAI_WEB_TOKEN` when valid, else random (FR-773).
+#[allow(dead_code)]
 fn dashboard_token(mut warn: impl FnMut(String)) -> String {
     let env = std::env::var("DMUXAI_WEB_TOKEN").ok();
     match dmuxai::web::discovery::token_from_env(env.as_deref()) {
@@ -758,22 +816,66 @@ fn publish_discovery(
     server: &DashboardServer,
     token: &str,
 ) -> Option<String> {
-    let host = if server.addr.ip().is_unspecified() {
-        "127.0.0.1".to_owned()
-    } else if server.addr.is_ipv6() {
-        format!("[{}]", server.addr.ip())
-    } else {
-        server.addr.ip().to_string()
-    };
     let discovery = dmuxai::web::discovery::Discovery {
-        base_url: format!("http://{host}:{}", server.addr.port()),
+        base_url: dmuxai::web::dashboard_url_plain(server.addr)
+            .trim_end_matches('/')
+            .to_owned(),
         port: server.addr.port(),
         pid: std::process::id(),
-        token: token.to_owned(),
+        token_required: server.token_required,
+        token_required_explicit: false,
+        token: if server.token_required {
+            Some(token.to_owned())
+        } else {
+            None
+        },
     };
     dmuxai::web::discovery::write_discovery(workspace_root, &discovery)
         .err()
         .map(|error| format!("could not write the dashboard discovery file: {error}"))
+}
+
+fn publish_user_discovery(
+    server: &DashboardServer,
+    token: &str,
+    mode: &str,
+    workspaces: &[(&str, &Path)],
+) -> Option<String> {
+    if !dmuxai::web::discovery::user_discovery_may_overwrite(mode) {
+        return None;
+    }
+    let started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let user = dmuxai::web::discovery::UserDiscovery {
+        base_url: dmuxai::web::dashboard_url_plain(server.addr)
+            .trim_end_matches('/')
+            .to_owned(),
+        windows_url: server.windows_url.clone(),
+        port: server.addr.port(),
+        pid: std::process::id(),
+        uid: dmuxai::web::effective_server_uid(),
+        mode: mode.to_owned(),
+        token_required: server.token_required,
+        token: if server.token_required {
+            Some(token.to_owned())
+        } else {
+            None
+        },
+        workspaces: workspaces
+            .iter()
+            .map(|(id, path)| dmuxai::web::discovery::UserWorkspaceRef {
+                id: (*id).to_owned(),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect(),
+        started_at_ms,
+    };
+    dmuxai::web::discovery::write_user_discovery(&user)
+        .err()
+        .map(|error| format!("could not write the user-level dashboard discovery file: {error}"))
 }
 
 /// Run the TUI, optionally alongside the in-process dashboard (FR-520, FR-530).
@@ -844,7 +946,7 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         // stdout so scripts can find the dashboard; `serve` prints the same
         // line. This branch is always headless.
         if let Some(server) = dashboard.as_ref() {
-            println!("dmuxai dashboard: {}", server.url);
+            print_dashboard_urls(server);
             io::stdout().flush()?;
         }
         dashboard
@@ -860,11 +962,15 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
         let (base_url, token) = server
             .url
             .split_once("/?token=")
-            .map(|(base, token)| (base.to_owned(), token.to_owned()))
-            .unwrap_or_else(|| (server.url.clone(), String::new()));
+            .map(|(base, token)| (base.trim_end_matches('/').to_owned(), token.to_owned()))
+            .unwrap_or_else(|| (server.url.trim_end_matches('/').to_owned(), String::new()));
         workspace_runtime::HostContext {
             directory: server.workspaces(),
-            token,
+            token: if server.token_required {
+                token
+            } else {
+                String::new()
+            },
             base_url,
         }
     });
@@ -909,17 +1015,21 @@ async fn run_tui(web: Option<WebOptions>) -> Result<(), Box<dyn Error>> {
     drop(session);
     let mut bound_port = None;
     let mut dashboard_tok = None;
+    let mut dashboard_token_required = None;
     if let Some(server) = dashboard {
         bound_port = Some(server.addr.port());
         dashboard_tok = server.url.split("/?token=").nth(1).map(str::to_owned);
+        dashboard_token_required = Some(server.token_required);
         server.stop().await;
         dmuxai::web::discovery::remove_discovery(&workspace_root);
+        dmuxai::web::discovery::remove_user_discovery_owned();
     }
     if let Some(target_workspace) = switch_target {
         exec_workspace_switch(
             &target_workspace,
             bound_port,
             dashboard_tok.as_deref(),
+            dashboard_token_required,
             open_conversation.as_deref(),
         );
     }
@@ -975,6 +1085,7 @@ fn exec_workspace_switch(
     target_workspace: &Path,
     bound_port: Option<u16>,
     token: Option<&str>,
+    token_required: Option<bool>,
     open_conversation: Option<&str>,
 ) -> ! {
     use std::os::unix::process::CommandExt;
@@ -993,6 +1104,14 @@ fn exec_workspace_switch(
     cmd.args(&new_args);
     if let Some(tok) = token {
         cmd.env("DMUXAI_WEB_TOKEN", tok);
+    }
+    if let Some(required) = token_required {
+        cmd.env(
+            "DMUXAI_WEB_TOKEN_REQUIRED",
+            if required { "1" } else { "0" },
+        );
+    } else {
+        cmd.env_remove("DMUXAI_WEB_TOKEN_REQUIRED");
     }
     cmd.env("DMUXAI_WORKSPACE", target_workspace);
     match open_conversation {
@@ -1016,7 +1135,8 @@ async fn attach_web_dashboard(
     options: WebOptions,
 ) -> Option<DashboardServer> {
     let mut token_warning = None;
-    let token = dashboard_token(|warning| token_warning = Some(warning));
+    let (token, token_required, _) =
+        resolve_dashboard_credentials(settings, &options, |warning| token_warning = Some(warning));
 
     let parts = workspace_runtime::build_web_workspace(app, workspace_root, settings, &token);
     for notice in parts.notices {
@@ -1030,7 +1150,12 @@ async fn attach_web_dashboard(
         bind: options.bind,
         port: options.port,
         allow_remote: options.allow_remote,
+        bind_explicit: options.bind_explicit,
         token: token.clone(),
+        token_required,
+        trust_wsl_host: settings.web_theme.trust_wsl_host,
+        discovery_mode: "web".to_owned(),
+        peer_source: None,
         services: parts.services,
     };
 
@@ -1039,11 +1164,13 @@ async fn attach_web_dashboard(
             if let Some(warning) = publish_discovery(workspace_root, &server, &token) {
                 app.push_startup_notice(warning);
             }
-            let base_url = server
-                .url
-                .split("/?token=")
-                .next()
-                .unwrap_or(&server.url)
+            if let Some(warning) =
+                publish_user_discovery(&server, &token, "web", &[("default", workspace_root)])
+            {
+                app.push_startup_notice(warning);
+            }
+            let base_url = dmuxai::web::dashboard_url_plain(server.addr)
+                .trim_end_matches('/')
                 .to_string();
             workspace_runtime::attach_web_workspace(
                 app,
@@ -1054,6 +1181,9 @@ async fn attach_web_dashboard(
                 base_url,
             );
             app.push_local_notice(format!("dmuxai dashboard: {}", server.url));
+            if let Some(url) = server.windows_url.as_ref() {
+                app.push_local_notice(format!("dmuxai dashboard (Windows): {url}"));
+            }
             if let Some(warning) = server.warning.clone() {
                 app.push_startup_notice(warning);
             }
@@ -1213,6 +1343,7 @@ mod tests {
             parse_cli(["serve", "--bind", "127.0.0.1"]),
             CliAction::Serve(WebOptions {
                 bind: "127.0.0.1".parse().unwrap(),
+                bind_explicit: true,
                 ..web_default()
             })
         );
@@ -1220,6 +1351,7 @@ mod tests {
             parse_cli(["serve", "--bind", "[::1]"]),
             CliAction::Serve(WebOptions {
                 bind: "::1".parse().unwrap(),
+                bind_explicit: true,
                 ..web_default()
             })
         );
@@ -1227,6 +1359,7 @@ mod tests {
             parse_cli(["serve", "--bind", "::1"]),
             CliAction::Serve(WebOptions {
                 bind: "::1".parse().unwrap(),
+                bind_explicit: true,
                 ..web_default()
             })
         );
@@ -1235,6 +1368,7 @@ mod tests {
             CliAction::Serve(WebOptions {
                 bind: "0.0.0.0".parse().unwrap(),
                 allow_remote: true,
+                bind_explicit: true,
                 ..web_default()
             })
         );
