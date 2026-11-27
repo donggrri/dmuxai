@@ -909,6 +909,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         }
     }
 
@@ -988,6 +989,7 @@ mod tests {
                     task: Some("task-1".to_owned()),
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "c".to_owned(),
@@ -1002,6 +1004,7 @@ mod tests {
                     task: Some("task-2".to_owned()),
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             vec![GraphEdge {
@@ -1074,6 +1077,7 @@ mod tests {
                     task: Some("task-1".to_owned()),
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "s2".to_owned(),
@@ -1088,6 +1092,7 @@ mod tests {
                     task: Some("task-2".to_owned()),
                     started_at_ms: Some(1),
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "s3".to_owned(),
@@ -1102,6 +1107,7 @@ mod tests {
                     task: Some("task-3".to_owned()),
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             vec![
@@ -1319,6 +1325,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "s".to_owned(),
@@ -1333,6 +1340,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 node("c", NodeRole::Test, GraphNodeStatus::Pending),
                 node("d", NodeRole::Review, GraphNodeStatus::Pending),
@@ -1352,6 +1360,7 @@ mod tests {
             task: None,
             started_at_ms: Some(1),
             finished_at_ms: Some(2),
+            test_gate: None,
         });
 
         // TC-974: depends_on failed or skipped step rejected (quoted id char-cut in rule).
@@ -1644,6 +1653,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         }
     }
 

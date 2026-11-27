@@ -518,7 +518,7 @@ pub fn validate_plan_with_limit(
         if parse_role(&step.role).is_none() {
             errors.push(PlanError::new(
                 step.id.clone(),
-                "role must be one of research, explore, test, implement, draft, plan, route, review",
+                "role must be one of spec, research, explore, test, implement, draft, plan, route, review",
             ));
         }
         if step.job.trim().is_empty() {
@@ -605,6 +605,7 @@ pub fn validate_plan_with_limit(
             task: step.task.clone(),
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         });
     }
 
@@ -1032,6 +1033,7 @@ pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) ->
                 task: Some(task.id.clone()),
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: default_limits(),
@@ -1075,6 +1077,7 @@ pub(crate) fn parse_role(role: &str) -> Option<NodeRole> {
         "plan" => NodeRole::Plan,
         "route" => NodeRole::Route,
         "review" => NodeRole::Review,
+        "spec" => NodeRole::Spec,
         _ => return None,
     })
 }
@@ -1268,6 +1271,7 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: vec![],
             limits: default_limits(),

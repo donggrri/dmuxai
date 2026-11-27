@@ -481,6 +481,7 @@ mod tests {
             task: Some(task.to_owned()),
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         }
     }
 

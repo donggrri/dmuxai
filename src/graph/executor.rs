@@ -472,6 +472,7 @@ impl RoleShort for GraphNode {
             NodeRole::Plan => "plan",
             NodeRole::Route => "route",
             NodeRole::Review => "review",
+            NodeRole::Spec => "spec",
         }
     }
 }
@@ -510,6 +511,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "step-1".to_owned(),
@@ -524,6 +526,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "step-2".to_owned(),
@@ -538,6 +541,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "step-3".to_owned(),
@@ -552,6 +556,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "step-4".to_owned(),
@@ -566,6 +571,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![
@@ -675,6 +681,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "impl-1".to_owned(),
@@ -689,6 +696,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 GraphNode {
                     id: "research-1".to_owned(),
@@ -703,6 +711,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![],

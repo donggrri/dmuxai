@@ -344,6 +344,7 @@ pub fn validate_add_nodes(
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         });
     }
 
@@ -379,6 +380,7 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: vec![],
             limits: GraphLimits {
@@ -514,6 +516,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         });
         let mut dep_failed = parsed_ok.clone();
         dep_failed[0].depends_on = vec!["step-failed".to_string()];

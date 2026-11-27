@@ -1169,6 +1169,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "step-2".to_string(),
@@ -1183,6 +1184,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "step-3".to_string(),
@@ -1197,6 +1199,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                 ],
                 edges: vec![GraphEdge {
@@ -1282,6 +1285,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         let run = GraphRun {
             plan: GraphPlan {
@@ -1499,6 +1503,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         let initial = PlanChange {
             rev: 1,
@@ -1592,6 +1597,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         let applied = PlanChange {
             rev: 2,
@@ -1738,6 +1744,7 @@ mod tests {
                         task: Some("task-1".to_string()),
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "s2".to_string(),
@@ -1752,6 +1759,7 @@ mod tests {
                         task: Some("task-2".to_string()),
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "s3".to_string(),
@@ -1766,6 +1774,7 @@ mod tests {
                         task: Some("task-3".to_string()),
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                 ],
                 edges: Vec::new(),
@@ -1827,6 +1836,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     }],
                     edges: Vec::new(),
                 },
@@ -2129,6 +2139,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: Vec::new(),
             },

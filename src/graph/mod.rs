@@ -5,6 +5,7 @@ mod plan_doc;
 mod planner;
 mod policy;
 mod replan;
+mod spec_first;
 mod store;
 mod tasks;
 mod triage_view;
@@ -36,6 +37,12 @@ pub use replan::{
     build_replan_prompt, cap_replan_step_summary, node_send_prompt, parse_replan,
     parse_replan_marker, replan_allowed, replan_revision_steps, replans_left,
     revision_needs_approval, strip_replan_marker,
+};
+pub use spec_first::{
+    SpecGateResult, TestGate, apply_spec_first, check_marker_gate, check_spec_gate,
+    ensure_spec_dir, implement_after_spec_directive, lite_directive, parse_tests_marker,
+    plan_prompt_for, replan_prompt_for, run_test_command, spec_node_directive, spec_snapshot,
+    test_node_directive, three_step_plan,
 };
 pub use store::{GraphRunListCache, GraphStore, load_run, save_run};
 pub use tasks::{

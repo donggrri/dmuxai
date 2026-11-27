@@ -591,6 +591,7 @@ mod tests {
                 task: Some("task-1".to_owned()),
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             });
         }
         GraphRun {

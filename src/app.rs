@@ -8569,6 +8569,7 @@ impl App {
                 task: None,
                 started_at_ms: Some(started_ms),
                 finished_at_ms: Some(finished_ms),
+                test_gate: None,
             },
         );
     }
@@ -20245,6 +20246,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-2".to_owned(),
@@ -20259,6 +20261,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![dmuxai::graph::GraphEdge {
@@ -20685,6 +20688,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         dmuxai::graph::GraphPlan {
             schema: "dmuxai.graph/v1".to_owned(),
@@ -20806,6 +20810,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-b".to_owned(),
@@ -20820,6 +20825,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: Vec::new(),
@@ -21032,6 +21038,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         }];
         nodes.extend(extra_nodes);
         app.start_graph_run(dmuxai::graph::GraphPlan {
@@ -21073,6 +21080,7 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
         );
 
@@ -21114,6 +21122,7 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
         );
         assert!(app.graph_assignment_line.contains(&format!(
@@ -21166,6 +21175,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -21282,6 +21292,7 @@ mod tests {
                     task: None,
                     started_at_ms: Some(1_000),
                     finished_at_ms: (phase == GraphRunPhase::Completed).then_some(61_000),
+                    test_gate: None,
                 }],
                 edges: Vec::new(),
             },
@@ -21903,6 +21914,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -22058,6 +22070,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -22148,6 +22161,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -22207,6 +22221,7 @@ out3
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     dmuxai::graph::GraphNode {
                         id: "node-b".to_owned(),
@@ -22221,6 +22236,7 @@ out3
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                 ],
                 edges: vec![],
@@ -22309,6 +22325,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -23062,6 +23079,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "node-b".to_owned(),
@@ -23076,6 +23094,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![],
@@ -23269,6 +23288,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
@@ -23283,6 +23303,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-2".to_owned(),
@@ -23297,6 +23318,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-3".to_owned(),
@@ -23311,6 +23333,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-4".to_owned(),
@@ -23325,6 +23348,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![],
@@ -27099,6 +27123,7 @@ out3
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
@@ -27363,6 +27388,7 @@ out3
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
@@ -33901,6 +33927,7 @@ out3
                 skill: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: vec![],
             tasks: vec![],
@@ -39618,6 +39645,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-b".to_owned(),
@@ -39632,6 +39660,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: Vec::new(),
@@ -40502,6 +40531,7 @@ out3
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),

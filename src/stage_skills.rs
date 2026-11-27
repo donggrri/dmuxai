@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Graph pre-steps plus every `NodeRole` name (FR-1500).
-pub const KNOWN_STAGES: [&str; 11] = [
+pub const KNOWN_STAGES: [&str; 12] = [
     "judge",
     "planner",
     "orchestrate",
+    "spec",
     "research",
     "explore",
     "test",
