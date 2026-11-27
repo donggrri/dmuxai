@@ -7223,6 +7223,7 @@ mod tests {
                     allow_sensitive: false,
                     todo_id: None,
                     model: None,
+                    no_spec_first: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
