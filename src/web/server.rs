@@ -864,6 +864,22 @@ async fn get_board_js() -> impl IntoResponse {
     )
 }
 
+async fn get_md_viewer_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::MD_VIEWER_JS,
+    )
+}
+
 async fn get_board_css() -> impl IntoResponse {
     (
         [
@@ -2454,6 +2470,7 @@ pub fn build_router_with_directory_access(
             "/api/global/projects/{repo_key}/runs/{run_id}/stream",
             get(crate::web::global_api::run_stream),
         )
+        .route("/assets/md-viewer.js", get(get_md_viewer_js))
         .route("/assets/board.js", get(get_board_js))
         .route("/assets/board.css", get(get_board_css))
         .route("/api/todos", get(list_todos).post(create_todo))

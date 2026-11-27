@@ -452,7 +452,11 @@ function boardRenderDrawer(item) {
   }
   drawer.textContent = '';
   drawer.appendChild(boardEl('h3', 'board-drawer-title', item.title));
-  drawer.appendChild(boardEl('p', 'board-drawer-summary', item.summary || ''));
+  var summaryEl = boardEl('p', 'board-drawer-summary', item.summary || '');
+  drawer.appendChild(summaryEl);
+  if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
+    window.dmuxaiLinkifyMdPaths(summaryEl);
+  }
   if (item.plan) {
     drawer.appendChild(boardEl('p', 'board-plan-meta',
       (item.plan.hash || '—') + ' · revision ' + item.plan.revision));
@@ -584,7 +588,11 @@ function boardRenderDrawer(item) {
       }
       line.appendChild(boardEl('div', 'board-chat-sender', msg.from || 'unknown'));
       line.appendChild(boardEl('div', 'board-chat-time', boardFormatChatTime(msg.at_ms)));
-      line.appendChild(boardEl('div', 'board-chat-bubble', msg.text || ''));
+      var bubble = boardEl('div', 'board-chat-bubble', msg.text || '');
+      line.appendChild(bubble);
+      if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
+        window.dmuxaiLinkifyMdPaths(bubble);
+      }
       thread.appendChild(line);
     }
   }

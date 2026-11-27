@@ -8,6 +8,7 @@ pub const SESSION_JS: &str = include_str!("assets/session.js");
 pub const WORKSPACE_JS: &str = include_str!("assets/workspace.js");
 pub const RUNS_JS: &str = include_str!("assets/runs.js");
 pub const ALL_PROJECTS_JS: &str = include_str!("assets/all-projects.js");
+pub const MD_VIEWER_JS: &str = include_str!("assets/md-viewer.js");
 pub const BOARD_JS: &str = include_str!("assets/board.js");
 pub const BOARD_CSS: &str = include_str!("assets/board.css");
 pub const SIDEBAR_RESIZE_JS: &str = include_str!("assets/sidebar-resize.js");
@@ -282,6 +283,7 @@ mod tests {
             AGENT_PROMPTS_JS,
             RUNS_JS,
             ALL_PROJECTS_JS,
+            MD_VIEWER_JS,
         ] {
             assert!(
                 source.contains("X-Dmuxai-Client") || source.contains("'x-dmuxai-client'"),
@@ -2595,5 +2597,52 @@ mod tests {
         assert!(BOARD_JS.contains("To check"));
         assert!(BOARD_JS.contains("board-mark-checked"));
         assert!(BOARD_JS.contains("/check"));
+    }
+
+    // TC-3217 (FR-3216, FR-3217)
+    #[tokio::test]
+    async fn tc_3217_markdown_paths_linkified_and_open_viewer() {
+        assert!(MD_VIEWER_JS.contains("md-path-link"));
+        assert!(MD_VIEWER_JS.contains("data-md-path"));
+        assert!(MD_VIEWER_JS.contains("/api/md/view"));
+        assert!(MD_VIEWER_JS.contains("aria-modal"));
+        assert!(MD_VIEWER_JS.contains("dmuxaiOpenMdViewer"));
+        assert!(MD_VIEWER_JS.contains("dmuxaiLinkifyMdPaths"));
+        assert!(MD_VIEWER_JS.contains("createTreeWalker"));
+        assert!(MD_VIEWER_JS.contains("'aria-label', 'Close'"));
+        assert!(MD_VIEWER_JS.contains("link.textContent = clean"));
+        // Only the server-sanitized payload.html may assign innerHTML.
+        assert_eq!(MD_VIEWER_JS.matches("innerHTML").count(), 1);
+        assert!(MD_VIEWER_JS.contains("bodyEl.innerHTML ="));
+
+        let md_viewer_pos = INDEX_HTML
+            .find("/assets/md-viewer.js")
+            .expect("index.html must include /assets/md-viewer.js");
+        let board_pos = INDEX_HTML
+            .find("/assets/board.js")
+            .expect("index.html must include /assets/board.js");
+        assert!(md_viewer_pos < board_pos);
+
+        assert!(BOARD_JS.contains("dmuxaiLinkifyMdPaths(summaryEl)"));
+        assert!(BOARD_JS.contains("dmuxaiLinkifyMdPaths(bubble)"));
+        assert!(SESSION_JS.contains("dmuxaiLinkifyMdPaths(target)"));
+
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let router = build_router(hub, "testtoken123".to_string(), None);
+        let req = axum::http::Request::builder()
+            .uri("/assets/md-viewer.js")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), MD_VIEWER_JS.as_bytes());
     }
 }

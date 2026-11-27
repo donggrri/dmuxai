@@ -368,6 +368,12 @@ struct ChangesQuery {
     node: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MdViewQuery {
+    #[serde(default)]
+    path: String,
+}
+
 async fn get_docs_js() -> impl IntoResponse {
     (
         [
@@ -955,6 +961,39 @@ fn safe_filename(path: &std::path::Path) -> String {
     }
 }
 
+async fn get_md_view(
+    State(state): State<DocsApiState>,
+    uri: axum::http::Uri,
+    Query(query): Query<MdViewQuery>,
+) -> Response {
+    let docs = state.docs_for(uri.query());
+    let Some(service) = &docs else {
+        return error_json(StatusCode::NOT_FOUND, "no such open folder");
+    };
+    let workspace_root = service.workspace.root().to_path_buf();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let raw_path = query.path;
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::docs::md_view::view_markdown(&raw_path, &workspace_root, home.as_deref())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(payload)) => json_ok(StatusCode::OK, &payload),
+        Ok(Err(err)) => {
+            use crate::docs::md_view::MdViewError;
+            let status = match err {
+                MdViewError::BadInput(_) => StatusCode::BAD_REQUEST,
+                MdViewError::Forbidden(_) => StatusCode::FORBIDDEN,
+                MdViewError::NotFound => StatusCode::NOT_FOUND,
+                MdViewError::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                MdViewError::Io => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_json(status, err.message())
+        }
+        Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "view failed"),
+    }
+}
+
 pub fn router<S>(workspaces: Arc<WorkspaceDirectory>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -969,6 +1008,7 @@ where
         .route("/api/docs/diff", get(get_diff))
         .route("/api/docs/render", get(get_render).post(post_render))
         .route("/api/docs/view", post(post_view))
+        .route("/api/md/view", get(get_md_view))
         .route("/docs/view/{ticket}", get(get_view_ticket))
         .route("/docs/download/{ticket}", get(get_download_ticket))
         .route("/docs/open/{ticket}", get(get_open_ticket))
@@ -2235,5 +2275,127 @@ mod tests {
         let bounded = crate::docs::list::list_children(&ws, "", 3).unwrap();
         assert!(bounded.truncated);
         assert_eq!(bounded.entries.len(), 3);
+    }
+
+    // TC-3214 (FR-3214)
+    #[tokio::test]
+    async fn tc_3214_md_view_renders_workspace_markdown_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        let md_src = "# Spec Title\n\n<script>alert('xss')</script>\n\nHello **world**.\n";
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/notes.md"), md_src).unwrap();
+        std::fs::write(dir.path().join("docs/plain.txt"), "not markdown").unwrap();
+
+        let token = "testtoken";
+        let service =
+            test_docs_service(ws, false, crate::docs::changes::ChangeLog::default(), None);
+        let router = test_router(Some(service), token);
+
+        let req = axum::http::Request::builder()
+            .uri("/api/md/view?path=docs%2Fnotes.md")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["path"], "docs/notes.md");
+        assert_eq!(val["bytes"], md_src.len());
+        let html = val["html"].as_str().unwrap();
+        assert!(html.contains("Spec Title"), "{html}");
+        assert!(html.contains("<strong>world</strong>"), "{html}");
+        assert!(!html.to_ascii_lowercase().contains("<script"), "{html}");
+        assert!(!html.contains("alert("), "{html}");
+
+        // Non-.md file -> 403 JSON {error} without echoing file content
+        let req = axum::http::Request::builder()
+            .uri("/api/md/view?path=docs%2Fplain.txt")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let err_val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(err_val["error"].is_string());
+        assert!(!err_val["error"].as_str().unwrap().contains("not markdown"));
+
+        // Missing file -> 404
+        let req = axum::http::Request::builder()
+            .uri("/api/md/view?path=docs%2Fmissing.md")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // TC-3216 (FR-3214)
+    #[tokio::test]
+    async fn tc_3216_md_view_requires_same_auth_as_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Auth Check").unwrap();
+
+        let token = "secret-token-3216";
+        let service = test_docs_service(ws, true, crate::docs::changes::ChangeLog::default(), None);
+        let router = test_router(Some(service), token);
+
+        // No token -> rejected just like /api/docs/file
+        let unauth_md = axum::http::Request::builder()
+            .uri("/api/md/view?path=README.md")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let unauth_docs = axum::http::Request::builder()
+            .uri("/api/docs/file?path=README.md")
+            .header("Host", "localhost:7420")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp_md = router.clone().oneshot(unauth_md).await.unwrap();
+        let resp_docs = router.clone().oneshot(unauth_docs).await.unwrap();
+        assert_eq!(resp_md.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp_md.status(), resp_docs.status());
+
+        // Wrong token -> 401
+        let bad_tok = axum::http::Request::builder()
+            .uri("/api/md/view?path=README.md")
+            .header("Host", "localhost:7420")
+            .header("Authorization", "Bearer wrong")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(bad_tok).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Bad Host -> 403
+        let bad_host = axum::http::Request::builder()
+            .uri("/api/md/view?path=README.md")
+            .header("Host", "evil.example:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(bad_host).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Valid token + Host (even on read-only serve router) -> 200
+        let ok_req = axum::http::Request::builder()
+            .uri("/api/md/view?path=README.md")
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(ok_req).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 }

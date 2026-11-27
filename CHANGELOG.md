@@ -8,6 +8,9 @@ All notable changes to dmuxai are listed here. Versions follow
 ### Fixed
 
 - `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
+### Added
+
+- Dashboard: Markdown file paths in agent and board messages open in a read-only viewer (workspace files, and `.md` files under your home folder).
 
 ## [0.4.1] - 2026-11-27
 

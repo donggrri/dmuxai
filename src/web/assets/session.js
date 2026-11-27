@@ -1734,7 +1734,7 @@
   // FR-1207: fenced ``` blocks become <pre><code>, `inline` spans become
   // <code>; everything is a text node (no HTML parsing), so agent output can
   // not inject markup. An unclosed fence (still streaming) renders as code.
-  function renderMessagePlain(target, content) {
+  function renderMessagePlain(target, content, linkifyMd) {
     if (target.dmuxContent === content && !target.dmuxHtmlKey) { return; }
     target.dmuxContent = content;
     target.dmuxHtmlKey = '';
@@ -1757,6 +1757,9 @@
       if (text.charAt(last) === '\n') { last++; }
     }
     if (last < text.length) { appendInline(target, text.slice(last).replace(/^\n+/, '')); }
+    if (linkifyMd && typeof window.dmuxaiLinkifyMdPaths === 'function') {
+      window.dmuxaiLinkifyMdPaths(target);
+    }
   }
 
   function renderMessageText(target, message) {
@@ -1768,6 +1771,9 @@
       target.dmuxHtmlKey = htmlKey;
       target.classList.add('md-body', 'msg-md');
       target.innerHTML = htmlKey;
+      if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
+        window.dmuxaiLinkifyMdPaths(target);
+      }
       return;
     }
     if (message.role === 'user') {
@@ -1779,7 +1785,7 @@
       target.appendChild(document.createTextNode(content));
       return;
     }
-    renderMessagePlain(target, content);
+    renderMessagePlain(target, content, message.role === 'agent');
   }
 
   function appendInline(target, text) {

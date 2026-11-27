@@ -12,6 +12,7 @@ pub mod highlight;
 pub mod links;
 pub mod list;
 pub mod markdown;
+pub mod md_view;
 pub mod office;
 
 use std::path::Path;
