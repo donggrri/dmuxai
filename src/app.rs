@@ -1608,6 +1608,9 @@ pub struct App {
     headless_plan_only_approval: bool,
     /// FR-2121: a plan-only agent reply was seen during this headless run.
     headless_plan_only_reply: bool,
+    /// FR-3400: true while `run_headless` executes a read-only turn (`--read-only` /
+    /// `mode = ask|plan`) so no path gates or upgrades any step to write tools.
+    headless_read_only: bool,
     /// Graph ID of the last graph session started or finished during a headless run.
     headless_last_graph_id: Option<String>,
     /// Test-only escape hatch: legacy app tests assume a direct send, so they
@@ -2078,6 +2081,7 @@ impl App {
             headless_require_edits: false,
             headless_plan_only_approval: false,
             headless_plan_only_reply: false,
+            headless_read_only: false,
             headless_last_graph_id: None,
             skip_judge_for_tests: false,
             last_group_expanded: false,
@@ -6367,7 +6371,11 @@ impl App {
             return Err(RunTodoError::Internal(message.to_owned()));
         }
         let simple_question = self.simple_question_turn_active(&prompt);
-        let mut policy = self.pending_turn_policy.unwrap_or(TurnPolicy::Agent);
+        let mut policy = if self.headless_read_only {
+            TurnPolicy::ReadOnly
+        } else {
+            self.pending_turn_policy.unwrap_or(TurnPolicy::Agent)
+        };
         if simple_question && agent == Agent::Agy && policy == TurnPolicy::Agent {
             policy = TurnPolicy::ReadOnly;
         }
@@ -11147,7 +11155,12 @@ impl App {
                         let result = self
                             .with_plan_context(&user_prompt, |ctx| apply_replan(&run, &doc, ctx));
                         match result {
-                            Ok((plan, change)) => {
+                            Ok((mut plan, change)) => {
+                                if self.headless_read_only {
+                                    for node in &mut plan.nodes {
+                                        node.requires_gate = false;
+                                    }
+                                }
                                 let old = run.plan;
                                 if revision_needs_approval(&old, &plan, &change) {
                                     self.finish_replan_needs_approval(pending, plan, change);
@@ -11687,6 +11700,11 @@ impl App {
             .find(|node| node.id == node_id)
             .and_then(|node| node.task.clone());
         let mut validated_nodes = validated_nodes;
+        if self.headless_read_only {
+            for node in &mut validated_nodes {
+                node.requires_gate = false;
+            }
+        }
         if !plan_snapshot.tasks.is_empty() {
             for node in &mut validated_nodes {
                 if node.task.is_none() {
@@ -12885,6 +12903,11 @@ impl App {
                 .filter(|node| node.role != NodeRole::Orchestrate)
                 .count()
                 <= 1;
+        if self.headless_read_only {
+            for node in &mut run.plan.nodes {
+                node.requires_gate = false;
+            }
+        }
         let mut session = GraphRunSession::new(run);
         self.graph_assignment_line =
             resolved_assignment_line(&self.model_catalogs, Some(&self.settings), &session);
@@ -13092,6 +13115,9 @@ impl App {
     }
 
     fn graph_node_expects_file_edits(&self, agent: Agent) -> bool {
+        if self.headless_read_only {
+            return false;
+        }
         // FR-2121: a headless direct run with `--approve-plan` asked for the
         // edit, so the quiet 1-node run must require file edits (AGY retries
         // once with a stricter edit instruction and then fails the turn).
@@ -13169,6 +13195,10 @@ impl App {
     ) -> Option<TurnPolicy> {
         if !self.settings.graph_enforce_read_only_roles {
             return None;
+        }
+        if self.headless_read_only {
+            self.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+            return Some(TurnPolicy::ReadOnly);
         }
         let node_policy = Self::graph_node_turn_policy_as_agent(node_turn_policy(role)?);
         let saved = self.pending_turn_policy;
@@ -14817,6 +14847,7 @@ impl App {
         self.headless_require_edits = false;
         self.headless_plan_only_approval = false;
         self.headless_plan_only_reply = false;
+        self.headless_read_only = false;
     }
 
     fn headless_outcome_exit_7(
@@ -15148,7 +15179,10 @@ impl App {
     ) -> HeadlessIdleAction {
         let phase = self.headless_active_run_phase();
         if phase == GraphRunPhase::WaitingGate {
-            if req.allow_sensitive || (req.agent.is_some() && req.approve_plan) {
+            if self.headless_read_only
+                || req.allow_sensitive
+                || (req.agent.is_some() && req.approve_plan)
+            {
                 self.continue_graph_gate();
                 return HeadlessIdleAction::ContinueAfterApprove;
             }
@@ -15171,7 +15205,7 @@ impl App {
             ));
         }
         if phase == GraphRunPhase::AwaitingApproval {
-            if req.approve_plan && !approved_plan {
+            if (self.headless_read_only || req.approve_plan) && !approved_plan {
                 if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
                     let message = Self::plan_decision_notice(error);
                     return HeadlessIdleAction::Exit(Box::new(
@@ -16066,6 +16100,7 @@ impl App {
             self.pending_turn_policy = Some(policy);
         }
         let read_only_run = self.pending_turn_policy == Some(TurnPolicy::ReadOnly);
+        self.headless_read_only = read_only_run;
         let read_only_workspace_before = if read_only_run {
             dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await
         } else {
@@ -16091,6 +16126,7 @@ impl App {
                     self.headless_triage = Some(triage);
                 }
                 Err(error) => {
+                    self.clear_headless_edit_policy();
                     return HeadlessOutcome::failure(
                         dmuxai::agent_api::exit::FAILED,
                         headless_conversation_id,
@@ -16175,6 +16211,7 @@ impl App {
 
         if req.approve_plan_id.is_some() {
             if let Err(outcome) = self.headless_start_approved_plan(&req) {
+                self.clear_headless_edit_policy();
                 return *outcome;
             }
             prompt_submitted = true;
@@ -16213,6 +16250,7 @@ impl App {
                             RunTodoError::Invalid(msg) => (dmuxai::agent_api::exit::USAGE, msg),
                             RunTodoError::Internal(msg) => (dmuxai::agent_api::exit::INTERNAL, msg),
                         };
+                        self.clear_headless_edit_policy();
                         return HeadlessOutcome::failure(
                             exit_code,
                             self.conversation_id.as_str().to_owned(),
@@ -30446,6 +30484,196 @@ out3
         let requests = sent.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].1.policy, TurnPolicy::ReadOnly);
+    }
+
+    // TC-3400 / FR-3400 (#353): headless --read-only without --agent skips the
+    // sensitive gate and stays read-only on every step.
+    #[tokio::test]
+    async fn tc_3400_read_only_without_agent_skips_sensitive_gate() {
+        for enforce_roles in [false, true] {
+            let (mut app, sent, event_tx) = test_app_with_event_sender();
+            app.settings.graph_enforce_read_only_roles = enforce_roles;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let sent_clone = Arc::clone(&sent);
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    let maybe_req = {
+                        let lock = sent_clone.lock().unwrap();
+                        lock.first().cloned()
+                    };
+                    if let Some((agent, req)) = maybe_req {
+                        let conv_id = req.conversation_id.clone();
+                        let turn_id = req.turn_id.clone();
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::TextDelta("read-only answer".to_owned()),
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conv_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Completed,
+                            })
+                            .await;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+
+            let req = HeadlessRequest {
+                prompt: "deploy the db migration to production".to_owned(),
+                agent: None,
+                mode: Some("ask".to_owned()),
+                graph: false,
+                approve_plan: false,
+                approve_plan_id: None,
+                allow_sensitive: false,
+                todo_id: None,
+                model: None,
+            };
+            let outcome = app.run_headless(req, cancel).await;
+            assert!(
+                outcome.ok,
+                "read-only turn without --agent must not be gated (enforce_roles={enforce_roles}): {outcome:?}"
+            );
+            assert_eq!(outcome.exit_code, 0);
+            assert_ne!(outcome.error_kind.as_deref(), Some("sensitive_gate"));
+            assert!(outcome.text.contains("read-only answer"));
+            let requests = sent.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].1.policy, TurnPolicy::ReadOnly);
+            assert!(!requests[0].1.require_file_edits);
+        }
+    }
+
+    // TC-3401 / FR-3401 (#353): board ask without [board] planner for an item
+    // whose title/thread contains sensitive words runs read-only without --allow-sensitive
+    // and returns an answer (exit 0), not exit 7.
+    #[tokio::test]
+    async fn tc_3401_board_ask_without_planner_sensitive_prompt_not_exit_7() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&board_base).unwrap();
+
+        let (cfg_agent, cfg_model) = {
+            let _guard = dmuxai::state_path::test_env_lock();
+            let empty_cfg_home = dir.path().join("empty-config");
+            std::fs::create_dir_all(&empty_cfg_home).unwrap();
+            let env = dmuxai::runtime_env::RuntimeEnv {
+                home: Some(empty_cfg_home.clone()),
+                xdg_config_home: Some(empty_cfg_home),
+                ..Default::default()
+            };
+            dmuxai::settings::BoardSettings::load_user_only_with_env(&env).planner_agent_and_model()
+        };
+        assert_eq!((cfg_agent.as_deref(), cfg_model.as_deref()), (None, None));
+
+        let argv = dmuxai::board::runner::ask_run_args(
+            &workspace,
+            cfg_agent.as_deref(),
+            cfg_model.as_deref(),
+        );
+        assert!(argv.contains(&"--read-only".to_owned()));
+        assert!(argv.contains(&"--json".to_owned()));
+        assert!(!argv.contains(&"--allow-sensitive".to_owned()));
+        assert!(!argv.contains(&"--agent".to_owned()));
+
+        let store = dmuxai::board::BoardStore::open(board_base).unwrap();
+        let item = store
+            .add(dmuxai::board::AddItemRequest {
+                title: "Deploy database migration".to_owned(),
+                summary: "Check production db rollout".to_owned(),
+                kind: dmuxai::board::Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "owner".to_owned(),
+                state_root: state,
+            })
+            .unwrap();
+        let item = store
+            .say(
+                &item.id,
+                dmuxai::board::SayRequest {
+                    text: "Should we run the db deploy tonight?".to_owned(),
+                    from: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let prompt = dmuxai::board::runner::build_ask_prompt(&item, "What is the riskiest step?");
+
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent_clone = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let maybe_req = {
+                    let lock = sent_clone.lock().unwrap();
+                    lock.first().cloned()
+                };
+                if let Some((agent, req)) = maybe_req {
+                    let conv_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta(
+                                "riskiest step is the db deploy lock".to_owned(),
+                            ),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conv_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let req = HeadlessRequest {
+            prompt,
+            agent: None,
+            mode: Some("ask".to_owned()),
+            graph: false,
+            approve_plan: false,
+            approve_plan_id: None,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app.run_headless(req, cancel).await;
+        assert!(outcome.ok, "board ask must not exit 7: {outcome:?}");
+        assert_eq!(outcome.exit_code, 0);
+        assert_ne!(outcome.error_kind.as_deref(), Some("sensitive_gate"));
+        assert!(outcome.text.contains("riskiest step is the db deploy lock"));
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1.policy, TurnPolicy::ReadOnly);
+        assert!(!requests[0].1.require_file_edits);
     }
 
     // TC-2121 / FR-2121: a headless direct run with --approve-plan requires
