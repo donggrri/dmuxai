@@ -33,6 +33,11 @@ use crate::web::local_peer::{
     LocalPeerSource, shared_peer_source, windows_host_ipv4, wsl_nat_listen_ipv4,
 };
 
+/// Normalizes a dashboard/API agent id at the request boundary (FR-3204).
+pub fn normalize_request_agent_id(raw: &str) -> String {
+    crate::runner_id::canonical_runner_id(raw)
+}
+
 /// Injectable re-execution hook for `POST /api/workspace/switch` (FR-874, TC-875).
 /// Arguments are `(executable, argv_after_arg0, dashboard_token)`.
 pub type ExecFn =
@@ -92,6 +97,8 @@ pub struct DashboardServices {
     /// Runtime environment for the trust store used by dashboard config saves (FR-2226);
     /// `None` = `RuntimeEnv::from_process()`. Tests inject a temp state dir here.
     pub trust_env: Option<crate::runtime_env::RuntimeEnv>,
+    /// Override user-level board store base (`<dir>/board`); tests only (FR-3120).
+    pub board_base: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -358,8 +365,11 @@ async fn get_agent_prompts(Ws(ws): Ws) -> Response {
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
-    let mut runner_ids: Vec<String> =
-        vec!["cursor".to_owned(), "agy".to_owned(), "codex".to_owned()];
+    let mut runner_ids: Vec<String> = vec![
+        crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
+        "agy".to_owned(),
+        "codex".to_owned(),
+    ];
     for spec in &settings.custom_agents {
         let id = spec.name.trim().to_ascii_lowercase();
         if !runner_ids.iter().any(|existing| existing == &id) {
@@ -453,9 +463,9 @@ async fn post_agent_prompts(Ws(ws): Ws, ApiJson(body): ApiJson<AgentPromptsPostB
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
 
-    let runner = body.runner.trim().to_ascii_lowercase();
+    let runner = normalize_request_agent_id(&body.runner);
     let mut known: Vec<String> = vec![
-        "cursor".to_owned(),
+        crate::runner_id::CURSOR_RUNNER_ID.to_owned(),
         "agy".to_owned(),
         "codex".to_owned(),
         "default".to_owned(),
@@ -819,6 +829,38 @@ async fn get_runs_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::RUNS_JS,
+    )
+}
+
+async fn get_board_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::BOARD_JS,
+    )
+}
+
+async fn get_board_css() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::BOARD_CSS,
     )
 }
 
@@ -1262,7 +1304,7 @@ async fn run_todo(
     let mode = match body.mode.as_str() {
         "agent" => match body.agent {
             Some(agent) if !agent.trim().is_empty() => RunMode::Agent {
-                agent: agent.trim().to_owned(),
+                agent: normalize_request_agent_id(&agent),
             },
             _ => return error_json(StatusCode::BAD_REQUEST, "mode agent requires an agent id"),
         },
@@ -2361,6 +2403,8 @@ pub fn build_router_with_directory_access(
         .route("/api/runs", get(crate::web::runs_api::list))
         .route("/api/runs/{id}", get(crate::web::runs_api::detail))
         .route("/api/runs/{id}/stream", get(crate::web::runs_api::stream))
+        .route("/assets/board.js", get(get_board_js))
+        .route("/assets/board.css", get(get_board_css))
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))
@@ -2377,6 +2421,11 @@ pub fn build_router_with_directory_access(
         .route("/api/prompt", post(post_prompt))
         .route("/api/command", post(post_command))
         .merge(crate::web::docs_api::router(state.workspaces.clone()))
+        .merge(crate::web::board_api::router(
+            crate::web::board_api::board_base_from_services(&state.workspaces.focused().services),
+            crate::web::board_api::state_root_from_services(&state.workspaces.focused().services),
+            state.workspaces.focused().services.web_attached,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -3761,6 +3810,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -3912,6 +3962,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
 
@@ -4056,6 +4107,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -4245,6 +4297,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = busy_router
@@ -4273,6 +4326,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = ok_router
@@ -4307,6 +4361,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = router
@@ -4341,6 +4396,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = router
@@ -4592,6 +4648,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -4872,6 +4929,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -4939,6 +4997,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let server = start_server(config, hub).await.unwrap();
         let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
@@ -5047,6 +5106,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
 
@@ -5302,6 +5362,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -5399,6 +5460,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -5552,6 +5614,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = no_store
@@ -5610,6 +5673,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -6066,6 +6130,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let config = ServerConfig::for_tests(
             "127.0.0.1".parse().unwrap(),
@@ -6974,7 +7039,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|r| r["runner"] == "cursor")
+            .find(|r| r["runner"] == crate::runner_id::CURSOR_RUNNER_ID)
             .unwrap();
         assert_eq!(cursor["delivery"], "prepend");
         let agy = v2["runners"]

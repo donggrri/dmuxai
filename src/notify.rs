@@ -22,9 +22,9 @@ use crate::events::{EventRecord, format_ts};
 /// Bounded queue between `notify()` and the background delivery task (FR-770).
 const QUEUE_CAPACITY: usize = 256;
 /// Default per-delivery timeout when `timeout_secs` is not configured.
-const DEFAULT_TIMEOUT_SECS: u64 = 5;
+pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 5;
 /// Header used for the webhook secret unless `secret_header` overrides it.
-const DEFAULT_SECRET_HEADER: &str = "X-Dmuxai-Secret";
+pub(crate) const DEFAULT_SECRET_HEADER: &str = "X-Dmuxai-Secret";
 /// Default stall threshold surfaced via [`NotifySettings::stall_after`].
 const DEFAULT_STALL_AFTER_SECS: u64 = 600;
 
@@ -250,6 +250,30 @@ async fn deliver_webhook(
             return;
         }
     };
+    deliver_webhook_json(
+        client,
+        url,
+        secret_header,
+        secret,
+        body,
+        &record.ts,
+        timeout,
+        log_path,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn deliver_webhook_json(
+    client: &reqwest::Client,
+    url: &str,
+    secret_header: &str,
+    secret: Option<&str>,
+    body: String,
+    ts: &str,
+    timeout: Duration,
+    log_path: &Path,
+) {
     let mut request = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -265,16 +289,13 @@ async fn deliver_webhook(
             // Non-2xx (including 3xx: redirects are never followed) is a
             // delivery failure, logged without the secret or the URL.
             if !response.status().is_success() {
-                append_log(
-                    log_path,
-                    &format!("{} webhook {}", record.ts, response.status()),
-                );
+                append_log(log_path, &format!("{ts} webhook {}", response.status()));
             }
         }
         Err(error) => {
             append_log(
                 log_path,
-                &format!("{} webhook {}", record.ts, describe_error(&error)),
+                &format!("{ts} webhook {}", describe_error(&error)),
             );
         }
     }
@@ -282,7 +303,7 @@ async fn deliver_webhook(
 
 /// Classify a reqwest error without echoing the URL (which can carry a query
 /// string) or any header value.
-fn describe_error(error: &reqwest::Error) -> &'static str {
+pub(crate) fn describe_error(error: &reqwest::Error) -> &'static str {
     if error.is_timeout() {
         "timeout"
     } else if error.is_connect() {
@@ -301,13 +322,39 @@ async fn deliver_command(
     timeout: Duration,
     log_path: &Path,
 ) {
+    let payload = match serde_json::to_string(record) {
+        Ok(payload) => payload,
+        Err(error) => {
+            append_log(log_path, &format!("{} command {error}", record.ts));
+            return;
+        }
+    };
+    deliver_command_json(
+        command,
+        workspace_root,
+        payload,
+        &record.ts,
+        timeout,
+        log_path,
+    )
+    .await;
+}
+
+pub(crate) async fn deliver_command_json(
+    command: &[String],
+    cwd: &Path,
+    payload: String,
+    ts: &str,
+    timeout: Duration,
+    log_path: &Path,
+) {
     let Some(program) = command.first() else {
         return;
     };
     let mut cmd = tokio::process::Command::new(program);
     crate::process::apply_child_env_policy_tokio(&mut cmd);
     cmd.args(&command[1..])
-        .current_dir(workspace_root)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -316,19 +363,12 @@ async fn deliver_command(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
-            append_log(log_path, &format!("{} command {error}", record.ts));
+            append_log(log_path, &format!("{ts} command {error}"));
             return;
         }
     };
 
     let mut stdin = child.stdin.take();
-    let payload = match serde_json::to_string(record) {
-        Ok(payload) => payload,
-        Err(error) => {
-            append_log(log_path, &format!("{} command {error}", record.ts));
-            return;
-        }
-    };
     let waited = tokio::time::timeout(timeout, async move {
         if let Some(pipe) = stdin.as_mut() {
             // FR-771: the event JSON plus a trailing newline on stdin.
@@ -342,28 +382,34 @@ async fn deliver_command(
     .await;
     match waited {
         Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => append_log(log_path, &format!("{} command failed: {status}", record.ts)),
-        Ok(Err(error)) => append_log(log_path, &format!("{} command {error}", record.ts)),
+        Ok(Ok(status)) => append_log(log_path, &format!("{ts} command failed: {status}")),
+        Ok(Err(error)) => append_log(log_path, &format!("{ts} command {error}")),
         Err(_) => {
             // Dropping the child (kill_on_drop) kills the hook process.
-            append_log(log_path, &format!("{} command timeout", record.ts));
+            append_log(log_path, &format!("{ts} command timeout"));
         }
     }
 }
 
 /// Append one line to `<workspace>/.dmuxai/notify.log`, creating the
 /// directory if needed. Failures are swallowed: logging never panics.
-fn append_log(log_path: &Path, line: &str) {
-    if let Some(parent) = log_path.parent() {
+pub(crate) fn append_log(log_path: &Path, line: &str) {
+    if let Some(parent) = log_path.parent()
+        && !parent.exists()
+    {
         let _ = crate::workspace::ensure_state_dir(parent);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut file) = opts.open(log_path) {
         use std::io::Write;
-        let _ = writeln!(file, "{line}");
+        let masked = crate::run_journal::mask_sensitive_tokens(line);
+        let _ = writeln!(file, "{masked}");
     }
 }
 

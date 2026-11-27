@@ -32,6 +32,7 @@ pub trait McpBackend {
     fn status(&self) -> Result<Value, String>;
     fn events_since(&self, since: u64, limit: Option<usize>) -> Result<Value, String>;
     fn models(&self, agent: Option<&str>) -> Result<Value, String>;
+    fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
 }
 
 fn tool_definitions() -> Value {
@@ -111,9 +112,193 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "agent": {
                         "type": "string",
-                        "description": "Optional runner id (e.g. agy, cursor, codex, or a custom agent name)"
+                        "description": "Optional runner id (e.g. agy, cursor-agent, codex, or a custom agent name)"
                     }
                 }
+            }
+        },
+        {
+            "name": "board_add",
+            "description": "Add an item to the user-level coordinator decision board.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["debug", "feature", "question", "review", "other"] },
+                    "summary": { "type": "string" },
+                    "grade": { "type": "string", "enum": ["A", "B", "C", "D"] },
+                    "lane": { "type": "string", "enum": ["auto", "needs_decision", "approved", "in_progress", "done", "rejected", "unknown"] },
+                    "bot": { "type": "string" },
+                    "channel": { "type": "string" },
+                    "ref": { "type": "string" },
+                    "workspace": { "type": "string" },
+                    "recommendation": { "type": "string" },
+                    "options": { "type": "array", "items": { "type": "string" } },
+                    "plan_hash": { "type": "string" },
+                    "key": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["title", "kind"]
+            }
+        },
+        {
+            "name": "board_list",
+            "description": "List decision board items.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "lane": { "type": "array", "items": { "type": "string", "enum": ["auto", "needs_decision", "approved", "in_progress", "done", "rejected", "unknown"] } },
+                    "workspace": { "type": "string" },
+                    "all": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "board_show",
+            "description": "Show one decision board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_update",
+            "description": "Update decision board item fields.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "title": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "recommendation": { "type": "string" },
+                    "options": { "type": "array", "items": { "type": "string" } },
+                    "grade": { "type": "string", "enum": ["A", "B", "C", "D", ""] },
+                    "kind": { "type": "string", "enum": ["debug", "feature", "question", "review", "other"] },
+                    "run_id": { "type": "string" },
+                    "if_version": { "type": "integer", "minimum": 1 },
+                    "by": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_move",
+            "description": "Move a decision board item to a lane.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "lane": { "type": "string", "enum": ["auto", "needs_decision", "approved", "in_progress", "done", "rejected", "unknown"] },
+                    "if_version": { "type": "integer", "minimum": 1 },
+                    "by": { "type": "string" }
+                },
+                "required": ["id", "lane"]
+            }
+        },
+        {
+            "name": "board_plan",
+            "description": "Attach or edit a graph plan on a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "hash": { "type": "string" },
+                    "steps": { "type": "array", "items": { "type": "object" } },
+                    "tasks": { "type": "array", "items": { "type": "object" } },
+                    "prompt": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_pending",
+            "description": "List decision board items waiting for human action (needs_decision, failed/unknown, or unchecked done).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "board_say",
+            "description": "Append a thread message on a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "from": { "type": "string" }
+                },
+                "required": ["id", "text"]
+            }
+        },
+        {
+            "name": "board_wait",
+            "description": "Wait for decision board activity (timeout capped at 300s).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "any": { "type": "boolean" },
+                    "since_version": { "type": "integer", "minimum": 0 },
+                    "since_seq": { "type": "integer", "minimum": 0 },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 300 },
+                    "wait_for": { "type": "string", "enum": ["decision", "message", "any"] },
+                    "waiter": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "board_prompt",
+            "description": "Return the unmasked graph plan prompt for a board item.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "hash": { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_events",
+            "description": "List decision board events with seq greater than `since`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "integer", "minimum": 0 }
+                }
+            }
+        },
+        {
+            "name": "board_ask",
+            "description": "Ask the planner a question on a decision board item or request a plan revision (blocks up to 900s).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "text": { "type": "string" },
+                    "revise": { "type": "boolean" },
+                    "agent": { "type": "string" },
+                    "model": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id", "text"]
+            }
+        },
+        {
+            "name": "board_run",
+            "description": "Start executing an approved or auto decision board item's graph plan (detached; returns once in_progress).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id"]
             }
         }
     ])
@@ -218,6 +403,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
             backend.events_since(since, limit)
         }
         "models" => backend.models(str_arg(args, "agent")),
+        name if name.starts_with("board_") => backend.board_tool(name, args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -289,6 +475,19 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "status",
                 "events_since",
                 "models",
+                "board_add",
+                "board_list",
+                "board_show",
+                "board_update",
+                "board_move",
+                "board_plan",
+                "board_pending",
+                "board_say",
+                "board_wait",
+                "board_prompt",
+                "board_events",
+                "board_ask",
+                "board_run",
             ];
             if !known.contains(&name) {
                 return Some(
@@ -362,10 +561,137 @@ mod tests {
                 .push(agent.map(str::to_owned));
             Ok(json!({ "ok": true, "agent": agent, "runners": [] }))
         }
+        fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
+            Ok(crate::board::mcp_invoke(
+                std::path::Path::new("/tmp"),
+                name,
+                args,
+            ))
+        }
     }
 
     fn call(stub: &Stub, line: Value) -> Value {
         serde_json::from_str(&handle_line(stub, &line.to_string()).expect("response")).unwrap()
+    }
+
+    // TC-3113 / FR-3113: board MCP tools are listed, every optional CLI flag
+    // has a schema field, and calls map validation errors to exit code 2.
+    #[test]
+    fn tc_3113_mcp_board_tools_listed_and_mapped() {
+        let state_home = tempfile::tempdir().unwrap();
+        let _guard = crate::state_path::test_env_lock();
+        // SAFETY: test-only mutation of the process environment.
+        unsafe { std::env::set_var("XDG_STATE_HOME", state_home.path()) };
+        let stub = Stub::default();
+        let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let properties = |name: &str| -> Vec<String> {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["inputSchema"]["properties"].as_object())
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        let expected: &[(&str, &[&str])] = &[
+            (
+                "board_add",
+                &[
+                    "title",
+                    "kind",
+                    "summary",
+                    "grade",
+                    "lane",
+                    "bot",
+                    "channel",
+                    "ref",
+                    "workspace",
+                    "recommendation",
+                    "options",
+                    "plan_hash",
+                    "key",
+                    "by",
+                ],
+            ),
+            ("board_list", &["lane", "workspace", "all"]),
+            ("board_show", &["id"]),
+            (
+                "board_update",
+                &[
+                    "id",
+                    "title",
+                    "summary",
+                    "recommendation",
+                    "options",
+                    "grade",
+                    "kind",
+                    "run_id",
+                    "if_version",
+                    "by",
+                ],
+            ),
+            ("board_move", &["id", "lane", "if_version", "by"]),
+            (
+                "board_plan",
+                &["id", "hash", "steps", "tasks", "prompt", "by"],
+            ),
+            ("board_pending", &["workspace"]),
+            ("board_say", &["id", "text", "from"]),
+            (
+                "board_wait",
+                &[
+                    "id",
+                    "any",
+                    "since_version",
+                    "since_seq",
+                    "timeout_secs",
+                    "wait_for",
+                    "waiter",
+                ],
+            ),
+            ("board_prompt", &["id", "hash"]),
+            ("board_events", &["since"]),
+        ];
+        let ok_call = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"debug"}}}),
+        );
+        let bad = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"not-a-kind"}}}),
+        );
+        let bad_lane = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"board_add","arguments":{"title":"T","kind":"debug","lane":"not-a-lane"}}}),
+        );
+        let events = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"board_events","arguments":{"since":0}}}),
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+
+        for (name, wanted) in expected {
+            assert!(names.contains(name), "missing MCP tool {name}");
+            let actual = properties(name);
+            for property in *wanted {
+                assert!(
+                    actual.iter().any(|p| p == property),
+                    "tool {name} schema missing property {property}: {actual:?}"
+                );
+            }
+            assert_eq!(
+                actual.len(),
+                wanted.len(),
+                "tool {name} has unexpected schema fields: {actual:?}"
+            );
+        }
+        assert_eq!(ok_call["result"]["structuredContent"]["ok"], true);
+        assert_eq!(bad["result"]["isError"], true);
+        assert_eq!(bad["result"]["structuredContent"]["exit_code"], 2);
+        assert_eq!(bad_lane["result"]["isError"], true);
+        assert_eq!(bad_lane["result"]["structuredContent"]["exit_code"], 2);
+        assert_eq!(events["result"]["structuredContent"]["ok"], true);
     }
 
     // TC-768 / FR-767: initialize, tools/list, tools/call for every tool,
@@ -397,16 +723,26 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "todo_add",
-                "todo_list",
-                "run",
-                "status",
-                "events_since",
-                "models"
-            ]
+        assert!(
+            names.contains(&"todo_add"),
+            "tools list must include todo_add"
+        );
+        for tool in [
+            "board_add",
+            "board_list",
+            "board_show",
+            "board_update",
+            "board_move",
+            "board_plan",
+            "board_pending",
+            "board_say",
+            "board_wait",
+        ] {
+            assert!(names.contains(&tool), "missing tool {tool}");
+        }
+        assert!(
+            !names.contains(&"board_decide"),
+            "board_decide must not be exposed over MCP"
         );
         let run_tool = list["result"]["tools"]
             .as_array()
@@ -775,5 +1111,32 @@ mod tests {
         assert_eq!(res["result"]["isError"], false);
         let calls = stub.models_calls.lock().unwrap();
         assert_eq!(calls.as_slice(), &[Some("agy".to_owned())]);
+    }
+
+    // TC-3205 / FR-3204
+    #[test]
+    fn tc_3205_mcp_accepts_cursor_agent_keyword() {
+        let stub = Stub::default();
+        let res = call(
+            &stub,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "models",
+                    "arguments": {
+                        "agent": "cursor-agent"
+                    }
+                }
+            }),
+        );
+        assert_eq!(res["result"]["isError"], false);
+        let calls = stub.models_calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), &[Some("cursor-agent".to_owned())]);
+        assert_eq!(
+            crate::runner_id::canonical_runner_id(" cursor-agent "),
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

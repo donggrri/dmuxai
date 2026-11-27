@@ -88,7 +88,7 @@ pub struct AcpTurnResult {
 pub fn acp_model_arg(runner: &str, model: Option<&str>) -> Result<Option<String>, String> {
     match model.map(str::trim).filter(|m| !m.is_empty()) {
         None => Ok(None),
-        Some(model) => dmuxai::model_policy::validate_model_for_runner(runner, model)
+        Some(model) => dmuxai::model_policy::validate_model_for_runner_with(runner, model, false)
             .map(|()| Some(model.to_owned()))
             .map_err(|error| format!("{runner} ACP refused model `{model}`: {error}")),
     }
@@ -97,7 +97,7 @@ pub fn acp_model_arg(runner: &str, model: Option<&str>) -> Result<Option<String>
 /// Cursor ACP argv: root options before the `acp` subcommand (FR-1300, FR-1415).
 pub fn cursor_acp_argv(model: Option<&str>, cwd: &Path) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
-    if let Some(model) = acp_model_arg("cursor", model)? {
+    if let Some(model) = acp_model_arg(dmuxai::runner_id::CURSOR_RUNNER_ID, model)? {
         args.push("--model".to_owned());
         args.push(model);
     }

@@ -469,10 +469,10 @@ pub fn pin_graph_plan_runners(
     pinned_model: &str,
     runner_allowed: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
-    let pinned_runner = pinned_runner.trim().to_ascii_lowercase();
+    let pinned_runner = crate::runner_id::canonical_runner_id(pinned_runner);
     let mut notes = Vec::new();
     for node in &mut plan.nodes {
-        let prior = node.runner.trim().to_ascii_lowercase();
+        let prior = crate::runner_id::canonical_runner_id(&node.runner);
         if prior != pinned_runner || !runner_allowed(&prior) {
             notes.push(format!(
                 "step {}: runner {} -> {} (pinned)",
@@ -580,7 +580,7 @@ pub fn validate_plan_with_limit(
     let mut edges = Vec::new();
     for step in &doc.steps {
         let role = parse_role(&step.role).expect("role checked");
-        let runner = step.runner.trim().to_ascii_lowercase();
+        let runner = crate::runner_id::canonical_runner_id(&step.runner);
         let model_id = resolved_model(step, &runner, ctx).expect("model checked");
         let keyword =
             sensitive_keyword_match(ctx.user_prompt) || sensitive_keyword_match(&step.job);
@@ -617,6 +617,7 @@ pub fn validate_plan_with_limit(
         edges,
         limits: default_limits(),
         tasks: doc.tasks.clone(),
+        dynamic_cap: None,
     })
 }
 
@@ -916,11 +917,11 @@ fn check_runner(step: &PlanStep, ctx: &PlanContext<'_>, errors: &mut Vec<PlanErr
         errors.push(PlanError::new(step.id.clone(), "runner is not registered"));
         return;
     }
-    let key = runner.to_ascii_lowercase();
+    let key = crate::runner_id::canonical_runner_id(runner);
     let registered = ctx
         .available_runners
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(&key));
+        .any(|candidate| crate::runner_id::canonical_runner_id(candidate) == key);
     if !registered {
         errors.push(PlanError::new(step.id.clone(), "runner is not registered"));
         return;
@@ -985,7 +986,7 @@ pub fn fallback_plan(
     effective_model: Option<&str>,
     cause: &str,
 ) -> Result<FallbackPlan, String> {
-    let runner = runner.trim().to_ascii_lowercase();
+    let runner = crate::runner_id::canonical_runner_id(runner);
     let model = match effective_model {
         Some(model) if crate::model_policy::validate_model_for_runner(&runner, model).is_ok() => {
             model.trim().to_owned()
@@ -1009,7 +1010,7 @@ pub fn fallback_plan(
 /// direct 1-node run when the selected agent has no explicit model and runs on
 /// its provider default (FR-937).
 pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) -> FallbackPlan {
-    let runner = runner.trim().to_ascii_lowercase();
+    let runner = crate::runner_id::canonical_runner_id(runner);
     let model = model.to_owned();
     let task = implicit_task(prompt);
     FallbackPlan {
@@ -1035,6 +1036,7 @@ pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) ->
             edges: Vec::new(),
             limits: default_limits(),
             tasks: vec![task],
+            dynamic_cap: None,
         },
         note: format!(
             "Plan fallback ({cause}): one step on {runner} {model}. Edit to ask for a real plan."
@@ -1042,7 +1044,7 @@ pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) ->
     }
 }
 
-fn valid_step_id(id: &str) -> bool {
+pub(crate) fn valid_step_id(id: &str) -> bool {
     let mut chars = id.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -1063,7 +1065,7 @@ fn valid_step_id(id: &str) -> bool {
     true
 }
 
-fn parse_role(role: &str) -> Option<NodeRole> {
+pub(crate) fn parse_role(role: &str) -> Option<NodeRole> {
     Some(match role {
         "research" => NodeRole::Research,
         "explore" => NodeRole::Explore,
@@ -1156,7 +1158,7 @@ mod tests {
                         .any(|denied| denied.eq_ignore_ascii_case(runner))
                 }),
                 effective_model: Box::new(move |runner: &str| {
-                    if runner.eq_ignore_ascii_case("cursor") {
+                    if runner.eq_ignore_ascii_case(crate::runner_id::CURSOR_RUNNER_ID) {
                         Some(if fast_cursor {
                             "composer-2.5-fast".to_owned()
                         } else {
@@ -1212,7 +1214,7 @@ mod tests {
         assert_eq!(plan.nodes[2].role, NodeRole::Test);
         assert_eq!(plan.nodes[0].model_id, "composer-2.5");
         assert_eq!(plan.nodes[1].model_id, "gemini-3.8-flash-medium");
-        assert_eq!(plan.nodes[2].runner, "cursor");
+        assert_eq!(plan.nodes[2].runner, crate::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(plan.nodes[2].model_id, "composer-2.5");
         assert!(plan.nodes[0].requires_gate, "sensitive true gates the step");
         assert!(
@@ -1270,6 +1272,7 @@ mod tests {
             edges: vec![],
             limits: default_limits(),
             tasks: vec![],
+            dynamic_cap: None,
         };
         let notes = pin_graph_plan_runners(&mut plan, "agy", "provider default", &|runner| {
             runner == "agy"
@@ -1363,10 +1366,11 @@ mod tests {
                 false,
             ),
             (
-                r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"agy","model":"gemini-4-pro","depends_on":[]}]}"#
+                r#"{"steps":[{"id":"a","role":"implement","job":"one","runner":"agy","model":"gemini-4-argon-fast","depends_on":[]}]}"#
                     .to_owned(),
                 "a",
-                crate::model_policy::validate_model_for_runner("agy", "gemini-4-pro").unwrap_err(),
+                crate::model_policy::validate_model_for_runner("agy", "gemini-4-argon-fast")
+                    .unwrap_err(),
                 false,
             ),
             (
@@ -1636,10 +1640,11 @@ DATA-nonce1>>>>
             let node = &fallback.plan.nodes[0];
             assert_eq!(node.id, "step-1");
             assert_eq!(node.role, NodeRole::Implement);
-            assert_eq!(node.runner, runner);
+            assert_eq!(node.runner, crate::runner_id::canonical_runner_id(runner));
             assert_eq!(node.job, prompt, "job is the user prompt verbatim");
+            let canon_runner = crate::runner_id::canonical_runner_id(runner);
             assert!(fallback.note.ends_with(&format!(
-                "one step on {runner} {}. Edit to ask for a real plan.",
+                "one step on {canon_runner} {}. Edit to ask for a real plan.",
                 node.model_id
             )));
             assert!(
@@ -1973,5 +1978,29 @@ DATA-nonce1>>>>
         let doc = parse_plan(&json).unwrap();
         let context = PlanCtx::new(&["cursor"], &[], false);
         validate_plan_with_limit(&doc, &context.context("build it"), 12).expect("12 tasks");
+    }
+
+    // TC-3204 / FR-3203
+    #[test]
+    fn tc_3204_plan_runner_accepts_cursor_agent() {
+        let json = r#"{"tasks":[{"id":"task-1","title":"one","done_check":"d","size":"small"}],"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor-agent","depends_on":[],"task":"task-1"}]}"#;
+        let doc = parse_plan(json).unwrap();
+        let context = PlanCtx::new(&[crate::runner_id::CURSOR_RUNNER_ID], &[], false);
+        let plan = validate_plan(&doc, &context.context("ship")).unwrap();
+        assert_eq!(plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
+
+        let legacy_json = r#"{"tasks":[{"id":"task-1","title":"one","done_check":"d","size":"small"}],"steps":[{"id":"a","role":"implement","job":"one","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let legacy_doc = parse_plan(legacy_json).unwrap();
+        let legacy_plan = validate_plan(&legacy_doc, &context.context("ship")).unwrap();
+        assert_eq!(
+            legacy_plan.nodes[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
+
+        let pinned = fallback_plan("ship it", "cursor-agent", None, "timeout").unwrap();
+        assert_eq!(
+            pinned.plan.nodes[0].runner,
+            crate::runner_id::CURSOR_RUNNER_ID
+        );
     }
 }

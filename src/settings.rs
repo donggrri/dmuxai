@@ -26,6 +26,54 @@ pub enum DefaultUiMode {
 /// Default `[web] max_workspaces` (FR-2975).
 pub const DEFAULT_WEB_MAX_WORKSPACES: usize = 8;
 
+const CURSOR_RUNNER_TABLE_CONFLICT: &str =
+    "[runners.cursor] and [runners.cursor-agent] both define settings; [runners.cursor-agent] wins";
+
+fn runners_define_cursor_and_alias(
+    runners: &BTreeMap<String, crate::agent_prompt::RunnerPromptToml>,
+) -> bool {
+    runners
+        .keys()
+        .any(|k| k.trim().eq_ignore_ascii_case("cursor"))
+        && runners
+            .keys()
+            .any(|k| k.trim().eq_ignore_ascii_case("cursor-agent"))
+}
+
+fn parse_runners_tables(
+    runners: BTreeMap<String, crate::agent_prompt::RunnerPromptToml>,
+    scope: &str,
+    base_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> (
+    BTreeMap<String, crate::agent_prompt::RunnerPromptConfig>,
+    BTreeMap<String, crate::runner_fallback::RunnerFallbackToml>,
+) {
+    let cursor_conflict = runners_define_cursor_and_alias(&runners);
+    let mut parsed_map = BTreeMap::new();
+    let mut fallback_map = BTreeMap::new();
+    for (id, raw) in runners {
+        let raw_norm = id.trim().to_ascii_lowercase();
+        let canon_id = crate::runner_id::canonical_runner_id(&raw_norm);
+        if cursor_conflict && raw_norm == "cursor-agent" {
+            warnings.push(CURSOR_RUNNER_TABLE_CONFLICT.to_owned());
+        }
+        let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
+            &canon_id, &raw, scope, base_dir, warnings,
+        );
+        parsed_map.insert(canon_id.clone(), cfg);
+        fallback_map.insert(
+            canon_id,
+            crate::runner_fallback::RunnerFallbackToml {
+                fallback: raw.fallback.clone(),
+                stall_timeout_secs: raw.stall_timeout_secs,
+                stall_api_retries: raw.stall_api_retries,
+            },
+        );
+    }
+    (parsed_map, fallback_map)
+}
+
 /// Web dashboard theme settings loaded from `[web]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebThemeSettings {
@@ -63,6 +111,131 @@ pub struct WorkspaceSettings {
     pub browse_roots: Vec<String>,
 }
 
+pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] =
+    &["needs_decision", "decision", "message", "run_finished"];
+
+/// Placeholder for unknown `[board]` TOML keys so `BoardSettings` keeps `Eq`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnknownBoardKey;
+
+impl<'de> serde::Deserialize<'de> for UnknownBoardKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+
+/// User-config `[board]` settings (SPEC-decision-board FR-3131). Read only from
+/// the user config, never from a workspace's `dmuxai.toml`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct BoardSettings {
+    #[serde(default)]
+    pub planner: Option<String>,
+    #[serde(default)]
+    pub notify_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub notify_webhook_url: Option<String>,
+    #[serde(default)]
+    pub notify_webhook_secret_env: Option<String>,
+    #[serde(default)]
+    pub notify_events: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownBoardKey>,
+}
+
+impl BoardSettings {
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for key in self.extra.keys() {
+            warnings.push(format!("unknown key '{key}' ignored"));
+        }
+        if let Some(planner) = &self.planner
+            && planner.trim().is_empty()
+        {
+            warnings.push("planner must not be empty".to_owned());
+        }
+        if let Some(url) = &self.notify_webhook_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            warnings.push("notify_webhook_url must start with http:// or https://".to_owned());
+        }
+        if self
+            .notify_command
+            .as_ref()
+            .is_some_and(|cmd| cmd.is_empty())
+        {
+            warnings.push("notify_command must not be empty".to_owned());
+        }
+        if let Some(events) = &self.notify_events {
+            for name in events {
+                if !VALID_BOARD_NOTIFY_EVENTS.contains(&name.as_str()) {
+                    warnings.push(format!(
+                        "notify_events entry '{name}' is not valid (expected {})",
+                        VALID_BOARD_NOTIFY_EVENTS.join(", ")
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    pub fn planner_agent_and_model(&self) -> (Option<String>, Option<String>) {
+        let Some(raw) = self.planner.as_deref() else {
+            return (None, None);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return (None, None);
+        }
+        if let Some((agent, model)) = trimmed.split_once(':') {
+            let agent = agent.trim();
+            let model = model.trim();
+            let agent = (!agent.is_empty()).then(|| agent.to_owned());
+            let model = (!model.is_empty()).then(|| model.to_owned());
+            (agent, model)
+        } else {
+            (Some(trimmed.to_owned()), None)
+        }
+    }
+
+    pub fn has_notify_target(&self) -> bool {
+        self.notify_command
+            .as_ref()
+            .is_some_and(|cmd| !cmd.is_empty())
+            || self.notify_webhook_url.as_deref().is_some_and(|url| {
+                let lower = url.trim().to_ascii_lowercase();
+                lower.starts_with("http://") || lower.starts_with("https://")
+            })
+    }
+
+    pub fn allows_event(&self, event: &str) -> bool {
+        self.notify_events
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|e| e == event))
+    }
+
+    pub fn load_user_only() -> Self {
+        Self::load_user_only_with_env(&RuntimeEnv::from_process())
+    }
+
+    pub fn load_user_only_with_env(env: &RuntimeEnv) -> Self {
+        let Some(user_path) = default_user_config_path_from(env) else {
+            return Self::default();
+        };
+        let Ok(contents) = std::fs::read_to_string(&user_path) else {
+            return Self::default();
+        };
+        toml::from_str::<DmuxToml>(&contents)
+            .ok()
+            .and_then(|parsed| parsed.board)
+            .unwrap_or_default()
+    }
+}
+
 /// Workspace-local and environment overrides for DmuxAI behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
@@ -85,6 +258,16 @@ pub struct DmuxSettings {
     /// `[graph] tasks_file` (FR-967). When true, writes
     /// `<workspace>/.dmuxai/tasks/TASKS-<run id>.md` on approval and task status changes.
     pub graph_tasks_file: bool,
+    /// `[graph] enforce_read_only_roles` (FR-2900): role-derived turn policy per graph node.
+    pub graph_enforce_read_only_roles: bool,
+    /// `[graph] dynamic_nodes` (FR-2940): allow running nodes to request dynamic node additions.
+    pub graph_dynamic_nodes: bool,
+    /// `[graph] dynamic_node_cap` (FR-2940): maximum dynamic nodes per run (0 disables).
+    pub graph_dynamic_node_cap: usize,
+    /// `[fanout] company_workspace` (FR-2916): skip free runners in fan-out legs.
+    pub fanout_company_workspace: bool,
+    /// `[fanout] min_free_gb` (FR-2937): minimum free GiB before write fan-out worktrees.
+    pub fanout_min_free_gb: u64,
     pub graph_allowed_runners: Option<Vec<String>>,
     pub theme: Theme,
     pub theme_force_color: Option<bool>,
@@ -118,6 +301,8 @@ pub struct DmuxSettings {
     pub notify: NotifySettings,
     /// User-config `[workspace]` settings (FR-870, FR-872).
     pub workspace: WorkspaceSettings,
+    /// User-config `[board]` settings (SPEC-decision-board FR-3131).
+    pub board: BoardSettings,
     /// Stage → skill mapping (SPEC-stage-skills).
     pub stage_skills: crate::stage_skills::StageSkillSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
@@ -144,6 +329,8 @@ pub struct DmuxSettings {
     /// Trusted `[terminal.serial] usbipd_attach` (FR-2614), parsed for
     /// compatibility. dmuxai never runs usbipd from WSL, so it has no effect.
     pub terminal_serial_usbipd_attach: Option<bool>,
+    /// User-level `[models] allow_fast` (FR-3003); workspace values are ignored.
+    pub models_allow_fast: bool,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,
 }
@@ -172,6 +359,7 @@ struct DmuxToml {
     cursor: Option<CursorToml>,
     routing: Option<RoutingToml>,
     graph: Option<GraphToml>,
+    fanout: Option<FanoutToml>,
     theme: Option<ThemeToml>,
     agents: Option<AgentsToml>,
     ui: Option<UiToml>,
@@ -182,6 +370,7 @@ struct DmuxToml {
     todo: Option<TodoToml>,
     jira: Option<JiraToml>,
     workspace: Option<WorkspaceSettings>,
+    board: Option<BoardSettings>,
     /// `[stages.<stage>]` skill mapping (SPEC-stage-skills FR-1500).
     stages: Option<std::collections::BTreeMap<String, crate::stage_skills::StageToml>>,
     /// `[skills]` sources (SPEC-stage-skills FR-1501).
@@ -195,6 +384,19 @@ struct DmuxToml {
     /// `[terminal]` sessions config (SPEC-terminal-sessions FR-2614, FR-2630).
     /// A restricted key: dropped from a workspace config unless it is trusted.
     terminal: Option<TerminalToml>,
+    /// `[models]` (FR-3003): user config only.
+    models: Option<ModelsToml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelsToml {
+    allow_fast: Option<bool>,
+}
+
+/// Applies the user-level fast-model opt-in once per process (FR-3003); value
+/// comes only from the user config, not workspace `dmuxai.toml`.
+pub fn wire_model_policy_switch(settings: &DmuxSettings) {
+    crate::model_policy::set_allow_fast(settings.models_allow_fast);
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -298,6 +500,12 @@ struct McpToml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct FanoutToml {
+    company_workspace: Option<bool>,
+    min_free_gb: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct GraphToml {
     enabled: Option<bool>,
     max_parallel: Option<usize>,
@@ -306,7 +514,10 @@ struct GraphToml {
     replan_budget_chars: Option<u32>,
     max_nodes: Option<u32>,
     tasks_file: Option<bool>,
+    enforce_read_only_roles: Option<bool>,
     allowed_runners: Option<Vec<String>>,
+    dynamic_nodes: Option<bool>,
+    dynamic_node_cap: Option<usize>,
 }
 
 /// Warning emitted once per settings load when `[graph] enabled` is present (FR-931).
@@ -317,6 +528,7 @@ const GRAPH_ENABLED_DEPRECATED: &str =
 const DEFAULT_GRAPH_MAX_REPLANS: u32 = 3;
 const DEFAULT_GRAPH_REPLAN_BUDGET_CHARS: u32 = 24_000;
 const DEFAULT_GRAPH_MAX_NODES: u32 = 12;
+pub const DEFAULT_GRAPH_DYNAMIC_NODE_CAP: usize = 3;
 
 /// Validates a `[graph]` replan cap (FR-958): a value inside `range` is used;
 /// an out-of-range value falls back to `default` with a config warning.
@@ -486,32 +698,28 @@ impl DmuxSettings {
                     if let Some(ws) = parsed.workspace.take() {
                         settings.workspace = ws;
                     }
+                    if let Some(board) = parsed.board.take() {
+                        for warning in board.validate() {
+                            settings.config_warnings.push(format!("board: {warning}"));
+                        }
+                        settings.board = board;
+                    }
+                    if let Some(models) = parsed.models.take()
+                        && let Some(allow_fast) = models.allow_fast
+                    {
+                        settings.models_allow_fast = allow_fast;
+                    }
                     if let Some(runners) = parsed.runners.take() {
                         let base_dir = match user_path.parent() {
                             Some(p) if !p.as_os_str().is_empty() => p,
                             _ => Path::new("."),
                         };
-                        let mut parsed_map = BTreeMap::new();
-                        let mut fallback_map = BTreeMap::new();
-                        for (id, raw) in runners {
-                            let norm_id = id.trim().to_ascii_lowercase();
-                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
-                                &norm_id,
-                                &raw,
-                                "user",
-                                base_dir,
-                                &mut settings.config_warnings,
-                            );
-                            parsed_map.insert(norm_id.clone(), cfg);
-                            fallback_map.insert(
-                                norm_id,
-                                crate::runner_fallback::RunnerFallbackToml {
-                                    fallback: raw.fallback.clone(),
-                                    stall_timeout_secs: raw.stall_timeout_secs,
-                                    stall_api_retries: raw.stall_api_retries,
-                                },
-                            );
-                        }
+                        let (parsed_map, fallback_map) = parse_runners_tables(
+                            runners,
+                            "user",
+                            base_dir,
+                            &mut settings.config_warnings,
+                        );
                         user_runners = Some(parsed_map);
                         user_fallback_tables = Some(fallback_map);
                     }
@@ -542,6 +750,18 @@ impl DmuxSettings {
                         .is_some_and(|custom| !custom.is_empty())
                     {
                         settings.workspace_defines_custom_agents = true;
+                    }
+                    if parsed.board.take().is_some() {
+                        settings.config_warnings.push(
+                            "[board] in workspace dmuxai.toml is ignored (user config only)"
+                                .to_owned(),
+                        );
+                    }
+                    if parsed.models.is_some() {
+                        settings
+                            .config_warnings
+                            .push("[models] is only valid in the user config; ignored".to_owned());
+                        parsed.models = None;
                     }
                     let sha256 = content_hash(contents.as_bytes());
                     let restricted = restricted_workspace_keys_with_user(
@@ -594,27 +814,12 @@ impl DmuxSettings {
                     }
 
                     if let Some(runners) = parsed.runners.take() {
-                        let mut parsed_map = BTreeMap::new();
-                        let mut fallback_map = BTreeMap::new();
-                        for (id, raw) in runners {
-                            let norm_id = id.trim().to_ascii_lowercase();
-                            let cfg = crate::agent_prompt::RunnerPromptConfig::parse_table(
-                                &norm_id,
-                                &raw,
-                                "workspace",
-                                workspace,
-                                &mut settings.config_warnings,
-                            );
-                            parsed_map.insert(norm_id.clone(), cfg);
-                            fallback_map.insert(
-                                norm_id,
-                                crate::runner_fallback::RunnerFallbackToml {
-                                    fallback: raw.fallback.clone(),
-                                    stall_timeout_secs: raw.stall_timeout_secs,
-                                    stall_api_retries: raw.stall_api_retries,
-                                },
-                            );
-                        }
+                        let (parsed_map, fallback_map) = parse_runners_tables(
+                            runners,
+                            "workspace",
+                            workspace,
+                            &mut settings.config_warnings,
+                        );
                         workspace_runners = Some(parsed_map);
                         workspace_fallback_tables = Some(fallback_map);
                     }
@@ -714,7 +919,10 @@ impl DmuxSettings {
             let custom_agents = &settings.custom_agents;
             let validate = |target: &crate::runner_fallback::FallbackTarget| -> Result<(), String> {
                 let runner = target.runner.as_str();
-                let is_builtin = matches!(runner, "cursor" | "agy" | "codex" | "opencode" | "grok");
+                let is_builtin = matches!(
+                    runner,
+                    crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex" | "opencode" | "grok"
+                );
                 let custom_spec = custom_agents
                     .iter()
                     .find(|spec| spec.name.eq_ignore_ascii_case(runner));
@@ -770,7 +978,7 @@ impl DmuxSettings {
             }
             let is_builtin = matches!(
                 id.as_str(),
-                "cursor" | "agy" | "codex" | "opencode" | "grok"
+                crate::runner_id::CURSOR_RUNNER_ID | "agy" | "codex" | "opencode" | "grok"
             );
             let custom_spec = settings
                 .custom_agents
@@ -818,7 +1026,7 @@ impl DmuxSettings {
             }
         }
 
-        let mut known: Vec<&str> = vec!["cursor", "agy", "codex"];
+        let mut known: Vec<&str> = vec![crate::runner_id::CURSOR_RUNNER_ID, "agy", "codex"];
         known.extend(known_custom.iter().map(String::as_str));
         let unknown = settings.theme.unknown_agent_ids(&known);
         drop(known);
@@ -1110,7 +1318,10 @@ impl DmuxSettings {
         }
         if let Some(routing) = parsed.routing {
             if let Some(default_agent) = routing.default_agent {
-                self.routing_default_agent = Some(default_agent);
+                let canon = crate::runner_id::canonical_runner_id(&default_agent);
+                if !canon.is_empty() {
+                    self.routing_default_agent = Some(canon);
+                }
             }
             if let Some(cursor_models) = routing.cursor_models {
                 self.routing_cursor_models = cursor_models;
@@ -1168,17 +1379,28 @@ impl DmuxSettings {
             if let Some(tasks_file) = graph.tasks_file {
                 self.graph_tasks_file = tasks_file;
             }
+            if let Some(enforce) = graph.enforce_read_only_roles {
+                self.graph_enforce_read_only_roles = enforce;
+            }
+            if let Some(dynamic_nodes) = graph.dynamic_nodes {
+                self.graph_dynamic_nodes = dynamic_nodes;
+            }
+            if let Some(dynamic_node_cap) = graph.dynamic_node_cap {
+                self.graph_dynamic_node_cap = dynamic_node_cap;
+            }
             if let Some(runners) = graph.allowed_runners {
                 let mut valid = Vec::new();
                 for runner in runners {
-                    let lower = runner.trim().to_ascii_lowercase();
+                    let lower = crate::runner_id::canonical_runner_id(&runner);
                     if lower.is_empty() {
                         continue;
                     }
-                    if matches!(lower.as_str(), "agy" | "codex" | "cursor")
-                        || pending_presets
-                            .iter()
-                            .any(|name| name.eq_ignore_ascii_case(&lower))
+                    if matches!(
+                        lower.as_str(),
+                        "agy" | "codex" | crate::runner_id::CURSOR_RUNNER_ID
+                    ) || pending_presets
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&lower))
                         || self
                             .custom_agents
                             .iter()
@@ -1195,6 +1417,14 @@ impl DmuxSettings {
                     }
                 }
                 self.graph_allowed_runners = Some(valid);
+            }
+        }
+        if let Some(fanout) = parsed.fanout {
+            if let Some(company_workspace) = fanout.company_workspace {
+                self.fanout_company_workspace = company_workspace;
+            }
+            if let Some(min_free_gb) = fanout.min_free_gb {
+                self.fanout_min_free_gb = min_free_gb;
             }
         }
         if let Some(ui) = parsed.ui {
@@ -1346,15 +1576,18 @@ impl DmuxSettings {
     /// SPEC-grok-runner FR-899). An unset `allowed_runners` admits every runner
     /// except built-in presets; a listed runner, including a preset, is admitted.
     pub fn graph_runner_allowed(&self, runner: &str) -> bool {
-        let runner = runner.trim();
+        let runner = crate::runner_id::canonical_runner_id(runner);
+        if runner.is_empty() {
+            return false;
+        }
         match &self.graph_allowed_runners {
             Some(allowed) => allowed
                 .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner)),
+                .any(|r| crate::runner_id::canonical_runner_id(r) == runner),
             None => !self
                 .custom_agents
                 .iter()
-                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(runner)),
+                .any(|spec| spec.builtin && spec.name.eq_ignore_ascii_case(&runner)),
         }
     }
 
@@ -1536,6 +1769,14 @@ fn restricted_workspace_keys_with_user(
     if parsed.terminal.is_some() {
         keys.push("terminal".to_owned());
     }
+    if parsed
+        .fanout
+        .as_ref()
+        .and_then(|fanout| fanout.company_workspace)
+        .is_some()
+    {
+        keys.push("fanout.company_workspace".to_owned());
+    }
     if let Some(runners) = &parsed.runners {
         for (id, raw) in runners {
             if let Some(file) = &raw.system_prompt_file
@@ -1687,6 +1928,9 @@ fn strip_restricted_workspace_keys_with_user(
     }
     parsed.jira = None;
     parsed.terminal = None;
+    if let Some(fanout) = &mut parsed.fanout {
+        fanout.company_workspace = None;
+    }
     if let Some(runners) = &mut parsed.runners {
         for raw in runners.values_mut() {
             if let Some(file) = &raw.system_prompt_file
@@ -1996,6 +2240,11 @@ impl Default for DmuxSettings {
             graph_replan_budget_chars: DEFAULT_GRAPH_REPLAN_BUDGET_CHARS,
             graph_max_nodes: DEFAULT_GRAPH_MAX_NODES,
             graph_tasks_file: false,
+            graph_enforce_read_only_roles: false,
+            graph_dynamic_nodes: false,
+            graph_dynamic_node_cap: DEFAULT_GRAPH_DYNAMIC_NODE_CAP,
+            fanout_company_workspace: false,
+            fanout_min_free_gb: 5,
             graph_allowed_runners: None,
             theme: Theme::default(),
             theme_force_color: None,
@@ -2011,6 +2260,7 @@ impl Default for DmuxSettings {
             ui_default_mode_error: None,
             web_theme: WebThemeSettings::default(),
             workspace_defines_custom_agents: false,
+            board: BoardSettings::default(),
             notify: NotifySettings::default(),
             workspace: WorkspaceSettings::default(),
             stage_skills: Default::default(),
@@ -2024,6 +2274,7 @@ impl Default for DmuxSettings {
             runs: crate::run_journal::JournalConfig::default(),
             terminal: crate::term::policy::TerminalSettings::default(),
             terminal_serial_usbipd_attach: None,
+            models_allow_fast: false,
             workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
         }
     }
@@ -2815,6 +3066,88 @@ text_path = "/part/text"
         parses_ui_section();
     }
 
+    // TC-2900 / FR-2900
+    #[test]
+    fn tc_2900_enforce_read_only_roles_default_off_and_workspace_overrides_user() {
+        let defaults = DmuxSettings::default();
+        assert!(!defaults.graph_enforce_read_only_roles);
+
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-ro-roles-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(
+            user_dir.join("dmuxai.toml"),
+            "[graph]\nenforce_read_only_roles = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\nenforce_read_only_roles = false\n",
+        )
+        .unwrap();
+
+        let settings =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(!settings.graph_enforce_read_only_roles);
+
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\nenforce_read_only_roles = true\n",
+        )
+        .unwrap();
+        let settings_on =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(settings_on.graph_enforce_read_only_roles);
+
+        std::fs::remove_dir_all(&temp_base).ok();
+    }
+
+    #[test]
+    fn tc_2940_dynamic_settings_defaults_and_merge() {
+        let defaults = DmuxSettings::default();
+        assert!(!defaults.graph_dynamic_nodes);
+        assert_eq!(defaults.graph_dynamic_node_cap, 3);
+
+        let temp_base =
+            std::env::temp_dir().join(format!("dmuxai-dyn-settings-{}", std::process::id()));
+        let user_dir = temp_base.join("user");
+        let ws_dir = temp_base.join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        std::fs::write(
+            user_dir.join("dmuxai.toml"),
+            "[graph]\ndynamic_nodes = true\ndynamic_node_cap = 5\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\ndynamic_node_cap = 2\n",
+        )
+        .unwrap();
+
+        let settings =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(settings.graph_dynamic_nodes);
+        assert_eq!(settings.graph_dynamic_node_cap, 2);
+
+        // 0 disables
+        std::fs::write(
+            ws_dir.join("dmuxai.toml"),
+            "[graph]\ndynamic_nodes = false\ndynamic_node_cap = 0\n",
+        )
+        .unwrap();
+        let settings_off =
+            DmuxSettings::load_with_user_config(&ws_dir, Some(&user_dir.join("dmuxai.toml")));
+        assert!(!settings_off.graph_dynamic_nodes);
+        assert_eq!(settings_off.graph_dynamic_node_cap, 0);
+
+        std::fs::remove_dir_all(&temp_base).ok();
+    }
+
     #[test]
     fn tc_433_user_config_merged_and_overridden_by_workspace() {
         // TC-433, FR-433
@@ -2892,7 +3225,10 @@ allowed_runners = ["AGY", "bogus_agent", "cursor"]
         let settings = DmuxSettings::load_with_user_config(&dir, None);
         assert_eq!(
             settings.graph_allowed_runners,
-            Some(vec!["agy".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "agy".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             settings.config_warnings.iter().any(
@@ -3635,7 +3971,10 @@ mod builtin_opencode_tests {
         let listed = load(Some(bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
-            Some(vec!["opencode".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "opencode".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             listed.config_warnings.is_empty(),
@@ -3972,7 +4311,10 @@ mod builtin_grok_tests {
         let listed = load(Some(path_bin.clone()));
         assert_eq!(
             listed.graph_allowed_runners,
-            Some(vec!["grok".to_owned(), "cursor".to_owned()])
+            Some(vec![
+                "grok".to_owned(),
+                crate::runner_id::CURSOR_RUNNER_ID.to_owned()
+            ])
         );
         assert!(
             listed.config_warnings.is_empty(),
@@ -4567,7 +4909,7 @@ model = "gemini-3.8-flash-high"
             ws3.path().join("dmuxai.toml"),
             r#"
 [runners.agy]
-model = "gemini-4-argon"
+model = "gemini-4-argon-fast"
 "#,
         )
         .unwrap();
@@ -4577,8 +4919,54 @@ model = "gemini-4-argon"
             settings3
                 .config_warnings
                 .iter()
-                .any(|w| w.contains("gemini-4-argon") && w.contains("not allowed"))
+                .any(|w| w.contains("gemini-4-argon-fast") && w.contains("not allowed"))
         );
+    }
+
+    // TC-3008 / FR-3003: `[models] allow_fast` is user-config only
+    #[test]
+    fn tc_3008_allow_fast_is_user_config_only() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let user_toml = user_dir.path().join("user.toml");
+        std::fs::write(
+            &user_toml,
+            r#"
+[models]
+allow_fast = true
+"#,
+        )
+        .unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let settings_user = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
+        assert!(settings_user.models_allow_fast);
+        assert!(
+            !settings_user
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown") && w.contains("allow_fast"))
+        );
+
+        let ws_only = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws_only.path().join("dmuxai.toml"),
+            r#"
+[models]
+allow_fast = true
+"#,
+        )
+        .unwrap();
+        let settings_ws = DmuxSettings::load_with_user_config(ws_only.path(), None);
+        assert!(!settings_ws.models_allow_fast);
+        assert!(
+            settings_ws
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[models]") && w.contains("user config"))
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        let settings_default = DmuxSettings::load_with_user_config(empty.path(), None);
+        assert!(!settings_default.models_allow_fast);
     }
 
     // TC-1754 / FR-1731: default ignored, custom accepted, unknown dropped
@@ -4666,7 +5054,10 @@ system_prompt = "ignored"
         .unwrap();
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
 
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         let model = cursor
             .models
             .as_ref()
@@ -4676,7 +5067,7 @@ system_prompt = "ignored"
         assert_eq!(prompt.text, "Model file prompt");
         assert_eq!(
             prompt.source,
-            "workspace:[runners.cursor.models.\"Composer-2.5\"] (model.txt)"
+            "workspace:[runners.cursor-agent.models.\"Composer-2.5\"] (model.txt)"
         );
         assert_eq!(model.inject, Some(PromptInject::Session));
 
@@ -4689,7 +5080,7 @@ system_prompt = "ignored"
         assert_eq!(inline.text, "Inline model prompt");
         assert_eq!(
             inline.source,
-            "workspace:[runners.cursor.models.\"inline-model\"]"
+            "workspace:[runners.cursor-agent.models.\"inline-model\"]"
         );
 
         let default = settings
@@ -4752,15 +5143,15 @@ prompt_inject = "immediately"
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
 
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"composer-2.5\"]")
+            w.contains("[runners.cursor-agent.models.\"composer-2.5\"]")
                 && w.contains("both system_prompt and system_prompt_file")
         }));
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"big\"]")
+            w.contains("[runners.cursor-agent.models.\"big\"]")
                 && w.contains("exceeds 32 KiB (32768 bytes)")
         }));
         assert!(settings.config_warnings.iter().any(|w| {
-            w.contains("[runners.cursor.models.\"bad-inject\"]")
+            w.contains("[runners.cursor-agent.models.\"bad-inject\"]")
                 && w.contains("unknown prompt_inject 'immediately'")
         }));
     }
@@ -4804,7 +5195,10 @@ system_prompt = "workspace model"
         .unwrap();
 
         let settings = DmuxSettings::load_with_user_config(ws.path(), Some(&user_toml));
-        let cursor = settings.runner_prompts.get("cursor").expect("cursor table");
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
         assert_eq!(cursor.builtin_prompt, Some(true));
 
         let models = cursor.models.as_ref().expect("models");
@@ -4813,7 +5207,7 @@ system_prompt = "workspace model"
         assert_eq!(prompt.text, "workspace model");
         assert_eq!(
             prompt.source,
-            "workspace:[runners.cursor.models.\"composer-2.5\"]"
+            "workspace:[runners.cursor-agent.models.\"composer-2.5\"]"
         );
         // The workspace entry did not set prompt_inject, so the user value stays.
         assert_eq!(composer.inject, Some(PromptInject::Always));
@@ -4970,7 +5364,7 @@ mod runner_fallback_settings_tests {
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join("dmuxai.toml"),
-            "[runners.agy]\nfallback = [\"agy:claude-opus\", \"nosuchrunner\", \"codex\"]\n",
+            "[runners.agy]\nfallback = [\"agy:gemini-3.8-flash-fast\", \"nosuchrunner\", \"codex\"]\n",
         )
         .unwrap();
         let settings = DmuxSettings::load_with_user_config(ws.path(), None);
@@ -4988,7 +5382,7 @@ mod runner_fallback_settings_tests {
             settings
                 .config_warnings
                 .iter()
-                .any(|w| w.contains("fallback 'agy:claude-opus' ignored")),
+                .any(|w| w.contains("fallback 'agy:gemini-3.8-flash-fast' ignored")),
             "warnings: {:?}",
             settings.config_warnings
         );
@@ -6200,5 +6594,248 @@ usbipd_attach = false
             settings.workspace_defines_custom_agents,
             "raw repo config with [[agents.custom]] must set flag even when untrusted"
         );
+    }
+
+    #[test]
+    fn tc_3131_board_config_user_only_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_dir = dir.path().join("user");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let user_cfg = user_dir.join("dmuxai.toml");
+        std::fs::write(
+            &user_cfg,
+            r#"[board]
+planner = "codex:gpt-5.4"
+notify_command = ["echo", "hi"]
+notify_webhook_url = "https://example.test/hook"
+notify_webhook_secret_env = "BOARD_SECRET"
+notify_events = ["needs_decision", "run_finished"]
+unknown_key = 42
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"[board]
+planner = "cursor"
+notify_webhook_url = "ftp://bad"
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&ws, Some(&user_cfg));
+        assert_eq!(settings.board.planner.as_deref(), Some("codex:gpt-5.4"));
+        assert_eq!(
+            settings.board.planner_agent_and_model(),
+            (Some("codex".to_owned()), Some("gpt-5.4".to_owned()))
+        );
+        assert_eq!(
+            settings.board.notify_command,
+            Some(vec!["echo".to_owned(), "hi".to_owned()])
+        );
+        assert_eq!(
+            settings.board.notify_webhook_url.as_deref(),
+            Some("https://example.test/hook")
+        );
+        assert_eq!(
+            settings.board.notify_webhook_secret_env.as_deref(),
+            Some("BOARD_SECRET")
+        );
+        assert!(settings.board.allows_event("needs_decision"));
+        assert!(!settings.board.allows_event("decision"));
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown key 'unknown_key'")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[board] in workspace dmuxai.toml is ignored")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+
+        let bad_board = BoardSettings {
+            planner: Some("   ".to_owned()),
+            notify_command: Some(vec![]),
+            notify_webhook_url: Some("ftp://invalid".to_owned()),
+            notify_webhook_secret_env: None,
+            notify_events: Some(vec!["bogus".to_owned()]),
+            extra: BTreeMap::new(),
+        };
+        let warnings = bad_board.validate();
+        assert_eq!(warnings.len(), 4, "warnings: {warnings:?}");
+        assert!(!bad_board.has_notify_target());
+
+        let env = RuntimeEnv {
+            xdg_config_home: Some(user_dir.clone()),
+            ..Default::default()
+        };
+        let user_cfg_dmuxai = user_dir.join("dmuxai");
+        std::fs::create_dir_all(&user_cfg_dmuxai).unwrap();
+        std::fs::copy(&user_cfg, user_cfg_dmuxai.join("dmuxai.toml")).unwrap();
+        let loaded = BoardSettings::load_user_only_with_env(&env);
+        assert_eq!(loaded.planner.as_deref(), Some("codex:gpt-5.4"));
+        assert!(loaded.has_notify_target());
+    }
+
+    // TC-3202 / FR-3202
+    #[test]
+    fn tc_3202_config_accepts_cursor_agent_keyword() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor-agent", "agy"]
+
+[routing]
+default_agent = "cursor-agent"
+
+[runners.cursor-agent]
+model = "composer-2.5"
+fallback = ["agy"]
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert!(settings.graph_runner_allowed("cursor"));
+        assert!(
+            settings
+                .graph_allowed_runners
+                .as_ref()
+                .is_some_and(|r| r.contains(&crate::runner_id::CURSOR_RUNNER_ID.to_owned()))
+        );
+        assert_eq!(
+            settings.routing_default_agent.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        let cursor = settings
+            .runner_prompts
+            .get(crate::runner_id::CURSOR_RUNNER_ID)
+            .expect("cursor table");
+        assert_eq!(cursor.model.as_deref(), Some("composer-2.5"));
+        assert!(
+            !settings
+                .runner_fallback
+                .chain_for("cursor", None)
+                .is_empty()
+        );
+    }
+
+    // TC-3203 / FR-3202
+    #[test]
+    fn tc_3203_cursor_and_cursor_agent_tables_conflict_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[runners.cursor]
+model = "composer-2.5"
+
+[runners.cursor-agent]
+model = "grok-4.7-high"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert_eq!(
+            settings
+                .runner_models
+                .get(crate::runner_id::CURSOR_RUNNER_ID)
+                .map(String::as_str),
+            Some("grok-4.7-high")
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains(CURSOR_RUNNER_TABLE_CONFLICT)),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+    }
+
+    // TC-3213 / FR-3208, FR-3209
+    #[test]
+    fn tc_3213_legacy_cursor_config_and_graph_store_normalize() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[graph]
+allowed_runners = ["cursor", "agy"]
+
+[routing]
+default_agent = "cursor"
+
+[runners.cursor]
+model = "composer-2.5"
+fallback = ["agy:composer-2.5"]
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load(ws);
+        assert!(settings.graph_runner_allowed(crate::runner_id::CURSOR_RUNNER_ID));
+        assert_eq!(
+            settings.routing_default_agent.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        assert!(
+            settings
+                .runner_prompts
+                .get(crate::runner_id::CURSOR_RUNNER_ID)
+                .and_then(|c| c.model.as_deref())
+                == Some("composer-2.5")
+        );
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("cursor") && w.contains("legacy"))
+        );
+        let mut run = crate::graph::GraphRun {
+            plan: crate::graph::GraphPlan {
+                schema: "dmuxai.graph/v1".to_owned(),
+                id: "p1".to_owned(),
+                orchestrator_model: "composer-2.5".to_owned(),
+                user_prompt: "p".to_owned(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                limits: Default::default(),
+                dynamic_cap: None,
+                tasks: Vec::new(),
+            },
+            conversation_id: "c".to_owned(),
+            phase: crate::graph::GraphRunPhase::Active,
+            ..Default::default()
+        };
+        run.plan.nodes.push(crate::graph::GraphNode {
+            id: "n1".to_owned(),
+            role: crate::graph::NodeRole::Implement,
+            job: "j".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: "composer-2.5".to_owned(),
+            skill: None,
+            requires_gate: false,
+            status: crate::graph::GraphNodeStatus::Pending,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+        });
+        run.normalize_legacy_runners();
+        assert_eq!(run.plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
     }
 }
