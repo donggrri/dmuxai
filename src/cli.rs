@@ -3249,6 +3249,62 @@ fn run_board_move(
         .map_err(ApiError::from)
 }
 
+fn run_board_decide(
+    store: &dmuxai::board::BoardStore,
+    state_root: &Path,
+    caller: dmuxai::board::BoardCaller,
+    id: &str,
+    mut req: dmuxai::board::DecideRequest,
+    confirm: impl FnOnce(&str, &str, &str) -> Result<(), ApiError>,
+) -> Result<
+    (
+        dmuxai::board::BoardItem,
+        dmuxai::board::runner::AutoRunOutcome,
+    ),
+    ApiError,
+> {
+    if req.by == "planner" {
+        return Err(ApiError::new(
+            exit::FORBIDDEN,
+            "planner cannot record decisions".to_owned(),
+        ));
+    }
+    if req.by == "owner" {
+        let existing = store.get(id).map_err(ApiError::from)?;
+        if matches!(req.verdict, dmuxai::board::Verdict::Approve)
+            && req.plan_hash.is_none()
+            && caller == dmuxai::board::BoardCaller::CliTty
+            && let Some(plan) = existing.plan.as_ref()
+        {
+            req.plan_hash = Some(plan.hash.clone());
+        }
+        confirm(id, req.verdict.as_str(), &existing.title)?;
+    }
+    let is_approve = matches!(req.verdict, dmuxai::board::Verdict::Approve);
+    let mut item = store
+        .decide_without_notify(id, req)
+        .map_err(ApiError::from)?;
+    let auto_run = if is_approve && item.decision.as_ref().is_some_and(|d| d.by == "owner") {
+        let outcome =
+            dmuxai::board::runner::auto_run_after_owner_approve(store, &item, state_root, true);
+        if (outcome.started || outcome.reason.is_some())
+            && let Ok(updated) = store.get(id)
+        {
+            item = updated;
+        }
+        outcome
+    } else {
+        dmuxai::board::runner::AutoRunOutcome::not_started()
+    };
+    let actor = item
+        .decision
+        .as_ref()
+        .map(|d| d.by.as_str())
+        .unwrap_or("owner");
+    dmuxai::board::notify::dispatch_decision_event(store.base(), &item, actor, auto_run.started);
+    Ok((item, auto_run))
+}
+
 fn format_pending_age(age_ms: u64) -> String {
     let mins = age_ms / 60_000;
     if mins < 60 {
@@ -3286,9 +3342,8 @@ fn execute_board_with_caller(
     caller: dmuxai::board::BoardCaller,
 ) -> i32 {
     use dmuxai::board::{
-        AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
-        UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, resolve_actor,
-        wait_ready_json,
+        AddItemRequest, DecideRequest, Grade, Kind, Lane, SayRequest, UpdateItemRequest, Verdict,
+        WaitFilter, WaitFor, WaitOutcome, resolve_actor, wait_ready_json,
     };
     use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
 
@@ -3564,38 +3619,40 @@ fn execute_board_with_caller(
                     .ok_or_else(|| ApiError::new(exit::USAGE, "invalid verdict".to_owned()))?;
                 dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
                 let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
-                if by == "planner" {
-                    return Err(ApiError::new(
-                        exit::FORBIDDEN,
-                        "planner cannot record decisions".to_owned(),
-                    ));
-                }
-                let mut plan_hash = plan_hash;
-                if by == "owner" {
-                    let existing = store.get(&id).map_err(ApiError::from)?;
-                    if matches!(verdict, Verdict::Approve)
-                        && plan_hash.is_none()
-                        && caller == BoardCaller::CliTty
-                        && let Some(plan) = existing.plan.as_ref()
-                    {
-                        plan_hash = Some(plan.hash.clone());
-                    }
-                    confirm_owner_action_cli(&id, verdict.as_str(), &existing.title)?;
-                }
-                let item = store
-                    .decide(
-                        &id,
-                        DecideRequest {
-                            verdict,
-                            text,
-                            option,
-                            plan_hash,
-                            by,
-                        },
-                    )
-                    .map_err(ApiError::from)?;
+                let (item, auto_run) = run_board_decide(
+                    &store,
+                    &state_root,
+                    caller,
+                    &id,
+                    DecideRequest {
+                        verdict,
+                        text,
+                        option,
+                        plan_hash,
+                        by,
+                    },
+                    confirm_owner_action_cli,
+                )?;
                 if json_out {
-                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                    let mut val = serde_json::to_value(&item).unwrap_or(Value::Null);
+                    if let Some(map) = val.as_object_mut() {
+                        map.insert(
+                            "auto_run".to_owned(),
+                            serde_json::to_value(&auto_run)
+                                .unwrap_or_else(|_| json!({ "started": false })),
+                        );
+                    }
+                    print_json(&val);
+                } else if auto_run.started {
+                    println!("{}\t{}\tauto-run started", item.id, item.lane.as_str());
+                } else if let Some(reason) = &auto_run.reason {
+                    println!(
+                        "{}\t{}\tauto-run skipped: {reason}",
+                        item.id,
+                        item.lane.as_str()
+                    );
+                } else {
+                    println!("{}\t{}", item.id, item.lane.as_str());
                 }
                 Ok(())
             }
@@ -7076,6 +7133,108 @@ mod tests {
         }
         assert_eq!(exec_exit, exit::OK);
         assert_eq!(store.get(&item.id).unwrap().lane, dmuxai::board::Lane::Done);
+    }
+
+    // FR-3232, FR-3236: TTY `board decide <id> approve` starts detached auto-run and emits
+    // `auto_run` outcome without blocking.
+    #[test]
+    fn tc_3232_cli_decide_approve_starts_detached_auto_run() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let ws = dir.path().join("ws");
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&xdg_cfg).unwrap();
+
+        let self_argv = dir.path().join("cli-self-argv.txt");
+        let fake_self = dir.path().join("fake-self.sh");
+        std::fs::write(
+            &fake_self,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+                self_argv.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_self).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_self, perms).unwrap();
+        }
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_self = std::env::var_os("DMUXAI_BOARD_SELF_BIN");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg);
+            std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self);
+        }
+
+        let store = dmuxai::board::BoardStore::open(state.join("board")).unwrap();
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"t","done_check":"d","size":"small","depends_on":[]}],"steps":[{"id":"s1","role":"implement","job":"j","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) =
+            dmuxai::board::edit_plan_from_json(&ws, &state, "ship", plan_json, None).unwrap();
+        let item = store
+            .add(dmuxai::board::AddItemRequest {
+                title: "CLI decide autorun".to_owned(),
+                summary: String::new(),
+                kind: dmuxai::board::Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("coordinator".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coordinator".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+
+        let (decided, auto_run) = run_board_decide(
+            &store,
+            &state,
+            dmuxai::board::BoardCaller::CliTty,
+            &item.id,
+            dmuxai::board::DecideRequest {
+                verdict: dmuxai::board::Verdict::Approve,
+                text: None,
+                option: None,
+                plan_hash: None,
+                by: "owner".to_owned(),
+            },
+            |id, verb, title| {
+                dmuxai::board::confirm_owner_action(id, verb, title, |_| Ok(id.to_owned()))
+                    .map_err(ApiError::from)
+            },
+        )
+        .unwrap();
+        assert!(auto_run.started);
+        assert!(auto_run.reason.is_none());
+        assert_eq!(decided.lane, dmuxai::board::Lane::InProgress);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !self_argv.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let argv = std::fs::read_to_string(&self_argv).expect("detached cli run");
+        assert!(argv.contains("--exec-prepared"), "argv: {argv}");
+        assert!(argv.contains(&hash), "argv: {argv}");
+
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_self {
+                Some(v) => std::env::set_var("DMUXAI_BOARD_SELF_BIN", v),
+                None => std::env::remove_var("DMUXAI_BOARD_SELF_BIN"),
+            }
+        }
     }
 
     // TC-3201 / FR-3201

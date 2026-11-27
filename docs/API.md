@@ -466,7 +466,7 @@ Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 1. `dmuxai -C <repo> run --graph --json -` — on exit `7`, take `plan_hash`.
 2. `dmuxai board add -C <repo> --title … --kind feature --plan-hash <hash> --bot coordinator --json`.
 3. Lane `auto`: `dmuxai board run <id>` (replaces the manual `board prompt` pipe).
-4. Lane `needs_decision`: `dmuxai board wait <id> --for any` (or `board wait --any`); on `approve`, run `dmuxai board run <id>`; on `request_changes` or messages, revise with `dmuxai board ask <id> --revise --text …` (or `board plan --edit`) and reply with `board say`. A failed run moves to `unknown` and can be retried with the same hash from `<state base>/board/plans/<hash>.json`.
+4. Lane `needs_decision`: `dmuxai board wait <id> --for any` (or `board wait --any`); on `approve`, the board starts the run itself (moving the item to `in_progress`), so only call `dmuxai board run <id>` if `[board] auto_run_on_approve = false` or the lane is still `approved`; on `request_changes` or messages, revise with `dmuxai board ask <id> --revise --text …` (or `board plan --edit`) and reply with `board say`. A failed run moves to `unknown` and can be retried with the same hash from `<state base>/board/plans/<hash>.json`.
 5. Bots poll with `dmuxai board events --since S`; plan prompts stay unmasked only under `graph-pending/<hash>.json` (and board plan copies `<state base>/board/plans/<hash>.json`).
 
 Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
@@ -488,6 +488,7 @@ with a warning in workspace `dmuxai.toml`):
 ```toml
 [board]
 planner = "codex:gpt-5.4"
+auto_run_on_approve = true
 notify_command = ["notify-send", "dmuxai-board"]
 notify_webhook_url = "https://hooks.example.test/board"
 notify_webhook_secret_env = "DMUXAI_BOARD_SECRET"
@@ -501,7 +502,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
 | GET | `/api/board/pending` | `?workspace=` | `200` `{items, count}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
-| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item | 400, 401, 403, 404, 409, 422 |
+| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item + `auto_run` | 400, 401, 403, 404, 409, 422 |
 | POST | `/api/board/{id}/check` | `{text?}` (human headers required) | `200` item | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |

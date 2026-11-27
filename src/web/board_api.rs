@@ -269,12 +269,49 @@ async fn board_decision(
         plan_hash: body.plan_hash,
         by,
     };
+    let launch_allowed = state.launch_allowed;
+    let state_root = state.state_root.clone();
     match with_store(state.board_base.clone(), move |store| {
-        store.decide(&id, req)
+        let mut item = store.decide_without_notify(&id, req)?;
+        let auto_run = if verdict == Verdict::Approve
+            && item.decision.as_ref().is_some_and(|d| d.by == "owner")
+        {
+            let outcome = crate::board::runner::auto_run_after_owner_approve(
+                store,
+                &item,
+                &state_root,
+                launch_allowed,
+            );
+            if (outcome.started || outcome.reason.is_some())
+                && let Ok(updated) = store.get(&id)
+            {
+                item = updated;
+            }
+            outcome
+        } else {
+            crate::board::runner::AutoRunOutcome::not_started()
+        };
+        let actor = item
+            .decision
+            .as_ref()
+            .map(|d| d.by.as_str())
+            .unwrap_or("owner");
+        crate::board::notify::dispatch_decision_event(store.base(), &item, actor, auto_run.started);
+        Ok((item, auto_run))
     })
     .await
     {
-        Ok(item) => json_ok(StatusCode::OK, &item_response(item)),
+        Ok((item, auto_run)) => {
+            let mut value = item_response(item);
+            if let Some(map) = value.as_object_mut() {
+                map.insert(
+                    "auto_run".to_owned(),
+                    serde_json::to_value(&auto_run)
+                        .unwrap_or_else(|_| serde_json::json!({ "started": false })),
+                );
+            }
+            json_ok(StatusCode::OK, &value)
+        }
         Err(error) => board_error_response(error),
     }
 }
@@ -1475,5 +1512,351 @@ mod tests {
         assert_eq!(pending_resp.status(), StatusCode::OK);
         let pending_body = body_string(pending_resp).await;
         assert!(pending_body.contains("\"count\":0"));
+    }
+
+    // TC-3232 / FR-3232, FR-3236: owner approve with matching plan hash in `--web`
+    // starts a detached board run, moves the item to in_progress, returns auto_run.started = true
+    // without blocking, and dispatches decision notify with bot/verdict/auto_run:true.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3232_owner_approve_with_matching_hash_starts_detached_run() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(xdg_cfg.join("dmuxai")).unwrap();
+
+        let notify_out = dir.path().join("notify.jsonl");
+        let notify_script = dir.path().join("notify.sh");
+        std::fs::write(
+            &notify_script,
+            format!(
+                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
+                notify_out.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&notify_script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&notify_script, perms).unwrap();
+        }
+        std::fs::write(
+            xdg_cfg.join("dmuxai").join("dmuxai.toml"),
+            format!(
+                "[board]\nnotify_command = [\"{}\"]\n",
+                notify_script.display()
+            ),
+        )
+        .unwrap();
+
+        let self_argv = dir.path().join("self-argv.txt");
+        let fake_self = dir.path().join("fake-self.sh");
+        std::fs::write(
+            &fake_self,
+            format!(
+                "#!/bin/sh\nsleep 0.2\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+                self_argv.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_self).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_self, perms).unwrap();
+        }
+
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_self = std::env::var_os("DMUXAI_BOARD_SELF_BIN");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg);
+            std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self);
+        }
+
+        let store = BoardStore::open(board.clone()).unwrap();
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&ws, &state, "ship it", plan_json, None).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "Auto run on approve".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coordinator".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coordinator".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+
+        let token = "boardtesttoken";
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let services = DashboardServices {
+            board_base: Some(board.clone()),
+            web_attached: true,
+            trust_env: Some(crate::runtime_env::RuntimeEnv {
+                dmuxai_state_dir: Some(state),
+                ..crate::runtime_env::RuntimeEnv::from_process()
+            }),
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(
+            hub,
+            token.to_string(),
+            Some(vec!["localhost:7420".to_string()]),
+            services,
+        );
+
+        let started_at = std::time::Instant::now();
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/{}/decision", item.id))
+                    .header("Host", "localhost:7420")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("X-Dmuxai-Human", "1")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"verdict":"approve","plan_hash":"{hash}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            started_at.elapsed() < std::time::Duration::from_millis(500),
+            "decision endpoint must not block on detached run"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&body_string(resp).await).expect("json response");
+        assert_eq!(body["lane"], "in_progress");
+        assert_eq!(body["auto_run"]["started"], true);
+        assert!(body["auto_run"].get("reason").is_none());
+        assert_eq!(store.get(&item.id).unwrap().lane, Lane::InProgress);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !self_argv.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let argv_text = std::fs::read_to_string(&self_argv).expect("detached child should run");
+        assert!(argv_text.contains("--exec-prepared"), "argv: {argv_text}");
+        assert!(argv_text.contains(&hash), "argv: {argv_text}");
+        assert!(argv_text.contains("owner"), "argv: {argv_text}");
+
+        crate::board::notify::wait_for_pending(std::time::Duration::from_secs(5));
+        let notify_raw = std::fs::read_to_string(&notify_out).expect("notify output");
+        let decision_ev: serde_json::Value = notify_raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l.trim()).ok())
+            .find(|v: &serde_json::Value| v["event"] == "decision" && v["item_id"] == item.id)
+            .expect("decision notify event");
+        assert_eq!(decision_ev["bot"], "coordinator");
+        assert_eq!(decision_ev["verdict"], "approve");
+        assert_eq!(decision_ev["auto_run"], true);
+
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_self {
+                Some(v) => std::env::set_var("DMUXAI_BOARD_SELF_BIN", v),
+                None => std::env::remove_var("DMUXAI_BOARD_SELF_BIN"),
+            }
+        }
+    }
+
+    // TC-3235 / FR-3235, NFR-3230: view-only `serve` adds `auto-run skipped: view-only dashboard`
+    // and never starts a run; `[board] auto_run_on_approve = false` never auto-runs and adds no thread msg.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3235_view_only_and_opt_out_never_auto_run() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(xdg_cfg.join("dmuxai")).unwrap();
+
+        let self_marker = dir.path().join("self-invoked.txt");
+        let fake_self = dir.path().join("fake-self.sh");
+        std::fs::write(
+            &fake_self,
+            format!("#!/bin/sh\ntouch \"{}\"\nexit 0\n", self_marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_self).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_self, perms).unwrap();
+        }
+
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_self = std::env::var_os("DMUXAI_BOARD_SELF_BIN");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg);
+            std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self);
+        }
+
+        let store = BoardStore::open(board.clone()).unwrap();
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&ws, &state, "ship it", plan_json, None).unwrap();
+
+        // 1. View-only `serve` (launch_allowed = false) skips auto-run and adds `run` message.
+        let view_item = store
+            .add(AddItemRequest {
+                title: "view-only approve".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let token = "boardtesttoken";
+        let view_router = test_router(board.clone(), state.clone(), token);
+        let resp = view_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/{}/decision", view_item.id))
+                    .header("Host", "localhost:7420")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("X-Dmuxai-Human", "1")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"verdict":"approve","plan_hash":"{hash}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["lane"], "approved");
+        assert_eq!(body["auto_run"]["started"], false);
+        assert_eq!(body["auto_run"]["reason"], "view-only dashboard");
+        let saved_view = store.get(&view_item.id).unwrap();
+        assert_eq!(saved_view.lane, Lane::Approved);
+        assert_eq!(saved_view.thread.len(), 1);
+        assert_eq!(saved_view.thread[0].from, "run");
+        assert_eq!(
+            saved_view.thread[0].text,
+            "auto-run skipped: view-only dashboard"
+        );
+        assert!(!self_marker.exists());
+
+        // 2. `[board] auto_run_on_approve = false` in user config (even on `--web`) never auto-runs
+        //    and starts no thread / adds no thread message (NFR-3230).
+        std::fs::write(
+            xdg_cfg.join("dmuxai").join("dmuxai.toml"),
+            "[board]\nauto_run_on_approve = false\n",
+        )
+        .unwrap();
+        let opt_out_item = store
+            .add(AddItemRequest {
+                title: "opt-out approve".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let services = DashboardServices {
+            board_base: Some(board),
+            web_attached: true,
+            trust_env: Some(crate::runtime_env::RuntimeEnv {
+                dmuxai_state_dir: Some(state),
+                ..crate::runtime_env::RuntimeEnv::from_process()
+            }),
+            ..DashboardServices::default()
+        };
+        let web_router = build_router_with(
+            hub,
+            token.to_string(),
+            Some(vec!["localhost:7420".to_string()]),
+            services,
+        );
+        let resp = web_router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/{}/decision", opt_out_item.id))
+                    .header("Host", "localhost:7420")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("X-Dmuxai-Human", "1")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"verdict":"approve","plan_hash":"{hash}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let opt_body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(opt_body["lane"], "approved");
+        assert_eq!(opt_body["auto_run"]["started"], false);
+        let saved_opt = store.get(&opt_out_item.id).unwrap();
+        assert_eq!(saved_opt.lane, Lane::Approved);
+        assert!(saved_opt.thread.is_empty());
+        assert!(!self_marker.exists());
+
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_self {
+                Some(v) => std::env::set_var("DMUXAI_BOARD_SELF_BIN", v),
+                None => std::env::remove_var("DMUXAI_BOARD_SELF_BIN"),
+            }
+        }
     }
 }

@@ -21,7 +21,12 @@ approved plan should start running without another click.
 | OQ-3231 | Opt-out | `[board] auto_run_on_approve = false` turns auto-run off (default `true`). |
 | OQ-3232 | Bot wake-up | Reuse the existing decision event (events log + `[board]` notify); the notify payload gains `bot` and `verdict` so a hook can route the wake-up to the posting bot. No new channel. |
 
-## 3. Requirements
+## 3. Scope
+
+- In scope: `decision` event wake-ups, `bot`/`verdict`/`auto_run` notify fields, detached auto-run on owner `approve`, `[board] auto_run_on_approve` opt-out, dashboard/CLI response feedback, and coordinator docs.
+- Non-goals: auto-running from non-approve verdicts, MCP, `say`/`ask`/`plan`/`move`/rules, view-only `serve`, or changing human-only approval rules (FR-3138).
+
+## 4. Requirements
 
 | ID | Priority | Requirement |
 | --- | --- | --- |
@@ -35,7 +40,7 @@ approved plan should start running without another click.
 | FR-3237 | Should | README board section and the coordinator guidance in SPEC-decision-board §7 tell bots: after `board wait` returns an approve decision, check the item lane; if it is `in_progress` the board already started the run — do not call `board run` again (it would get a conflict). |
 | NFR-3230 | Must | Auto-run adds no work to non-approve decisions and starts no thread when `auto_run_on_approve = false`. The decision write is not delayed by the run (detached spawn only). |
 
-## 4. Tests
+## 5. Acceptance scenarios and test design
 
 | ID | Covers | Test |
 | --- | --- | --- |

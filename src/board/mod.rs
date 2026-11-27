@@ -813,4 +813,28 @@ mod tests {
             );
         }
     }
+
+    // TC-3237 / FR-3237: README board section and SPEC-decision-board §7 document auto-run
+    // on approve and instruct bots not to call `board run` when lane is already `in_progress`.
+    #[test]
+    fn tc_3237_readme_documents_auto_run_on_approve() {
+        let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        let board_spec = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/specs/SPEC-decision-board.md"
+        ));
+        let board_js = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/web/assets/board.js"
+        ));
+        assert!(readme.contains("### Decision board"));
+        assert!(readme.contains("auto_run_on_approve"));
+        assert!(readme.contains("board wait"));
+        assert!(readme.contains("in_progress"));
+        assert!(readme.contains("board run"));
+        assert!(board_spec.contains("in_progress"));
+        assert!(board_spec.contains("auto_run_on_approve"));
+        assert!(board_js.contains("Approved — run started"));
+        assert!(board_js.contains("Approved — auto-run skipped: "));
+    }
 }
