@@ -54,6 +54,7 @@ impl Default for WebOptions {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
     Help,
@@ -105,6 +106,7 @@ Usage:
   dmuxai term send NAME <text|text --keys KEYS> | term read NAME [--since N] [--tail N] [--raw]
   dmuxai term wait NAME --match REGEX|--idle MS --timeout DUR [--since N] | term exec NAME <command> [--timeout DUR]
   dmuxai term approve <id> [--json] | term list|show|resize|close|reopen ...
+  dmuxai board add|list|show|…   Coordinator decision board (user-level)
   dmuxai mcp
   dmuxai init [--workspace] [--force]
 
@@ -185,6 +187,13 @@ where
             let text = match args.get(1).map(String::as_str) {
                 Some(subcommand) => cli::term_subcommand_usage(subcommand),
                 None => cli::TERM_USAGE,
+            };
+            return CliAction::HelpTopic(text);
+        }
+        if wants_help && args.first().map(String::as_str) == Some("board") {
+            let text = match args.get(1).map(String::as_str) {
+                Some(subcommand) => cli::board_subcommand_usage(subcommand),
+                None => cli::BOARD_USAGE,
             };
             return CliAction::HelpTopic(text);
         }

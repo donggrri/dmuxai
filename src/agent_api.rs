@@ -80,6 +80,14 @@ impl From<TodoError> for ApiError {
     }
 }
 
+/// Opens the user-level decision board store (FR-3100).
+pub fn open_board_store() -> Result<crate::board::BoardStore, ApiError> {
+    let base = crate::state_path::state_base()
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?
+        .join("board");
+    crate::board::BoardStore::open(base).map_err(|e| ApiError::new(e.exit_code(), e.to_string()))
+}
+
 /// Opens the per-repo to-do store (same database as the TUI, FR-540).
 pub fn open_todo_store(workspace_root: &Path) -> Result<TodoStore, ApiError> {
     let db_path = crate::state_path::repo_db_path(workspace_root)
