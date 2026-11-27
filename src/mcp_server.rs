@@ -21,6 +21,7 @@ pub struct RunArgs {
     pub allow_sensitive: bool,
     pub graph: bool,
     pub todo_id: Option<String>,
+    pub no_spec_first: bool,
 }
 
 /// Operations behind the MCP tools. Each returns a JSON value that becomes
@@ -85,6 +86,10 @@ fn tool_definitions() -> Value {
                         "description": "Confirm every sensitive gate like dmuxai run --allow-sensitive"
                     },
                     "graph": { "type": "boolean", "description": "Use the graph planner" },
+                    "no_spec_first": {
+                        "type": "boolean",
+                        "description": "Disable spec-first workflow for this run (same as dmuxai run --no-spec-first)"
+                    },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
                 }
             }
@@ -382,6 +387,10 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                     .unwrap_or(false),
                 graph: args.get("graph").and_then(Value::as_bool).unwrap_or(false),
                 todo_id: str_arg(args, "todo_id").map(str::to_owned),
+                no_spec_first: args
+                    .get("no_spec_first")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             if run.todo_id.is_none() && run.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
                 return Err("prompt or todo_id is required".to_owned());
@@ -855,8 +864,18 @@ mod tests {
         assert!(out.contains("\"id\":1"));
     }
 
-    // TC-2509 / FR-2509, FR-2510: model, approve_plan and allow_sensitive are
-    // parsed and forwarded to the backend, for prompt and to-do runs.
+    // TC-3513 / FR-3513: MCP `run` accepts `no_spec_first`.
+    #[test]
+    fn tc_3513_mcp_run_no_spec_first() {
+        let stub = Stub::default();
+        let result = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"x","agent":"agy","no_spec_first":true}}}),
+        );
+        assert_eq!(result["result"]["isError"], false);
+        assert!(stub.runs.lock().unwrap()[0].no_spec_first);
+    }
+
     #[test]
     fn tc_2509_mcp_run_forwards_parity_fields() {
         let stub = Stub::default();
@@ -878,6 +897,7 @@ mod tests {
                     allow_sensitive: true,
                     graph: false,
                     todo_id: None,
+                    no_spec_first: false,
                 }
             );
         }

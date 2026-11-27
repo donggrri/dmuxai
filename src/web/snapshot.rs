@@ -1155,6 +1155,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     GraphNode {
                         id: "step-1".to_string(),
@@ -1169,6 +1170,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "step-2".to_string(),
@@ -1183,6 +1185,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "step-3".to_string(),
@@ -1197,6 +1200,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                 ],
                 edges: vec![GraphEdge {
@@ -1282,6 +1286,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         let run = GraphRun {
             plan: GraphPlan {
@@ -1292,6 +1297,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     make_node("a", "root"),
                     make_node("b", "left"),
@@ -1447,6 +1453,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -1499,6 +1506,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         let initial = PlanChange {
             rev: 1,
@@ -1529,6 +1537,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![make_node("node-a"), make_node("node-b")],
                 edges: Vec::new(),
             },
@@ -1592,6 +1601,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         let applied = PlanChange {
             rev: 2,
@@ -1642,6 +1652,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![make_node("node-a"), make_node("node-b")],
                 edges: Vec::new(),
             },
@@ -1724,6 +1735,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks,
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     GraphNode {
                         id: "s1".to_string(),
@@ -1738,6 +1750,7 @@ mod tests {
                         task: Some("task-1".to_string()),
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "s2".to_string(),
@@ -1752,6 +1765,7 @@ mod tests {
                         task: Some("task-2".to_string()),
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     GraphNode {
                         id: "s3".to_string(),
@@ -1766,6 +1780,7 @@ mod tests {
                         task: Some("task-3".to_string()),
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                 ],
                 edges: Vec::new(),
@@ -1814,6 +1829,7 @@ mod tests {
                     limits: GraphLimits::default(),
                     tasks: Vec::new(),
                     dynamic_cap: None,
+                    workflow: None,
                     nodes: vec![GraphNode {
                         id: node_id.to_string(),
                         role: NodeRole::Implement,
@@ -1827,6 +1843,7 @@ mod tests {
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     }],
                     edges: Vec::new(),
                 },
@@ -1960,6 +1977,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -2116,6 +2134,7 @@ mod tests {
                 limits: GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![GraphNode {
                     id: "n1".to_string(),
                     role: NodeRole::Implement,
@@ -2129,6 +2148,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: Vec::new(),
             },

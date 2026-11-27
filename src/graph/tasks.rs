@@ -481,6 +481,7 @@ mod tests {
             task: Some(task.to_owned()),
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         }
     }
 
@@ -495,6 +496,7 @@ mod tests {
             limits: GraphLimits::default(),
             tasks,
             dynamic_cap: None,
+            workflow: None,
         }
     }
 

@@ -186,6 +186,7 @@ mod tests {
                 limits: Default::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             },
             conversation_id: "conv".to_owned(),
             phase: GraphRunPhase::Active,

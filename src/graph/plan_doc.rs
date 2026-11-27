@@ -13,6 +13,9 @@ use uuid::Uuid;
 use super::judge::{PromptBlocked, json_objects, reject_data};
 use super::planner::sensitive_keyword_match;
 use super::policy::{ORCHESTRATOR_MODEL, default_limits};
+use crate::settings::SpecFirstMode;
+
+use super::spec_first::plan_prompt_for;
 use super::types::{
     GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, NodeRole, PlanTask, TaskSize,
 };
@@ -136,6 +139,8 @@ pub struct PlanPromptRequest<'a> {
     pub runners: &'a [AllowedRunner<'a>],
     pub mode: PlanPromptMode<'a>,
     pub max_steps: usize,
+    pub spec_first: SpecFirstMode,
+    pub spec_dir: &'a str,
 }
 
 /// Runners the App has registered, the allow-list check, each runner's
@@ -173,12 +178,13 @@ pub fn build_plan_prompt(request: &PlanPromptRequest<'_>) -> Result<String, Prom
     }
 
     let max_steps = request.max_steps.max(1);
+    let base_prompt = plan_prompt_for(request.spec_first, request.spec_dir);
     let mut out = String::new();
     if max_steps == 8 {
-        out.push_str(PLAN_PROMPT);
+        out.push_str(&base_prompt);
     } else {
         let cap = format!("Use 1 to {max_steps} tasks and at most {max_steps} steps");
-        out.push_str(&PLAN_PROMPT.replace("Use 1 to 8 tasks and at most 8 steps", &cap));
+        out.push_str(&base_prompt.replace("Use 1 to 8 tasks and at most 8 steps", &cap));
     }
     out.push('\n');
     out.push_str("Verdict reason:\n");
@@ -518,7 +524,7 @@ pub fn validate_plan_with_limit(
         if parse_role(&step.role).is_none() {
             errors.push(PlanError::new(
                 step.id.clone(),
-                "role must be one of research, explore, test, implement, draft, plan, route, review",
+                "role must be one of spec, research, explore, test, implement, draft, plan, route, review",
             ));
         }
         if step.job.trim().is_empty() {
@@ -605,6 +611,7 @@ pub fn validate_plan_with_limit(
             task: step.task.clone(),
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         });
     }
 
@@ -618,6 +625,7 @@ pub fn validate_plan_with_limit(
         limits: default_limits(),
         tasks: doc.tasks.clone(),
         dynamic_cap: None,
+        workflow: None,
     })
 }
 
@@ -1032,11 +1040,13 @@ pub fn one_node_plan_on(prompt: &str, runner: &str, model: &str, cause: &str) ->
                 task: Some(task.id.clone()),
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: default_limits(),
             tasks: vec![task],
             dynamic_cap: None,
+            workflow: None,
         },
         note: format!(
             "Plan fallback ({cause}): one step on {runner} {model}. Edit to ask for a real plan."
@@ -1075,6 +1085,7 @@ pub(crate) fn parse_role(role: &str) -> Option<NodeRole> {
         "plan" => NodeRole::Plan,
         "route" => NodeRole::Route,
         "review" => NodeRole::Review,
+        "spec" => NodeRole::Spec,
         _ => return None,
     })
 }
@@ -1268,11 +1279,13 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: vec![],
             limits: default_limits(),
             tasks: vec![],
             dynamic_cap: None,
+            workflow: None,
         };
         let notes = pin_graph_plan_runners(&mut plan, "agy", "provider default", &|runner| {
             runner == "agy"
@@ -1323,7 +1336,7 @@ mod tests {
                 r#"{"steps":[{"id":"a","role":"ship","job":"one","runner":"cursor","depends_on":[]}]}"#
                     .to_owned(),
                 "a",
-                "role must be one of research, explore, test, implement, draft, plan, route, review"
+                "role must be one of spec, research, explore, test, implement, draft, plan, route, review"
                     .to_owned(),
                 false,
             ),
@@ -1449,6 +1462,8 @@ mod tests {
             runners: &runners,
             max_steps: 8,
             mode: PlanPromptMode::Initial,
+            spec_first: SpecFirstMode::Off,
+            spec_dir: "docs/specs",
         })
         .unwrap();
         assert_eq!(initial.matches(hostile).count(), 1);
@@ -1500,6 +1515,8 @@ DATA-nonce1>>>>
             mode: PlanPromptMode::Repair {
                 errors: &["step a: duplicate id"],
             },
+            spec_first: SpecFirstMode::Off,
+            spec_dir: "docs/specs",
         })
         .unwrap();
         let errors_at = repair.find("Validation errors:\n").unwrap();
@@ -1518,6 +1535,8 @@ DATA-nonce1>>>>
                 previous_plan: r#"{"steps":[]}"#,
                 feedback: "drop the test step",
             },
+            spec_first: SpecFirstMode::Off,
+            spec_dir: "docs/specs",
         })
         .unwrap();
         assert!(edit.contains("Previous plan:\n<<<DATA-nonce1\n{\"steps\":[]}\nDATA-nonce1>>>>"));
@@ -1537,6 +1556,8 @@ DATA-nonce1>>>>
                 previous_plan: r#"{"steps":[]}"#,
                 feedback: &marker,
             },
+            spec_first: SpecFirstMode::Off,
+            spec_dir: "docs/specs",
         });
         assert_eq!(blocked, Err(PromptBlocked));
     }

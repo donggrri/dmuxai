@@ -180,6 +180,62 @@ impl Default for BoardSettings {
     }
 }
 
+/// Spec-first workflow mode (FR-3500).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpecFirstMode {
+    #[default]
+    Full,
+    Lite,
+    Off,
+}
+
+impl SpecFirstMode {
+    pub fn parse_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "lite" => Some(Self::Lite),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Resolved `[workflow]` settings (FR-3500).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowSettings {
+    pub spec_first: SpecFirstMode,
+    pub require_tests: bool,
+    pub spec_dir: String,
+    pub test_command: String,
+    pub test_timeout_secs: u64,
+}
+
+impl Default for WorkflowSettings {
+    fn default() -> Self {
+        Self {
+            spec_first: SpecFirstMode::Full,
+            require_tests: true,
+            spec_dir: "docs/specs".to_owned(),
+            test_command: String::new(),
+            test_timeout_secs: 1800,
+        }
+    }
+}
+
+fn valid_relative_spec_dir(dir: &str) -> bool {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let path = Path::new(trimmed);
+    path.is_relative()
+        && !trimmed.starts_with('/')
+        && !trimmed.starts_with('\\')
+        && !path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
 impl BoardSettings {
     pub fn validate(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -369,6 +425,8 @@ pub struct DmuxSettings {
     pub models_allow_fast: bool,
     /// Trust status of workspace configuration.
     pub workspace_trust: WorkspaceTrustStatus,
+    /// Resolved `[workflow]` settings (SPEC-spec-first-workflow FR-3500).
+    pub workflow: WorkflowSettings,
 }
 
 /// Convenience alias for [`DmuxSettings`].
@@ -420,6 +478,8 @@ struct DmuxToml {
     /// `[terminal]` sessions config (SPEC-terminal-sessions FR-2614, FR-2630).
     /// A restricted key: dropped from a workspace config unless it is trusted.
     terminal: Option<TerminalToml>,
+    /// `[workflow]` spec-first settings (SPEC-spec-first-workflow FR-3500).
+    workflow: Option<WorkflowToml>,
     /// `[models]` (FR-3003): user config only.
     models: Option<ModelsToml>,
 }
@@ -441,6 +501,16 @@ struct RunsToml {
     retention_bytes: Option<u64>,
     max_age_ms: Option<u64>,
     max_total_bytes: Option<u64>,
+}
+
+/// `[workflow]` (SPEC-spec-first-workflow FR-3500).
+#[derive(Debug, Default, Deserialize)]
+struct WorkflowToml {
+    spec_first: Option<toml::Value>,
+    require_tests: Option<toml::Value>,
+    spec_dir: Option<toml::Value>,
+    test_command: Option<toml::Value>,
+    test_timeout_secs: Option<toml::Value>,
 }
 
 /// `[terminal]` (SPEC-terminal-sessions FR-2614, FR-2630).
@@ -1339,6 +1409,9 @@ impl DmuxSettings {
         if let Some(terminal) = parsed.terminal {
             self.merge_terminal(terminal);
         }
+        if let Some(workflow) = parsed.workflow {
+            self.merge_workflow(workflow);
+        }
         if let Some(cursor) = parsed.cursor {
             if let Some(prewarm) = cursor.prewarm {
                 self.cursor_prewarm = prewarm;
@@ -1541,6 +1614,67 @@ impl DmuxSettings {
     /// A workspace's `[terminal]` reaches this only when the workspace is
     /// trusted (the restricted-key strip removes it otherwise); a user-config
     /// `[terminal]` is always applied.
+    fn merge_workflow(&mut self, workflow: WorkflowToml) {
+        if let Some(value) = workflow.spec_first {
+            match value {
+                toml::Value::String(raw) => match SpecFirstMode::parse_config(&raw) {
+                    Some(mode) => self.workflow.spec_first = mode,
+                    None => self.config_warnings.push(format!(
+                        "[workflow] spec_first = \"{raw}\" ignored: expected full, lite, or off"
+                    )),
+                },
+                _ => self
+                    .config_warnings
+                    .push("[workflow] spec_first ignored: expected a string".to_owned()),
+            }
+        }
+        if let Some(value) = workflow.require_tests {
+            match value {
+                toml::Value::Boolean(flag) => self.workflow.require_tests = flag,
+                _ => self
+                    .config_warnings
+                    .push("[workflow] require_tests ignored: expected a boolean".to_owned()),
+            }
+        }
+        if let Some(value) = workflow.spec_dir {
+            match value {
+                toml::Value::String(dir) => {
+                    if valid_relative_spec_dir(&dir) {
+                        self.workflow.spec_dir = dir.trim().replace('\\', "/");
+                    } else {
+                        self.config_warnings.push(format!(
+                            "[workflow] spec_dir = \"{dir}\" ignored: must be a relative path without .."
+                        ));
+                    }
+                }
+                _ => self
+                    .config_warnings
+                    .push("[workflow] spec_dir ignored: expected a string".to_owned()),
+            }
+        }
+        if let Some(value) = workflow.test_command {
+            match value {
+                toml::Value::String(cmd) => self.workflow.test_command = cmd,
+                _ => self
+                    .config_warnings
+                    .push("[workflow] test_command ignored: expected a string".to_owned()),
+            }
+        }
+        if let Some(value) = workflow.test_timeout_secs {
+            match value {
+                toml::Value::Integer(secs) if secs > 0 => {
+                    self.workflow.test_timeout_secs = secs as u64;
+                }
+                toml::Value::Integer(_) => self
+                    .config_warnings
+                    .push("[workflow] test_timeout_secs ignored: must be positive".to_owned()),
+                _ => self
+                    .config_warnings
+                    .push("[workflow] test_timeout_secs ignored: expected an integer".to_owned()),
+            }
+        }
+    }
+
     fn merge_terminal(&mut self, terminal: TerminalToml) {
         if let Some(policy) = terminal.policy {
             if let Some(allow) = policy.allow {
@@ -1816,6 +1950,14 @@ fn restricted_workspace_keys_with_user(
         keys.push("terminal".to_owned());
     }
     if parsed
+        .workflow
+        .as_ref()
+        .and_then(|w| w.test_command.as_ref())
+        .is_some()
+    {
+        keys.push("workflow.test_command".to_owned());
+    }
+    if parsed
         .fanout
         .as_ref()
         .and_then(|fanout| fanout.company_workspace)
@@ -1974,6 +2116,9 @@ fn strip_restricted_workspace_keys_with_user(
     }
     parsed.jira = None;
     parsed.terminal = None;
+    if let Some(workflow) = &mut parsed.workflow {
+        workflow.test_command = None;
+    }
     if let Some(fanout) = &mut parsed.fanout {
         fanout.company_workspace = None;
     }
@@ -2271,6 +2416,20 @@ pub fn inspect_workspace_trust_full(
     (true, content_hash(contents.as_bytes()), keys, details)
 }
 
+/// Append to a workspace or user test `dmuxai.toml` so headless runs keep the legacy single-step path.
+pub const WORKFLOW_SPEC_FIRST_OFF_TOML: &str = "[workflow]\nspec_first = \"off\"\n";
+
+impl DmuxSettings {
+    /// Test harness defaults (not for production): [`Default`] with `spec_first` off.
+    /// tc_35xx tests enable Full/Lite explicitly.
+    #[doc(hidden)]
+    pub fn for_unit_tests() -> Self {
+        let mut settings = Self::default();
+        settings.workflow.spec_first = SpecFirstMode::Off;
+        settings
+    }
+}
+
 impl Default for DmuxSettings {
     fn default() -> Self {
         Self {
@@ -2323,6 +2482,7 @@ impl Default for DmuxSettings {
             terminal_serial_usbipd_attach: None,
             models_allow_fast: false,
             workspace_trust: WorkspaceTrustStatus::NoWorkspaceConfig,
+            workflow: WorkflowSettings::default(),
         }
     }
 }
@@ -7372,6 +7532,7 @@ fallback = ["agy:composer-2.5"]
                 edges: Vec::new(),
                 limits: Default::default(),
                 dynamic_cap: None,
+                workflow: None,
                 tasks: Vec::new(),
             },
             conversation_id: "c".to_owned(),
@@ -7391,6 +7552,7 @@ fallback = ["agy:composer-2.5"]
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         });
         run.normalize_legacy_runners();
         assert_eq!(run.plan.nodes[0].runner, crate::runner_id::CURSOR_RUNNER_ID);
@@ -7539,5 +7701,94 @@ model = \"gemini-4-hydrogen-high\"
             let mode_after = std::fs::metadata(&user_cfg).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode_after, 0o640);
         }
+    }
+
+    #[test]
+    fn tc_3500_workflow_defaults() {
+        let s = DmuxSettings::default();
+        assert_eq!(s.workflow.spec_first, SpecFirstMode::Full);
+        assert!(s.workflow.require_tests);
+        assert_eq!(s.workflow.spec_dir, "docs/specs");
+        assert!(s.workflow.test_command.is_empty());
+        assert_eq!(s.workflow.test_timeout_secs, 1800);
+    }
+
+    #[test]
+    fn tc_3500_workflow_parse_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[workflow]
+spec_first = "lite"
+require_tests = false
+spec_dir = "specs"
+test_timeout_secs = 60
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&ws, None);
+        assert_eq!(settings.workflow.spec_first, SpecFirstMode::Lite);
+        assert!(!settings.workflow.require_tests);
+        assert_eq!(settings.workflow.spec_dir, "specs");
+        assert_eq!(settings.workflow.test_timeout_secs, 60);
+    }
+
+    #[test]
+    fn tc_3500_workflow_invalid_values_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"
+[workflow]
+spec_first = "bogus"
+spec_dir = "/abs"
+require_tests = "no"
+"#,
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&ws, None);
+        assert_eq!(settings.workflow.spec_first, SpecFirstMode::Full);
+        assert!(settings.workflow.require_tests);
+        assert_eq!(settings.workflow.spec_dir, "docs/specs");
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("spec_first"))
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("spec_dir"))
+        );
+    }
+
+    #[test]
+    fn tc_3500_workflow_test_command_restricted() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[workflow]\ntest_command = \"rm -rf /\"\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&ws, None);
+        assert!(settings.workflow.test_command.is_empty());
+        assert!(
+            matches!(
+                settings.workspace_trust,
+                WorkspaceTrustStatus::Untrusted { .. }
+            ) || settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("test_command") || w.contains("not trusted"))
+        );
     }
 }

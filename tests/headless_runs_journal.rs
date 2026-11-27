@@ -33,6 +33,11 @@ impl Sandbox {
         fs::create_dir_all(&cfg_home).unwrap();
         fs::create_dir_all(&home).unwrap();
 
+        let config = format!(
+            "{}{}",
+            dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
+            config
+        );
         fs::write(workspace.join("dmuxai.toml"), config).unwrap();
 
         Self {

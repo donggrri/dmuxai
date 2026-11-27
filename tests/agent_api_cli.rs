@@ -18,6 +18,11 @@ struct Sandbox {
 impl Sandbox {
     fn new(config: &str) -> Self {
         let sandbox = Self::bare();
+        let config = format!(
+            "{}{}",
+            dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
+            config
+        );
         std::fs::write(sandbox.workspace.join("dmuxai.toml"), config).unwrap();
         sandbox
     }
@@ -787,6 +792,11 @@ fn tc_2450_opencode_run_uses_the_workspace_cwd_and_pwd() {
     let sandbox = Sandbox::bare();
     let target = sandbox.root.join("target-ws");
     std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("dmuxai.toml"),
+        dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
+    )
+    .unwrap();
     let target_arg = target.to_str().unwrap();
     let target_canonical = std::fs::canonicalize(&target).unwrap();
     let expected = target_canonical.display().to_string();
@@ -988,26 +998,33 @@ fn tc_813_init_writes_starter_config() {
 #[cfg(unix)]
 #[test]
 fn tc_1675_config_flag_and_env_select_config_file() {
+    let off = dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let flag_cfg = root.join("flag.toml");
     let env_cfg = root.join("env.toml");
     std::fs::write(
         &flag_cfg,
-        r#"[[agents.custom]]
+        format!(
+            r#"{off}[[agents.custom]]
 name = "fakeflag"
 command = ["sh", "-c", "cat >/dev/null; echo ok"]
 prompt_via = "stdin"
 "#,
+            off = off
+        ),
     )
     .unwrap();
     std::fs::write(
         &env_cfg,
-        r#"[[agents.custom]]
+        format!(
+            r#"{off}[[agents.custom]]
 name = "fakeenv"
 command = ["sh", "-c", "cat >/dev/null; echo ok"]
 prompt_via = "stdin"
 "#,
+            off = off
+        ),
     )
     .unwrap();
 
@@ -1123,15 +1140,19 @@ fn tc_1676_missing_config_file_exits_2() {
 #[cfg(unix)]
 #[test]
 fn tc_1677_child_env_policy_snapshot() {
+    let off = dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let cfg = root.join("env.toml");
     std::fs::write(
         &cfg,
-        r#"[[agents.custom]]
+        format!(
+            r#"{off}[[agents.custom]]
 name = "envprobe"
 command = ["sh", "-c", "env"]
 "#,
+            off = off
+        ),
     )
     .unwrap();
     let xdg = root.join("xdg");

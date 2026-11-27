@@ -290,6 +290,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             },
             conversation_id: "c".to_owned(),
             phase: dmuxai::graph::GraphRunPhase::Active,

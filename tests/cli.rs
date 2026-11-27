@@ -258,6 +258,11 @@ mod plan_gate {
             for sub in ["ws", "state", "cfg", "home"] {
                 std::fs::create_dir_all(root.join(sub)).unwrap();
             }
+            let config = format!(
+                "{}{}",
+                dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
+                config
+            );
             std::fs::write(workspace.join("dmuxai.toml"), config).unwrap();
             Self {
                 _dir: dir,

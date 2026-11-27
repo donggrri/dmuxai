@@ -17,6 +17,7 @@ pub enum NodeRole {
     Plan,
     Route,
     Review,
+    Spec,
 }
 
 impl fmt::Display for NodeRole {
@@ -31,6 +32,7 @@ impl fmt::Display for NodeRole {
             Self::Plan => "plan",
             Self::Route => "route",
             Self::Review => "review",
+            Self::Spec => "spec",
         };
         formatter.write_str(label)
     }
@@ -54,6 +56,8 @@ pub struct GraphNode {
     pub started_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_gate: Option<super::spec_first::TestGate>,
 }
 
 /// FR-963: one planned task (one runner turn or less).
@@ -131,6 +135,15 @@ fn default_max_nodes() -> usize {
     12
 }
 
+/// Captured workflow settings for spec-first gates on a run (FR-3508..FR-3510).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    pub spec_dir: String,
+    pub test_command: String,
+    pub require_tests: bool,
+    pub lite: bool,
+}
+
 impl Default for GraphLimits {
     fn default() -> Self {
         Self {
@@ -158,6 +171,8 @@ pub struct GraphPlan {
     /// Dynamic node addition cap (SPEC-graph-dynamic-nodes FR-2942).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_cap: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +536,20 @@ mod tests {
         assert!(json.contains("\"finished_at_ms\":1700000120000"));
         let roundtrip: GraphNode = serde_json::from_str(&json).expect("roundtrip timed");
         assert_eq!(roundtrip, timed);
+    }
+
+    #[test]
+    fn tc_3501_spec_role_roundtrip() {
+        use crate::graph::plan_doc::parse_role;
+        use crate::graph::policy::{NodeTurnPolicy, model_for_role, node_turn_policy};
+        use crate::stage_skills::KNOWN_STAGES;
+
+        let role = parse_role("spec").expect("spec parses");
+        assert_eq!(role, NodeRole::Spec);
+        assert_eq!(role.to_string(), "spec");
+        assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::Write));
+        assert_eq!(model_for_role(role), crate::graph::policy::IMPLEMENT_MODEL);
+        assert!(KNOWN_STAGES.contains(&"spec"));
     }
 
     #[test]

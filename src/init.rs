@@ -26,6 +26,13 @@ const STARTER_CONFIG: &str = r##"# DmuxAI configuration (dmuxai.toml). Everythin
 # Runner used when no runner is named explicitly.
 # default_agent = "cursor-agent"
 
+# [workflow]
+# spec_first = "full"   # full | lite | off
+# require_tests = true
+# spec_dir = "docs/specs"
+# test_command = ""
+# test_timeout_secs = 1800
+
 # [graph]
 # Graph orchestration splits multi-step prompts across runners (always on).
 # max_parallel = 2

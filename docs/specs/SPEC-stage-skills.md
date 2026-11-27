@@ -55,7 +55,7 @@ Per-task override: `/plan --skills grill-me,-implement:tdd,review:local-review <
 
 | ID | Requirement |
 |---|---|
-| FR-1500 | `[stages.<stage>] skills = [..]` is accepted for `judge`, `planner` and every `NodeRole` name. An unknown stage name is a startup config problem, not a crash. |
+| FR-1500 | `[stages.<stage>] skills = [..]` is accepted for `judge`, `planner` and every `NodeRole` name. An unknown stage name is a startup config problem, not a crash. The `spec` role (SPEC-spec-first-workflow FR-3501) is a stage too. |
 | FR-1501 | A skill reference resolves in this order: an explicit `[skills.sources]` entry, then a workspace path (`./...`), then discovered dirs `.agents/skills`, `.claude/skills`, `.cursor/skills`, `.grok/skills`, then the user-level dirs `~/.agents/skills` and `~/.claude/skills`. The first match wins, and the resolved path is shown. |
 | FR-1502 | A git source needs `rev` as a full 40-character commit SHA. dmuxai never downloads an unpinned or branch-only source. A fetch is only the explicit `dmuxai skills sync` (or `/skills sync`) command, never automatic at run time; it checks out exactly that commit under `.dmuxai/skills-cache/<name>-<sha>` and verifies `HEAD`. **Every pinned commit also needs a one-time approval** (`/skills approve <source>`, stored in `.dmuxai/skill-approvals.json`); when the pin changes, the skill is blocked until approved again. |
 | FR-1503 | Delivery `auto` uses `inject` for every runner. `native` is opt-in per runner (FR-1504). This keeps behaviour identical across Cursor, agy, Grok, opencode and codex. |

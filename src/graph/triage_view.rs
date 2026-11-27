@@ -576,6 +576,7 @@ mod tests {
             limits: GraphLimits::default(),
             tasks,
             dynamic_cap: None,
+            workflow: None,
         };
         if !plan.tasks.is_empty() {
             plan.nodes.push(GraphNode {
@@ -591,6 +592,7 @@ mod tests {
                 task: Some("task-1".to_owned()),
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             });
         }
         GraphRun {

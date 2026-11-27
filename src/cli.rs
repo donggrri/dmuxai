@@ -302,6 +302,7 @@ pub struct RunOptions {
     pub judge: Option<String>,
     pub write: bool,
     pub keep_worktrees: bool,
+    pub no_spec_first: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
@@ -422,6 +423,7 @@ Options:
   --min-ok N               Minimum successful legs required (default 1; fan-out only)
   --model M                Model id for the runner
   --approve-plan           Approve a pending plan and confirm sensitive gates
+  --no-spec-first          Disable spec-first workflow for this run only
   --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
   --allow-sensitive        Confirm every sensitive gate
   --graph                  Use the graph planner
@@ -445,6 +447,7 @@ Options for `todo run`:
   --agent ID               Runner id (cannot be used with --graph)
   --model M                Model id for the runner
   --approve-plan           Approve a pending plan and confirm sensitive gates
+  --no-spec-first          Disable spec-first workflow for this run only
   --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
   --allow-sensitive        Confirm every sensitive gate
   --graph                  Use the graph planner
@@ -971,6 +974,11 @@ pub const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--no-spec-first"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
         names: &["--approve-plan-id"],
         takes_value: true,
         hidden: false,
@@ -1026,6 +1034,11 @@ pub const TODO_RUN_FLAGS: &[FlagSpec] = &[
     },
     FlagSpec {
         names: &["--approve-plan"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--no-spec-first"],
         takes_value: false,
         hidden: false,
     },
@@ -1270,6 +1283,7 @@ fn parse_run_options_with_flags(
         judge: parsed.flags.get("--judge").cloned().flatten(),
         write: parsed.flags.contains_key("--write"),
         keep_worktrees: parsed.flags.contains_key("--keep-worktrees"),
+        no_spec_first: parsed.flags.contains_key("--no-spec-first"),
     };
     if options.write && options.agents.is_none() {
         return Err("--write requires --agents".to_owned());
@@ -5454,6 +5468,7 @@ async fn run_headless(
         allow_sensitive: options.allow_sensitive,
         todo_id,
         model: options.model.clone(),
+        no_spec_first: options.no_spec_first,
     };
     let mut outcome = app.run_headless(request, cancel).await;
     app.shutdown().await;
@@ -5542,6 +5557,9 @@ fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
     }
     if args.graph {
         argv.push("--graph".into());
+    }
+    if args.no_spec_first {
+        argv.push("--no-spec-first".into());
     }
     argv.push("--json".into());
     if args.todo_id.is_none() {
@@ -6486,7 +6504,26 @@ mod tests {
         );
     }
 
-    // TC-1769: table-driven parser handles run flags and --progress.
+    // TC-3513 / FR-3513: `--no-spec-first` is parsed for run and todo run.
+    #[test]
+    fn tc_3513_no_spec_first_flag_parsed() {
+        match parse(&args(&[
+            "run",
+            "--agent",
+            "codex",
+            "--no-spec-first",
+            "ship",
+        ])) {
+            Ok(AgentCommand::Run(run)) => assert!(run.no_spec_first),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&args(&["todo", "run", "t1", "--no-spec-first"])) {
+            Ok(AgentCommand::TodoRun { run, .. }) => assert!(run.no_spec_first),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(RUN_USAGE.contains("--no-spec-first"));
+    }
+
     #[test]
     fn tc_1769_flag_table_parses_run_flags_and_progress() {
         assert_eq!(
@@ -6549,6 +6586,7 @@ mod tests {
             allow_sensitive: true,
             graph: false,
             todo_id: None,
+            no_spec_first: false,
         };
         assert_eq!(
             mcp_run_argv(&args),
@@ -6575,6 +6613,7 @@ mod tests {
             allow_sensitive: true,
             graph: false,
             todo_id: Some("t1".into()),
+            no_spec_first: false,
         };
         assert_eq!(
             mcp_run_argv(&todo),
@@ -7184,6 +7223,7 @@ mod tests {
                     allow_sensitive: false,
                     todo_id: None,
                     model: None,
+                    no_spec_first: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )

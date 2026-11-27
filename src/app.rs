@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io, mem,
     ops::Range,
     path::{Path, PathBuf},
@@ -60,21 +60,22 @@ use dmuxai::{
         NodeAssignment, NodeRole, NodeTurnPolicy, OverrideKind, PanelLineKind, PlanChange,
         PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest,
         PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo, PlannerIoKind,
-        QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
-        apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
-        build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
-        cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
-        graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
-        judge_line_text, judging_line_text, next_plan_change_rev, node_turn_policy,
-        parse_add_nodes_marker, parse_plan, parse_replan, parse_replan_marker, parse_verdict,
-        pin_graph_plan_runners, plan_json_for_edit, replan_allowed, replan_revision_steps,
-        revision_needs_approval, save_run, strip_add_nodes_marker, strip_replan_marker,
-        task_counter_text, validate_add_nodes, validate_plan_with_limit,
-        write_tasks_file_if_enabled,
+        QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, SpecGateResult, TaskEdit, Triage,
+        TriageSource, WorkflowSnapshot, apply_replan, apply_spec_first,
+        approval_panel_lines_with_skills, budget_allows, build_judge_prompt, build_plan_prompt,
+        build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
+        check_marker_gate, check_spec_gate, diff_plan_steps, diff_plan_tasks, ensure_spec_dir,
+        fallback_plan, graph_plan_from_revision_steps, heuristic_route, is_question_prompt,
+        is_trivial_prompt, judge_line_text, judging_line_text, lite_directive,
+        next_plan_change_rev, node_turn_policy, parse_add_nodes_marker, parse_plan, parse_replan,
+        parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
+        replan_allowed, replan_revision_steps, revision_needs_approval, run_test_command, save_run,
+        spec_snapshot, strip_add_nodes_marker, strip_replan_marker, task_counter_text,
+        three_step_plan, validate_add_nodes, validate_plan_with_limit, write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
     mcp::registry::McpRegistry,
-    settings::DmuxSettings,
+    settings::{DmuxSettings, SpecFirstMode},
     skills::{discover_skills, skill_prompt_prefix},
     stage_skills::{self, SkillContext, SkillOverride},
     theme::{Speaker, Theme},
@@ -1074,6 +1075,7 @@ pub struct HeadlessRequest {
     pub allow_sensitive: bool,
     pub todo_id: Option<String>,
     pub model: Option<String>,
+    pub no_spec_first: bool,
 }
 
 /// FR-2545: persisted plan document for `--approve-plan-id`.
@@ -1611,6 +1613,10 @@ pub struct App {
     /// FR-3400: true while `run_headless` executes a read-only turn (`--read-only` /
     /// `mode = ask|plan`) so no path gates or upgrades any step to write tools.
     headless_read_only: bool,
+    /// FR-3513: headless `--no-spec-first` disables spec-first for one run.
+    headless_no_spec_first: bool,
+    /// FR-3508: git status snapshot before spec (or lite implement) steps.
+    graph_node_spec_snapshot: HashMap<String, Option<BTreeMap<String, String>>>,
     /// Graph ID of the last graph session started or finished during a headless run.
     headless_last_graph_id: Option<String>,
     /// Test-only escape hatch: legacy app tests assume a direct send, so they
@@ -2082,6 +2088,8 @@ impl App {
             headless_plan_only_approval: false,
             headless_plan_only_reply: false,
             headless_read_only: false,
+            headless_no_spec_first: false,
+            graph_node_spec_snapshot: HashMap::new(),
             headless_last_graph_id: None,
             skip_judge_for_tests: false,
             last_group_expanded: false,
@@ -6790,6 +6798,7 @@ impl App {
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             };
             let mut run = self.build_graph_run(
                 plan,
@@ -8378,6 +8387,7 @@ impl App {
             )
         })?;
         graph_plan.dynamic_cap = run_dynamic_cap;
+        let _inserted = self.apply_spec_first_invariants(&mut graph_plan);
         Self::attach_orchestrate_node(&mut graph_plan, &triage, orchestrate_started, plan_fixed);
         let decided_at = unix_ms_now();
         let (plan_id, rev, save_error) = {
@@ -8569,6 +8579,7 @@ impl App {
                 task: None,
                 started_at_ms: Some(started_ms),
                 finished_at_ms: Some(finished_ms),
+                test_gate: None,
             },
         );
     }
@@ -8746,6 +8757,163 @@ impl App {
         })
     }
 
+    fn spec_first_mode(&self) -> SpecFirstMode {
+        if self.headless_no_spec_first || self.headless_read_only {
+            return SpecFirstMode::Off;
+        }
+        if self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
+            return SpecFirstMode::Off;
+        }
+        self.settings.workflow.spec_first
+    }
+
+    /// FR-3507: write runs that keep the legacy single-step behavior.
+    fn spec_first_exempt(&self, prompt: &str, source: TriageSource, reason: &str) -> bool {
+        if self.spec_first_mode() == SpecFirstMode::Off {
+            return true;
+        }
+        if self.headless_read_only || self.pending_turn_policy == Some(TurnPolicy::ReadOnly) {
+            return true;
+        }
+        if self.in_fanout_run && !self.fanout_write_mode {
+            return true;
+        }
+        if is_question_prompt(prompt) {
+            return true;
+        }
+        source == TriageSource::Heuristic && reason == "short prompt" && is_trivial_prompt(prompt)
+    }
+
+    fn attach_workflow_snapshot(&self, plan: &mut GraphPlan, lite: bool) {
+        if self.spec_first_mode() == SpecFirstMode::Off {
+            plan.workflow = None;
+            return;
+        }
+        let wf = &self.settings.workflow;
+        plan.workflow = Some(WorkflowSnapshot {
+            spec_dir: wf.spec_dir.clone(),
+            test_command: wf.test_command.clone(),
+            require_tests: wf.require_tests,
+            lite,
+        });
+    }
+
+    fn apply_spec_first_invariants(&self, plan: &mut GraphPlan) -> Vec<String> {
+        if self.spec_first_mode() == SpecFirstMode::Off {
+            return Vec::new();
+        }
+        let inserted = apply_spec_first(plan, &self.settings.workflow);
+        let lite = self.spec_first_mode() == SpecFirstMode::Lite;
+        self.attach_workflow_snapshot(plan, lite);
+        inserted
+    }
+
+    fn steps_from_graph_plan(plan: &GraphPlan) -> Vec<PlanStep> {
+        let mut incoming: HashMap<&str, Vec<String>> = HashMap::new();
+        for edge in &plan.edges {
+            incoming
+                .entry(edge.to.as_str())
+                .or_default()
+                .push(edge.from.clone());
+        }
+        plan.nodes
+            .iter()
+            .filter(|node| node.role != NodeRole::Orchestrate)
+            .map(|node| PlanStep {
+                id: node.id.clone(),
+                role: node.role.to_string(),
+                job: node.job.clone(),
+                runner: node.runner.clone(),
+                model: Some(node.model_id.clone()),
+                depends_on: incoming.get(node.id.as_str()).cloned().unwrap_or_default(),
+                sensitive: Some(node.requires_gate),
+                task: node.task.clone(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn apply_spec_first_node_gates(
+        &mut self,
+        node_id: &str,
+        role: NodeRole,
+        success: bool,
+        output_text: &str,
+    ) -> (bool, Option<String>) {
+        if !success {
+            return (false, None);
+        }
+        let snap = self
+            .graph_session
+            .as_ref()
+            .and_then(|session| session.run().plan.workflow.clone());
+        let Some(snap) = snap else {
+            return (true, None);
+        };
+        let lite_write = snap.lite && matches!(role, NodeRole::Implement | NodeRole::Draft);
+        if role == NodeRole::Spec || lite_write {
+            let before = self
+                .graph_node_spec_snapshot
+                .get(node_id)
+                .and_then(|entry| entry.clone());
+            let spec_dir = snap.spec_dir.clone();
+            let lite = snap.lite;
+            match check_spec_gate(before.as_ref(), &self.workspace_root, &spec_dir, lite) {
+                SpecGateResult::Ok => {}
+                SpecGateResult::Skipped(note) => self.push_system(note.to_owned()),
+                SpecGateResult::Failed(message) => return (false, Some(message)),
+            }
+        }
+        let run_test = role == NodeRole::Test || lite_write;
+        if !run_test {
+            return (true, None);
+        }
+        let timeout = Duration::from_secs(self.settings.workflow.test_timeout_secs.max(1));
+        let test_cmd = snap.test_command.clone();
+        let require_tests = snap.require_tests;
+        let gate_result = if !test_cmd.trim().is_empty() {
+            self.push_system(format!("test gate: running {test_cmd}"));
+            let (gate, result) = run_test_command(&self.workspace_root, test_cmd.trim(), timeout);
+            if let Some(session) = self.graph_session.as_mut() {
+                if let Some(node) = session
+                    .run_mut()
+                    .plan
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.id == node_id)
+                {
+                    node.test_gate = Some(gate);
+                }
+                let _ = save_run(&self.workspace_root, session.run());
+            }
+            result
+        } else {
+            match check_marker_gate(output_text, require_tests) {
+                Ok(Some(gate)) => {
+                    if let Some(session) = self.graph_session.as_mut() {
+                        if let Some(node) = session
+                            .run_mut()
+                            .plan
+                            .nodes
+                            .iter_mut()
+                            .find(|n| n.id == node_id)
+                        {
+                            node.test_gate = Some(gate);
+                        }
+                        let _ = save_run(&self.workspace_root, session.run());
+                    }
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(message) => Err(message),
+            }
+        };
+        match gate_result {
+            Ok(()) => (true, None),
+            Err(message) => (false, Some(message)),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_one_node_run(
         &self,
@@ -8774,6 +8942,26 @@ impl App {
             Err(error) => return Err(error),
         };
         let mut plan = built.plan;
+        if !self.spec_first_exempt(prompt, source, &reason) {
+            match self.spec_first_mode() {
+                SpecFirstMode::Full => {
+                    plan = three_step_plan(plan);
+                    self.attach_workflow_snapshot(&mut plan, false);
+                }
+                SpecFirstMode::Lite => {
+                    if let Some(node) = plan
+                        .nodes
+                        .iter_mut()
+                        .find(|n| matches!(n.role, NodeRole::Implement | NodeRole::Draft))
+                    {
+                        let wf = &self.settings.workflow;
+                        node.job = format!("{}{}", lite_directive(&wf.spec_dir, wf), node.job);
+                    }
+                    self.attach_workflow_snapshot(&mut plan, true);
+                }
+                SpecFirstMode::Off => {}
+            }
+        }
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
         let mut limits = self.graph_limits();
@@ -8955,24 +9143,27 @@ impl App {
         let run_id_for_io = run_id.clone();
         let mut plan = built.plan;
         self.apply_runner_pin_to_plan(&mut plan);
+        let inserted = self.apply_spec_first_invariants(&mut plan);
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
         plan.limits = self.graph_limits();
         if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
             plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
         }
-        let step = PlanStep {
-            id: "step-1".to_owned(),
-            role: "implement".to_owned(),
-            job: prompt.clone(),
-            runner: runner.clone(),
-            model: Some(model.clone()),
-            depends_on: Vec::new(),
-            sensitive: Some(requires_gate),
-            // The revision is re-validated against `plan.tasks` on approve
-            // (FR-963), so the step must keep the implicit task reference.
-            task: plan.nodes.first().and_then(|node| node.task.clone()),
-            ..Default::default()
+        let steps = if inserted.is_empty() {
+            vec![PlanStep {
+                id: "step-1".to_owned(),
+                role: "implement".to_owned(),
+                job: prompt.clone(),
+                runner: runner.clone(),
+                model: Some(model.clone()),
+                depends_on: Vec::new(),
+                sensitive: Some(requires_gate),
+                task: plan.nodes.first().and_then(|node| node.task.clone()),
+                ..Default::default()
+            }]
+        } else {
+            Self::steps_from_graph_plan(&plan)
         };
         let revision_error_lines = revision_errors.unwrap_or_else(|| vec![built.note.clone()]);
         let approval = Approval {
@@ -8980,8 +9171,8 @@ impl App {
             revisions: vec![PlanRevision {
                 n: 1,
                 source: "fallback".to_owned(),
-                steps: vec![step],
-                added: Vec::new(),
+                steps,
+                added: inserted,
                 changed: Vec::new(),
                 feedback: None,
                 errors: Some(revision_error_lines),
@@ -9131,6 +9322,8 @@ impl App {
                 runners: &allowed_refs,
                 max_steps,
                 mode: PlanPromptMode::Repair { errors: &errors },
+                spec_first: self.spec_first_mode(),
+                spec_dir: self.settings.workflow.spec_dir.as_str(),
             })
         } else if let Some((previous, feedback)) = edit.as_ref() {
             build_plan_prompt(&PlanPromptRequest {
@@ -9143,6 +9336,8 @@ impl App {
                     previous_plan: previous,
                     feedback,
                 },
+                spec_first: self.spec_first_mode(),
+                spec_dir: self.settings.workflow.spec_dir.as_str(),
             })
         } else if attempt == 0 {
             build_plan_prompt(&PlanPromptRequest {
@@ -9152,6 +9347,8 @@ impl App {
                 runners: &allowed_refs,
                 max_steps,
                 mode: PlanPromptMode::Initial,
+                spec_first: self.spec_first_mode(),
+                spec_dir: self.settings.workflow.spec_dir.as_str(),
             })
         } else {
             let errors: Vec<&str> = repair_errors.iter().map(String::as_str).collect();
@@ -9162,6 +9359,8 @@ impl App {
                 runners: &allowed_refs,
                 max_steps,
                 mode: PlanPromptMode::Repair { errors: &errors },
+                spec_first: self.spec_first_mode(),
+                spec_dir: self.settings.workflow.spec_dir.as_str(),
             })
         } {
             Ok(plan_prompt) => {
@@ -9246,6 +9445,7 @@ impl App {
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             };
             let mut planning_run = self.build_graph_run(
                 planning_plan,
@@ -9465,6 +9665,12 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
+        let inserted = self.apply_spec_first_invariants(&mut graph_plan);
+        let (revision_steps, added) = if inserted.is_empty() {
+            (Self::revision_steps_from_doc(doc), Vec::new())
+        } else {
+            (Self::steps_from_graph_plan(&graph_plan), inserted)
+        };
         self.apply_runner_pin_to_plan(&mut graph_plan);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
@@ -9480,8 +9686,8 @@ impl App {
             revisions: vec![PlanRevision {
                 n: 1,
                 source: "agent".to_owned(),
-                steps: Self::revision_steps_from_doc(doc),
-                added: Vec::new(),
+                steps: revision_steps,
+                added,
                 changed: Vec::new(),
                 feedback: None,
                 errors: None,
@@ -9538,6 +9744,7 @@ impl App {
         doc: &PlanDoc,
         mut graph_plan: GraphPlan,
     ) {
+        let inserted = self.apply_spec_first_invariants(&mut graph_plan);
         self.apply_runner_pin_to_plan(&mut graph_plan);
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
@@ -9548,7 +9755,12 @@ impl App {
             graph_plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
         }
         let feedback = pending.edit_feedback.clone();
-        let steps = Self::revision_steps_from_doc(doc);
+        let mut steps = Self::revision_steps_from_doc(doc);
+        let mut inserted_added = Vec::new();
+        if !inserted.is_empty() {
+            steps = Self::steps_from_graph_plan(&graph_plan);
+            inserted_added = inserted;
+        }
         let Some(run) = self
             .last_graph_run
             .as_mut()
@@ -9572,12 +9784,17 @@ impl App {
                 .last()
                 .map(|rev| rev.steps.clone())
                 .unwrap_or_default();
-            let (added, changed, removed) = diff_plan_steps(&prev_steps, &steps);
+            let (mut added, changed, removed) = diff_plan_steps(&prev_steps, &steps);
+            for id in inserted_added {
+                if !added.contains(&id) {
+                    added.push(id);
+                }
+            }
             approval.revisions.push(PlanRevision {
                 n: next_n,
                 source: "edit".to_owned(),
                 steps,
-                added: Vec::new(),
+                added: added.clone(),
                 changed: Vec::new(),
                 feedback,
                 errors: None,
@@ -10209,7 +10426,16 @@ impl App {
         let summaries = self.replan_summaries.clone();
         let nonce = Uuid::new_v4().simple().to_string();
         let prompt = match self.with_plan_context(&user_prompt, |ctx| {
-            build_replan_prompt(&run, trigger, &reason, &summaries, ctx, &nonce)
+            build_replan_prompt(
+                &run,
+                trigger,
+                &reason,
+                &summaries,
+                ctx,
+                &nonce,
+                self.spec_first_mode(),
+                self.settings.workflow.spec_dir.as_str(),
+            )
         }) {
             Ok(prompt) => prompt,
             Err(_) => {
@@ -11168,6 +11394,7 @@ impl App {
                                         node.requires_gate = false;
                                     }
                                 }
+                                let _inserted = self.apply_spec_first_invariants(&mut plan);
                                 let old = run.plan;
                                 if revision_needs_approval(&old, &plan, &change) {
                                     self.finish_replan_needs_approval(pending, plan, change);
@@ -11364,7 +11591,7 @@ impl App {
         agent: Agent,
         conversation_id: &str,
         node_id: String,
-        success: bool,
+        mut success: bool,
         output_text: &str,
         error: Option<&str>,
     ) {
@@ -11426,6 +11653,17 @@ impl App {
                 None
             };
 
+        let node_role = run_for_policy
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == node_id)
+            .map(|n| n.role);
+        if success && let Some(role) = node_role {
+            let (gated_ok, _gate_err) =
+                self.apply_spec_first_node_gates(&node_id, role, success, output_text);
+            success = gated_ok;
+        }
         let (actions, run_snapshot) = if session_is_target {
             if let Some(marker_res) = dynamic_marker {
                 self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
@@ -11519,7 +11757,6 @@ impl App {
                 }
             }
         }
-        let error = policy_error.as_deref().or(error);
         let mut display_text = output_text.to_owned();
         let mut marker_reason = None;
         if let Some(reason) = parse_replan_marker(output_text) {
@@ -11544,6 +11781,24 @@ impl App {
         if let Some(marker_res) = dynamic_marker {
             self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
         }
+        let node_role = self.graph_session.as_ref().and_then(|session| {
+            session
+                .run()
+                .plan
+                .nodes
+                .iter()
+                .find(|n| n.id == node_id)
+                .map(|n| n.role)
+        });
+        if success && let Some(role) = node_role {
+            let (gated_ok, gate_err) =
+                self.apply_spec_first_node_gates(&node_id, role, success, output_text);
+            success = gated_ok;
+            if let Some(err) = gate_err {
+                policy_error = Some(err);
+            }
+        }
+        let error = policy_error.as_deref().or(error);
         let (actions, failed_message, run_snapshot) = {
             let Some(session) = self.graph_session.as_mut() else {
                 return;
@@ -11721,28 +11976,44 @@ impl App {
         }
 
         let added_ids: Vec<String> = validated_nodes.iter().map(|n| n.id.clone()).collect();
+        {
+            let Some(session) = self.graph_session.as_mut() else {
+                return;
+            };
+            let run = session.run_mut();
+            for spec in &new_nodes {
+                for dep in &spec.depends_on {
+                    let edge = GraphEdge {
+                        from: dep.clone(),
+                        to: spec.id.clone(),
+                    };
+                    if !run
+                        .plan
+                        .edges
+                        .iter()
+                        .any(|existing| existing.from == edge.from && existing.to == edge.to)
+                    {
+                        run.plan.edges.push(edge);
+                    }
+                }
+            }
+            run.plan.nodes.extend(validated_nodes);
+            run.dynamic_added = Some(dynamic_added + added_ids.len());
+        }
+        let mut plan = self
+            .graph_session
+            .as_ref()
+            .map(|session| session.run().plan.clone());
+        if let Some(plan) = plan.as_mut() {
+            let _inserted = self.apply_spec_first_invariants(plan);
+        }
+        if let (Some(session), Some(plan)) = (self.graph_session.as_mut(), plan) {
+            session.run_mut().plan = plan;
+        }
         let Some(session) = self.graph_session.as_mut() else {
             return;
         };
         let run = session.run_mut();
-        for spec in &new_nodes {
-            for dep in &spec.depends_on {
-                let edge = GraphEdge {
-                    from: dep.clone(),
-                    to: spec.id.clone(),
-                };
-                if !run
-                    .plan
-                    .edges
-                    .iter()
-                    .any(|existing| existing.from == edge.from && existing.to == edge.to)
-                {
-                    run.plan.edges.push(edge);
-                }
-            }
-        }
-        run.plan.nodes.extend(validated_nodes);
-        run.dynamic_added = Some(dynamic_added + added_ids.len());
 
         let rev = next_plan_change_rev(run);
         let change = PlanChange {
@@ -13200,6 +13471,19 @@ impl App {
         node_id: &str,
         role: NodeRole,
     ) -> Option<TurnPolicy> {
+        let lite_implement = self
+            .graph_session
+            .as_ref()
+            .and_then(|s| s.run().plan.workflow.as_ref())
+            .is_some_and(|w| w.lite)
+            && matches!(role, NodeRole::Implement | NodeRole::Draft);
+        if role == NodeRole::Spec || lite_implement {
+            let spec_dir = self.settings.workflow.spec_dir.as_str();
+            let _ = ensure_spec_dir(&self.workspace_root, spec_dir);
+            let snap = spec_snapshot(&self.workspace_root);
+            self.graph_node_spec_snapshot
+                .insert(node_id.to_owned(), snap);
+        }
         if !self.settings.graph_enforce_read_only_roles {
             return None;
         }
@@ -13227,11 +13511,13 @@ impl App {
             self.pending_turn_policy = saved;
         }
         self.graph_node_read_only_fingerprint.remove(node_id);
+        self.graph_node_spec_snapshot.remove(node_id);
     }
 
     fn clear_graph_node_turn_policy_state(&mut self) {
         self.graph_node_saved_policy.clear();
         self.graph_node_read_only_fingerprint.clear();
+        self.graph_node_spec_snapshot.clear();
     }
 
     fn graph_read_only_runner_candidates(&self, current_runner: &str) -> Vec<String> {
@@ -14855,6 +15141,7 @@ impl App {
         self.headless_plan_only_approval = false;
         self.headless_plan_only_reply = false;
         self.headless_read_only = false;
+        self.headless_no_spec_first = false;
     }
 
     fn headless_outcome_exit_7(
@@ -15062,6 +15349,7 @@ impl App {
             }
         };
         graph_plan.dynamic_cap = pending.dynamic_cap;
+        let _inserted = self.apply_spec_first_invariants(&mut graph_plan);
         let doc = PlanDoc {
             steps: pending.steps.clone(),
             tasks: pending.tasks.clone(),
@@ -15130,7 +15418,12 @@ impl App {
             {
                 let _ = self.apply_runner_and_model(&runner, &model);
             }
-            let prompt = if self.settings.stage_skills.chat {
+            let exempt = self.spec_first_exempt(&req.prompt, TriageSource::Override, "override");
+            if !exempt && self.spec_first_mode() != SpecFirstMode::Off {
+                self.submit_direct_run(req.prompt.clone(), agent, OverrideKind::Agent);
+                return Ok(());
+            }
+            let prompt = if exempt && self.settings.stage_skills.chat {
                 let prefix = self.stage_skill_prefix(
                     &NodeRole::Implement.to_string(),
                     runner_name(agent),
@@ -16122,6 +16415,7 @@ impl App {
         }
         let read_only_run = self.pending_turn_policy == Some(TurnPolicy::ReadOnly);
         self.headless_read_only = read_only_run;
+        self.headless_no_spec_first = req.no_spec_first;
         let read_only_workspace_before = if read_only_run {
             dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await
         } else {
@@ -19865,7 +20159,7 @@ mod tests {
             Vec::new(),
             engine,
             std::env::current_dir().unwrap_or_default(),
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -19922,7 +20216,7 @@ mod tests {
             Vec::new(),
             engine,
             workspace,
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -19983,7 +20277,7 @@ mod tests {
             Vec::new(),
             engine,
             workspace,
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -20245,6 +20539,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-2".to_owned(),
@@ -20259,6 +20554,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![dmuxai::graph::GraphEdge {
@@ -20272,6 +20568,7 @@ mod tests {
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         }
     }
 
@@ -20685,6 +20982,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         };
         dmuxai::graph::GraphPlan {
             schema: "dmuxai.graph/v1".to_owned(),
@@ -20703,6 +21001,7 @@ mod tests {
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         }
     }
 
@@ -20806,6 +21105,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-b".to_owned(),
@@ -20820,6 +21120,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: Vec::new(),
@@ -20830,6 +21131,7 @@ mod tests {
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
         app.graph_session = Some(GraphRunSession::new(GraphRun {
             plan,
@@ -21032,6 +21334,7 @@ mod tests {
             task: None,
             started_at_ms: None,
             finished_at_ms: None,
+            test_gate: None,
         }];
         nodes.extend(extra_nodes);
         app.start_graph_run(dmuxai::graph::GraphPlan {
@@ -21048,6 +21351,7 @@ mod tests {
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         });
     }
 
@@ -21073,6 +21377,7 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
         );
 
@@ -21114,6 +21419,7 @@ mod tests {
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
         );
         assert!(app.graph_assignment_line.contains(&format!(
@@ -21153,6 +21459,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -21166,6 +21473,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -21226,6 +21534,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![],
                 edges: vec![],
             },
@@ -21269,6 +21578,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: dmuxai::graph::NodeRole::Implement,
@@ -21282,6 +21592,7 @@ mod tests {
                     task: None,
                     started_at_ms: Some(1_000),
                     finished_at_ms: (phase == GraphRunPhase::Completed).then_some(61_000),
+                    test_gate: None,
                 }],
                 edges: Vec::new(),
             },
@@ -21890,6 +22201,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -21903,6 +22215,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -22045,6 +22358,7 @@ mod tests {
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -22058,6 +22372,7 @@ mod tests {
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -22135,6 +22450,7 @@ out3
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -22148,6 +22464,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -22193,6 +22510,7 @@ out3
                 },
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![
                     dmuxai::graph::GraphNode {
                         id: "node-a".to_owned(),
@@ -22207,6 +22525,7 @@ out3
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                     dmuxai::graph::GraphNode {
                         id: "node-b".to_owned(),
@@ -22221,6 +22540,7 @@ out3
                         task: None,
                         started_at_ms: None,
                         finished_at_ms: None,
+                        test_gate: None,
                     },
                 ],
                 edges: vec![],
@@ -22296,6 +22616,7 @@ out3
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -22309,6 +22630,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 }],
                 edges: vec![],
             },
@@ -23062,6 +23384,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "node-b".to_owned(),
@@ -23076,6 +23399,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![],
@@ -23086,6 +23410,7 @@ out3
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
 
         app.graph_session = Some(GraphRunSession::new(GraphRun {
@@ -23269,6 +23594,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
@@ -23283,6 +23609,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-2".to_owned(),
@@ -23297,6 +23624,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-3".to_owned(),
@@ -23311,6 +23639,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-4".to_owned(),
@@ -23325,12 +23654,14 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: vec![],
             limits: dmuxai::graph::GraphLimits::default(),
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
         let run = GraphRun {
             plan,
@@ -27099,11 +27430,13 @@ out3
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         }
     }
 
@@ -27363,11 +27696,13 @@ out3
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
         app.start_graph_run(plan);
 
@@ -27434,6 +27769,7 @@ out3
                 },
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             },
             conversation_id: conv_before.clone(),
             phase: GraphRunPhase::Failed,
@@ -27484,6 +27820,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -27657,6 +27994,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         releaser.join().unwrap();
@@ -27734,6 +28072,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
 
@@ -27777,6 +28116,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         lock.release();
@@ -27820,6 +28160,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -27861,6 +28202,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         lock.release();
@@ -27938,6 +28280,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
 
@@ -27993,6 +28336,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
         assert!(!outcome.ok);
@@ -28011,6 +28355,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -28080,6 +28425,7 @@ out3
                 allow_sensitive: false,
                 todo_id: None,
                 model: Some("gemini-4-argon-fast".to_owned()),
+                no_spec_first: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28102,6 +28448,7 @@ out3
                 allow_sensitive: false,
                 todo_id: None,
                 model: Some("composer-2.5-fast".to_owned()),
+                no_spec_first: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28160,6 +28507,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: Some("gemini-3.8-flash-high".to_owned()),
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -28228,6 +28576,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: model.map(str::to_owned),
+            no_spec_first: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -28273,7 +28622,7 @@ out3
             Vec::new(),
             engine,
             workspace,
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -28639,7 +28988,7 @@ out3
             Vec::new(),
             engine,
             workspace.clone(),
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -28698,6 +29047,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29020,7 +29370,7 @@ out3
             Vec::new(),
             engine,
             workspace.clone(),
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -29100,7 +29450,7 @@ out3
             Vec::new(),
             engine,
             workspace.clone(),
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -29444,6 +29794,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29522,6 +29873,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -29562,6 +29914,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
             .await
@@ -29752,6 +30105,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -29871,6 +30225,7 @@ out3
                 allow_sensitive: false,
                 todo_id: None,
                 model: None,
+                no_spec_first: true,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(outcome.ok, "chat_enabled={chat_enabled}");
@@ -30013,6 +30368,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert_eq!(outcome.exit_code, 0);
@@ -30082,6 +30438,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome2 = app_no_sink.run_headless(req2, cancel2).await;
         assert_eq!(outcome2.exit_code, 0);
@@ -30254,6 +30611,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -30332,6 +30690,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -30361,6 +30720,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req_gated, Arc::clone(&cancel)).await;
         assert_eq!(outcome.exit_code, 7);
@@ -30411,6 +30771,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome2 = app.run_headless(req_approved, cancel).await;
         assert_eq!(outcome2.exit_code, 0);
@@ -30436,6 +30797,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert_eq!(outcome.exit_code, 7);
@@ -30498,6 +30860,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok, "read-only turn must not be gated: {outcome:?}");
@@ -30557,6 +30920,7 @@ out3
                 allow_sensitive: false,
                 todo_id: None,
                 model: None,
+                no_spec_first: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(
@@ -30685,6 +31049,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok, "board ask must not exit 7: {outcome:?}");
@@ -30737,6 +31102,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -30815,6 +31181,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -30937,7 +31304,7 @@ out3
         let mut app = App::new_interactive(
             engine,
             temp_dir.path().to_path_buf(),
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
         )
         .unwrap();
         disable_builtin_prompts(&mut app);
@@ -32417,7 +32784,7 @@ out3
         let temp_dir = tempfile::tempdir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
-        let mut settings = DmuxSettings::default();
+        let mut settings = DmuxSettings::for_unit_tests();
         settings.cursor_prewarm = true;
         settings.cursor_protocol = dmuxai::runner_protocol::RunnerProtocol::Legacy;
 
@@ -32456,7 +32823,7 @@ out3
         let temp_dir = tempfile::tempdir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
-        let mut settings = DmuxSettings::default();
+        let mut settings = DmuxSettings::for_unit_tests();
         settings.cursor_prewarm = true;
         let mut app =
             App::new_interactive(engine, temp_dir.path().to_path_buf(), settings).unwrap();
@@ -32477,7 +32844,7 @@ out3
         let temp_dir = tempfile::tempdir().unwrap();
         let engine =
             ConversationEngine::open(std::path::Path::new(":memory:"), temp_dir.path()).unwrap();
-        let mut settings = DmuxSettings::default();
+        let mut settings = DmuxSettings::for_unit_tests();
         settings.cursor_prewarm = true;
         settings.cursor_protocol = dmuxai::runner_protocol::RunnerProtocol::Legacy;
 
@@ -32503,6 +32870,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outcome = app.run_headless(req, cancel).await;
@@ -32797,7 +33165,7 @@ out3
             Vec::new(),
             engine,
             workspace,
-            DmuxSettings::default(),
+            DmuxSettings::for_unit_tests(),
             Vec::new(),
             Vec::new(),
         )
@@ -32982,7 +33350,11 @@ out3
                 display_text: None,
             })
             .unwrap();
-        let app = startup_app_with_engine(engine, Agent::BUILTIN.to_vec(), DmuxSettings::default());
+        let app = startup_app_with_engine(
+            engine,
+            Agent::BUILTIN.to_vec(),
+            DmuxSettings::for_unit_tests(),
+        );
         assert!(app.selected < app.adapters.len());
         assert_eq!(adapter_slot(Agent::Custom(u8::MAX)), None);
         assert!(
@@ -32997,7 +33369,7 @@ out3
     #[test]
     fn startup_new_session_honours_allowed_runners() {
         pin_test_state_dir();
-        let mut settings = DmuxSettings::default();
+        let mut settings = DmuxSettings::for_unit_tests();
         settings.graph_allowed_runners = Some(vec!["agy".to_owned()]);
         let app = startup_app_with_settings(Agent::BUILTIN.to_vec(), settings);
         assert_eq!(app.adapters[app.selected].agent(), Agent::Agy);
@@ -33007,7 +33379,7 @@ out3
     #[test]
     fn startup_new_session_honours_routing_default() {
         pin_test_state_dir();
-        let mut settings = DmuxSettings::default();
+        let mut settings = DmuxSettings::for_unit_tests();
         settings.routing_default_agent = Some("agy".to_owned());
         let app = startup_app_with_settings(Agent::BUILTIN.to_vec(), settings);
         assert_eq!(app.adapters[app.selected].agent(), Agent::Agy);
@@ -33021,7 +33393,7 @@ out3
     // TC-816 (FR-983): the welcome line names adapters in picker order.
     #[test]
     fn tc_816_welcome_lists_registered_runners() {
-        let mut with_custom = DmuxSettings::default();
+        let mut with_custom = DmuxSettings::for_unit_tests();
         with_custom.custom_agents = vec![
             dmuxai::custom_agent::opencode_preset("opencode"),
             dmuxai::custom_agent::grok_preset("grok"),
@@ -33055,7 +33427,7 @@ out3
         assert!(startup.contains("F2 to choose a model"), "{startup}");
         assert!(startup.contains("Ctrl+C"), "{startup}");
 
-        let plain = app_with_runner_agents(Agent::BUILTIN.to_vec(), DmuxSettings::default());
+        let plain = app_with_runner_agents(Agent::BUILTIN.to_vec(), DmuxSettings::for_unit_tests());
         let plain_first = &plain.messages[0].content;
         assert!(
             plain_first.starts_with("Runners: cursor-agent, agy, codex."),
@@ -33084,7 +33456,7 @@ out3
             command: vec!["sh".to_owned()],
             ..dmuxai::custom_agent::CustomAgentSpec::default()
         };
-        let mut settings = DmuxSettings::default();
+        let mut settings = DmuxSettings::for_unit_tests();
         settings.custom_agents = vec![missing, present];
         let mut agents = Agent::BUILTIN.to_vec();
         agents.push(Agent::Custom(0));
@@ -33901,10 +34273,12 @@ out3
                 skill: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: vec![],
             tasks: vec![],
             dynamic_cap: None,
+            workflow: None,
         };
         harness.app.apply_runner_pin_to_plan(&mut plan);
         assert_eq!(plan.nodes[0].runner, "codex");
@@ -34183,6 +34557,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
 
         let result = app.headless_submit_prompt(&req);
@@ -34860,6 +35235,7 @@ out3
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -34894,6 +35270,7 @@ out3
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -35598,6 +35975,7 @@ out3
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -35736,7 +36114,11 @@ out3
             "REVIEW-BODY check error handling.",
         );
         std::fs::write(workspace.join("dmuxai.toml"), toml).unwrap();
-        plan_gate_harness_in_workspace(workspace, &[])
+        let mut h = plan_gate_harness_in_workspace(workspace.clone(), &[]);
+        h.app.settings = DmuxSettings::load_with_user_config(&workspace, None);
+        // Harness defaults off; tc_35xx and stage-skill tests opt in to Full.
+        h.app.settings.workflow.spec_first = SpecFirstMode::Off;
+        h
     }
 
     fn requests_with_prefix(sent: &SentRequests, prefix: &str) -> Vec<AgentRequest> {
@@ -36842,6 +37224,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         }
     }
 
@@ -37059,6 +37442,7 @@ out3
                 limits: dmuxai::graph::default_limits(),
                 tasks: Vec::new(),
                 dynamic_cap: None,
+                workflow: None,
             },
             conversation_id: app.conversation_id.to_string(),
             phase: GraphRunPhase::AwaitingApproval,
@@ -39618,6 +40002,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
                 dmuxai::graph::GraphNode {
                     id: "step-b".to_owned(),
@@ -39632,6 +40017,7 @@ out3
                     task: None,
                     started_at_ms: None,
                     finished_at_ms: None,
+                    test_gate: None,
                 },
             ],
             edges: Vec::new(),
@@ -39642,6 +40028,7 @@ out3
             },
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
         };
         app.graph_session = Some(GraphRunSession::new(GraphRun {
             plan,
@@ -40070,6 +40457,7 @@ out3
             allow_sensitive: false,
             todo_id: None,
             model: None,
+            no_spec_first: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         let sp = outcome
@@ -40489,6 +40877,7 @@ out3
             user_prompt: "graph fallback".to_owned(),
             tasks: Vec::new(),
             dynamic_cap: None,
+            workflow: None,
             nodes: vec![dmuxai::graph::GraphNode {
                 id: "step-1".to_owned(),
                 role: NodeRole::Implement,
@@ -40502,6 +40891,7 @@ out3
                 task: None,
                 started_at_ms: None,
                 finished_at_ms: None,
+                test_gate: None,
             }],
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
@@ -41479,6 +41869,433 @@ out3
                 .content
                 .contains("DMUXAI_ADD_NODES")
         );
+    }
+
+    #[test]
+    fn tc_3505_simple_runs_three_steps() {
+        let mut h = plan_gate_test_app();
+        h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.test_command = "true".to_owned();
+        h.app.input = "please verify the release notes".to_owned();
+        h.app.submit_prompt();
+        let judge = h.sent.lock().unwrap()[0].1.clone();
+        let simple = "{\"route\":\"simple\",\"reason\":\"tiny\"}";
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::TextDelta(simple.to_owned()),
+        )));
+        assert!(h.app.apply_agent_output(triage_output(
+            Agent::Codex,
+            &judge,
+            AgentEvent::Completed,
+        )));
+        let ids: Vec<_> = h
+            .app
+            .graph_session
+            .as_ref()
+            .unwrap()
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["spec-1", "step-1", "test-1"]);
+        let approval = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .and_then(|r| r.approval.as_ref());
+        assert!(
+            approval.is_none_or(|a| a.state == ApprovalState::NotRequired),
+            "simple graph must not wait on approval"
+        );
+    }
+
+    // TC-3505 / FR-3505: direct write run expands to spec → implement → test.
+    #[test]
+    fn tc_3505_direct_run_three_step_graph() {
+        let (mut app, _) = test_app();
+        app.skip_judge_for_tests = false;
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.test_command = "true".to_owned();
+        app.submit_direct_run("fix the bug".into(), Agent::Codex, OverrideKind::Direct);
+        let session = app.graph_session.as_ref().expect("graph");
+        let ids: Vec<_> = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["spec-1", "step-1", "test-1"]);
+        assert!(
+            session
+                .run()
+                .approval
+                .as_ref()
+                .is_none_or(|a| a.state == ApprovalState::NotRequired)
+        );
+    }
+
+    // TC-3506 / FR-3506: headless `--agent` write runs the three-step graph.
+    #[tokio::test]
+    async fn tc_3506_headless_agent_runs_graph() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), dir.path()).unwrap();
+        let (mut app, sent, event_tx) =
+            test_app_with_engine_and_event_sender(engine, dir.path().to_path_buf());
+        app.set_headless(true);
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.test_command = "true".to_owned();
+        let workspace = dir.path().to_path_buf();
+        let sent_bg = Arc::clone(&sent);
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut finished = 0usize;
+            for _ in 0..400 {
+                let pending: Vec<_> = {
+                    let lock = sent_bg.lock().unwrap();
+                    lock.iter().skip(finished).cloned().collect()
+                };
+                for (agent, req) in pending {
+                    finished += 1;
+                    if finished == 1 {
+                        let spec = workspace.join("docs/specs/x.md");
+                        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+                        std::fs::write(&spec, "spec").unwrap();
+                    }
+                    let cid = req.conversation_id.clone();
+                    let tid = req.turn_id.clone();
+                    let _ = tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(cid.clone()),
+                            turn_id: Some(tid.clone()),
+                            event: AgentEvent::TextDelta("ok".to_owned()),
+                        })
+                        .await;
+                    let _ = tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(cid),
+                            turn_id: Some(tid),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                }
+                if finished >= 3 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_headless(
+                HeadlessRequest {
+                    prompt: "implement feature".to_owned(),
+                    agent: Some("codex".to_owned()),
+                    mode: None,
+                    graph: false,
+                    approve_plan: false,
+                    approve_plan_id: None,
+                    allow_sensitive: false,
+                    todo_id: None,
+                    model: None,
+                    no_spec_first: false,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(outcome.graph_id.is_some());
+        assert_eq!(sent.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn tc_3506_headless_read_only_stays_plain_turn() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        app.set_headless(true);
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        complete_first_headless_request(&sent, event_tx, "answer");
+        let outcome = app
+            .run_headless(
+                HeadlessRequest {
+                    prompt: "explain this".to_owned(),
+                    agent: Some("codex".to_owned()),
+                    mode: Some("ask".to_owned()),
+                    graph: false,
+                    approve_plan: false,
+                    approve_plan_id: None,
+                    allow_sensitive: false,
+                    todo_id: None,
+                    model: None,
+                    no_spec_first: false,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        assert!(outcome.ok);
+        assert!(outcome.graph_id.is_none());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-3503 / FR-3503: planner implement-only plan gets spec and test inserts.
+    #[test]
+    fn tc_3503_planner_plan_gets_spec_and_test() {
+        let (mut app, _) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        let mut plan = fallback_plan("ship", "codex", None, "test").unwrap().plan;
+        let inserted = app.apply_spec_first_invariants(&mut plan);
+        assert_eq!(inserted, vec!["spec-1", "test-1"]);
+        let again = app.apply_spec_first_invariants(&mut plan);
+        assert!(again.is_empty());
+        let steps = App::steps_from_graph_plan(&plan);
+        let json = serde_json::to_string(&serde_json::json!({
+            "prompt": "ship",
+            "tasks": [],
+            "steps": steps,
+        }))
+        .unwrap();
+        let hash1: String = dmuxai::docs::sha256_hex(json.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let again2 = app.apply_spec_first_invariants(&mut plan);
+        assert!(again2.is_empty());
+        let json2 = serde_json::to_string(&serde_json::json!({
+            "prompt": "ship",
+            "tasks": [],
+            "steps": App::steps_from_graph_plan(&plan),
+        }))
+        .unwrap();
+        let hash2: String = dmuxai::docs::sha256_hex(json2.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn tc_3508_spec_node_outside_change_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let mut h = plan_gate_harness_in_workspace(dir.path().to_path_buf(), &[]);
+        h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.test_command = "true".to_owned();
+        h.app
+            .submit_direct_run("fix".into(), Agent::Codex, OverrideKind::Direct);
+        let spec = dir.path().join("docs/specs/x.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, "spec").unwrap();
+        let src = dir.path().join("src/a.rs");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, "x").unwrap();
+        complete_sent_graph_turn(&mut h.app, &h.sent, 0);
+        let spec_node = h
+            .app
+            .graph_session
+            .as_ref()
+            .or_else(|| {
+                h.app
+                    .last_graph_run
+                    .as_ref()
+                    .and(h.app.graph_session.as_ref())
+            })
+            .and_then(|s| s.run().plan.nodes.iter().find(|n| n.id == "spec-1"))
+            .or_else(|| {
+                h.app
+                    .last_graph_run
+                    .as_ref()
+                    .and_then(|r| r.plan.nodes.iter().find(|n| n.id == "spec-1"))
+            });
+        assert!(spec_node.is_some_and(|n| n.status != GraphNodeStatus::Completed));
+    }
+
+    #[test]
+    fn tc_3509_test_command_failure_fails_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let mut h = plan_gate_harness_in_workspace(dir.path().to_path_buf(), &[]);
+        h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.test_command = "exit 3".to_owned();
+        h.app
+            .submit_direct_run("fix".into(), Agent::Codex, OverrideKind::Direct);
+        let spec = dir.path().join("docs/specs/x.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, "spec").unwrap();
+        complete_sent_graph_turn(&mut h.app, &h.sent, 0);
+        complete_sent_graph_turn(&mut h.app, &h.sent, 1);
+        complete_sent_graph_turn_with_text(&mut h.app, &h.sent, 2, "tests done");
+        let test = h
+            .app
+            .last_graph_run
+            .as_ref()
+            .and_then(|r| r.plan.nodes.iter().find(|n| n.id == "test-1"))
+            .expect("test node");
+        assert_ne!(test.status, GraphNodeStatus::Completed);
+        assert!(test.test_gate.is_some());
+    }
+
+    #[test]
+    fn tc_3510_marker_required() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        let mut h = plan_gate_harness_in_workspace(dir.path().to_path_buf(), &[]);
+        h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.test_command.clear();
+        h.app.settings.workflow.require_tests = true;
+        h.app
+            .submit_direct_run("fix".into(), Agent::Codex, OverrideKind::Direct);
+        let spec = dir.path().join("docs/specs/x.md");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, "spec").unwrap();
+        complete_sent_graph_turn(&mut h.app, &h.sent, 0);
+        complete_sent_graph_turn(&mut h.app, &h.sent, 1);
+        complete_sent_graph_turn_with_text(&mut h.app, &h.sent, 2, "no marker");
+        let test = h
+            .app
+            .graph_session
+            .as_ref()
+            .and_then(|s| s.run().plan.nodes.iter().find(|n| n.id == "test-1"))
+            .or_else(|| {
+                h.app
+                    .last_graph_run
+                    .as_ref()
+                    .and_then(|r| r.plan.nodes.iter().find(|n| n.id == "test-1"))
+            });
+        assert!(test.is_some_and(|n| n.status != GraphNodeStatus::Completed));
+    }
+
+    #[test]
+    fn tc_3514_spec_stage_skill_injected() {
+        let mut h = stage_skill_harness("[stages.spec]\nskills = [\"grill-me\"]\n");
+        h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.test_command = "true".to_owned();
+        h.app
+            .submit_direct_run("feature".into(), Agent::Codex, OverrideKind::Direct);
+        let prompt = h.sent.lock().unwrap()[0].1.prompt.clone();
+        assert!(prompt.contains("GRILL-BODY"));
+    }
+
+    // TC-3507 / FR-3507: questions stay a single step when spec-first is on.
+    #[test]
+    fn tc_3507_question_exempt_from_spec_first() {
+        let (mut app, _) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        assert!(app.spec_first_exempt("why is it broken?", TriageSource::Heuristic, "short"));
+        let run = app
+            .build_one_node_run(
+                "why is it broken?",
+                Agent::Codex,
+                Route::Simple,
+                "short".into(),
+                TriageSource::Heuristic,
+                None,
+                None,
+                "run-q".into(),
+                0,
+                0,
+            )
+            .expect("run");
+        assert_eq!(run.plan.nodes.len(), 1);
+        assert_eq!(run.plan.nodes[0].role, NodeRole::Implement);
+    }
+
+    #[test]
+    fn tc_3507_trivial_short_prompt_exempt() {
+        let (mut app, _) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        assert!(app.spec_first_exempt("hi", TriageSource::Heuristic, "short prompt"));
+        let run = app
+            .build_one_node_run(
+                "hi",
+                Agent::Codex,
+                Route::Simple,
+                "short prompt".into(),
+                TriageSource::Heuristic,
+                None,
+                None,
+                "triv".into(),
+                0,
+                0,
+            )
+            .expect("run");
+        assert_eq!(run.plan.nodes.len(), 1);
+    }
+
+    #[test]
+    fn tc_3507_spec_first_off_stays_one_node() {
+        let (mut app, _) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Off;
+        let run = app
+            .build_one_node_run(
+                "fix bug",
+                Agent::Codex,
+                Route::Simple,
+                "override".into(),
+                TriageSource::Override,
+                None,
+                Some(OverrideKind::Direct),
+                "off".into(),
+                0,
+                0,
+            )
+            .expect("run");
+        assert_eq!(run.plan.nodes.len(), 1);
+    }
+
+    // TC-3507: `--no-spec-first` mode is off for the headless run.
+    #[test]
+    fn tc_3507_headless_no_spec_first_off() {
+        let (mut app, _) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.headless_no_spec_first = true;
+        assert_eq!(app.spec_first_mode(), SpecFirstMode::Off);
+    }
+
+    // TC-3511 / FR-3511: lite mode keeps one node with a directive prefix.
+    #[test]
+    fn tc_3511_lite_single_node_has_directive() {
+        let (mut app, _) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Lite;
+        let run = app
+            .build_one_node_run(
+                "add feature",
+                Agent::Codex,
+                Route::Simple,
+                "override".into(),
+                TriageSource::Override,
+                None,
+                Some(OverrideKind::Direct),
+                "lite-1".into(),
+                0,
+                0,
+            )
+            .expect("run");
+        assert_eq!(run.plan.nodes.len(), 1);
+        assert!(run.plan.nodes[0].job.contains("docs/specs"));
+        assert!(run.plan.workflow.as_ref().is_some_and(|w| w.lite));
     }
 }
 

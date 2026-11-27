@@ -29,7 +29,9 @@ pub fn node_turn_policy(role: NodeRole) -> Option<NodeTurnPolicy> {
         | NodeRole::Plan
         | NodeRole::Route
         | NodeRole::Review => Some(NodeTurnPolicy::ReadOnly),
-        NodeRole::Implement | NodeRole::Draft | NodeRole::Test => Some(NodeTurnPolicy::Write),
+        NodeRole::Implement | NodeRole::Draft | NodeRole::Test | NodeRole::Spec => {
+            Some(NodeTurnPolicy::Write)
+        }
     }
 }
 
@@ -38,7 +40,7 @@ pub fn model_for_role(role: NodeRole) -> &'static str {
         NodeRole::Orchestrate => ORCHESTRATOR_MODEL,
         NodeRole::Plan | NodeRole::Route | NodeRole::Review => PLAN_REVIEW_MODEL,
         NodeRole::Research | NodeRole::Explore | NodeRole::Test => RESEARCH_MODEL,
-        NodeRole::Implement | NodeRole::Draft => IMPLEMENT_MODEL,
+        NodeRole::Implement | NodeRole::Draft | NodeRole::Spec => IMPLEMENT_MODEL,
     }
 }
 
@@ -189,7 +191,12 @@ mod tests {
         ] {
             assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::ReadOnly));
         }
-        for role in [NodeRole::Implement, NodeRole::Draft, NodeRole::Test] {
+        for role in [
+            NodeRole::Implement,
+            NodeRole::Draft,
+            NodeRole::Test,
+            NodeRole::Spec,
+        ] {
             assert_eq!(node_turn_policy(role), Some(NodeTurnPolicy::Write));
         }
         assert_eq!(node_turn_policy(NodeRole::Orchestrate), None);

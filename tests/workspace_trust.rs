@@ -36,7 +36,7 @@ impl TrustSandbox {
             .join("fixtures")
             .join("fake-agent.sh");
         let user_toml = format!(
-            r#"[graph]
+            r#"{off}[graph]
 enabled = false
 
 [[agents.custom]]
@@ -49,7 +49,8 @@ text_when = {{ path = "/type", equals = "text" }}
 error_path = "/error/message"
 timeout_secs = 30
 "#,
-            fixture = fixture.display().to_string().replace('\\', "/")
+            fixture = fixture.display().to_string().replace('\\', "/"),
+            off = dmuxai::settings::WORKFLOW_SPEC_FIRST_OFF_TOML,
         );
         let user_cfg_dir = root.join("cfg").join("dmuxai");
         std::fs::create_dir_all(&user_cfg_dir).unwrap();

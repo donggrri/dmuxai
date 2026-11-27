@@ -5,6 +5,7 @@ mod plan_doc;
 mod planner;
 mod policy;
 mod replan;
+mod spec_first;
 mod store;
 mod tasks;
 mod triage_view;
@@ -37,6 +38,12 @@ pub use replan::{
     parse_replan_marker, replan_allowed, replan_revision_steps, replans_left,
     revision_needs_approval, strip_replan_marker,
 };
+pub use spec_first::{
+    SpecGateResult, TestGate, apply_spec_first, check_marker_gate, check_spec_gate,
+    ensure_spec_dir, implement_after_spec_directive, lite_directive, node_has_spec_ancestor,
+    parse_tests_marker, plan_prompt_for, replan_prompt_for, run_test_command, spec_node_directive,
+    spec_snapshot, test_node_directive, three_step_plan,
+};
 pub use store::{GraphRunListCache, GraphStore, load_run, save_run};
 pub use tasks::{
     TaskEdit, TaskState, apply_task_delete, apply_task_merge, apply_task_move, apply_task_rename,
@@ -51,6 +58,6 @@ pub use types::{
     Approval, ApprovalState, DecisionBy, ExecutionPlan, GraphEdge, GraphLimits, GraphNode,
     GraphNodeStatus, GraphPlan, GraphRun, GraphRunPhase, MAX_PLAN_REVISIONS, NodeRole,
     PLAN_HISTORY_MAX, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanRevision, PlanTask,
-    PlannerCalls, PlannerIo, PlannerIoKind, SinglePlan, TaskSize, Triage,
+    PlannerCalls, PlannerIo, PlannerIoKind, SinglePlan, TaskSize, Triage, WorkflowSnapshot,
     cap_plan_response_excerpt, cap_revision_raw, next_plan_change_rev,
 };
