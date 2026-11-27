@@ -56,18 +56,18 @@ use dmuxai::{
     graph::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
         GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache, GraphRunPhase, GraphRunSession,
-        GraphStopReason, GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind,
-        PanelLineKind, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc,
-        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls,
+        GraphStopReason, GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, NodeTurnPolicy,
+        OverrideKind, PanelLineKind, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext,
+        PlanDoc, PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls,
         PlannerIo, PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit,
         Triage, TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
         build_judge_prompt, build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt,
         cap_replan_step_summary, cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
         graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
-        judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
-        parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
-        replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
-        strip_replan_marker, task_counter_text, validate_plan_with_limit,
+        judge_line_text, judging_line_text, next_plan_change_rev, node_turn_policy, parse_plan,
+        parse_replan, parse_replan_marker, parse_verdict, pin_graph_plan_runners,
+        plan_json_for_edit, replan_allowed, replan_revision_steps, revision_needs_approval,
+        save_run, strip_replan_marker, task_counter_text, validate_plan_with_limit,
         write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
@@ -1646,6 +1646,10 @@ pub struct App {
     pub(crate) switch_ready: Option<PathBuf>,
     /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
     pending_turn_policy: Option<TurnPolicy>,
+    /// App-wide policy saved before a node overrides it (FR-2903), keyed by node id.
+    graph_node_saved_policy: HashMap<String, Option<TurnPolicy>>,
+    /// Worktree fingerprint at read-only graph node start for headless write guard (FR-2905).
+    graph_node_read_only_fingerprint: HashMap<String, String>,
     /// When set, planner nodes are rewritten to this runner and model (FR-1645).
     turn_runner_pin: Option<(String, String)>,
     /// Headless `--model` accepted for this run (Explicit source), if any.
@@ -2052,6 +2056,8 @@ impl App {
             switch_pending: None,
             switch_ready: None,
             pending_turn_policy: None,
+            graph_node_saved_policy: HashMap::new(),
+            graph_node_read_only_fingerprint: HashMap::new(),
             turn_runner_pin: None,
             headless_explicit_model: None,
             allow_multi_runner_graph: false,
@@ -11198,10 +11204,37 @@ impl App {
         &mut self,
         agent: Agent,
         node_id: String,
-        success: bool,
+        mut success: bool,
         output_text: &str,
         error: Option<&str>,
     ) {
+        let mut policy_error = error.map(str::to_owned);
+        if success
+            && self.settings.graph_enforce_read_only_roles
+            && self.quiet_graph_run
+            && let Some(before) = self.graph_node_read_only_fingerprint.get(&node_id)
+            && dmuxai::workspace::read_only_workspace_write_detected_sync(
+                Some(before.as_str()),
+                &self.workspace_root,
+            )
+        {
+            success = false;
+            policy_error = Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned());
+            self.push_system(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned());
+            if let Some(session) = self.graph_session.as_mut() {
+                let max_retries = session.run().plan.limits.max_retries;
+                if let Some(node) = session
+                    .run_mut()
+                    .plan
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == node_id)
+                {
+                    node.attempt = max_retries.saturating_sub(1);
+                }
+            }
+        }
+        let error = policy_error.as_deref().or(error);
         let mut display_text = output_text.to_owned();
         let mut marker_reason = None;
         if let Some(reason) = parse_replan_marker(output_text) {
@@ -11233,6 +11266,7 @@ impl App {
             };
             (actions, failed_message, run_snapshot)
         };
+        self.restore_graph_node_turn_policy(&node_id);
         self.sync_tasks_file_for_run(&run_snapshot);
         if let Some(message) = failed_message
             && self.graph_session_is_multi_step()
@@ -12111,6 +12145,7 @@ impl App {
             } else if !success && is_cancelled {
                 // FR-1416: a cancelled step (user cancel or denied ACP permission)
                 // stops the graph as cancelled, without retry or failure replan.
+                self.restore_graph_node_turn_policy(&node_id);
                 self.dispatch_graph_actions(vec![GraphAction::Cancelled(format!(
                     "step {node_id} was cancelled"
                 ))]);
@@ -12129,7 +12164,7 @@ impl App {
             }) {
                 self.intercept_graph_node_finished(
                     agent,
-                    node_id,
+                    node_id.clone(),
                     success,
                     &output_text,
                     error_string.as_deref(),
@@ -12434,7 +12469,10 @@ impl App {
                     self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
-                    self.clear_pending_turn_policy();
+                    if !self.settings.graph_enforce_read_only_roles {
+                        self.clear_pending_turn_policy();
+                    }
+                    self.clear_graph_node_turn_policy_state();
                     self.clear_turn_runner_pin();
                     let finish = self.todos.finish_graph(true, None);
                     self.report_todo_finish(finish);
@@ -12480,7 +12518,10 @@ impl App {
                     self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
-                    self.clear_pending_turn_policy();
+                    if !self.settings.graph_enforce_read_only_roles {
+                        self.clear_pending_turn_policy();
+                    }
+                    self.clear_graph_node_turn_policy_state();
                     let finish = self
                         .todos
                         .finish_graph(false, Some(format!("cancelled: {detail}")));
@@ -12528,7 +12569,10 @@ impl App {
                     self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
-                    self.clear_pending_turn_policy();
+                    if !self.settings.graph_enforce_read_only_roles {
+                        self.clear_pending_turn_policy();
+                    }
+                    self.clear_graph_node_turn_policy_state();
                     let finish = self.todos.finish_graph(false, Some(message.clone()));
                     self.report_todo_finish(finish);
                     break;
@@ -12610,6 +12654,107 @@ impl App {
         }
     }
 
+    fn graph_node_turn_policy_as_agent(node: NodeTurnPolicy) -> TurnPolicy {
+        match node {
+            NodeTurnPolicy::ReadOnly => TurnPolicy::ReadOnly,
+            NodeTurnPolicy::Write => TurnPolicy::Agent,
+        }
+    }
+
+    fn begin_graph_node_turn_policy(
+        &mut self,
+        node_id: &str,
+        role: NodeRole,
+    ) -> Option<TurnPolicy> {
+        if !self.settings.graph_enforce_read_only_roles {
+            return None;
+        }
+        let node_policy = Self::graph_node_turn_policy_as_agent(node_turn_policy(role)?);
+        let saved = self.pending_turn_policy;
+        self.graph_node_saved_policy
+            .entry(node_id.to_owned())
+            .or_insert(saved);
+        self.pending_turn_policy = Some(node_policy);
+        if node_policy == TurnPolicy::ReadOnly
+            && let Some(fp) = dmuxai::workspace::git_worktree_fingerprint_sync(&self.workspace_root)
+        {
+            self.graph_node_read_only_fingerprint
+                .insert(node_id.to_owned(), fp);
+        }
+        Some(node_policy)
+    }
+
+    fn restore_graph_node_turn_policy(&mut self, node_id: &str) {
+        if let Some(saved) = self.graph_node_saved_policy.remove(node_id) {
+            self.pending_turn_policy = saved;
+        }
+        self.graph_node_read_only_fingerprint.remove(node_id);
+    }
+
+    fn clear_graph_node_turn_policy_state(&mut self) {
+        self.graph_node_saved_policy.clear();
+        self.graph_node_read_only_fingerprint.clear();
+    }
+
+    fn graph_read_only_runner_candidates(&self, current_runner: &str) -> Vec<String> {
+        let current = current_runner.trim().to_ascii_lowercase();
+        self.settings
+            .graph_allowed_runners
+            .as_ref()
+            .map(|runners| {
+                runners
+                    .iter()
+                    .map(|r| r.trim().to_ascii_lowercase())
+                    .filter(|r| !r.is_empty() && r != &current)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                ["cursor", "agy", "codex"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .filter(|r| self.settings.graph_runner_allowed(r) && r != &current)
+                    .collect()
+            })
+    }
+
+    fn try_graph_read_only_runner_fallback(
+        &mut self,
+        assignment: &NodeAssignment,
+        failed_agent: Agent,
+    ) -> Option<NodeAssignment> {
+        for runner in self.graph_read_only_runner_candidates(&assignment.runner) {
+            let model_id = assignment.model_id.clone();
+            if self
+                .apply_runner_and_model(&runner, &model_id)
+                .is_some_and(|agent| agent != failed_agent)
+            {
+                if let Some(session) = self.graph_session.as_mut()
+                    && let Some(node) = session
+                        .run_mut()
+                        .plan
+                        .nodes
+                        .iter_mut()
+                        .find(|node| node.id == assignment.node_id)
+                {
+                    node.runner = runner.clone();
+                }
+                let mut next = assignment.clone();
+                next.runner = runner;
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn send_error_is_no_read_only_mode(err: &RunTodoError) -> bool {
+        matches!(
+            err,
+            RunTodoError::Internal(message)
+                if message.contains("Unsupported")
+                    || message.contains("agent does not support this command")
+        )
+    }
+
     fn defer_graph_node_start(&mut self, agent: Agent, assignment: NodeAssignment) {
         let node_id = assignment.node_id.clone();
         self.graph_defer.defer(agent, assignment, Instant::now());
@@ -12679,6 +12824,7 @@ impl App {
             ))]);
             return Err(format!("unknown graph runner: {}", assignment.runner));
         };
+        let mut assignment = assignment;
         let deferred_assignment = assignment.clone();
         if self.busy_agents.contains(&agent) && !self.quiet_graph_run {
             self.defer_graph_node_start(agent, deferred_assignment);
@@ -12690,8 +12836,9 @@ impl App {
         self.graph_node_details.remove(&assignment.node_id);
         self.graph_agent_nodes
             .insert(agent, assignment.node_id.clone());
+        self.begin_graph_node_turn_policy(&assignment.node_id, assignment.role);
         let raw_prompt = assignment.prompt.clone();
-        let mut prompt = assignment.prompt;
+        let mut prompt = assignment.prompt.clone();
         if let Some(run_id) = self
             .graph_session
             .as_ref()
@@ -12755,54 +12902,101 @@ impl App {
         let restore_input = self.quiet_graph_run;
         let allow_defer = self.quiet_graph_run;
 
-        if let Err(err) =
-            self.try_submit_to_agent(agent, prompt.clone(), restore_input, allow_defer)
-        {
-            if !self.quiet_graph_run && matches!(&err, RunTodoError::Busy(_)) {
-                self.graph_agent_nodes.remove(&agent);
-                self.defer_graph_node_start(agent, deferred_assignment);
-                return Ok(GraphNodeDispatch::Deferred);
-            }
-            if self.quiet_graph_run && Self::is_quiet_graph_agent_busy(&err) {
-                if self.input.is_empty() {
-                    self.input = prompt;
+        let mut agent = agent;
+        let mut deferred_assignment = deferred_assignment;
+        loop {
+            let submit_err =
+                self.try_submit_to_agent(agent, prompt.clone(), restore_input, allow_defer);
+            match submit_err {
+                Ok(_) => break,
+                Err(err) => {
+                    if Self::send_error_is_no_read_only_mode(&err)
+                        && self.settings.graph_enforce_read_only_roles
+                        && node_turn_policy(assignment.role) == Some(NodeTurnPolicy::ReadOnly)
+                    {
+                        self.graph_agent_nodes.remove(&agent);
+                        if let Some(next) =
+                            self.try_graph_read_only_runner_fallback(&assignment, agent)
+                        {
+                            self.restore_graph_node_turn_policy(&assignment.node_id);
+                            assignment = next.clone();
+                            deferred_assignment = assignment.clone();
+                            let Some(next_agent) = self
+                                .apply_runner_and_model(&assignment.runner, &assignment.model_id)
+                            else {
+                                self.restore_graph_node_turn_policy(&assignment.node_id);
+                                let message = format!(
+                                    "no runner can execute read-only turn for graph node {}",
+                                    assignment.node_id
+                                );
+                                self.dispatch_graph_actions(vec![GraphAction::Failed(
+                                    message.clone(),
+                                )]);
+                                return Err(message);
+                            };
+                            agent = next_agent;
+                            self.graph_agent_nodes
+                                .insert(agent, assignment.node_id.clone());
+                            self.begin_graph_node_turn_policy(&assignment.node_id, assignment.role);
+                            continue;
+                        }
+                        self.restore_graph_node_turn_policy(&assignment.node_id);
+                        let message = format!(
+                            "no runner can execute read-only turn for graph node {}",
+                            assignment.node_id
+                        );
+                        self.dispatch_graph_actions(vec![GraphAction::Failed(message.clone())]);
+                        return Err(message);
+                    }
+                    if !self.quiet_graph_run && matches!(&err, RunTodoError::Busy(_)) {
+                        self.graph_agent_nodes.remove(&agent);
+                        self.defer_graph_node_start(agent, deferred_assignment);
+                        return Ok(GraphNodeDispatch::Deferred);
+                    }
+                    if self.quiet_graph_run && Self::is_quiet_graph_agent_busy(&err) {
+                        self.restore_graph_node_turn_policy(&assignment.node_id);
+                        if self.input.is_empty() {
+                            self.input = prompt;
+                        }
+                        self.push_system(format!(
+                            "{agent} is busy; cancel the active turn before sending another prompt."
+                        ));
+                        if let Some(session) = self.graph_session.as_mut() {
+                            session.run_mut().phase = GraphRunPhase::Failed;
+                            let run = session.run().clone();
+                            let _ = save_run(&self.workspace_root, &run);
+                            let graph_id = run.plan.id.clone();
+                            self.last_graph_run = Some(run);
+                            self.set_headless_last_graph_id(graph_id);
+                        }
+                        self.graph_agent_nodes.remove(&agent);
+                        self.graph_session = None;
+                        self.busy_retry_user_message.clear();
+                        self.graph_assignment_line.clear();
+                        self.quiet_graph_run = false;
+                        return Err(format!(
+                            "failed to start node {}: {err:?}",
+                            assignment.node_id
+                        ));
+                    }
+                    if matches!(
+                        &err,
+                        RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
+                    ) {
+                        self.graph_agent_nodes.remove(&agent);
+                        return Ok(GraphNodeDispatch::Deferred);
+                    }
+                    self.restore_graph_node_turn_policy(&assignment.node_id);
+                    self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                        "failed to start node {}: {err:?}",
+                        assignment.node_id
+                    ))]);
+                    return Err(format!(
+                        "failed to start node {}: {err:?}",
+                        assignment.node_id
+                    ));
                 }
-                self.push_system(format!(
-                    "{agent} is busy; cancel the active turn before sending another prompt."
-                ));
-                if let Some(session) = self.graph_session.as_mut() {
-                    session.run_mut().phase = GraphRunPhase::Failed;
-                    let run = session.run().clone();
-                    let _ = save_run(&self.workspace_root, &run);
-                    let graph_id = run.plan.id.clone();
-                    self.last_graph_run = Some(run);
-                    self.set_headless_last_graph_id(graph_id);
-                }
-                self.graph_agent_nodes.remove(&agent);
-                self.graph_session = None;
-                self.busy_retry_user_message.clear();
-                self.graph_assignment_line.clear();
-                self.quiet_graph_run = false;
-                return Err(format!(
-                    "failed to start node {}: {err:?}",
-                    assignment.node_id
-                ));
             }
-            if matches!(
-                &err,
-                RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
-            ) {
-                self.graph_agent_nodes.remove(&agent);
-                return Ok(GraphNodeDispatch::Deferred);
-            }
-            self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
-                "failed to start node {}: {err:?}",
-                assignment.node_id
-            ))]);
-            return Err(format!(
-                "failed to start node {}: {err:?}",
-                assignment.node_id
-            ));
         }
         self.graph_defer.node_started(&assignment.node_id);
         Ok(GraphNodeDispatch::Started)
@@ -12827,13 +13021,20 @@ impl App {
                 }
             }
         };
+        let read_only_roles = if self.settings.graph_enforce_read_only_roles {
+            "on"
+        } else {
+            "off"
+        };
         if self.graph_assignment_line.is_empty() {
             self.push_system("No active graph assignment. Send a multi-step prompt to plan one.");
             self.push_system(format!("Allowed runners: {allowed_str}"));
+            self.push_system(format!("read-only roles: {read_only_roles}"));
             return;
         }
         self.push_system(format!("Graph assignment: {}", self.graph_assignment_line));
         self.push_system(format!("Allowed runners: {allowed_str}"));
+        self.push_system(format!("read-only roles: {read_only_roles}"));
         self.push_system(
             "Plan gate: /graph approve · /graph edit <feedback> · /graph reject · /graph replan [note]",
         );
@@ -15089,6 +15290,15 @@ impl App {
                 dmuxai::agent_api::exit::CANCELLED,
                 last_system_error.or_else(|| Some("cancelled".to_owned())),
                 Some(AgentErrorKind::Cancelled.as_str().to_owned()),
+            )
+        } else if graph_failed
+            && last_system_error.as_deref() == Some(READ_ONLY_WORKSPACE_WRITE_ERROR)
+        {
+            (
+                false,
+                dmuxai::agent_api::exit::FAILED,
+                Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned()),
+                Some(AgentErrorKind::Policy.as_str().to_owned()),
             )
         } else if had_agent_error || graph_failed {
             (
@@ -25574,6 +25784,230 @@ out3
         let thinking_summary = app.activity_summary(Agent::Agy, now);
         assert!(thinking_summary.contains("last event 0s ago"));
         assert!(thinking_summary.contains("working"));
+    }
+
+    fn graph_plan_for_tc_290(role: NodeRole, runner: &str, id: &str) -> dmuxai::graph::GraphPlan {
+        dmuxai::graph::GraphPlan {
+            schema: "dmuxai.graph/v1".to_owned(),
+            id: id.to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "tc-290".to_owned(),
+            nodes: vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role,
+                job: "job".to_owned(),
+                runner: runner.to_owned(),
+                model_id: "composer-2.5".to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+                task: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+            }],
+            edges: Vec::new(),
+            limits: dmuxai::graph::default_limits(),
+            tasks: Vec::new(),
+        }
+    }
+
+    // TC-2902 / FR-2901
+    #[test]
+    fn tc_2902_start_graph_node_uses_read_only_policy_for_research_node_when_on() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_enforce_read_only_roles = true;
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2902",
+        ));
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::ReadOnly);
+    }
+
+    // TC-2903 / FR-2902
+    #[test]
+    fn tc_2903_setting_off_keeps_app_wide_policy_for_all_roles() {
+        let (mut app, sent) = test_app();
+        app.pending_turn_policy = Some(TurnPolicy::Agent);
+        app.settings.graph_enforce_read_only_roles = false;
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2903",
+        ));
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::Agent);
+    }
+
+    // TC-2904 / FR-2903
+    #[test]
+    fn tc_2904_pending_policy_restored_after_node_finish_fail_cancel() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_enforce_read_only_roles = true;
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Implement,
+            "cursor",
+            "tc-2904-finish",
+        ));
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::Agent);
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        assert_eq!(app.pending_turn_policy, Some(TurnPolicy::ReadOnly));
+
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2904-fail",
+        ));
+        let idx = sent.lock().unwrap().len() - 1;
+        let (agent, req) = sent.lock().unwrap()[idx].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        assert_eq!(app.pending_turn_policy, Some(TurnPolicy::ReadOnly));
+
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2904-cancel",
+        ));
+        let idx = sent.lock().unwrap().len() - 1;
+        let (agent, req) = sent.lock().unwrap()[idx].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(app.pending_turn_policy, Some(TurnPolicy::ReadOnly));
+    }
+
+    // TC-2905 / FR-2904
+    #[test]
+    fn tc_2905_read_only_node_without_read_only_runner_falls_back_or_fails() {
+        let mut h = plan_gate_harness(&[(Agent::Codex, TurnPolicy::ReadOnly)]);
+        h.app.settings.graph_enforce_read_only_roles = true;
+        h.app.settings.graph_allowed_runners = Some(vec!["codex".to_owned(), "cursor".to_owned()]);
+        h.app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "codex",
+            "tc-2905-ok",
+        ));
+        let sent = h.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, Agent::Cursor);
+        assert_eq!(sent[0].1.policy, TurnPolicy::ReadOnly);
+        drop(sent);
+
+        let mut fail = plan_gate_harness(&[(Agent::Codex, TurnPolicy::ReadOnly)]);
+        fail.app.settings.graph_enforce_read_only_roles = true;
+        fail.app.settings.graph_allowed_runners = Some(vec!["codex".to_owned()]);
+        fail.app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "codex",
+            "tc-2905-fail",
+        ));
+        assert!(
+            fail.app.graph_session.is_none()
+                || fail
+                    .app
+                    .last_graph_run
+                    .as_ref()
+                    .is_some_and(|run| run.phase == GraphRunPhase::Failed),
+            "must fail when no read-only runner is available"
+        );
+    }
+
+    // TC-2906 / FR-2905
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2906_read_only_graph_node_that_writes_files_fails_with_policy_error() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let git_run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git_run(&["init", "-q"]);
+        std::fs::write(workspace.join("README.md"), "initial\n").unwrap();
+        git_run(&["add", "README.md"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let mut harness = plan_gate_harness_in_workspace(workspace.clone(), &[]);
+        harness.app.settings.graph_enforce_read_only_roles = true;
+        harness.app.quiet_graph_run = true;
+        harness.app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2906",
+        ));
+        let (agent, req) = harness.sent.lock().unwrap()[0].clone();
+        std::fs::write(workspace.join("SQA_GRAPH_WRITE.txt"), "wrote\n").unwrap();
+        assert!(harness.app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::TextDelta("done".to_owned()),
+        }));
+        assert!(harness.app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+        assert!(harness.app.graph_session.is_none());
+        assert!(
+            harness
+                .app
+                .messages
+                .iter()
+                .any(|m| m.content.contains(READ_ONLY_WORKSPACE_WRITE_ERROR)),
+            "graph node write guard must surface policy error"
+        );
+        assert_eq!(
+            harness.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Failed)
+        );
+    }
+
+    // TC-2907 / UX-2900
+    #[test]
+    fn tc_2907_graph_status_shows_read_only_roles_state() {
+        let (mut app, _) = test_app();
+        app.settings.graph_enforce_read_only_roles = true;
+        app.input = "/graph".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("read-only roles: on"))
+        );
+        app.settings.graph_enforce_read_only_roles = false;
+        app.input = "/graph".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("read-only roles: off"))
+        );
     }
 
     #[test]

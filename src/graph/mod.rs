@@ -22,8 +22,8 @@ pub use plan_doc::{
 };
 pub use planner::{heuristic_route, sensitive_keyword_match};
 pub use policy::{
-    ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed, model_for_role,
-    validate_model_id,
+    NodeTurnPolicy, ORCHESTRATOR_MODEL, assign_runner, default_limits, is_runner_allowed,
+    model_for_role, node_turn_policy, validate_model_id,
 };
 pub use replan::{
     NODE_REPLAN_HINT, REPLAN_PROMPT, ReplanDoc, ReplanTrigger, apply_replan, budget_allows,
