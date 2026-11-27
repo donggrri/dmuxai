@@ -180,7 +180,7 @@ Series:
 3. Lane `auto`: `dmuxai board prompt <id> | dmuxai -C <repo> run --graph --approve-plan-id <hash> -`,
    then `board move <id> in_progress` / `done`.
 4. Lane `needs_decision`: `dmuxai board wait --any --since-seq <S> --timeout 600 --as bot:coordinator`
-   in a loop (or `board wait <id>`). On `approve` run `dmuxai board run <id>`; on `request_changes`
+   in a loop (or `board wait <id>`). On `approve` the board starts the run itself (SPEC-board-approve-autorun; the lane is `in_progress`), so only run `dmuxai board run <id>` when `[board] auto_run_on_approve = false` or the decision reported `auto_run.started = false`; on `request_changes`
    or a message, revise with `dmuxai board ask <id> --revise --text ...` (or `board plan --edit`)
    and reply with `board say`.
 5. Lane `auto`: `dmuxai board run <id>` replaces the manual pipe in step 3. A failed run moves the
