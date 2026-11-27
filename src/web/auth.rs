@@ -173,6 +173,7 @@ mod tests {
     // TC-2951 partial / FR-2951
     #[test]
     fn tc_2951_require_token_config_env_token_remote_bind_and_reexec_enforce_token() {
+        let _guard = crate::state_path::test_env_lock();
         let prev_req = std::env::var_os("DMUXAI_WEB_REQUIRE_TOKEN");
         let prev_state = std::env::var_os("DMUXAI_WEB_TOKEN_REQUIRED");
         unsafe { std::env::remove_var("DMUXAI_WEB_REQUIRE_TOKEN") };

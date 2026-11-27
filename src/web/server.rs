@@ -1696,6 +1696,7 @@ struct WorkspaceInfoResponse {
     recent: Vec<String>,
     browse_roots: Vec<String>,
     can_switch: bool,
+    view_only: bool,
 }
 
 async fn get_workspace(Ws(ws): Ws) -> Response {
@@ -1706,6 +1707,7 @@ async fn get_workspace(Ws(ws): Ws) -> Response {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let can_switch = ws.services.web_attached && is_unix_switch_supported(&ws);
+    let view_only = !ws.services.web_attached;
     json_ok(
         StatusCode::OK,
         &WorkspaceInfoResponse {
@@ -1713,6 +1715,7 @@ async fn get_workspace(Ws(ws): Ws) -> Response {
             recent,
             browse_roots,
             can_switch,
+            view_only,
         },
     )
 }
@@ -1871,7 +1874,13 @@ struct WorkspacePathBody {
     path: String,
 }
 
-async fn post_workspace_validate(ApiJson(body): ApiJson<WorkspacePathBody>) -> Response {
+async fn post_workspace_validate(
+    Ws(ws): Ws,
+    ApiJson(body): ApiJson<WorkspacePathBody>,
+) -> Response {
+    if !ws.services.web_attached {
+        return error_json(StatusCode::FORBIDDEN, "view-only: start dmuxai --web");
+    }
     match crate::workspace::validate_workspace_dir(std::path::Path::new(&body.path)) {
         Ok(canonical) => json_ok(
             StatusCode::OK,
@@ -2716,6 +2725,54 @@ mod tests {
                 .iter()
                 .any(|h| h.contains("172.24.64.5"))
         );
+
+        // Also bind the extra WSL listener via start_server using 127.0.0.2.
+        let bind_mock = Arc::new(MockNat {
+            version: Some("microsoft WSL2".to_owned()),
+            wslinfo: Some("nat".to_owned()),
+            route: Some(
+                "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                 eth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+                    .to_owned(),
+            ),
+            iface_ip: Some(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+            ..Default::default()
+        });
+        let bind_config = ServerConfig {
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 0,
+            allow_remote: false,
+            bind_explicit: false,
+            token: "tok".to_owned(),
+            token_required: false,
+            trust_wsl_host: true,
+            discovery_mode: "web".to_owned(),
+            max_workspaces: crate::web::directory::DEFAULT_MAX_WORKSPACES,
+            peer_source: Some(bind_mock),
+            services: DashboardServices::default(),
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = start_server(bind_config, test_hub()).await.unwrap();
+            if let Some(win_url) = server.windows_url.as_deref() {
+                let authority = win_url
+                    .strip_prefix("http://")
+                    .unwrap()
+                    .trim_end_matches('/');
+                let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+                let req = format!(
+                    "GET /api/state HTTP/1.1\r\nHost: {authority}\r\nX-Dmuxai-Client: 1\r\nConnection: close\r\n\r\n"
+                );
+                stream.write_all(req.as_bytes()).await.unwrap();
+                let mut resp = String::new();
+                stream.read_to_string(&mut resp).await.unwrap();
+                assert!(
+                    resp.starts_with("HTTP/1.1 401"),
+                    "unexpected WSL listener response: {resp}"
+                );
+            }
+            server.handle.abort();
+        });
     }
 
     // TC-2950 / FR-2950
@@ -5989,7 +6046,7 @@ mod tests {
             assert_eq!(v["reason"], expected_reason);
         }
 
-        // View-only router refuses dirs and switch, but allows validate
+        // View-only router refuses dirs, switch, and validate
         let view_only_router = build_router_with(
             test_hub(),
             token.clone(),
@@ -6032,7 +6089,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         match prev_home {
             Some(v) => unsafe { std::env::set_var("HOME", v) },

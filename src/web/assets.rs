@@ -278,6 +278,8 @@ mod tests {
             SESSION_JS,
             SKILLS_JS,
             AGENT_PROMPTS_JS,
+            RUNS_JS,
+            ALL_PROJECTS_JS,
         ] {
             assert!(
                 source.contains("X-Dmuxai-Client") || source.contains("'x-dmuxai-client'"),

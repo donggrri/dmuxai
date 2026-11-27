@@ -143,7 +143,6 @@ pub struct GlobalProjectItem {
     pub run_count: usize,
     pub active_run_count: usize,
     pub last_activity_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub open_ws: Option<String>,
 }
 
@@ -184,9 +183,12 @@ fn build_project_item(loc: &RepoLocations) -> GlobalProjectItem {
         .map(|m| m.completed_at_ms.unwrap_or(m.created_at_ms))
         .max()
         .unwrap_or(0);
-    let manifest_root = manifests
-        .iter()
-        .find_map(|m| m.workspace_root.as_ref().filter(|s| !s.is_empty()).cloned());
+    let manifest_root = manifests.iter().find_map(|m| {
+        m.workspace_root
+            .as_ref()
+            .filter(|s| !s.is_empty() && repo_key_for_canonical(s) == loc.repo_key)
+            .cloned()
+    });
 
     let canonical_path = ws_meta
         .as_ref()
@@ -268,10 +270,10 @@ fn resolve_workspace_root(loc: &RepoLocations) -> Option<PathBuf> {
     }
     if let Some(runs_dir) = loc.runs_dir.as_deref() {
         let store = JournalStore::new(runs_dir.to_path_buf());
-        if let Some(root) = list_manifests(&store)
-            .into_iter()
-            .find_map(|m| m.workspace_root.filter(|s| !s.is_empty()))
-        {
+        if let Some(root) = list_manifests(&store).into_iter().find_map(|m| {
+            m.workspace_root
+                .filter(|s| !s.is_empty() && repo_key_for_canonical(s) == loc.repo_key)
+        }) {
             return Some(PathBuf::from(root));
         }
     }
@@ -479,9 +481,8 @@ pub(crate) async fn run_stream(
     let Some(runs_dir) = loc.runs_dir.clone() else {
         return error_json(StatusCode::NOT_FOUND, "run not found");
     };
-    let events_path = resolve_workspace_root(&loc)
-        .map(|root| root.join(".dmuxai").join("events.jsonl"))
-        .filter(|p| p.is_file());
+    let events_path =
+        resolve_workspace_root(&loc).map(|root| root.join(".dmuxai").join("events.jsonl"));
     stream_response(
         &JournalStore::new(runs_dir),
         events_path,
@@ -546,6 +547,54 @@ mod tests {
 
         let found = lookup_repo_key(valid_key).expect("enumerated key must resolve");
         assert_eq!(found.repo_key, valid_key);
+
+        // Symlinked repo directories must be skipped by enumerate_repo_locations / lookup_repo_key.
+        #[cfg(unix)]
+        {
+            let real_dir = tmp.path().join("outside");
+            fs::create_dir_all(&real_dir).unwrap();
+            let sym_key = "sym-0123456789abcdef";
+            std::os::unix::fs::symlink(&real_dir, state_dir.join("repos").join(sym_key)).unwrap();
+            assert!(lookup_repo_key(sym_key).is_none());
+        }
+
+        // Spoofed manifest.workspace_root hashing to a different repo_key must be ignored.
+        let ws_real = tmp.path().join("real-repo");
+        let ws_spoof = tmp.path().join("spoof-repo");
+        fs::create_dir_all(&ws_real).unwrap();
+        fs::create_dir_all(&ws_spoof).unwrap();
+        let real_key = crate::state_path::repo_key(&ws_real).unwrap();
+        let runs_dir = data_dir.join("repos").join(&real_key).join("runs");
+        let store = JournalStore::new(runs_dir);
+        let spoof_manifest = crate::run_journal::RunManifest {
+            schema_version: 1,
+            run_id: "1111222233334444".to_owned(),
+            origin: "cli_headless".to_owned(),
+            status: "completed".to_owned(),
+            created_at_ms: 1000,
+            completed_at_ms: Some(2000),
+            duration_ms: Some(1000),
+            requested_runner: None,
+            resolved_runner: None,
+            requested_model: None,
+            resolved_model: None,
+            dmuxai_version: None,
+            build_commit: None,
+            pid: None,
+            dmuxai_exit_code: Some(0),
+            child_exit_code: None,
+            child_signal: None,
+            error_kind: None,
+            error_summary: None,
+            links: Default::default(),
+            diagnostics: Default::default(),
+            end_summary: None,
+            workspace_root: Some(ws_spoof.to_string_lossy().into_owned()),
+        };
+        store.save_relaxed(&spoof_manifest).unwrap();
+        let real_loc = lookup_repo_key(&real_key).unwrap();
+        assert!(resolve_workspace_root(&real_loc).is_none());
+        assert!(build_project_item(&real_loc).canonical_path.is_none());
     }
 
     // TC-2987 / NFR-2980: listing uses bounded queries and caches for 5s.
@@ -584,6 +633,15 @@ mod tests {
         }
         let summary = summarize_repo_db(&db1, &key1).expect("bounded summary");
         assert_eq!(summary.count, 1);
+
+        // Drop `messages` table to prove summarize_repo_db does not scan messages.
+        {
+            let conn = rusqlite::Connection::open(&db1).unwrap();
+            conn.execute("DROP TABLE messages", []).unwrap();
+        }
+        let summary_no_msgs =
+            summarize_repo_db(&db1, &key1).expect("bounded summary without messages table");
+        assert_eq!(summary_no_msgs.count, 1);
 
         let first = list_projects_cached();
         assert_eq!(first.len(), 1);

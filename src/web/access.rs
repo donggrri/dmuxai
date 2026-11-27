@@ -333,7 +333,8 @@ fn check_loopback_peer_uid(access: &WebAccess, peer: &PeerConnectInfo) -> Result
     if let Some(result) = *guard {
         return result.map_err(|_| forbidden());
     }
-    let verdict = if let Some(uid) = peer_uid_for_connection(access.peer_source.as_ref(), peer.addr)
+    let verdict = if let Some(uid) =
+        peer_uid_for_connection(access.peer_source.as_ref(), peer.addr, peer.local_addr)
     {
         if uid != access.server_uid && uid != 0 {
             Err(())
@@ -797,10 +798,12 @@ mod tests {
     #[test]
     fn tc_2955_peer_uid_mismatch_rejected_root_allowed_once_per_connection() {
         use crate::web::local_peer::LocalPeerSource;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        #[derive(Clone, Default)]
+        #[derive(Default)]
         struct MockPeer {
             tcp: String,
+            reads: AtomicUsize,
         }
 
         impl LocalPeerSource for MockPeer {
@@ -820,6 +823,7 @@ mod tests {
                 None
             }
             fn proc_net_tcp(&self) -> Option<String> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
                 Some(self.tcp.clone())
             }
             fn proc_net_tcp6(&self) -> Option<String> {
@@ -829,9 +833,11 @@ mod tests {
 
         let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
              0: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 123 1 00000000\n";
-        let peer_src = Arc::new(MockPeer {
+        let mock_peer = Arc::new(MockPeer {
             tcp: table.to_owned(),
-        }) as Arc<dyn LocalPeerSource>;
+            reads: AtomicUsize::new(0),
+        });
+        let peer_src = mock_peer.clone() as Arc<dyn LocalPeerSource>;
         let server_uid = 2000_u32;
         let access = WebAccess {
             token_required: false,
@@ -843,9 +849,25 @@ mod tests {
             token: Arc::new("tok".to_owned()),
         };
         let peer: SocketAddr = "127.0.0.1:50001".parse().unwrap();
-        let peer_info = PeerConnectInfo::new(peer);
+        let server_local: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let peer_info = PeerConnectInfo::with_local(peer, Some(server_local));
         let mut headers = HeaderMap::new();
         headers.insert(CLIENT_HEADER, HeaderValue::from_static("1"));
+
+        // Unguarded "/" does not read /proc/net/tcp.
+        assert!(
+            check_guarded_request(
+                &access,
+                &Method::GET,
+                "/",
+                &headers,
+                "localhost:7420",
+                None,
+                Some(&peer_info),
+            )
+            .is_ok()
+        );
+        assert_eq!(mock_peer.reads.load(Ordering::SeqCst), 0);
 
         assert!(
             check_guarded_request(
@@ -859,6 +881,7 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(mock_peer.reads.load(Ordering::SeqCst), 1);
         assert!(
             check_guarded_request(
                 &access,
@@ -872,12 +895,19 @@ mod tests {
             .is_err(),
             "rejected peer stays rejected on keep-alive"
         );
+        assert_eq!(
+            mock_peer.reads.load(Ordering::SeqCst),
+            1,
+            "keep-alive connection must cache peer uid check"
+        );
 
         let root_table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
              0: 0100007F:C351 0100007F:C350 01 00000000:00000000 00:00000000 00000000     0        0 123 1 00000000\n";
-        let root_src = Arc::new(MockPeer {
+        let root_mock = Arc::new(MockPeer {
             tcp: root_table.to_owned(),
-        }) as Arc<dyn LocalPeerSource>;
+            reads: AtomicUsize::new(0),
+        });
+        let root_src = root_mock.clone() as Arc<dyn LocalPeerSource>;
         let root_access = WebAccess {
             token_required: false,
             listener: ListenerKind::Loopback,
@@ -887,23 +917,24 @@ mod tests {
             peer_source: root_src,
             token: Arc::new("tok".to_owned()),
         };
-        let root_peer = PeerConnectInfo::new(peer);
+        let root_peer = PeerConnectInfo::with_local(peer, Some(server_local));
         assert!(
             check_guarded_request(
                 &root_access,
                 &Method::GET,
-                "/",
+                "/api/state",
                 &headers,
                 "localhost:7420",
                 None,
                 Some(&root_peer),
             )
             .is_ok(),
-            "root path skips guarded peer check"
+            "uid 0 peer allowed on guarded path"
         );
+        assert_eq!(root_mock.reads.load(Ordering::SeqCst), 1);
 
         let v6_peer: SocketAddr = "[::ffff:127.0.0.1]:50001".parse().unwrap();
-        let v6_info = PeerConnectInfo::new(v6_peer);
+        let v6_info = PeerConnectInfo::with_local(v6_peer, Some(server_local));
         assert!(
             check_guarded_request(
                 &access,
@@ -925,6 +956,7 @@ mod tests {
             server_uid,
             peer_source: Arc::new(MockPeer {
                 tcp: table.to_owned(),
+                reads: AtomicUsize::new(0),
             }) as Arc<dyn LocalPeerSource>,
             token: Arc::new("sekrit".to_owned()),
         };

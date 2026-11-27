@@ -154,7 +154,11 @@ pub fn workspace_metadata_path(repo_key: &str) -> io::Result<PathBuf> {
 pub fn write_workspace_metadata(workspace_root: &Path) -> io::Result<PathBuf> {
     let canonical_path = normalize_workspace_path(workspace_root)?;
     let key = repo_key_for_canonical(&canonical_path);
-    let repo_dir = state_base()?.join("repos").join(&key);
+    let base = state_base()?;
+    let repos_dir = base.join("repos");
+    let repo_dir = repos_dir.join(&key);
+    create_private_dir(&base)?;
+    create_private_dir(&repos_dir)?;
     create_private_dir(&repo_dir)?;
 
     let last_seen_ms = SystemTime::now()
@@ -183,20 +187,20 @@ pub fn warn_write_workspace_metadata(workspace_root: &Path) {
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
         if let Some(parent) = dir.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-        {
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(dir)?;
+        handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -237,6 +241,17 @@ fn write_private_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Err(err) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(parent)
+        {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }

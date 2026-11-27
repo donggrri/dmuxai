@@ -344,6 +344,9 @@
         try {
           var es = new EventSource(streamUrl);
           activeStream = es;
+          es.addEventListener('open', function () {
+            logOl.replaceChildren();
+          });
           es.addEventListener('run', function (ev) {
             try {
               var snap = JSON.parse(ev.data);
@@ -375,21 +378,37 @@
       return;
     }
     var btn = $('all-projects-open-btn');
+    var hint = $('all-projects-open-hint');
+    function showOpenError(msg) {
+      if (hint) {
+        hint.textContent = msg || 'Failed to open project.';
+        hint.hidden = false;
+      }
+      updateOpenButton();
+    }
     if (btn) { btn.disabled = true; }
-    postJson(apiUrl('/api/workspace/attach'), { path: proj.canonical_path }).then(function (res) {
+    if (hint) { hint.textContent = ''; hint.hidden = true; }
+    postJson('/api/workspace/attach', { path: proj.canonical_path }).then(function (res) {
       if (!res.ok || !res.body || !res.body.id) {
-        updateOpenButton();
+        showOpenError(res.body && res.body.error);
         return;
       }
       var wsId = res.body.id;
-      var p = Promise.resolve();
+      var p = Promise.resolve({ ok: true });
       if (selectedConvId) {
         p = postJson(apiUrlFor(wsId, '/api/command'), {
           command: 'load_conversation',
           id: selectedConvId
         });
       }
-      return p.then(function () {
+      return p.then(function (cmdRes) {
+        if (cmdRes && !cmdRes.ok) {
+          showOpenError(cmdRes.body && cmdRes.body.error);
+          return;
+        }
+        if (typeof window.dmuxaiSetCenterView === 'function') {
+          window.dmuxaiSetCenterView(null);
+        }
         var nextUrl = new URL(window.location.href);
         if (wsId === 'default') {
           nextUrl.searchParams.delete('ws');
@@ -399,20 +418,20 @@
         window.location.assign(nextUrl.toString());
       });
     }).catch(function () {
-      updateOpenButton();
+      showOpenError('Failed to open project.');
     });
   }
 
   function refresh() {
     Promise.all([
       fetchJson(apiUrl('/api/global/projects')).catch(function () { return { projects: [] }; }),
-      fetchJson(apiUrl('/api/workspace')).catch(function () { return {}; })
+      fetchJson('/api/workspace').catch(function () { return {}; })
     ]).then(function (results) {
       var projData = results[0] || {};
       var wsData = results[1] || {};
       projects = Array.isArray(projData.projects) ? projData.projects : [];
-      viewOnlyMode = wsData.view_only !== false && !wsData.can_switch;
-      canOpenInWeb = !!wsData.can_switch && !wsData.view_only;
+      viewOnlyMode = wsData.view_only !== false;
+      canOpenInWeb = !viewOnlyMode;
       renderProjectsList();
       updateOpenButton();
     });

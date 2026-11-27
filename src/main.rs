@@ -678,13 +678,18 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
     let docs = ws.map(|workspace| {
         let changes = dmuxai::docs::changes::ChangeLog::default();
         let soffice = dmuxai::docs::office::find_soffice();
+        let docs_token = if token_required {
+            token.clone()
+        } else {
+            String::new()
+        };
         Arc::new(dmuxai::web::docs_api::DocsService::new(
             workspace,
             true, // read_only
             changes,
             soffice,
             open_tickets.clone(),
-            token.clone(),
+            docs_token,
         ))
     });
 

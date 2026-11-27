@@ -404,7 +404,9 @@ fn progress_as_json_values(store: &JournalStore, id: &str) -> Vec<serde_json::Va
         .into_iter()
         .filter_map(|line| {
             let masked = mask_sensitive_tokens(&line);
-            serde_json::from_str::<serde_json::Value>(&masked).ok()
+            let mut value = serde_json::from_str::<serde_json::Value>(&masked).ok()?;
+            mask_json_value(&mut value);
+            Some(value)
         })
         .collect()
 }
@@ -635,7 +637,16 @@ pub(crate) fn stream_response(
 
                 for line in tail_text_lines(&progress_path, &mut progress_offset, 500) {
                     had_new_data = true;
-                    let line = redact_token_in_text(&line, &token);
+                    let line =
+                        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) {
+                            mask_json_value(&mut value);
+                            redact_token_in_value(&mut value, &token);
+                            serde_json::to_string(&value).unwrap_or_else(|_| {
+                                redact_token_in_text(&mask_sensitive_tokens(&line), &token)
+                            })
+                        } else {
+                            redact_token_in_text(&mask_sensitive_tokens(&line), &token)
+                        };
                     if tx
                         .send(Ok(Event::default().event("progress").data(line)))
                         .is_err()

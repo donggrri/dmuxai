@@ -331,6 +331,16 @@ fn tc_2980_workspace_json_written_on_open_and_run_start_and_manifest_has_root() 
     }"#;
     let old_manifest: RunManifest = serde_json::from_str(old_json).expect("old manifest readable");
     assert_eq!(old_manifest.workspace_root, None);
+
+    // Warning-only failure when workspace does not exist.
+    dmuxai::state_path::warn_write_workspace_metadata(&env.root().join("nonexistent-ws"));
+
+    // Live dashboard startup writes workspace.json for the opened workspace.
+    let ws_live = env.root().join("proj-live");
+    fs::create_dir_all(&ws_live).unwrap();
+    let (_url, _guard) = spawn_dashboard("serve", &ws_live, &env);
+    let live_key = repo_key(&ws_live).unwrap();
+    assert!(workspace_metadata_path(&live_key).unwrap().is_file());
 }
 
 // TC-2981 / FR-2981: GET /api/global/projects lists repos from both state and data bases,
@@ -340,10 +350,14 @@ fn tc_2981_global_projects_lists_repos_from_state_and_data_bases() {
     let env = IsolatedEnv::new();
     let ws_conv = env.root().join("repo-conv");
     let ws_runs = env.root().join("repo-runs");
+    let ws_missing = env.root().join("repo-missing");
+    let ws_noroot = env.root().join("repo-noroot");
     fs::create_dir_all(&ws_conv).unwrap();
     fs::create_dir_all(&ws_runs).unwrap();
+    fs::create_dir_all(&ws_missing).unwrap();
+    fs::create_dir_all(&ws_noroot).unwrap();
 
-    let key_conv = {
+    let (k_conv, k_runs, k_missing, k_noroot, db_path) = {
         let _lock = dmuxai::state_path::test_env_lock();
         let _s = EnvRestore::set("DMUXAI_STATE_DIR", &env.state_dir);
         let _d = EnvRestore::set("DMUXAI_DATA_DIR", &env.data_dir);
@@ -373,7 +387,21 @@ fn tc_2981_global_projects_lists_repos_from_state_and_data_bases() {
         let store = JournalStore::new(runs_dir);
         let manifest = make_manifest("aaaa1111bbbb2222", "active", Some(&ws_runs), "cli_headless");
         store.save_relaxed(&manifest).unwrap();
-        (k_conv, k_runs)
+
+        let k_missing = repo_key(&ws_missing).unwrap();
+        write_workspace_metadata(&ws_missing).unwrap();
+        fs::remove_dir_all(&ws_missing).unwrap();
+
+        let k_noroot = repo_key(&ws_noroot).unwrap();
+        let noroot_runs = env.data_dir.join("repos").join(&k_noroot).join("runs");
+        let noroot_store = JournalStore::new(noroot_runs);
+        let mut noroot_manifest =
+            make_manifest("cccc3333dddd4444", "completed", None, "cli_headless");
+        noroot_manifest.created_at_ms = 1_600_000_000_000;
+        noroot_manifest.completed_at_ms = Some(1_600_000_001_000);
+        noroot_store.save_relaxed(&noroot_manifest).unwrap();
+
+        (k_conv, k_runs, k_missing, k_noroot, db_path)
     };
 
     let (url, _guard) = spawn_dashboard("serve", &ws_conv, &env);
@@ -383,15 +411,25 @@ fn tc_2981_global_projects_lists_repos_from_state_and_data_bases() {
     let projects = parsed["projects"].as_array().expect("projects array");
     let p_conv = projects
         .iter()
-        .find(|p| p["repo_key"] == key_conv.0)
+        .find(|p| p["repo_key"] == k_conv)
         .expect("conv repo listed");
     let p_runs = projects
         .iter()
-        .find(|p| p["repo_key"] == key_conv.1)
+        .find(|p| p["repo_key"] == k_runs)
         .expect("runs-only repo listed");
+    let p_missing = projects
+        .iter()
+        .find(|p| p["repo_key"] == k_missing)
+        .expect("missing repo listed");
+    let p_noroot = projects
+        .iter()
+        .find(|p| p["repo_key"] == k_noroot)
+        .expect("noroot repo listed");
     assert_eq!(p_conv["conversation_count"], 1);
+    assert_eq!(p_conv["open_ws"], "default");
     assert_eq!(p_runs["run_count"], 1);
     assert_eq!(p_runs["active_run_count"], 1);
+    assert!(p_runs.get("open_ws").is_some() && p_runs["open_ws"].is_null());
     assert_eq!(
         p_runs["canonical_path"],
         fs::canonicalize(&ws_runs)
@@ -399,6 +437,28 @@ fn tc_2981_global_projects_lists_repos_from_state_and_data_bases() {
             .to_string_lossy()
             .as_ref()
     );
+    assert_eq!(p_missing["missing"], true);
+    assert!(p_noroot.get("canonical_path").is_some() && p_noroot["canonical_path"].is_null());
+    assert_eq!(p_noroot["missing"], true);
+
+    // Verify last_activity_ms descending sort order.
+    for pair in projects.windows(2) {
+        let a = pair[0]["last_activity_ms"].as_u64().unwrap();
+        let b = pair[1]["last_activity_ms"].as_u64().unwrap();
+        assert!(
+            a >= b,
+            "projects not sorted by last_activity_ms desc: {a} < {b}"
+        );
+    }
+
+    // Verify DB was opened read-only and not migrated/modified.
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let user_ver: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert!(user_ver >= 1);
 }
 
 // TC-2982 / FR-2982: global conversation detail, run detail, run stream, and 404 on bad keys/ids.
@@ -485,6 +545,44 @@ fn tc_2982_global_conversation_run_detail_and_stream_read_only_bad_keys_404() {
     assert_eq!(st, 200);
     assert!(sse_body.contains("event: run"));
 
+    // Live active -> completed stream transition.
+    let live_run_id = "1234567890abcdef";
+    let runs_dir = env.data_dir.join("repos").join(&k_runs).join("runs");
+    let store = JournalStore::new(runs_dir);
+    store
+        .save_relaxed(&make_manifest(
+            live_run_id,
+            "active",
+            Some(&ws_runs),
+            "cli_headless",
+        ))
+        .unwrap();
+    let url_clone = url.clone();
+    let k_runs_clone = k_runs.clone();
+    let handle = std::thread::spawn(move || {
+        read_sse_until(
+            &url_clone,
+            &format!("/api/global/projects/{k_runs_clone}/runs/{live_run_id}/stream"),
+            "event: end",
+        )
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    store
+        .append_progress(live_run_id, r#"{"kind":"step","msg":"live-line"}"#)
+        .unwrap();
+    store
+        .save_relaxed(&make_manifest(
+            live_run_id,
+            "completed",
+            Some(&ws_runs),
+            "cli_headless",
+        ))
+        .unwrap();
+    let (live_st, live_sse) = handle.join().unwrap();
+    assert_eq!(live_st, 200);
+    assert!(live_sse.contains("live-line"));
+    assert!(live_sse.contains("event: end"));
+
     // Unknown or invalid repo keys and ids return 404.
     let (st, _) = http_get(
         &url,
@@ -544,10 +642,22 @@ fn tc_2983_global_responses_mask_secrets() {
             "cli sk-proj-secret1234567890abcd",
         );
         store.save_relaxed(&manifest).unwrap();
+        store
+            .append_progress(
+                run_id,
+                r#"{"apikey":"secret-api-key-val","msg":"Bearer sk-proj-secret1234567890abcd"}"#,
+            )
+            .unwrap();
         (k, conv_id, run_id.to_owned())
     };
 
     let (url, _guard) = spawn_dashboard("serve", &ws, &env);
+    let (_, projs_body) = http_get(&url, "/api/global/projects");
+    assert!(!projs_body.contains("sk-proj-secret1234567890abcd"));
+
+    let (_, convs_body) = http_get(&url, &format!("/api/global/projects/{k}/conversations"));
+    assert!(!convs_body.contains("sk-proj-secret1234567890abcd"));
+
     let (_, conv_body) = http_get(
         &url,
         &format!("/api/global/projects/{k}/conversations/{conv_id}"),
@@ -555,8 +665,21 @@ fn tc_2983_global_responses_mask_secrets() {
     assert!(!conv_body.contains("sk-proj-secret1234567890abcd"));
     assert!(!conv_body.contains("ghp_1234567890abcdef1234567890abcdef1234"));
 
+    let (_, runs_body) = http_get(&url, &format!("/api/global/projects/{k}/runs"));
+    assert!(!runs_body.contains("sk-proj-secret1234567890abcd"));
+
     let (_, run_body) = http_get(&url, &format!("/api/global/projects/{k}/runs/{run_id}"));
     assert!(!run_body.contains("sk-proj-secret1234567890abcd"));
+    assert!(!run_body.contains("secret-api-key-val"));
+
+    let (st, sse_body) = read_sse_until(
+        &url,
+        &format!("/api/global/projects/{k}/runs/{run_id}/stream"),
+        "event: end",
+    );
+    assert_eq!(st, 200);
+    assert!(!sse_body.contains("sk-proj-secret1234567890abcd"));
+    assert!(!sse_body.contains("secret-api-key-val"));
 }
 
 // --- Headless Chrome helpers for TC-2984 and TC-2985 ---
@@ -934,6 +1057,26 @@ fn tc_2984_all_projects_view_renders_projects_conversations_runs() {
             .unwrap_or("")
             .contains("read only message")
     );
+
+    // Click second project and inspect its run detail.
+    chrome
+        .cdp
+        .eval(&format!(
+            "document.querySelector('[data-repo-key=\"{k2}\"]').click()"
+        ))
+        .unwrap();
+    wait_until(
+        &mut chrome,
+        "!!document.querySelector('#all-projects-runs [data-run-id=\"cafe0000beef1111\"]')",
+    );
+    chrome
+        .cdp
+        .eval("document.querySelector('#all-projects-runs [data-run-id=\"cafe0000beef1111\"]').click()")
+        .unwrap();
+    wait_until(
+        &mut chrome,
+        "!!document.querySelector('.all-projects-run-log') && !!document.querySelector('.all-projects-readonly-badge')",
+    );
 }
 
 // TC-2985 / FR-2985: Open project is disabled in serve with hint, and in --web attaches and loads conversation.
@@ -1001,6 +1144,11 @@ fn tc_2985_open_project_attaches_and_loads_conversation_disabled_in_serve() {
         .eval("document.querySelector('#all-projects-open-btn').disabled")
         .unwrap();
     assert_eq!(disabled, Value::Bool(true));
+    let serve_hint = serve_chrome
+        .cdp
+        .eval("document.querySelector('#all-projects-open-hint')?.textContent || ''")
+        .unwrap();
+    assert!(serve_hint.as_str().unwrap_or("").contains("View-only"));
 
     // 2. In --web host, Open project is enabled, attaches ws2, and loads selected conversation.
     let (web_url, _web_guard) = spawn_dashboard("web", &ws1, &env);
@@ -1040,4 +1188,12 @@ fn tc_2985_open_project_attaches_and_loads_conversation_disabled_in_serve() {
         .eval("document.querySelector('#all-projects-open-btn').click()")
         .unwrap();
     wait_until(&mut web_chrome, "window.location.search.includes('ws=')");
+    wait_until(
+        &mut web_chrome,
+        "document.getElementById('all-projects').hidden === true",
+    );
+    wait_until(
+        &mut web_chrome,
+        "(document.getElementById('session')?.textContent || '').includes('target prompt')",
+    );
 }
