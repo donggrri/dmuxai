@@ -495,7 +495,6 @@ pub fn ask_item_execute(
         guard,
         params,
     } = prepared;
-    let _guard = guard;
     let ws_str = workspace.to_string_lossy().into_owned();
     let timeout = child_timeout();
 
@@ -529,6 +528,8 @@ pub fn ask_item_execute(
         };
         let masked = mask_sensitive_tokens(&raw_answer);
         let answer: String = masked.chars().take(TEXT_MAX).collect();
+        // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
+        drop(guard);
         return store.say(
             &params.id,
             SayRequest {
@@ -560,6 +561,8 @@ pub fn ask_item_execute(
         let rev = updated.plan.as_ref().map(|p| p.revision).unwrap_or(0);
         let steps = updated.plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
         let msg = format!("Revised plan to revision {rev} ({new_hash}, {steps} steps).");
+        // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
+        drop(guard);
         return store.say(
             &params.id,
             SayRequest {
@@ -579,6 +582,8 @@ pub fn ask_item_execute(
         msg.push(' ');
         msg.push_str(&clipped);
     }
+    // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
+    drop(guard);
     store.say(
         &params.id,
         SayRequest {
