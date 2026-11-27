@@ -54,20 +54,22 @@ use dmuxai::{
     },
     events::EventDraft,
     graph::{
-        AllowedRunner, Approval, ApprovalState, DecisionBy, FallbackCause, GraphAction, GraphNode,
-        GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache, GraphRunPhase, GraphRunSession,
-        GraphStopReason, GraphStore, MAX_PLAN_REVISIONS, NodeAssignment, NodeRole, OverrideKind,
-        PanelLineKind, PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc,
-        PlanPromptMode, PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls,
-        PlannerIo, PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit,
-        Triage, TriageSource, apply_replan, approval_panel_lines_with_skills, budget_allows,
-        build_judge_prompt, build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt,
-        cap_replan_step_summary, cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
+        AllowedRunner, Approval, ApprovalState, DecisionBy, DynamicNodeSpec, FallbackCause,
+        GraphAction, GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache,
+        GraphRunPhase, GraphRunSession, GraphStopReason, GraphStore, MAX_PLAN_REVISIONS,
+        NodeAssignment, NodeRole, NodeTurnPolicy, OverrideKind, PanelLineKind, PlanChange,
+        PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest,
+        PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo, PlannerIoKind,
+        QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, TaskEdit, Triage, TriageSource,
+        apply_replan, approval_panel_lines_with_skills, budget_allows, build_judge_prompt,
+        build_plan_prompt, build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary,
+        cap_revision_raw, diff_plan_steps, diff_plan_tasks, fallback_plan,
         graph_plan_from_revision_steps, heuristic_route, is_question_prompt, is_trivial_prompt,
-        judge_line_text, judging_line_text, next_plan_change_rev, parse_plan, parse_replan,
-        parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
-        replan_allowed, replan_revision_steps, revision_needs_approval, save_run,
-        strip_replan_marker, task_counter_text, validate_plan_with_limit,
+        judge_line_text, judging_line_text, next_plan_change_rev, node_turn_policy,
+        parse_add_nodes_marker, parse_plan, parse_replan, parse_replan_marker, parse_verdict,
+        pin_graph_plan_runners, plan_json_for_edit, replan_allowed, replan_revision_steps,
+        revision_needs_approval, save_run, strip_add_nodes_marker, strip_replan_marker,
+        task_counter_text, validate_add_nodes, validate_plan_with_limit,
         write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
@@ -436,6 +438,8 @@ struct ActiveTurn {
     /// projection instead of a native resume, ready for the one fresh retry
     /// after the provider rejects the stored session id (FR-2325).
     retry_fresh_request: Option<AgentRequest>,
+    /// Write fan-out leg worktree (FR-2938 fallback keeps the same directory).
+    fanout_worktree: Option<PathBuf>,
 }
 
 /// Handover state for the turn that takes over a failed runner
@@ -790,6 +794,25 @@ impl InternalTurn for PendingSummary {
     }
 }
 
+#[derive(Clone)]
+struct FanoutLegTracker {
+    runner: String,
+    conversation_id: StoredConversationId,
+    turn_id: StoredTurnId,
+    buffer: TurnBuffer,
+    started: Instant,
+    model: Option<String>,
+    finished: bool,
+    ok: bool,
+    error: Option<String>,
+    error_kind: Option<String>,
+    worktree: Option<PathBuf>,
+    diff_stat: Option<dmuxai::fanout_worktree::FanoutDiffStat>,
+    patch_path: Option<String>,
+    worktree_path: Option<String>,
+    changed: Option<bool>,
+}
+
 /// FR-932: an internal read-only judge turn. Its streamed text is buffered and
 /// never shown; the agent is busy for its duration and its mode is restored on
 /// every ending.
@@ -1059,12 +1082,16 @@ struct HeadlessPendingPlan {
     prompt: String,
     tasks: Vec<PlanTask>,
     steps: Vec<PlanStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dynamic_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadlessPlan {
     pub steps: Vec<PlanStep>,
     pub tasks: Vec<PlanTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1107,6 +1134,16 @@ pub struct HeadlessOutcome {
     pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<dmuxai::runner_fallback::FallbackRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<dmuxai::fanout::FanoutReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate: Option<dmuxai::fanout::FanoutAggregate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_skipped: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fanout_judge: Option<dmuxai::fanout::FanoutJudgeMeta>,
 }
 
 impl HeadlessOutcome {
@@ -1133,6 +1170,11 @@ impl HeadlessOutcome {
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
+            fanout: None,
+            aggregate: None,
+            aggregate_error: None,
+            aggregate_skipped: None,
+            fanout_judge: None,
         }
     }
 
@@ -1510,6 +1552,14 @@ pub struct App {
     /// Typed error reported by the failing node held for replan (FR-956 / #134).
     graph_failure_replan_error: Option<String>,
     deferred_internal_turn: Option<DeferredInternalTurnWait>,
+    /// Runners reserved by other fan-out legs (FR-2914).
+    fanout_reserved_runners: HashSet<String>,
+    in_fanout_run: bool,
+    fanout_trackers: HashMap<Agent, FanoutLegTracker>,
+    fanout_write_mode: bool,
+    fanout_keep_worktrees: bool,
+    fanout_run_id: Option<String>,
+    fanout_active_worktrees: Vec<PathBuf>,
     /// FR-1008: planner_io recorded before the run row exists (e.g. judge).
     deferred_planner_io: HashMap<String, Vec<PlannerIo>>,
     deferred_turns: Vec<DeferredTurn>,
@@ -1646,6 +1696,10 @@ pub struct App {
     pub(crate) switch_ready: Option<PathBuf>,
     /// Next user/agent turn policy from dashboard `mode` or headless `mode` (cleared on send).
     pending_turn_policy: Option<TurnPolicy>,
+    /// App-wide policy saved before a node overrides it (FR-2903), keyed by node id.
+    graph_node_saved_policy: HashMap<String, Option<TurnPolicy>>,
+    /// Worktree fingerprint at read-only graph node start for headless write guard (FR-2905).
+    graph_node_read_only_fingerprint: HashMap<String, String>,
     /// When set, planner nodes are rewritten to this runner and model (FR-1645).
     turn_runner_pin: Option<(String, String)>,
     /// Headless `--model` accepted for this run (Explicit source), if any.
@@ -1840,6 +1894,7 @@ impl App {
         settings: DmuxSettings,
         prewarm: bool,
     ) -> Result<Self, ConversationError> {
+        dmuxai::settings::wire_model_policy_switch(&settings);
         let (mcp_servers, mcp_warnings) =
             dmuxai::mcp::config::resolve_servers(&settings.mcp_servers, |k| std::env::var(k).ok());
         let (event_tx, event_rx) = event_channel();
@@ -1970,6 +2025,13 @@ impl App {
             graph_failure_replan: None,
             graph_failure_replan_error: None,
             deferred_internal_turn: None,
+            fanout_reserved_runners: HashSet::new(),
+            in_fanout_run: false,
+            fanout_trackers: HashMap::new(),
+            fanout_write_mode: false,
+            fanout_keep_worktrees: false,
+            fanout_run_id: None,
+            fanout_active_worktrees: Vec::new(),
             deferred_planner_io: HashMap::new(),
             deferred_turns: Vec::new(),
             restored_inputs: HashMap::new(),
@@ -2052,6 +2114,8 @@ impl App {
             switch_pending: None,
             switch_ready: None,
             pending_turn_policy: None,
+            graph_node_saved_policy: HashMap::new(),
+            graph_node_read_only_fingerprint: HashMap::new(),
             turn_runner_pin: None,
             headless_explicit_model: None,
             allow_multi_runner_graph: false,
@@ -2586,11 +2650,10 @@ impl App {
             return Err(RunTodoError::Busy(PLAN_AWAITING_APPROVAL_MSG.to_owned()));
         }
         let target_agent = if let Some(ref agent_str) = agent {
-            let runner_clean = agent_str.trim().to_ascii_lowercase();
-            let adapter = self
-                .adapters
-                .iter()
-                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+            let runner_clean = dmuxai::runner_id::canonical_runner_id(agent_str);
+            let adapter = self.adapters.iter().find(|a| {
+                dmuxai::runner_id::canonical_runner_id(runner_name(a.agent())) == runner_clean
+            });
             let Some(adapter) = adapter else {
                 if runner_clean == "opencode"
                     && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
@@ -2609,10 +2672,7 @@ impl App {
             if allowed.is_empty() {
                 return Err(RunTodoError::Forbidden("no allowed runners".to_owned()));
             }
-            if !allowed
-                .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim()))
-            {
+            if !self.runner_is_allowed(runner_id) {
                 return Err(RunTodoError::Forbidden(format!(
                     "runner '{runner_id}' is not in allowed_runners"
                 )));
@@ -2982,11 +3042,12 @@ impl App {
 
     /// Whether `[graph] allowed_runners` permits a runner (unset = every runner).
     fn runner_is_allowed(&self, runner_id: &str) -> bool {
+        let canon = dmuxai::runner_id::canonical_runner_id(runner_id);
         match &self.settings.graph_allowed_runners {
             None => true,
             Some(allowed) => allowed
                 .iter()
-                .any(|r| r.trim().eq_ignore_ascii_case(runner_id.trim())),
+                .any(|r| dmuxai::runner_id::canonical_runner_id(r) == canon),
         }
     }
 
@@ -3005,7 +3066,9 @@ impl App {
         match &self.settings.graph_allowed_runners {
             None => self.registered_runner_names().into_iter().next(),
             Some(allowed) if allowed.is_empty() => None,
-            Some(allowed) => allowed.first().map(|r| r.trim().to_ascii_lowercase()),
+            Some(allowed) => allowed
+                .first()
+                .map(|r| dmuxai::runner_id::canonical_runner_id(r)),
         }
     }
 
@@ -3094,7 +3157,9 @@ impl App {
         let replacement_index = self.initial_runner_index(agent);
         let replacement = self.agent_runner_name(self.adapters[replacement_index].agent());
         self.selected = replacement_index;
-        if replacement.eq_ignore_ascii_case(runner) {
+        if dmuxai::runner_id::canonical_runner_id(&replacement)
+            == dmuxai::runner_id::canonical_runner_id(runner)
+        {
             return;
         }
         if registered {
@@ -3253,10 +3318,11 @@ impl App {
         let Some(raw) = agent.map(str::trim).filter(|raw| !raw.is_empty()) else {
             return Ok(self.adapters[self.selected].agent());
         };
+        let canon = dmuxai::runner_id::canonical_runner_id(raw);
         self.adapters
             .iter()
             .map(|adapter| adapter.agent())
-            .find(|candidate| self.agent_runner_name(*candidate).eq_ignore_ascii_case(raw))
+            .find(|candidate| self.agent_runner_name(*candidate) == canon)
             .ok_or_else(|| {
                 if raw.eq_ignore_ascii_case("opencode")
                     && let Some(message) = dmuxai::settings::opencode_bin_explicit_missing_message()
@@ -3280,7 +3346,7 @@ impl App {
     fn agent_key_runner_name(&self, key: AgentKey) -> String {
         match key {
             AgentKey::Codex => "codex".to_owned(),
-            AgentKey::Cursor => "cursor".to_owned(),
+            AgentKey::Cursor => dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             AgentKey::Agy => "agy".to_owned(),
             AgentKey::Custom(index) => self
                 .custom_spec(index)
@@ -3567,21 +3633,34 @@ impl App {
                     models_loading: catalog.is_some_and(|catalog| catalog.loading),
                     models: catalog
                         .map(|catalog| {
-                            catalog
-                                .models
-                                .iter()
-                                .filter(|model| {
-                                    dmuxai::model_policy::validate_model_for_runner(&id, &model.id)
+                            if matches!(agent, Agent::Cursor | Agent::Agy) {
+                                picker_offered_models(agent, &id, catalog)
+                                    .into_iter()
+                                    .map(|model| session_model(agent, model))
+                                    .collect()
+                            } else {
+                                catalog
+                                    .models
+                                    .iter()
+                                    .filter(|model| {
+                                        dmuxai::model_policy::validate_model_for_runner(
+                                            &id, &model.id,
+                                        )
                                         .is_ok()
-                                })
-                                .map(|model| session_model(agent, model))
-                                .collect()
+                                    })
+                                    .map(|model| session_model(agent, model))
+                                    .collect()
+                            }
                         })
                         .unwrap_or_default(),
                     default_model: catalog
                         .and_then(|catalog| catalog.default_model.clone())
                         .filter(|model| {
-                            dmuxai::model_policy::validate_model_for_runner(&id, model).is_ok()
+                            if matches!(agent, Agent::Cursor | Agent::Agy) {
+                                model_offered_in_picker(&id, model)
+                            } else {
+                                dmuxai::model_policy::validate_model_for_runner(&id, model).is_ok()
+                            }
                         }),
                     id,
                     run: Some(self.run_state_view_for_dashboard(agent)),
@@ -3840,8 +3919,10 @@ impl App {
                 self.quiet_model_echo.remove(&target);
                 // Same Cursor model pin as the TUI picker (SPEC-cursor-model-pin).
                 if target == Agent::Cursor
-                    && let Err(error) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &info.id)
+                    && let Err(error) = dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &info.id,
+                    )
                 {
                     self.push_system(format!(
                         "Model {} rejected for Cursor ({error}); replaced with {}",
@@ -3942,7 +4023,7 @@ impl App {
                 let id = self.agent_runner_name(agent);
                 if parse_agent(&id).is_none() {
                     return Err(RunTodoError::Invalid(
-                        "share target must be codex, cursor or agy".to_owned(),
+                        "share target must be codex, cursor-agent or agy".to_owned(),
                     ));
                 }
                 if !self.runner_is_allowed(&id) {
@@ -4316,6 +4397,43 @@ impl App {
 
     fn apply_agent_output(&mut self, mut output: AgentOutput) -> bool {
         self.attach_model_catalog_hint(&mut output);
+        if self.in_fanout_run {
+            let leg_event = match (&output.conversation_id, &output.turn_id) {
+                (Some(conversation_id), Some(turn_id)) => self
+                    .fanout_trackers
+                    .get(&output.agent)
+                    .is_some_and(|track| {
+                        track.conversation_id.as_str() == conversation_id.as_str()
+                            && track.turn_id.as_str() == turn_id.as_str()
+                    }),
+                _ => false,
+            };
+            if leg_event {
+                if let Some(track) = self.fanout_trackers.get_mut(&output.agent) {
+                    match &output.event {
+                        AgentEvent::TextDelta(delta) => track.buffer.push(delta),
+                        AgentEvent::Error(err) => {
+                            track.error = Some(err.to_string());
+                            track.error_kind = Some(err.kind.as_str().to_owned());
+                        }
+                        AgentEvent::Cancelled => {
+                            track.error = Some("cancelled".to_owned());
+                            track.error_kind = Some(AgentErrorKind::Cancelled.as_str().to_owned());
+                        }
+                        AgentEvent::Completed => track.ok = true,
+                        _ => {}
+                    }
+                }
+                if matches!(
+                    output.event,
+                    AgentEvent::Completed | AgentEvent::Error(_) | AgentEvent::Cancelled
+                ) {
+                    self.busy_agents.remove(&output.agent);
+                    self.active_turns.remove(&output.agent);
+                }
+                return true;
+            }
+        }
         if output
             .turn_id
             .as_ref()
@@ -4491,6 +4609,9 @@ impl App {
     /// change. Other adapters are covered only when their error text matches
     /// the same patterns.
     fn try_fresh_resume_retry(&mut self, agent: Agent, err: &AgentError) -> bool {
+        if self.in_fanout_run {
+            return false;
+        }
         if !is_resume_rejection_message(&err.message) {
             return false;
         }
@@ -4547,6 +4668,9 @@ impl App {
     /// that fails to start leaves the original error to the normal error path
     /// (FR-2130..FR-2133).
     fn try_runner_fallback(&mut self, agent: Agent, err: &AgentError) -> bool {
+        if self.in_fanout_run {
+            return false;
+        }
         // FR-2130 / TC-2130: a pending handover from an earlier attempt must never leak
         // into this one.
         self.pending_fallback = None;
@@ -4590,6 +4714,9 @@ impl App {
             }
         };
 
+        let fanout_reserved = self.fanout_reserved_runners.clone();
+        let fanout_company = self.in_fanout_run && self.settings.fanout_company_workspace;
+        let fanout_settings = self.settings.clone();
         let is_usable = |t: &dmuxai::runner_fallback::FallbackTarget,
                          adapters: &[Box<dyn AgentAdapter>],
                          busy_agents: &HashSet<Agent>,
@@ -4605,6 +4732,18 @@ impl App {
             }
             if busy_agents.contains(&cand_agent) && cand_agent != agent {
                 return false;
+            }
+            if fanout_reserved.contains(&t.runner.to_ascii_lowercase()) {
+                return false;
+            }
+            if fanout_company {
+                let leg = dmuxai::fanout::FanoutLegSpec {
+                    runner: t.runner.to_ascii_lowercase(),
+                    model: t.model.clone(),
+                };
+                if dmuxai::fanout::fanout_runner_is_free(&leg, &fanout_settings) {
+                    return false;
+                }
             }
             if !allowed_fn(&t.runner) {
                 return false;
@@ -5454,20 +5593,25 @@ impl App {
             return;
         }
 
+        let runner = self.agent_runner_name(agent);
         let catalog = self
             .model_catalogs
             .get_mut(&agent)
             .expect("every agent has a model catalog");
-        let cursor = catalog
-            .selected
-            .as_ref()
-            .and_then(|selected| {
-                catalog
-                    .models
-                    .iter()
-                    .position(|model| &model.id == selected)
-            })
-            .unwrap_or(0);
+        let cursor = if matches!(agent, Agent::Cursor | Agent::Agy) {
+            picker_selected_index(agent, &runner, catalog)
+        } else {
+            catalog
+                .selected
+                .as_ref()
+                .and_then(|selected| {
+                    catalog
+                        .models
+                        .iter()
+                        .position(|model| &model.id == selected)
+                })
+                .unwrap_or(0)
+        };
         let should_load = catalog.models.is_empty() && !catalog.loading;
         if should_load {
             catalog.loading = true;
@@ -5487,6 +5631,8 @@ impl App {
         let Some(mut picker) = self.model_picker.take() else {
             return;
         };
+        let policy_picker = matches!(picker.agent, Agent::Cursor | Agent::Agy);
+        let runner = self.agent_runner_name(picker.agent);
 
         match key.code {
             KeyCode::Esc => {}
@@ -5498,9 +5644,14 @@ impl App {
                 let model_count = self
                     .model_catalogs
                     .get(&picker.agent)
-                    .expect("every agent has a model catalog")
-                    .models
-                    .len();
+                    .map(|catalog| {
+                        if policy_picker {
+                            picker_offered_models(picker.agent, &runner, catalog).len()
+                        } else {
+                            catalog.models.len()
+                        }
+                    })
+                    .unwrap_or(0);
                 if model_count > 0 {
                     picker.cursor = (picker.cursor + 1).min(model_count - 1);
                 }
@@ -5508,12 +5659,16 @@ impl App {
             }
             KeyCode::Tab if picker.agent != Agent::Codex => self.model_picker = Some(picker),
             KeyCode::Enter | KeyCode::Tab => {
-                let Some(model) = self
-                    .model_catalogs
-                    .get(&picker.agent)
-                    .and_then(|catalog| catalog.models.get(picker.cursor))
-                    .cloned()
-                else {
+                let Some(model) = self.model_catalogs.get(&picker.agent).and_then(|catalog| {
+                    if policy_picker {
+                        picker_offered_models(picker.agent, &runner, catalog)
+                            .into_iter()
+                            .nth(picker.cursor)
+                            .cloned()
+                    } else {
+                        catalog.models.get(picker.cursor).cloned()
+                    }
+                }) else {
                     self.model_picker = Some(picker);
                     return;
                 };
@@ -5524,8 +5679,10 @@ impl App {
                     .expect("picker agent belongs to Agent::all()");
                 self.quiet_model_echo.remove(&agent);
                 if agent == Agent::Cursor
-                    && let Err(error) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &model.id)
+                    && let Err(error) = dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &model.id,
+                    )
                 {
                     self.push_system(format!(
                         "Model {} rejected for Cursor ({error}); replaced with {}",
@@ -6125,9 +6282,10 @@ impl App {
                 .and_then(|catalog| catalog.selected.clone());
             match current {
                 Some(selected) => {
-                    if let Err(err) =
-                        dmuxai::model_policy::validate_model_for_runner("cursor", &selected)
-                    {
+                    if let Err(err) = dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &selected,
+                    ) {
                         self.push_system(format!(
                             "Disallowed model '{selected}' for Cursor replaced with {}: {err}",
                             dmuxai::model_policy::ALLOWED_MODEL
@@ -6234,7 +6392,17 @@ impl App {
             ),
             RequestContext::Fresh(_) => (None, Vec::new(), String::new()),
         };
-        let mut adapter_request = adapter_request(request, image_paths, policy, require_file_edits);
+        let fanout_worktree = self
+            .active_turns
+            .get(&agent)
+            .and_then(|active| active.fanout_worktree.clone());
+        let mut adapter_request = adapter_request(
+            request,
+            image_paths,
+            policy,
+            require_file_edits,
+            fanout_worktree,
+        );
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
 
         // Determine the prompt role for this turn.
@@ -6448,6 +6616,7 @@ impl App {
                         fallback_policy,
                         fallback_chain: pending_fallback.map(|fallback| fallback.chain),
                         retry_fresh_request,
+                        fanout_worktree: None,
                     },
                 );
                 // FR-2140: the next turn starts with a fresh busy-retry budget
@@ -6605,6 +6774,7 @@ impl App {
                 edges: Vec::new(),
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             };
             let mut run = self.build_graph_run(
                 plan,
@@ -6941,6 +7111,7 @@ impl App {
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         match self.adapters[slot].send(request) {
             Ok(()) => {
@@ -7164,6 +7335,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let run_id = self
             .todos
@@ -8134,7 +8306,16 @@ impl App {
         {
             return self.approve_replan_awaiting(by);
         }
-        let (triage, steps, tasks, user_prompt, plan_id, orchestrate_started, plan_fixed) = {
+        let (
+            triage,
+            steps,
+            tasks,
+            user_prompt,
+            plan_id,
+            orchestrate_started,
+            plan_fixed,
+            run_dynamic_cap,
+        ) = {
             let run = self
                 .last_graph_run
                 .as_ref()
@@ -8157,6 +8338,7 @@ impl App {
                 run.plan.id.clone(),
                 run.orchestrate_started_ms.unwrap_or_else(unix_ms_now),
                 run.plan_fixed_ms.unwrap_or_else(unix_ms_now),
+                run.plan.dynamic_cap,
             )
         };
         let limits = self.graph_limits();
@@ -8180,6 +8362,7 @@ impl App {
                     .join("; "),
             )
         })?;
+        graph_plan.dynamic_cap = run_dynamic_cap;
         Self::attach_orchestrate_node(&mut graph_plan, &triage, orchestrate_started, plan_fixed);
         let decided_at = unix_ms_now();
         let (plan_id, rev, save_error) = {
@@ -8202,6 +8385,7 @@ impl App {
             approval.decided_at_ms = Some(decided_at);
             run.phase = GraphRunPhase::Active;
             run.plan = graph_plan;
+            run.dynamic_cap = run.plan.dynamic_cap;
             let (added, changed, removed) = if run.plan_history.is_empty() {
                 diff_plan_steps(&[], &revision_steps)
             } else {
@@ -8759,6 +8943,9 @@ impl App {
         plan.id = run_id;
         plan.orchestrator_model = model.clone();
         plan.limits = self.graph_limits();
+        if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
+            plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
+        }
         let step = PlanStep {
             id: "step-1".to_owned(),
             role: "implement".to_owned(),
@@ -8998,6 +9185,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let triage = Triage {
             route,
@@ -9042,6 +9230,7 @@ impl App {
                 edges: Vec::new(),
                 limits: self.graph_limits(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             };
             let mut planning_run = self.build_graph_run(
                 planning_plan,
@@ -9265,6 +9454,12 @@ impl App {
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
+        if graph_plan.dynamic_cap.is_none()
+            && self.settings.graph_dynamic_nodes
+            && self.settings.graph_dynamic_node_cap > 0
+        {
+            graph_plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
+        }
         let approval = Approval {
             state: ApprovalState::Pending,
             revisions: vec![PlanRevision {
@@ -9332,6 +9527,11 @@ impl App {
         graph_plan.id = pending.run_id.clone();
         graph_plan.orchestrator_model = pending.model.clone();
         graph_plan.limits = self.graph_limits();
+        if let Some(existing_run) = self.last_graph_run.as_ref() {
+            graph_plan.dynamic_cap = existing_run.plan.dynamic_cap;
+        } else if self.settings.graph_dynamic_nodes && self.settings.graph_dynamic_node_cap > 0 {
+            graph_plan.dynamic_cap = Some(self.settings.graph_dynamic_node_cap);
+        }
         let feedback = pending.edit_feedback.clone();
         let steps = Self::revision_steps_from_doc(doc);
         let Some(run) = self
@@ -10090,6 +10290,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         match self.adapters[index].send(request) {
             Ok(()) => {
@@ -10321,6 +10522,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -10366,6 +10568,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -10404,6 +10607,7 @@ impl App {
             policy: TurnPolicy::ReadOnly,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         let now = Instant::now();
         pending.started = now;
@@ -11045,6 +11249,39 @@ impl App {
         self.replan_summaries.push((node_id.to_owned(), capped));
     }
 
+    fn graph_plan_is_quiet(run: &GraphRun) -> bool {
+        run.plan
+            .nodes
+            .iter()
+            .all(|node| node.role != NodeRole::Orchestrate)
+            && run
+                .plan
+                .nodes
+                .iter()
+                .filter(|node| node.role != NodeRole::Orchestrate)
+                .count()
+                <= 1
+    }
+
+    /// Whether node output should be scanned for `DMUXAI_ADD_NODES` (FR-2941, NFR-2940).
+    fn graph_dynamic_markers_enabled_for_run(&self, run: &GraphRun) -> bool {
+        if !self.settings.graph_dynamic_nodes || Self::graph_plan_is_quiet(run) {
+            return false;
+        }
+        let approved_cap = run.plan.dynamic_cap.or(run.dynamic_cap).unwrap_or(0);
+        approved_cap > 0 && self.settings.graph_dynamic_node_cap > 0
+    }
+
+    fn graph_dynamic_markers_enabled(&self) -> bool {
+        if self.quiet_graph_run {
+            return false;
+        }
+        let Some(session) = self.graph_session.as_ref() else {
+            return false;
+        };
+        self.graph_dynamic_markers_enabled_for_run(session.run())
+    }
+
     fn active_stored_graph_run_for_node(
         workspace: &std::path::Path,
         conversation_id: &str,
@@ -11108,6 +11345,7 @@ impl App {
         conversation_id: &str,
         node_id: String,
         success: bool,
+        output_text: &str,
         error: Option<&str>,
     ) {
         if !success && error == Some("cancelled") {
@@ -11142,19 +11380,52 @@ impl App {
             .as_ref()
             .is_some_and(|session| session.run().conversation_id == conversation_id);
 
+        let stored_run = (!session_is_target)
+            .then(|| {
+                Self::active_stored_graph_run_for_node(
+                    &self.workspace_root,
+                    conversation_id,
+                    &node_id,
+                )
+            })
+            .flatten();
+
+        let run_for_policy = if session_is_target {
+            self.graph_session.as_ref().map(|s| s.run().clone())
+        } else {
+            stored_run.clone()
+        };
+        let Some(run_for_policy) = run_for_policy else {
+            return;
+        };
+
+        let dynamic_marker =
+            if self.graph_dynamic_markers_enabled_for_run(&run_for_policy) && success {
+                parse_add_nodes_marker(output_text)
+            } else {
+                None
+            };
+
         let (actions, run_snapshot) = if session_is_target {
+            if let Some(marker_res) = dynamic_marker {
+                self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
+            }
             let session = self.graph_session.as_mut().expect("graph session");
             let actions = session.on_node_finished(&node_id, success);
             let snapshot = session.run().clone();
             let _ = save_run(&self.workspace_root, session.run());
             (actions, snapshot)
-        } else if let Some(run) =
-            Self::active_stored_graph_run_for_node(&self.workspace_root, conversation_id, &node_id)
-        {
-            let mut session = GraphRunSession::new(run);
+        } else if let Some(run) = stored_run {
+            let prior = self.graph_session.take();
+            self.graph_session = Some(GraphRunSession::new(run));
+            if let Some(marker_res) = dynamic_marker {
+                self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
+            }
+            let session = self.graph_session.as_mut().expect("graph session");
             let actions = session.on_node_finished(&node_id, success);
             let snapshot = session.run().clone();
             let _ = save_run(&self.workspace_root, &snapshot);
+            self.graph_session = prior;
             (actions, snapshot)
         } else {
             return;
@@ -11198,10 +11469,37 @@ impl App {
         &mut self,
         agent: Agent,
         node_id: String,
-        success: bool,
+        mut success: bool,
         output_text: &str,
         error: Option<&str>,
     ) {
+        let mut policy_error = error.map(str::to_owned);
+        if success
+            && self.settings.graph_enforce_read_only_roles
+            && self.quiet_graph_run
+            && let Some(before) = self.graph_node_read_only_fingerprint.get(&node_id)
+            && dmuxai::workspace::read_only_workspace_write_detected_sync(
+                Some(before.as_str()),
+                &self.workspace_root,
+            )
+        {
+            success = false;
+            policy_error = Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned());
+            self.push_system(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned());
+            if let Some(session) = self.graph_session.as_mut() {
+                let max_retries = session.run().plan.limits.max_retries;
+                if let Some(node) = session
+                    .run_mut()
+                    .plan
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == node_id)
+                {
+                    node.attempt = max_retries.saturating_sub(1);
+                }
+            }
+        }
+        let error = policy_error.as_deref().or(error);
         let mut display_text = output_text.to_owned();
         let mut marker_reason = None;
         if let Some(reason) = parse_replan_marker(output_text) {
@@ -11211,8 +11509,20 @@ impl App {
             }
             marker_reason = Some(reason);
         }
+        let dynamic_marker = if self.graph_dynamic_markers_enabled() && success {
+            parse_add_nodes_marker(output_text)
+        } else {
+            None
+        };
         if success {
+            if dynamic_marker.is_some() {
+                display_text = strip_add_nodes_marker(&display_text);
+                self.rewrite_last_agent_message(agent, display_text.clone());
+            }
             self.note_replan_summary(&node_id, &display_text);
+        }
+        if let Some(marker_res) = dynamic_marker {
+            self.handle_dynamic_add_nodes_marker(&node_id, marker_res);
         }
         let (actions, failed_message, run_snapshot) = {
             let Some(session) = self.graph_session.as_mut() else {
@@ -11233,6 +11543,7 @@ impl App {
             };
             (actions, failed_message, run_snapshot)
         };
+        self.restore_graph_node_turn_policy(&node_id);
         self.sync_tasks_file_for_run(&run_snapshot);
         if let Some(message) = failed_message
             && self.graph_session_is_multi_step()
@@ -11268,6 +11579,180 @@ impl App {
         self.dispatch_graph_actions(actions);
     }
 
+    fn record_dynamic_node_rejection(&mut self, node_id: &str, error: String) {
+        if error.contains("company workspace") && self.headless {
+            eprintln!("{error}");
+        }
+        self.push_system(format!("Dynamic nodes rejected: {error}"));
+        let Some(session) = self.graph_session.as_mut() else {
+            return;
+        };
+        let run = session.run_mut();
+        let rev = next_plan_change_rev(run);
+        let change = PlanChange {
+            rev,
+            kind: PlanChangeKind::DynamicAdd,
+            at_ms: unix_ms_now(),
+            after_node: Some(node_id.to_owned()),
+            reason: error.clone(),
+            trigger: Some(PlanChangeTrigger::DynamicAdd),
+            prompt_chars: None,
+            response_chars: None,
+            added: Vec::new(),
+            changed: Vec::new(),
+            removed: Vec::new(),
+            tasks_added: 0,
+            tasks_changed: 0,
+            tasks_removed: 0,
+            applied: false,
+            error: Some(error),
+            response_excerpt: None,
+            decided_by: None,
+        };
+        run.push_plan_change(change);
+        let plan_id = run.plan.id.clone();
+        let snapshot = run.clone();
+        let _ = save_run(&self.workspace_root, &snapshot);
+        if self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|stored| stored.plan.id == plan_id)
+        {
+            self.last_graph_run = Some(snapshot);
+        }
+    }
+
+    fn handle_dynamic_add_nodes_marker(
+        &mut self,
+        node_id: &str,
+        marker_res: Result<Vec<DynamicNodeSpec>, String>,
+    ) {
+        let (already_added, approved_cap, dynamic_added, max_nodes, plan_snapshot) = {
+            let Some(session) = self.graph_session.as_ref() else {
+                return;
+            };
+            let run = session.run();
+            let already_added = run.plan_history.iter().any(|c| {
+                c.trigger == Some(PlanChangeTrigger::DynamicAdd)
+                    && c.after_node.as_deref() == Some(node_id)
+                    && c.applied
+            });
+            let approved_cap = run.plan.dynamic_cap.or(run.dynamic_cap).unwrap_or(0);
+            let dynamic_added = run.dynamic_added.unwrap_or(0);
+            let max_nodes = run.plan.limits.max_nodes;
+            (
+                already_added,
+                approved_cap,
+                dynamic_added,
+                max_nodes,
+                run.plan.clone(),
+            )
+        };
+
+        if already_added {
+            let msg = format!("node {node_id} already added nodes");
+            self.record_dynamic_node_rejection(node_id, msg);
+            return;
+        }
+
+        let new_nodes = match marker_res {
+            Ok(specs) => specs,
+            Err(parse_err) => {
+                self.record_dynamic_node_rejection(node_id, parse_err);
+                return;
+            }
+        };
+
+        let cap_remaining = approved_cap.saturating_sub(dynamic_added);
+        let company_workspace = self.settings.fanout_company_workspace;
+
+        let validated_nodes = match validate_add_nodes(
+            &plan_snapshot,
+            &new_nodes,
+            cap_remaining,
+            &self.settings,
+            max_nodes,
+            company_workspace,
+        ) {
+            Ok(nodes) => nodes,
+            Err(validation_err) => {
+                self.record_dynamic_node_rejection(node_id, validation_err);
+                return;
+            }
+        };
+
+        let parent_task = plan_snapshot
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .and_then(|node| node.task.clone());
+        let mut validated_nodes = validated_nodes;
+        if !plan_snapshot.tasks.is_empty() {
+            for node in &mut validated_nodes {
+                if node.task.is_none() {
+                    node.task = parent_task.clone();
+                }
+            }
+        }
+
+        let added_ids: Vec<String> = validated_nodes.iter().map(|n| n.id.clone()).collect();
+        let Some(session) = self.graph_session.as_mut() else {
+            return;
+        };
+        let run = session.run_mut();
+        for spec in &new_nodes {
+            for dep in &spec.depends_on {
+                let edge = GraphEdge {
+                    from: dep.clone(),
+                    to: spec.id.clone(),
+                };
+                if !run
+                    .plan
+                    .edges
+                    .iter()
+                    .any(|existing| existing.from == edge.from && existing.to == edge.to)
+                {
+                    run.plan.edges.push(edge);
+                }
+            }
+        }
+        run.plan.nodes.extend(validated_nodes);
+        run.dynamic_added = Some(dynamic_added + added_ids.len());
+
+        let rev = next_plan_change_rev(run);
+        let change = PlanChange {
+            rev,
+            kind: PlanChangeKind::DynamicAdd,
+            at_ms: unix_ms_now(),
+            after_node: Some(node_id.to_owned()),
+            reason: format!("dynamic add by node {node_id}"),
+            trigger: Some(PlanChangeTrigger::DynamicAdd),
+            prompt_chars: None,
+            response_chars: None,
+            added: added_ids,
+            changed: Vec::new(),
+            removed: Vec::new(),
+            tasks_added: 0,
+            tasks_changed: 0,
+            tasks_removed: 0,
+            applied: true,
+            error: None,
+            response_excerpt: None,
+            decided_by: None,
+        };
+        run.push_plan_change(change);
+        let plan_id = run.plan.id.clone();
+        let _ = save_run(&self.workspace_root, run);
+        if self
+            .last_graph_run
+            .as_ref()
+            .is_some_and(|stored| stored.plan.id == plan_id)
+        {
+            self.last_graph_run = Some(run.clone());
+        }
+        self.emit_plan_revised_event(&plan_id, rev);
+    }
+
     fn build_graph_run(
         &self,
         plan: GraphPlan,
@@ -11281,6 +11766,7 @@ impl App {
             + 1;
         // A to-do link: still pending (judge stage) or already bound to this plan id.
         let todo_id = self.todos.todo_for_new_run(&plan.id);
+        let dynamic_cap = plan.dynamic_cap;
         GraphRun {
             plan,
             conversation_id: self.conversation_id.as_str().to_owned(),
@@ -11301,6 +11787,8 @@ impl App {
             pending_replan_plan: None,
             planner_io: Vec::new(),
             todo_id,
+            dynamic_cap,
+            dynamic_added: None,
         }
     }
 
@@ -11419,10 +11907,14 @@ impl App {
     fn configured_cursor_model(settings: &DmuxSettings) -> Option<String> {
         settings
             .runner_models
-            .get("cursor")
+            .get(dmuxai::runner_id::CURSOR_RUNNER_ID)
             .map(|model| model.trim())
             .filter(|model| {
-                dmuxai::model_policy::validate_model_for_runner("cursor", model).is_ok()
+                dmuxai::model_policy::validate_model_for_runner(
+                    dmuxai::runner_id::CURSOR_RUNNER_ID,
+                    model,
+                )
+                .is_ok()
             })
             .map(str::to_owned)
     }
@@ -11453,7 +11945,7 @@ impl App {
         let config_default = self
             .settings
             .runner_models
-            .get(&runner.to_ascii_lowercase())
+            .get(&dmuxai::runner_id::canonical_runner_id(runner))
             .cloned();
         let resolution = Self::model_resolution_for(
             &self.model_catalogs,
@@ -11586,6 +12078,7 @@ impl App {
                 selected,
                 selected_effort,
             } => {
+                let runner = self.agent_runner_name(agent);
                 let catalog = self
                     .model_catalogs
                     .get_mut(&agent)
@@ -11594,12 +12087,25 @@ impl App {
                 catalog.selected = if agent == Agent::Cursor {
                     match selected {
                         Some(ref m)
-                            if dmuxai::model_policy::validate_model_for_runner("cursor", m)
-                                .is_ok() =>
+                            if dmuxai::model_policy::validate_model_for_runner(
+                                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                                m,
+                            )
+                            .is_ok() =>
                         {
                             selected
                         }
                         _ => Some(dmuxai::model_policy::ALLOWED_MODEL.to_owned()),
+                    }
+                } else if agent == Agent::Agy {
+                    match selected {
+                        Some(ref m)
+                            if dmuxai::model_policy::validate_model_for_runner("agy", m)
+                                .is_ok() =>
+                        {
+                            selected
+                        }
+                        _ => None,
                     }
                 } else {
                     selected
@@ -11612,27 +12118,45 @@ impl App {
                 if let Some(picker) = self.model_picker.as_mut()
                     && picker.agent == agent
                 {
-                    picker.cursor = catalog
-                        .selected
-                        .as_ref()
-                        .and_then(|selected| {
-                            catalog
-                                .models
-                                .iter()
-                                .position(|model| &model.id == selected)
-                        })
-                        .unwrap_or(0);
+                    picker.cursor = if matches!(agent, Agent::Cursor | Agent::Agy) {
+                        picker_selected_index(agent, &runner, catalog)
+                    } else {
+                        catalog
+                            .selected
+                            .as_ref()
+                            .and_then(|selected| {
+                                catalog
+                                    .models
+                                    .iter()
+                                    .position(|model| &model.id == selected)
+                            })
+                            .unwrap_or(0)
+                    };
                 }
             }
             AgentEvent::ModelSelected(model) => {
+                let runner = self.agent_runner_name(agent);
                 let model = if agent == Agent::Cursor
-                    && dmuxai::model_policy::validate_model_for_runner("cursor", &model).is_err()
+                    && dmuxai::model_policy::validate_model_for_runner(
+                        dmuxai::runner_id::CURSOR_RUNNER_ID,
+                        &model,
+                    )
+                    .is_err()
                 {
                     self.push_system(format!(
                         "Disallowed model '{model}' for Cursor replaced with {}",
                         dmuxai::model_policy::ALLOWED_MODEL
                     ));
                     dmuxai::model_policy::ALLOWED_MODEL.to_owned()
+                } else if agent == Agent::Agy
+                    && dmuxai::model_policy::validate_model_for_runner("agy", &model).is_err()
+                {
+                    self.push_system(format!(
+                        "Disallowed model '{model}' for AGY ({})",
+                        dmuxai::model_policy::validate_model_for_runner(&runner, &model)
+                            .unwrap_err()
+                    ));
+                    return;
                 } else {
                     model
                 };
@@ -12091,6 +12615,7 @@ impl App {
                         conversation_id.as_str(),
                         node_id,
                         success,
+                        &output_text,
                         error_string.as_deref(),
                     );
                 }
@@ -12111,6 +12636,7 @@ impl App {
             } else if !success && is_cancelled {
                 // FR-1416: a cancelled step (user cancel or denied ACP permission)
                 // stops the graph as cancelled, without retry or failure replan.
+                self.restore_graph_node_turn_policy(&node_id);
                 self.dispatch_graph_actions(vec![GraphAction::Cancelled(format!(
                     "step {node_id} was cancelled"
                 ))]);
@@ -12129,7 +12655,7 @@ impl App {
             }) {
                 self.intercept_graph_node_finished(
                     agent,
-                    node_id,
+                    node_id.clone(),
                     success,
                     &output_text,
                     error_string.as_deref(),
@@ -12140,6 +12666,7 @@ impl App {
                     conversation_id.as_str(),
                     node_id,
                     success,
+                    &output_text,
                     error_string.as_deref(),
                 );
             }
@@ -12160,6 +12687,7 @@ impl App {
                 conversation_id.as_str(),
                 node_id,
                 success,
+                &output_text,
                 error_string.as_deref(),
             );
         }
@@ -12213,7 +12741,11 @@ impl App {
 
         let runner = runner_name(agent);
         let config_default = settings
-            .and_then(|s| s.runner_models.get(&runner.to_ascii_lowercase()).cloned())
+            .and_then(|s| {
+                s.runner_models
+                    .get(&dmuxai::runner_id::canonical_runner_id(runner))
+                    .cloned()
+            })
             .or_else(|| match agent {
                 Agent::Custom(index) => {
                     dmuxai::custom_agent::spec_at(index).and_then(|spec| spec.default_model.clone())
@@ -12239,7 +12771,11 @@ impl App {
                 .get(&agent)
                 .and_then(|c| c.selected.as_deref())
             && prev != model_id
-            && dmuxai::model_policy::validate_model_for_runner("cursor", prev).is_err()
+            && dmuxai::model_policy::validate_model_for_runner(
+                dmuxai::runner_id::CURSOR_RUNNER_ID,
+                prev,
+            )
+            .is_err()
         {
             self.push_system(format!(
                 "Disallowed model '{prev}' for Cursor replaced with {}: disallowed by policy",
@@ -12434,7 +12970,10 @@ impl App {
                     self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
-                    self.clear_pending_turn_policy();
+                    if !self.settings.graph_enforce_read_only_roles {
+                        self.clear_pending_turn_policy();
+                    }
+                    self.clear_graph_node_turn_policy_state();
                     self.clear_turn_runner_pin();
                     let finish = self.todos.finish_graph(true, None);
                     self.report_todo_finish(finish);
@@ -12480,7 +13019,10 @@ impl App {
                     self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
-                    self.clear_pending_turn_policy();
+                    if !self.settings.graph_enforce_read_only_roles {
+                        self.clear_pending_turn_policy();
+                    }
+                    self.clear_graph_node_turn_policy_state();
                     let finish = self
                         .todos
                         .finish_graph(false, Some(format!("cancelled: {detail}")));
@@ -12528,7 +13070,10 @@ impl App {
                     self.busy_retry_user_message.clear();
                     self.graph_assignment_line.clear();
                     self.single_graph_plan = None;
-                    self.clear_pending_turn_policy();
+                    if !self.settings.graph_enforce_read_only_roles {
+                        self.clear_pending_turn_policy();
+                    }
+                    self.clear_graph_node_turn_policy_state();
                     let finish = self.todos.finish_graph(false, Some(message.clone()));
                     self.report_todo_finish(finish);
                     break;
@@ -12610,6 +13155,107 @@ impl App {
         }
     }
 
+    fn graph_node_turn_policy_as_agent(node: NodeTurnPolicy) -> TurnPolicy {
+        match node {
+            NodeTurnPolicy::ReadOnly => TurnPolicy::ReadOnly,
+            NodeTurnPolicy::Write => TurnPolicy::Agent,
+        }
+    }
+
+    fn begin_graph_node_turn_policy(
+        &mut self,
+        node_id: &str,
+        role: NodeRole,
+    ) -> Option<TurnPolicy> {
+        if !self.settings.graph_enforce_read_only_roles {
+            return None;
+        }
+        let node_policy = Self::graph_node_turn_policy_as_agent(node_turn_policy(role)?);
+        let saved = self.pending_turn_policy;
+        self.graph_node_saved_policy
+            .entry(node_id.to_owned())
+            .or_insert(saved);
+        self.pending_turn_policy = Some(node_policy);
+        if node_policy == TurnPolicy::ReadOnly
+            && let Some(fp) = dmuxai::workspace::git_worktree_fingerprint_sync(&self.workspace_root)
+        {
+            self.graph_node_read_only_fingerprint
+                .insert(node_id.to_owned(), fp);
+        }
+        Some(node_policy)
+    }
+
+    fn restore_graph_node_turn_policy(&mut self, node_id: &str) {
+        if let Some(saved) = self.graph_node_saved_policy.remove(node_id) {
+            self.pending_turn_policy = saved;
+        }
+        self.graph_node_read_only_fingerprint.remove(node_id);
+    }
+
+    fn clear_graph_node_turn_policy_state(&mut self) {
+        self.graph_node_saved_policy.clear();
+        self.graph_node_read_only_fingerprint.clear();
+    }
+
+    fn graph_read_only_runner_candidates(&self, current_runner: &str) -> Vec<String> {
+        let current = current_runner.trim().to_ascii_lowercase();
+        self.settings
+            .graph_allowed_runners
+            .as_ref()
+            .map(|runners| {
+                runners
+                    .iter()
+                    .map(|r| r.trim().to_ascii_lowercase())
+                    .filter(|r| !r.is_empty() && r != &current)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                ["cursor", "agy", "codex"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .filter(|r| self.settings.graph_runner_allowed(r) && r != &current)
+                    .collect()
+            })
+    }
+
+    fn try_graph_read_only_runner_fallback(
+        &mut self,
+        assignment: &NodeAssignment,
+        failed_agent: Agent,
+    ) -> Option<NodeAssignment> {
+        for runner in self.graph_read_only_runner_candidates(&assignment.runner) {
+            let model_id = assignment.model_id.clone();
+            if self
+                .apply_runner_and_model(&runner, &model_id)
+                .is_some_and(|agent| agent != failed_agent)
+            {
+                if let Some(session) = self.graph_session.as_mut()
+                    && let Some(node) = session
+                        .run_mut()
+                        .plan
+                        .nodes
+                        .iter_mut()
+                        .find(|node| node.id == assignment.node_id)
+                {
+                    node.runner = runner.clone();
+                }
+                let mut next = assignment.clone();
+                next.runner = runner;
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn send_error_is_no_read_only_mode(err: &RunTodoError) -> bool {
+        matches!(
+            err,
+            RunTodoError::Internal(message)
+                if message.contains("Unsupported")
+                    || message.contains("agent does not support this command")
+        )
+    }
+
     fn defer_graph_node_start(&mut self, agent: Agent, assignment: NodeAssignment) {
         let node_id = assignment.node_id.clone();
         self.graph_defer.defer(agent, assignment, Instant::now());
@@ -12679,6 +13325,7 @@ impl App {
             ))]);
             return Err(format!("unknown graph runner: {}", assignment.runner));
         };
+        let mut assignment = assignment;
         let deferred_assignment = assignment.clone();
         if self.busy_agents.contains(&agent) && !self.quiet_graph_run {
             self.defer_graph_node_start(agent, deferred_assignment);
@@ -12690,8 +13337,9 @@ impl App {
         self.graph_node_details.remove(&assignment.node_id);
         self.graph_agent_nodes
             .insert(agent, assignment.node_id.clone());
+        self.begin_graph_node_turn_policy(&assignment.node_id, assignment.role);
         let raw_prompt = assignment.prompt.clone();
-        let mut prompt = assignment.prompt;
+        let mut prompt = assignment.prompt.clone();
         if let Some(run_id) = self
             .graph_session
             .as_ref()
@@ -12755,54 +13403,101 @@ impl App {
         let restore_input = self.quiet_graph_run;
         let allow_defer = self.quiet_graph_run;
 
-        if let Err(err) =
-            self.try_submit_to_agent(agent, prompt.clone(), restore_input, allow_defer)
-        {
-            if !self.quiet_graph_run && matches!(&err, RunTodoError::Busy(_)) {
-                self.graph_agent_nodes.remove(&agent);
-                self.defer_graph_node_start(agent, deferred_assignment);
-                return Ok(GraphNodeDispatch::Deferred);
-            }
-            if self.quiet_graph_run && Self::is_quiet_graph_agent_busy(&err) {
-                if self.input.is_empty() {
-                    self.input = prompt;
+        let mut agent = agent;
+        let mut deferred_assignment = deferred_assignment;
+        loop {
+            let submit_err =
+                self.try_submit_to_agent(agent, prompt.clone(), restore_input, allow_defer);
+            match submit_err {
+                Ok(_) => break,
+                Err(err) => {
+                    if Self::send_error_is_no_read_only_mode(&err)
+                        && self.settings.graph_enforce_read_only_roles
+                        && node_turn_policy(assignment.role) == Some(NodeTurnPolicy::ReadOnly)
+                    {
+                        self.graph_agent_nodes.remove(&agent);
+                        if let Some(next) =
+                            self.try_graph_read_only_runner_fallback(&assignment, agent)
+                        {
+                            self.restore_graph_node_turn_policy(&assignment.node_id);
+                            assignment = next.clone();
+                            deferred_assignment = assignment.clone();
+                            let Some(next_agent) = self
+                                .apply_runner_and_model(&assignment.runner, &assignment.model_id)
+                            else {
+                                self.restore_graph_node_turn_policy(&assignment.node_id);
+                                let message = format!(
+                                    "no runner can execute read-only turn for graph node {}",
+                                    assignment.node_id
+                                );
+                                self.dispatch_graph_actions(vec![GraphAction::Failed(
+                                    message.clone(),
+                                )]);
+                                return Err(message);
+                            };
+                            agent = next_agent;
+                            self.graph_agent_nodes
+                                .insert(agent, assignment.node_id.clone());
+                            self.begin_graph_node_turn_policy(&assignment.node_id, assignment.role);
+                            continue;
+                        }
+                        self.restore_graph_node_turn_policy(&assignment.node_id);
+                        let message = format!(
+                            "no runner can execute read-only turn for graph node {}",
+                            assignment.node_id
+                        );
+                        self.dispatch_graph_actions(vec![GraphAction::Failed(message.clone())]);
+                        return Err(message);
+                    }
+                    if !self.quiet_graph_run && matches!(&err, RunTodoError::Busy(_)) {
+                        self.graph_agent_nodes.remove(&agent);
+                        self.defer_graph_node_start(agent, deferred_assignment);
+                        return Ok(GraphNodeDispatch::Deferred);
+                    }
+                    if self.quiet_graph_run && Self::is_quiet_graph_agent_busy(&err) {
+                        self.restore_graph_node_turn_policy(&assignment.node_id);
+                        if self.input.is_empty() {
+                            self.input = prompt;
+                        }
+                        self.push_system(format!(
+                            "{agent} is busy; cancel the active turn before sending another prompt."
+                        ));
+                        if let Some(session) = self.graph_session.as_mut() {
+                            session.run_mut().phase = GraphRunPhase::Failed;
+                            let run = session.run().clone();
+                            let _ = save_run(&self.workspace_root, &run);
+                            let graph_id = run.plan.id.clone();
+                            self.last_graph_run = Some(run);
+                            self.set_headless_last_graph_id(graph_id);
+                        }
+                        self.graph_agent_nodes.remove(&agent);
+                        self.graph_session = None;
+                        self.busy_retry_user_message.clear();
+                        self.graph_assignment_line.clear();
+                        self.quiet_graph_run = false;
+                        return Err(format!(
+                            "failed to start node {}: {err:?}",
+                            assignment.node_id
+                        ));
+                    }
+                    if matches!(
+                        &err,
+                        RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
+                    ) {
+                        self.graph_agent_nodes.remove(&agent);
+                        return Ok(GraphNodeDispatch::Deferred);
+                    }
+                    self.restore_graph_node_turn_policy(&assignment.node_id);
+                    self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
+                        "failed to start node {}: {err:?}",
+                        assignment.node_id
+                    ))]);
+                    return Err(format!(
+                        "failed to start node {}: {err:?}",
+                        assignment.node_id
+                    ));
                 }
-                self.push_system(format!(
-                    "{agent} is busy; cancel the active turn before sending another prompt."
-                ));
-                if let Some(session) = self.graph_session.as_mut() {
-                    session.run_mut().phase = GraphRunPhase::Failed;
-                    let run = session.run().clone();
-                    let _ = save_run(&self.workspace_root, &run);
-                    let graph_id = run.plan.id.clone();
-                    self.last_graph_run = Some(run);
-                    self.set_headless_last_graph_id(graph_id);
-                }
-                self.graph_agent_nodes.remove(&agent);
-                self.graph_session = None;
-                self.busy_retry_user_message.clear();
-                self.graph_assignment_line.clear();
-                self.quiet_graph_run = false;
-                return Err(format!(
-                    "failed to start node {}: {err:?}",
-                    assignment.node_id
-                ));
             }
-            if matches!(
-                &err,
-                RunTodoError::Busy(msg) if msg.contains("requires conversation summary")
-            ) {
-                self.graph_agent_nodes.remove(&agent);
-                return Ok(GraphNodeDispatch::Deferred);
-            }
-            self.dispatch_graph_actions(vec![GraphAction::Failed(format!(
-                "failed to start node {}: {err:?}",
-                assignment.node_id
-            ))]);
-            return Err(format!(
-                "failed to start node {}: {err:?}",
-                assignment.node_id
-            ));
         }
         self.graph_defer.node_started(&assignment.node_id);
         Ok(GraphNodeDispatch::Started)
@@ -12827,13 +13522,20 @@ impl App {
                 }
             }
         };
+        let read_only_roles = if self.settings.graph_enforce_read_only_roles {
+            "on"
+        } else {
+            "off"
+        };
         if self.graph_assignment_line.is_empty() {
             self.push_system("No active graph assignment. Send a multi-step prompt to plan one.");
             self.push_system(format!("Allowed runners: {allowed_str}"));
+            self.push_system(format!("read-only roles: {read_only_roles}"));
             return;
         }
         self.push_system(format!("Graph assignment: {}", self.graph_assignment_line));
         self.push_system(format!("Allowed runners: {allowed_str}"));
+        self.push_system(format!("read-only roles: {read_only_roles}"));
         self.push_system(
             "Plan gate: /graph approve · /graph edit <feedback> · /graph reject · /graph replan [note]",
         );
@@ -13697,7 +14399,7 @@ impl App {
 
     pub(crate) fn agent_runner_name(&self, agent: Agent) -> String {
         match agent {
-            Agent::Cursor => "cursor".to_owned(),
+            Agent::Cursor => dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             Agent::Agy => "agy".to_owned(),
             Agent::Codex => "codex".to_owned(),
             Agent::Custom(index) => self
@@ -13992,6 +14694,7 @@ impl App {
             approval.revisions.last().map(|revision| HeadlessPlan {
                 steps: revision.steps.clone(),
                 tasks: run.plan.tasks.clone(),
+                dynamic_cap: run.plan.dynamic_cap,
             })
         });
         (triage, plan)
@@ -14144,7 +14847,7 @@ impl App {
 
     /// FR-2545: writes the awaiting graph plan plus its hash under the state dir.
     fn headless_write_pending_plan(&mut self) -> Option<String> {
-        let (prompt, tasks, steps) = {
+        let (prompt, tasks, steps, dynamic_cap) = {
             let run = self.last_graph_run.as_ref()?;
             if run.phase != GraphRunPhase::AwaitingApproval {
                 return None;
@@ -14162,12 +14865,14 @@ impl App {
                 run.plan.user_prompt.clone(),
                 run.plan.tasks.clone(),
                 revision.steps.clone(),
+                run.plan.dynamic_cap,
             )
         };
         let pending = HeadlessPendingPlan {
             prompt,
             tasks,
             steps,
+            dynamic_cap,
         };
         let json = match serde_json::to_string(&pending) {
             Ok(json) => json,
@@ -14304,7 +15009,7 @@ impl App {
                 ctx,
             )
         });
-        let graph_plan = match result {
+        let mut graph_plan = match result {
             Ok(plan) => plan,
             Err(errors) => {
                 let message = errors
@@ -14318,6 +15023,7 @@ impl App {
                 ));
             }
         };
+        graph_plan.dynamic_cap = pending.dynamic_cap;
         let doc = PlanDoc {
             steps: pending.steps.clone(),
             tasks: pending.tasks.clone(),
@@ -14563,6 +15269,655 @@ impl App {
         agent_texts.join("\n\n")
     }
 
+    fn fanout_finalize_write_leg(&mut self, track: &mut FanoutLegTracker) {
+        let Some(run_id) = self.fanout_run_id.as_deref() else {
+            return;
+        };
+        let Some(wt) = track.worktree.as_ref() else {
+            return;
+        };
+        if let Ok(patch) = dmuxai::fanout_worktree::produce_leg_patch(
+            &self.workspace_root,
+            run_id,
+            &track.runner,
+            wt,
+        ) {
+            track.diff_stat = Some(patch.diff_stat);
+            track.changed = Some(patch.changed);
+            track.patch_path = patch.patch_path.to_str().map(|s| s.to_owned());
+        }
+        if self.fanout_keep_worktrees {
+            track.worktree_path = wt.to_str().map(str::to_owned);
+        } else {
+            let _ = dmuxai::fanout_worktree::remove_leg_worktree(&self.workspace_root, wt);
+            self.fanout_active_worktrees.retain(|p| p != wt);
+            track.worktree_path = None;
+        }
+    }
+
+    fn fanout_cleanup_all_write_worktrees(&mut self) {
+        if self.fanout_keep_worktrees || !self.fanout_write_mode {
+            return;
+        }
+        let workspace = self.workspace_root.clone();
+        let paths = std::mem::take(&mut self.fanout_active_worktrees);
+        for wt in paths {
+            let _ = dmuxai::fanout_worktree::remove_leg_worktree(&workspace, &wt);
+        }
+    }
+
+    fn fanout_restore_main_conversation(&mut self, saved: &StoredConversationId) {
+        if let Ok(snapshot) = self
+            .engine
+            .select(ConversationSelection::Existing(saved.clone()))
+        {
+            self.conversation_id = snapshot.id;
+        }
+    }
+
+    fn fanout_start_leg(
+        &mut self,
+        user_prompt: &str,
+        leg: &dmuxai::fanout::FanoutLegSpec,
+        title: &str,
+        write_worktree: Option<&Path>,
+    ) -> FanoutLegTracker {
+        let started = Instant::now();
+        let workspace_root = self.workspace_root.clone();
+        let fanout_run_id = self
+            .fanout_run_id
+            .clone()
+            .unwrap_or_else(|| "fanout".to_owned());
+        let leg_runner = leg.runner.clone();
+        let write_fields = move |wt: Option<&Path>| {
+            if wt.is_none() {
+                (None, None, None, None)
+            } else {
+                (
+                    Some(dmuxai::fanout_worktree::FanoutDiffStat {
+                        files: 0,
+                        insertions: 0,
+                        deletions: 0,
+                    }),
+                    wt.and_then(|_| {
+                        dmuxai::fanout_worktree::leg_patch_path(
+                            &workspace_root,
+                            &fanout_run_id,
+                            &leg_runner,
+                        )
+                        .to_str()
+                        .map(str::to_owned)
+                    }),
+                    wt.and_then(|p| p.to_str().map(str::to_owned)),
+                    Some(false),
+                )
+            }
+        };
+        let fail = |runner: &str, error: String, kind: &str| {
+            let (diff_stat, patch_path, worktree_path, changed) = write_fields(write_worktree);
+            FanoutLegTracker {
+                runner: runner.to_owned(),
+                conversation_id: StoredConversationId::new("fanout-failed"),
+                turn_id: StoredTurnId::new("fanout-failed"),
+                buffer: TurnBuffer::new(),
+                started,
+                model: leg.model.clone(),
+                finished: true,
+                ok: false,
+                error: Some(error),
+                error_kind: Some(kind.to_owned()),
+                worktree: write_worktree.map(Path::to_path_buf),
+                diff_stat,
+                patch_path,
+                worktree_path,
+                changed,
+            }
+        };
+        let Some(agent) = runner_from_str(&leg.runner) else {
+            return fail(
+                &leg.runner,
+                format!("unknown agent '{}'", leg.runner),
+                "not_found",
+            );
+        };
+        if !self.runner_is_allowed(&leg.runner) {
+            return fail(
+                &leg.runner,
+                format!("runner '{}' is not in allowed_runners", leg.runner),
+                "policy",
+            );
+        }
+        let index = adapter_index(agent);
+        if index >= self.adapters.len() {
+            return fail(
+                &leg.runner,
+                format!("unknown agent '{}'", leg.runner),
+                "not_found",
+            );
+        }
+        if write_worktree.is_none()
+            && let Agent::Custom(custom_index) = agent
+            && let Some(spec) = dmuxai::custom_agent::spec_at(custom_index)
+            && !spec.has_read_only_mode()
+        {
+            return fail(
+                &leg.runner,
+                format!("{agent} does not support read-only mode"),
+                "no_read_only_mode",
+            );
+        }
+        if let Some(model_value) = leg.model.clone() {
+            if let Err(err) = Self::model_resolution_for(
+                &self.model_catalogs,
+                agent,
+                Some(&model_value),
+                self.settings
+                    .runner_models
+                    .get(&leg.runner)
+                    .map(String::as_str),
+            ) {
+                return fail(&leg.runner, err, "policy");
+            }
+            if let Err(err) = self.adapters[index].select_model(model_value) {
+                return fail(&leg.runner, err.to_string(), "internal");
+            }
+        }
+        let saved_main = self.conversation_id.clone();
+        let Ok(snapshot) = self.engine.select(ConversationSelection::New {
+            title: Some(title.to_owned()),
+        }) else {
+            return fail(
+                &leg.runner,
+                "could not create fan-out conversation".to_owned(),
+                "internal",
+            );
+        };
+        let leg_conversation_id = snapshot.id.clone();
+        let Ok(BeginTurnOutcome::Ready(request)) = self.engine.begin_turn(BeginTurn {
+            agent: agent_key(agent),
+            model_id: leg.model.clone(),
+            prompt: user_prompt.to_owned(),
+            display_text: None,
+        }) else {
+            self.fanout_restore_main_conversation(&saved_main);
+            return fail(
+                &leg.runner,
+                "could not start fan-out turn".to_owned(),
+                "internal",
+            );
+        };
+        let turn_id = request.turn_id.clone();
+        let leg_policy = if write_worktree.is_some() {
+            TurnPolicy::Agent
+        } else {
+            TurnPolicy::ReadOnly
+        };
+        let mut adapter_request = adapter_request(
+            request,
+            Vec::new(),
+            leg_policy,
+            false,
+            write_worktree.map(Path::to_path_buf),
+        );
+        if let Some(dir) = write_worktree {
+            adapter_request.working_directory = Some(dir.to_path_buf());
+        }
+        let send_result = self.adapters[index].send(adapter_request);
+        self.fanout_restore_main_conversation(&saved_main);
+        if let Err(error) = send_result {
+            return fail(
+                &leg.runner,
+                format!("Could not start {agent}: {error}"),
+                "internal",
+            );
+        }
+        self.busy_agents.insert(agent);
+        self.active_turns.insert(
+            agent,
+            ActiveTurn {
+                conversation_id: leg_conversation_id.clone(),
+                turn_id: StoredTurnId::new(turn_id.as_str()),
+                started_ms: unix_ms_now(),
+                workspace_scan: Arc::new(Mutex::new(None)),
+                graph_node_id: None,
+                offscreen_activity: Vec::new(),
+                model_catalog_hint: None,
+                fallback_original_prompt: user_prompt.to_owned(),
+                fallback_display_text: None,
+                fallback_policy: Some(leg_policy),
+                fallback_chain: None,
+                retry_fresh_request: None,
+                fanout_worktree: write_worktree.map(Path::to_path_buf),
+            },
+        );
+        let model = leg
+            .model
+            .clone()
+            .or_else(|| self.selected_run_model(agent).ok().flatten());
+        FanoutLegTracker {
+            runner: leg.runner.clone(),
+            conversation_id: leg_conversation_id,
+            turn_id: StoredTurnId::new(turn_id.as_str()),
+            buffer: TurnBuffer::new(),
+            started,
+            model,
+            finished: false,
+            ok: false,
+            error: None,
+            error_kind: None,
+            worktree: write_worktree.map(Path::to_path_buf),
+            diff_stat: None,
+            patch_path: None,
+            worktree_path: write_worktree.and_then(|p| p.to_str().map(str::to_owned)),
+            changed: None,
+        }
+    }
+
+    /// Headless read-only fan-out across distinct runners (FR-2910..FR-2917,
+    /// FR-2920..FR-2926 with optional judge).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_fanout_headless(
+        &mut self,
+        user_prompt: String,
+        legs: Vec<dmuxai::fanout::FanoutLegSpec>,
+        min_ok: usize,
+        skipped: Vec<dmuxai::fanout::FanoutLegReport>,
+        cli_order: Vec<String>,
+        judge: Option<dmuxai::fanout::FanoutLegSpec>,
+        cancel: Arc<AtomicBool>,
+        write: Option<dmuxai::fanout_worktree::FanoutWriteRunConfig>,
+    ) -> HeadlessOutcome {
+        let prompt_prefix = user_prompt.trim().chars().take(40).collect::<String>();
+        let before_fp = dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await;
+        let before_head = write
+            .as_ref()
+            .and_then(|_| dmuxai::fanout_worktree::main_workspace_head_sha(&self.workspace_root));
+        self.in_fanout_run = true;
+        self.fanout_write_mode = write.is_some();
+        self.fanout_keep_worktrees = write.as_ref().is_some_and(|w| w.keep_worktrees);
+        self.fanout_run_id = write.as_ref().map(|w| w.run_id.clone());
+        self.fanout_reserved_runners = cli_order
+            .iter()
+            .map(|runner| runner.to_ascii_lowercase())
+            .collect();
+        let mut leg_worktrees: HashMap<String, PathBuf> = HashMap::new();
+        if let Some(ref cfg) = write {
+            for leg in &legs {
+                match dmuxai::fanout_worktree::create_leg_worktree(
+                    &self.workspace_root,
+                    &cfg.run_id,
+                    &leg.runner,
+                ) {
+                    Ok(path) => {
+                        self.fanout_active_worktrees.push(path.clone());
+                        leg_worktrees.insert(leg.runner.clone(), path);
+                    }
+                    Err(error) => {
+                        self.fanout_cleanup_all_write_worktrees();
+                        self.in_fanout_run = false;
+                        self.fanout_write_mode = false;
+                        return HeadlessOutcome::failure(
+                            dmuxai::agent_api::exit::USAGE,
+                            self.conversation_id.as_str().to_owned(),
+                            None,
+                            error.to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        let order = cli_order;
+        let mut trackers: HashMap<String, FanoutLegTracker> = HashMap::new();
+        for leg in &legs {
+            let title = format!("fanout: {prompt_prefix} [{}]", leg.runner);
+            let wt = leg_worktrees.get(&leg.runner).map(PathBuf::as_path);
+            let track = self.fanout_start_leg(&user_prompt, leg, &title, wt);
+            let runner = leg.runner.clone();
+            if track.finished {
+                trackers.insert(runner, track);
+            } else {
+                let agent = runner_from_str(&leg.runner).expect("validated");
+                self.fanout_trackers.insert(agent, track.clone());
+                trackers.insert(runner, track);
+            }
+        }
+        let fanout_deadline = Instant::now()
+            + Duration::from_secs(dmuxai::runner_fallback::DEFAULT_STALL_TIMEOUT_SECS);
+        while self
+            .busy_agents
+            .iter()
+            .any(|agent| self.fanout_trackers.contains_key(agent))
+        {
+            if Instant::now() >= fanout_deadline {
+                for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                    let idx = adapter_index(agent);
+                    if idx < self.adapters.len() {
+                        let _ = self.adapters[idx].cancel();
+                    }
+                    if let Some(track) = self.fanout_trackers.get_mut(&agent) {
+                        track.error = Some("fan-out leg timed out".to_owned());
+                        track.error_kind = Some(AgentErrorKind::Timeout.as_str().to_owned());
+                    }
+                }
+                break;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                    let idx = adapter_index(agent);
+                    if idx < self.adapters.len() {
+                        let _ = self.adapters[idx].cancel();
+                    }
+                }
+                let wait_deadline = Instant::now() + Duration::from_secs(30);
+                while self
+                    .busy_agents
+                    .iter()
+                    .any(|agent| self.fanout_trackers.contains_key(agent))
+                    && Instant::now() < wait_deadline
+                {
+                    let _ = self.drain_agent_events();
+                    self.tick();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                break;
+            }
+            let _ = self.drain_agent_events();
+            self.tick();
+            for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+                if let Some(track) = self.fanout_trackers.get(&agent) {
+                    let leg_timeout_secs = self
+                        .settings
+                        .runner_fallback
+                        .config_for(&track.runner)
+                        .map(|cfg| cfg.effective_stall_timeout_secs())
+                        .unwrap_or(dmuxai::runner_fallback::DEFAULT_STALL_TIMEOUT_SECS);
+                    let leg_timeout = Duration::from_secs(leg_timeout_secs);
+                    if track.started.elapsed() > leg_timeout {
+                        let idx = adapter_index(agent);
+                        if idx < self.adapters.len() {
+                            let _ = self.adapters[idx].cancel();
+                        }
+                        if let Some(track) = self.fanout_trackers.get_mut(&agent) {
+                            track.error = Some("fan-out leg timed out".to_owned());
+                            track.error_kind = Some(AgentErrorKind::Timeout.as_str().to_owned());
+                        }
+                    }
+                }
+                if !self.busy_agents.contains(&agent)
+                    && let Some(mut track) = self.fanout_trackers.remove(&agent)
+                {
+                    track.finished = true;
+                    if track.error.is_some() {
+                        track.ok = false;
+                    }
+                    if self.fanout_write_mode {
+                        self.fanout_finalize_write_leg(&mut track);
+                    }
+                    trackers.insert(track.runner.clone(), track);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let wait_deadline = Instant::now() + Duration::from_secs(30);
+        while self
+            .busy_agents
+            .iter()
+            .any(|a| self.fanout_trackers.contains_key(a))
+            && Instant::now() < wait_deadline
+        {
+            let _ = self.drain_agent_events();
+            self.tick();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for agent in self.fanout_trackers.keys().copied().collect::<Vec<_>>() {
+            if let Some(mut track) = self.fanout_trackers.remove(&agent) {
+                track.finished = true;
+                track.ok = track.error.is_none();
+                if self.fanout_write_mode {
+                    self.fanout_finalize_write_leg(&mut track);
+                }
+                trackers.insert(track.runner.clone(), track);
+            }
+        }
+        self.fanout_cleanup_all_write_worktrees();
+        self.in_fanout_run = false;
+        self.fanout_write_mode = false;
+        self.fanout_reserved_runners.clear();
+        self.fanout_trackers.clear();
+
+        let mut reports: Vec<dmuxai::fanout::FanoutLegReport> = Vec::new();
+        for key in order {
+            if let Some(skip) = skipped.iter().find(|s| s.agent == key) {
+                reports.push(skip.clone());
+            } else if let Some(track) = trackers.get(&key) {
+                let status = if track.finished && track.ok {
+                    dmuxai::fanout::LegStatus::Ok
+                } else {
+                    dmuxai::fanout::LegStatus::Failed
+                };
+                reports.push(dmuxai::fanout::FanoutLegReport {
+                    agent: track.runner.clone(),
+                    model: track.model.clone(),
+                    status,
+                    text: track.buffer.as_str().to_owned(),
+                    error: track.error.clone(),
+                    error_kind: track.error_kind.clone(),
+                    blocked: false,
+                    duration_ms: track.started.elapsed().as_millis() as u64,
+                    diff_stat: track.diff_stat.clone(),
+                    patch_path: track.patch_path.clone(),
+                    worktree_path: track.worktree_path.clone(),
+                    changed: track.changed,
+                });
+            }
+        }
+
+        let leg_policy_violation = dmuxai::workspace::read_only_workspace_write_detected(
+            before_fp.as_deref(),
+            &self.workspace_root,
+        )
+        .await
+            || dmuxai::fanout_worktree::main_workspace_head_changed(
+                before_head.as_deref(),
+                &self.workspace_root,
+            );
+
+        let mut aggregate = None;
+        let mut aggregate_error = None;
+        let mut aggregate_skipped = None;
+        let mut fanout_judge = None;
+        let had_judge = judge.is_some();
+        if let Some(ref judge_spec) = judge {
+            if leg_policy_violation {
+                let write_error = READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned();
+                let write_kind = AgentErrorKind::Policy.as_str().to_owned();
+                for leg in &mut reports {
+                    if leg.status == dmuxai::fanout::LegStatus::Ok {
+                        leg.status = dmuxai::fanout::LegStatus::Failed;
+                        leg.error = Some(write_error.clone());
+                        leg.error_kind = Some(write_kind.clone());
+                    }
+                }
+            } else if cancel.load(Ordering::Relaxed) {
+                aggregate_skipped = Some("cancelled".to_owned());
+            } else {
+                let judge_started = Instant::now();
+                let nonce = uuid::Uuid::new_v4().simple().to_string();
+                for leg in &mut reports {
+                    if leg.status == dmuxai::fanout::LegStatus::Ok
+                        && dmuxai::fanout::fanout_leg_judge_blocked(&nonce, &leg.text)
+                    {
+                        leg.blocked = true;
+                        leg.error_kind = Some("blocked".to_owned());
+                    }
+                }
+                let inputs: Vec<dmuxai::fanout::AggregateLegInput> = reports
+                    .iter()
+                    .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok && !leg.blocked)
+                    .map(|leg| dmuxai::fanout::AggregateLegInput {
+                        agent: leg.agent.clone(),
+                        text: leg.text.clone(),
+                    })
+                    .collect();
+                if inputs.len() < 2 {
+                    aggregate_skipped = Some("too_few_legs".to_owned());
+                } else {
+                    let allowed_refs: Vec<&str> = inputs.iter().map(|l| l.agent.as_str()).collect();
+                    let title = format!("fanout judge: {prompt_prefix}");
+                    let judge_prompt = match dmuxai::fanout::build_aggregate_prompt(&inputs, &nonce)
+                    {
+                        Ok(prompt) => prompt,
+                        Err(_) => {
+                            aggregate_error = Some("invalid_aggregate".to_owned());
+                            String::new()
+                        }
+                    };
+                    if aggregate_error.is_none() {
+                        let mut judge_leg = judge_spec.clone();
+                        if judge_leg.model.is_none() {
+                            judge_leg.model = dmuxai::fanout::resolved_fanout_leg_model(
+                                &judge_leg,
+                                &self.settings,
+                            );
+                        }
+                        let mut track =
+                            self.fanout_start_leg(&judge_prompt, &judge_leg, &title, None);
+                        fanout_judge = Some(dmuxai::fanout::FanoutJudgeMeta {
+                            agent: judge_spec.runner.clone(),
+                            model: track.model.clone().or(judge_leg.model.clone()),
+                            duration_ms: judge_started.elapsed().as_millis() as u64,
+                        });
+                        let map_track_aggregate_error = |track: &FanoutLegTracker| -> String {
+                            track
+                                .error_kind
+                                .clone()
+                                .filter(|kind| kind != "internal")
+                                .unwrap_or_else(|| "provider".to_owned())
+                        };
+                        if track.finished {
+                            aggregate_error = Some(map_track_aggregate_error(&track));
+                        } else if let Some(agent) = runner_from_str(&judge_spec.runner) {
+                            self.in_fanout_run = true;
+                            self.fanout_trackers.insert(agent, track.clone());
+                            let mut judge_cancelled = false;
+                            while self.busy_agents.contains(&agent) {
+                                if cancel.load(Ordering::Relaxed) {
+                                    let idx = adapter_index(agent);
+                                    if idx < self.adapters.len() {
+                                        let _ = self.adapters[idx].cancel();
+                                    }
+                                    judge_cancelled = true;
+                                    break;
+                                }
+                                let _ = self.drain_agent_events();
+                                self.tick();
+                                if !self.busy_agents.contains(&agent)
+                                    && let Some(finished) = self.fanout_trackers.remove(&agent)
+                                {
+                                    track = finished;
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            self.in_fanout_run = false;
+                            self.fanout_trackers.clear();
+                            self.busy_agents.remove(&agent);
+                            self.active_turns.remove(&agent);
+                            if let Some(meta) = fanout_judge.as_mut() {
+                                meta.duration_ms = judge_started.elapsed().as_millis() as u64;
+                                meta.model = track.model.clone().or(meta.model.clone());
+                            }
+                            if judge_cancelled {
+                                aggregate_error = Some("cancelled".to_owned());
+                            } else if track.ok {
+                                match dmuxai::fanout::parse_aggregate(
+                                    track.buffer.as_str(),
+                                    &allowed_refs,
+                                ) {
+                                    Ok(agg) => aggregate = Some(agg),
+                                    Err(_) => {
+                                        aggregate_error = Some("invalid_aggregate".to_owned())
+                                    }
+                                }
+                            } else {
+                                aggregate_error = Some(map_track_aggregate_error(&track));
+                            }
+                        }
+                        let judge_write = dmuxai::workspace::read_only_workspace_write_detected(
+                            before_fp.as_deref(),
+                            &self.workspace_root,
+                        )
+                        .await;
+                        if judge_write {
+                            aggregate = None;
+                            aggregate_error = Some(AgentErrorKind::Policy.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+        }
+
+        let policy_violation = leg_policy_violation;
+        let ok_count_after = reports
+            .iter()
+            .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
+            .count();
+
+        let ok = dmuxai::fanout::fanout_run_ok(ok_count_after, min_ok) && !policy_violation;
+        let exit_code = dmuxai::fanout::fanout_exit_code(ok, false);
+        let mut error = if policy_violation {
+            Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned())
+        } else {
+            None
+        };
+        let mut error_kind = if policy_violation {
+            Some(AgentErrorKind::Policy.as_str().to_owned())
+        } else {
+            None
+        };
+        if !ok && error.is_none() {
+            error = Some("fan-out quorum not met".to_owned());
+            error_kind = Some(AgentErrorKind::Policy.as_str().to_owned());
+        }
+        let text = if had_judge {
+            dmuxai::fanout::fanout_text_with_aggregate(
+                &reports,
+                aggregate.as_ref(),
+                aggregate_error.as_deref(),
+                aggregate_skipped.as_deref(),
+            )
+        } else {
+            dmuxai::fanout::fanout_text_output(&reports)
+        };
+        HeadlessOutcome {
+            ok,
+            exit_code,
+            conversation_id: self.conversation_id.as_str().to_owned(),
+            agent: None,
+            graph_id: None,
+            text,
+            messages: Vec::new(),
+            error,
+            error_kind,
+            todo: None,
+            triage: None,
+            plan: None,
+            plan_hash: None,
+            system_prompt: None,
+            run_id: None,
+            fallbacks: Vec::new(),
+            fanout: Some(dmuxai::fanout::FanoutReport {
+                min_ok,
+                legs: reports,
+                judge_enabled: had_judge,
+            }),
+            aggregate,
+            aggregate_error,
+            aggregate_skipped,
+            fanout_judge,
+        }
+    }
+
     /// Runs a prompt or to-do headlessly without terminal I/O (SPEC-agent-api FR-761, FR-762).
     pub async fn run_headless(
         &mut self,
@@ -14576,17 +15931,17 @@ impl App {
         }
         let start_fallbacks_len = self.fallback_history.len();
         if let Some(ref agent_str) = req.agent {
-            let runner_clean = agent_str.trim().to_ascii_lowercase();
+            let runner_clean = dmuxai::runner_id::canonical_runner_id(agent_str);
             let adapter = self
                 .adapters
                 .iter()
-                .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean);
+                .find(|a| runner_name(a.agent()) == runner_clean);
             let Some(adapter) = adapter else {
                 return HeadlessOutcome::failure(
                     dmuxai::agent_api::exit::NOT_FOUND,
                     self.conversation_id.as_str().to_owned(),
                     Some(agent_str.clone()),
-                    format!("unknown agent '{agent_str}'"),
+                    dmuxai::runner_id::format_unknown_agent_message(agent_str),
                 );
             };
             let target_agent = adapter.agent();
@@ -14641,7 +15996,7 @@ impl App {
             let config_default = self
                 .settings
                 .runner_models
-                .get(&runner_id.to_ascii_lowercase())
+                .get(&dmuxai::runner_id::canonical_runner_id(&runner_id))
                 .cloned()
                 .or_else(|| match target_agent {
                     Agent::Custom(index) => dmuxai::custom_agent::spec_at(index)
@@ -15090,6 +16445,15 @@ impl App {
                 last_system_error.or_else(|| Some("cancelled".to_owned())),
                 Some(AgentErrorKind::Cancelled.as_str().to_owned()),
             )
+        } else if graph_failed
+            && last_system_error.as_deref() == Some(READ_ONLY_WORKSPACE_WRITE_ERROR)
+        {
+            (
+                false,
+                dmuxai::agent_api::exit::FAILED,
+                Some(READ_ONLY_WORKSPACE_WRITE_ERROR.to_owned()),
+                Some(AgentErrorKind::Policy.as_str().to_owned()),
+            )
         } else if had_agent_error || graph_failed {
             (
                 false,
@@ -15146,6 +16510,11 @@ impl App {
             system_prompt: self.system_prompt_applied.clone(),
             run_id: None,
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
+            fanout: None,
+            aggregate: None,
+            aggregate_error: None,
+            aggregate_skipped: None,
+            fanout_judge: None,
         }
     }
 
@@ -15317,11 +16686,13 @@ impl App {
         runner_req: &str,
         prompt: String,
     ) -> Result<Todo, RunTodoError> {
-        let runner_clean = runner_req.trim().to_ascii_lowercase();
+        let runner_clean = dmuxai::runner_id::canonical_runner_id(runner_req);
         let adapter = self
             .adapters
             .iter()
-            .find(|a| runner_name(a.agent()).trim().to_ascii_lowercase() == runner_clean)
+            .find(|a| {
+                dmuxai::runner_id::canonical_runner_id(runner_name(a.agent())) == runner_clean
+            })
             .ok_or_else(|| RunTodoError::UnknownAgent(runner_req.to_owned()))?;
         let target_agent = adapter.agent();
         let runner_id = runner_name(target_agent);
@@ -16290,7 +17661,12 @@ impl App {
                 .get(&selected)
                 .and_then(|catalog| {
                     catalog.selected.as_ref().and_then(|sel| {
-                        if dmuxai::model_policy::validate_model_for_runner("cursor", sel).is_ok() {
+                        if dmuxai::model_policy::validate_model_for_runner(
+                            dmuxai::runner_id::CURSOR_RUNNER_ID,
+                            sel,
+                        )
+                        .is_ok()
+                        {
                             catalog
                                 .models
                                 .iter()
@@ -16445,6 +17821,13 @@ impl App {
             .model_catalogs
             .get(&picker.agent)
             .expect("every agent has a model catalog");
+        let policy_picker = matches!(picker.agent, Agent::Cursor | Agent::Agy);
+        let offered: Vec<&ModelInfo> = if policy_picker {
+            let runner = self.agent_runner_name(picker.agent);
+            picker_offered_models(picker.agent, &runner, catalog)
+        } else {
+            catalog.models.iter().collect()
+        };
         let title = format!(" {} models ", picker.agent);
         if catalog.loading {
             let mut block = Block::default().borders(Borders::ALL).title(title);
@@ -16462,8 +17845,7 @@ impl App {
             return;
         }
 
-        let items = catalog
-            .models
+        let items = offered
             .iter()
             .map(|model| {
                 let marker = if catalog.selected.as_deref() == Some(model.id.as_str()) {
@@ -16502,7 +17884,7 @@ impl App {
             list = list.style(Style::default().fg(fg));
         }
         let mut state = ListState::default().with_selected(
-            (!catalog.models.is_empty()).then_some(picker.cursor.min(catalog.models.len() - 1)),
+            (!offered.is_empty()).then_some(picker.cursor.min(offered.len().saturating_sub(1))),
         );
         frame.render_stateful_widget(list, area, &mut state);
     }
@@ -17289,6 +18671,7 @@ fn adapter_request(
     image_paths: Vec<PathBuf>,
     policy: TurnPolicy,
     require_file_edits: bool,
+    working_directory: Option<PathBuf>,
 ) -> AgentRequest {
     let prompt = match &request.context {
         RequestContext::Resume { delta, fallback } if request.resume_session.is_some() => {
@@ -17308,6 +18691,7 @@ fn adapter_request(
         policy,
         require_file_edits,
         system_prompt: None,
+        working_directory,
     }
 }
 
@@ -17332,7 +18716,7 @@ fn resolved_assignment_line(
 
 fn runner_name(agent: Agent) -> &'static str {
     match agent {
-        Agent::Cursor => "cursor",
+        Agent::Cursor => dmuxai::runner_id::CURSOR_RUNNER_ID,
         Agent::Agy => "agy",
         Agent::Codex => "codex",
         Agent::Custom(index) => dmuxai::custom_agent::spec_at(index)
@@ -17342,10 +18726,11 @@ fn runner_name(agent: Agent) -> &'static str {
 }
 
 fn runner_from_str(runner: &str) -> Option<Agent> {
-    match runner.trim().to_ascii_lowercase().as_str() {
-        "cursor" => Some(Agent::Cursor),
+    match dmuxai::runner_id::canonical_runner_id(runner).as_str() {
+        id if id == dmuxai::runner_id::CURSOR_RUNNER_ID => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
         "codex" => Some(Agent::Codex),
+        "" => None,
         other => dmuxai::custom_agent::index_of(other).map(Agent::Custom),
     }
 }
@@ -17601,9 +18986,9 @@ fn terminal_snapshot_notice(turn: &TurnSnapshot) -> Option<String> {
 }
 
 fn parse_agent(value: &str) -> Option<Agent> {
-    match value.to_ascii_lowercase().as_str() {
+    match dmuxai::runner_id::canonical_runner_id(value).as_str() {
         "codex" => Some(Agent::Codex),
-        "cursor" => Some(Agent::Cursor),
+        id if id == dmuxai::runner_id::CURSOR_RUNNER_ID => Some(Agent::Cursor),
         "agy" => Some(Agent::Agy),
         _ => None,
     }
@@ -17780,6 +19165,33 @@ fn bounded_activity_detail(value: &str) -> String {
     } else {
         prefix
     }
+}
+
+/// F2 and dashboard pickers hide fast ids even when `[models] allow_fast` is set (FR-3008).
+fn model_offered_in_picker(runner: &str, model_id: &str) -> bool {
+    dmuxai::model_policy::validate_model_for_runner_with(runner, model_id, false).is_ok()
+}
+
+fn picker_offered_models<'a>(
+    agent: Agent,
+    runner: &str,
+    catalog: &'a ModelCatalog,
+) -> Vec<&'a ModelInfo> {
+    debug_assert!(matches!(agent, Agent::Cursor | Agent::Agy));
+    catalog
+        .models
+        .iter()
+        .filter(|model| model_offered_in_picker(runner, &model.id))
+        .collect()
+}
+
+fn picker_selected_index(agent: Agent, runner: &str, catalog: &ModelCatalog) -> usize {
+    debug_assert!(matches!(agent, Agent::Cursor | Agent::Agy));
+    let selected = catalog.selected.as_deref();
+    picker_offered_models(agent, runner, catalog)
+        .iter()
+        .position(|model| selected == Some(model.id.as_str()))
+        .unwrap_or(0)
 }
 
 /// Resolve a requested model id against a runner's catalog (SPEC-agy-bare-model).
@@ -18222,14 +19634,20 @@ mod tests {
     type CancelRequests = Arc<Mutex<Vec<Agent>>>;
     type SelectedModels = Arc<Mutex<Vec<(Agent, String)>>>;
 
-    fn install_shared_test_registry() -> Vec<String> {
+    fn install_test_custom_agents() -> Vec<String> {
         let mut spec = dmuxai::custom_agent::opencode_preset("opencode-step");
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
+        let nowrite = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
         dmuxai::custom_agent::install_registry(vec![
             dmuxai::custom_agent::grok_preset("grok"),
             spec,
+            nowrite,
         ])
     }
     struct RecordingAdapter {
@@ -18759,7 +20177,7 @@ mod tests {
                     id: "step-1".to_owned(),
                     role: NodeRole::Research,
                     job: "first".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -18773,7 +20191,7 @@ mod tests {
                     id: "step-2".to_owned(),
                     role: NodeRole::Test,
                     job: "second".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -18794,6 +20212,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
@@ -19224,6 +20643,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         }
     }
 
@@ -19318,7 +20738,7 @@ mod tests {
                     id: "step-a".to_owned(),
                     role: NodeRole::Research,
                     job: "a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -19332,7 +20752,7 @@ mod tests {
                     id: "step-b".to_owned(),
                     role: NodeRole::Test,
                     job: "b".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -19350,6 +20770,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         app.graph_session = Some(GraphRunSession::new(GraphRun {
             plan,
@@ -19361,14 +20782,14 @@ mod tests {
 
         let first = NodeAssignment {
             node_id: "step-a".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "a".to_owned(),
             role: NodeRole::Research,
         };
         let second = NodeAssignment {
             node_id: "step-b".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "b".to_owned(),
             role: NodeRole::Test,
@@ -19543,7 +20964,7 @@ mod tests {
             id: "orchestrate".to_owned(),
             role: NodeRole::Orchestrate,
             job: "Build graph".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             skill: None,
             requires_gate: false,
@@ -19567,6 +20988,7 @@ mod tests {
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         });
     }
 
@@ -19624,7 +21046,7 @@ mod tests {
                 id: "step-2".to_owned(),
                 role: NodeRole::Implement,
                 job: "Implement task".to_owned(),
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model_id: "composer-2.5".to_owned(),
                 skill: None,
                 requires_gate: false,
@@ -19635,17 +21057,20 @@ mod tests {
                 finished_at_ms: None,
             }],
         );
-        assert!(
-            app.graph_assignment_line
-                .contains("step-2:impl→cursor:composer-2.5")
-        );
+        assert!(app.graph_assignment_line.contains(&format!(
+            "step-2:impl→{}:composer-2.5",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
 
         // Disallowed F2 pick is replaced by the policy pin.
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected =
             Some("grok-4.7-medium-fast".to_owned());
         let session = app.graph_session.as_ref().unwrap();
         let resolved = resolved_assignment_line(&app.model_catalogs, Some(&app.settings), session);
-        assert!(resolved.contains("step-2:impl→cursor:composer-2.5"));
+        assert!(resolved.contains(&format!(
+            "step-2:impl→{}:composer-2.5",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
         assert!(!resolved.contains("grok-4.7-medium-fast"));
     }
 
@@ -19668,6 +21093,7 @@ mod tests {
                 user_prompt: "build the dashboard".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -19740,6 +21166,7 @@ mod tests {
                 user_prompt: "old conversation".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![],
                 edges: vec![],
             },
@@ -19782,6 +21209,7 @@ mod tests {
                 user_prompt: prompt.to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: dmuxai::graph::NodeRole::Implement,
@@ -20402,6 +21830,7 @@ mod tests {
                 user_prompt: "track details".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -20556,6 +21985,7 @@ mod tests {
                 user_prompt: "track activity".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -20645,6 +22075,7 @@ out3
                 user_prompt: "track".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -20702,6 +22133,7 @@ out3
                     ..dmuxai::graph::GraphLimits::default()
                 },
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![
                     dmuxai::graph::GraphNode {
                         id: "node-a".to_owned(),
@@ -20721,7 +22153,7 @@ out3
                         id: "node-b".to_owned(),
                         role: NodeRole::Review,
                         job: "work b".to_owned(),
-                        runner: "cursor".to_owned(),
+                        runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                         model_id: "m".to_owned(),
                         skill: None,
                         requires_gate: false,
@@ -20804,6 +22236,7 @@ out3
                 user_prompt: "retry".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: vec![dmuxai::graph::GraphNode {
                     id: "step-1".to_owned(),
                     role: NodeRole::Implement,
@@ -21561,7 +22994,7 @@ out3
                     id: "node-a".to_owned(),
                     role: NodeRole::Implement,
                     job: "job a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -21593,6 +23026,7 @@ out3
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
 
         app.graph_session = Some(GraphRunSession::new(GraphRun {
@@ -21609,7 +23043,7 @@ out3
                 node_id: "node-a".to_owned(),
                 role: NodeRole::Implement,
                 prompt: "prompt a".to_owned(),
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model_id: "composer-2.5".to_owned(),
             }),
             GraphAction::Failed("pipeline exploded mid-batch".to_owned()),
@@ -21642,7 +23076,7 @@ out3
             node_id: "node-c".to_owned(),
             role: NodeRole::Implement,
             prompt: "prompt c".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
         });
         assert!(noop_res.is_err());
@@ -21767,7 +23201,7 @@ out3
                     id: "orchestrate".to_owned(),
                     role: NodeRole::Orchestrate,
                     job: "Build graph".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -21781,7 +23215,7 @@ out3
                     id: "step-1".to_owned(),
                     role: NodeRole::Research,
                     job: "Research task".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -21809,7 +23243,7 @@ out3
                     id: "step-3".to_owned(),
                     role: NodeRole::Test,
                     job: "Test task".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -21823,7 +23257,7 @@ out3
                     id: "step-4".to_owned(),
                     role: NodeRole::Review,
                     job: "Review task".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -21837,6 +23271,7 @@ out3
             edges: vec![],
             limits: dmuxai::graph::GraphLimits::default(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         let run = GraphRun {
             plan,
@@ -21878,7 +23313,10 @@ out3
         let areas = app.ui_areas(app.terminal_area);
         assert!(areas.graph_status.is_some());
         let rendered = render_text_at(&mut app, 100, 30);
-        assert!(rendered.contains("Graph 1/1 · single implement · cursor composer-2.5 · running"));
+        assert!(rendered.contains(&format!(
+            "Graph 1/1 · single implement · {} composer-2.5 · running",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
 
         // When turn finishes, single plan cleared
         app.finish_turn(Agent::Cursor);
@@ -21906,7 +23344,7 @@ out3
             source: TriageSource::Judge,
             cause: None,
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 12,
         };
@@ -21915,10 +23353,10 @@ out3
         assert!(areas.judge_line.is_some());
         assert_eq!(areas.judge_line.unwrap().bottom(), areas.input.y);
         let rendered = render_text_at(&mut app, 100, 30);
-        assert!(rendered.contains("Judge (cursor composer-2.5): simple — quick fix"));
-        assert_eq!(find_cell_fg(&mut app, "Judge (cursor"), Some(system));
+        assert!(rendered.contains("Judge (cursor-agent composer-2.5): simple — quick fix"));
+        assert_eq!(find_cell_fg(&mut app, "Judge (cursor-agent"), Some(system));
         assert!(
-            find_cell_modifier(&mut app, "Judge (cursor")
+            find_cell_modifier(&mut app, "Judge (cursor-agent")
                 .is_some_and(|m| m.contains(Modifier::DIM))
         );
 
@@ -21928,14 +23366,14 @@ out3
             source: TriageSource::Judge,
             cause: None,
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 12,
         };
         app.judge_reason_line = Some((1, conversation_id.as_str().to_owned(), complex));
         assert!(
             render_text_at(&mut app, 100, 30)
-                .contains("Judge (cursor composer-2.5): complex — needs plan")
+                .contains("Judge (cursor-agent composer-2.5): complex — needs plan")
         );
 
         let fallback = Triage {
@@ -21944,7 +23382,7 @@ out3
             source: TriageSource::Fallback,
             cause: Some(FallbackCause::Timeout),
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 12,
         };
@@ -21960,7 +23398,7 @@ out3
             source: TriageSource::Override,
             cause: None,
             override_kind: Some(OverrideKind::Plan),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 0,
         };
@@ -21973,7 +23411,7 @@ out3
             source: TriageSource::Override,
             cause: None,
             override_kind: Some(OverrideKind::Direct),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 0,
         };
@@ -22013,7 +23451,7 @@ out3
             source: TriageSource::Judge,
             cause: None,
             override_kind: None,
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model: "composer-2.5".to_owned(),
             elapsed_ms: 1,
         };
@@ -22022,7 +23460,7 @@ out3
         let rendered = render_text_at(&mut app, 100, 30);
         let line = rendered
             .lines()
-            .find(|line| line.contains("Judge (cursor"))
+            .find(|line| line.contains("Judge (cursor-agent"))
             .expect("judge line");
         assert!(line.contains('…'));
         assert!(!line.contains(&"가".repeat(80)));
@@ -22046,7 +23484,10 @@ out3
         });
         let frame = spinner_frame(Duration::ZERO, app.reduced_motion());
         let rendered = render_text_at(&mut app, 100, 30);
-        assert!(rendered.contains(&format!("{frame} Judging with cursor composer-2.5…")));
+        assert!(rendered.contains(&format!(
+            "{frame} Judging with {} composer-2.5…",
+            dmuxai::runner_id::CURSOR_RUNNER_ID
+        )));
         assert_eq!(find_cell_fg(&mut app, "Judging with"), Some(system));
         assert!(
             find_cell_modifier(&mut app, "Judging with").is_some_and(|m| m.contains(Modifier::DIM))
@@ -22063,7 +23504,7 @@ out3
                 source: TriageSource::Judge,
                 cause: None,
                 override_kind: None,
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model: "composer-2.5".to_owned(),
                 elapsed_ms: 12,
             },
@@ -22275,7 +23716,7 @@ out3
 
         let cursor_view = agents
             .iter()
-            .find(|a| a["id"] == "cursor")
+            .find(|a| a["id"] == dmuxai::runner_id::CURSOR_RUNNER_ID)
             .expect("cursor agent present");
         let expected_cursor_hex = dmuxai::theme::color_hex(app.settings.theme.cursor).unwrap();
         assert_eq!(cursor_view["color"], expected_cursor_hex);
@@ -23961,6 +25402,7 @@ out3
                 fallback_policy: None,
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: None,
             },
         );
 
@@ -23975,8 +25417,8 @@ out3
     // adapter Cancelled does not write a second one.
     #[test]
     fn tc_984_cancel_appends_one_cancelled_notice_for_every_runner() {
-        // First install wins process-wide; the other test installs the same grok preset.
-        let _ = install_shared_test_registry();
+        // First install wins process-wide; every test installs the same shared list.
+        let _ = install_test_custom_agents();
         assert!(dmuxai::custom_agent::index_of("grok").is_some());
         let (mut app, sent) = test_app();
         let hub = dmuxai::web::DashboardHub::new(
@@ -25138,6 +26580,7 @@ out3
             policy: TurnPolicy::Agent,
             require_file_edits: false,
             system_prompt: None,
+            working_directory: None,
         };
         // Empty memory: unchanged.
         let mut r = request(None);
@@ -25468,6 +26911,7 @@ out3
                 fallback_policy: None,
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: None,
             },
         );
         app.busy_agents.insert(Agent::Cursor);
@@ -25521,6 +26965,7 @@ out3
                 fallback_policy: None,
                 fallback_chain: None,
                 retry_fresh_request: None,
+                fanout_worktree: None,
             },
         );
         app.activities.insert(
@@ -25574,6 +27019,231 @@ out3
         let thinking_summary = app.activity_summary(Agent::Agy, now);
         assert!(thinking_summary.contains("last event 0s ago"));
         assert!(thinking_summary.contains("working"));
+    }
+
+    fn graph_plan_for_tc_290(role: NodeRole, runner: &str, id: &str) -> dmuxai::graph::GraphPlan {
+        dmuxai::graph::GraphPlan {
+            schema: "dmuxai.graph/v1".to_owned(),
+            id: id.to_owned(),
+            orchestrator_model: "composer-2.5".to_owned(),
+            user_prompt: "tc-290".to_owned(),
+            nodes: vec![dmuxai::graph::GraphNode {
+                id: "step-1".to_owned(),
+                role,
+                job: "job".to_owned(),
+                runner: runner.to_owned(),
+                model_id: "composer-2.5".to_owned(),
+                skill: None,
+                requires_gate: false,
+                status: dmuxai::graph::GraphNodeStatus::Pending,
+                attempt: 0,
+                task: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+            }],
+            edges: Vec::new(),
+            limits: dmuxai::graph::default_limits(),
+            tasks: Vec::new(),
+            dynamic_cap: None,
+        }
+    }
+
+    // TC-2902 / FR-2901
+    #[test]
+    fn tc_2902_start_graph_node_uses_read_only_policy_for_research_node_when_on() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_enforce_read_only_roles = true;
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2902",
+        ));
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::ReadOnly);
+    }
+
+    // TC-2903 / FR-2902
+    #[test]
+    fn tc_2903_setting_off_keeps_app_wide_policy_for_all_roles() {
+        let (mut app, sent) = test_app();
+        app.pending_turn_policy = Some(TurnPolicy::Agent);
+        app.settings.graph_enforce_read_only_roles = false;
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2903",
+        ));
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::Agent);
+    }
+
+    // TC-2904 / FR-2903
+    #[test]
+    fn tc_2904_pending_policy_restored_after_node_finish_fail_cancel() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_enforce_read_only_roles = true;
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Implement,
+            "cursor",
+            "tc-2904-finish",
+        ));
+        assert_eq!(graph_node_requests(&sent)[0].policy, TurnPolicy::Agent);
+        complete_sent_graph_turn(&mut app, &sent, 0);
+        assert_eq!(app.pending_turn_policy, Some(TurnPolicy::ReadOnly));
+
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2904-fail",
+        ));
+        let idx = sent.lock().unwrap().len() - 1;
+        let (agent, req) = sent.lock().unwrap()[idx].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("boom")),
+        }));
+        assert_eq!(app.pending_turn_policy, Some(TurnPolicy::ReadOnly));
+
+        app.pending_turn_policy = Some(TurnPolicy::ReadOnly);
+        app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2904-cancel",
+        ));
+        let idx = sent.lock().unwrap().len() - 1;
+        let (agent, req) = sent.lock().unwrap()[idx].clone();
+        assert!(app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Cancelled,
+        }));
+        assert_eq!(app.pending_turn_policy, Some(TurnPolicy::ReadOnly));
+    }
+
+    // TC-2905 / FR-2904
+    #[test]
+    fn tc_2905_read_only_node_without_read_only_runner_falls_back_or_fails() {
+        let mut h = plan_gate_harness(&[(Agent::Codex, TurnPolicy::ReadOnly)]);
+        h.app.settings.graph_enforce_read_only_roles = true;
+        h.app.settings.graph_allowed_runners = Some(vec!["codex".to_owned(), "cursor".to_owned()]);
+        h.app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "codex",
+            "tc-2905-ok",
+        ));
+        let sent = h.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, Agent::Cursor);
+        assert_eq!(sent[0].1.policy, TurnPolicy::ReadOnly);
+        drop(sent);
+
+        let mut fail = plan_gate_harness(&[(Agent::Codex, TurnPolicy::ReadOnly)]);
+        fail.app.settings.graph_enforce_read_only_roles = true;
+        fail.app.settings.graph_allowed_runners = Some(vec!["codex".to_owned()]);
+        fail.app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "codex",
+            "tc-2905-fail",
+        ));
+        assert!(
+            fail.app.graph_session.is_none()
+                || fail
+                    .app
+                    .last_graph_run
+                    .as_ref()
+                    .is_some_and(|run| run.phase == GraphRunPhase::Failed),
+            "must fail when no read-only runner is available"
+        );
+    }
+
+    // TC-2906 / FR-2905
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2906_read_only_graph_node_that_writes_files_fails_with_policy_error() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let git_run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&workspace)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {:?} failed", args);
+        };
+        git_run(&["init", "-q"]);
+        std::fs::write(workspace.join("README.md"), "initial\n").unwrap();
+        git_run(&["add", "README.md"]);
+        git_run(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+
+        let mut harness = plan_gate_harness_in_workspace(workspace.clone(), &[]);
+        harness.app.settings.graph_enforce_read_only_roles = true;
+        harness.app.quiet_graph_run = true;
+        harness.app.start_graph_run(graph_plan_for_tc_290(
+            NodeRole::Research,
+            "cursor",
+            "tc-2906",
+        ));
+        let (agent, req) = harness.sent.lock().unwrap()[0].clone();
+        std::fs::write(workspace.join("SQA_GRAPH_WRITE.txt"), "wrote\n").unwrap();
+        assert!(harness.app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::TextDelta("done".to_owned()),
+        }));
+        assert!(harness.app.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Completed,
+        }));
+        assert!(harness.app.graph_session.is_none());
+        assert!(
+            harness
+                .app
+                .messages
+                .iter()
+                .any(|m| m.content.contains(READ_ONLY_WORKSPACE_WRITE_ERROR)),
+            "graph node write guard must surface policy error"
+        );
+        assert_eq!(
+            harness.app.last_graph_run.as_ref().map(|run| run.phase),
+            Some(GraphRunPhase::Failed)
+        );
+    }
+
+    // TC-2907 / UX-2900
+    #[test]
+    fn tc_2907_graph_status_shows_read_only_roles_state() {
+        let (mut app, _) = test_app();
+        app.settings.graph_enforce_read_only_roles = true;
+        app.input = "/graph".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("read-only roles: on"))
+        );
+        app.settings.graph_enforce_read_only_roles = false;
+        app.input = "/graph".to_owned();
+        app.submit_prompt();
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("read-only roles: off"))
+        );
     }
 
     #[test]
@@ -25638,6 +27308,7 @@ out3
             edges: Vec::new(),
             limits: dmuxai::graph::default_limits(),
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         app.start_graph_run(plan);
 
@@ -25703,6 +27374,7 @@ out3
                     ..dmuxai::graph::GraphLimits::default()
                 },
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             conversation_id: conv_before.clone(),
             phase: GraphRunPhase::Failed,
@@ -26334,7 +28006,7 @@ out3
     // TC-1751 / FR-1730: disallowed headless model is policy-rejected before any request
     #[tokio::test]
     async fn tc_1751_headless_disallowed_model_policy() {
-        // agy + gemini-4-argon
+        // agy + fast model
         {
             let (mut app, sent) = test_app();
             app.selected = adapter_index(Agent::Agy);
@@ -26348,7 +28020,7 @@ out3
                 approve_plan_id: None,
                 allow_sensitive: false,
                 todo_id: None,
-                model: Some("gemini-4-argon".to_owned()),
+                model: Some("gemini-4-argon-fast".to_owned()),
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -26505,6 +28177,1094 @@ out3
         let requests = sent.lock().unwrap();
         assert_eq!(requests.len(), 1, "{agent:?} should send one request");
         (requests[0].0, requests[0].1.policy)
+    }
+
+    fn fanout_recording_app(
+        fail_agents: &[Agent],
+        read_only_blocked: &[Agent],
+    ) -> (App, SentRequests, mpsc::Sender<AgentOutput>) {
+        let workspace = std::env::current_dir().unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let selected_models = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::clone(&cancelled),
+                    fail_send: fail_agents.contains(&agent),
+                    fail_select_model: false,
+                    unsupported_modes: if read_only_blocked.contains(&agent) {
+                        vec![TurnPolicy::ReadOnly]
+                    } else {
+                        Vec::new()
+                    },
+                    selected_models: Arc::clone(&selected_models),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace,
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.selected = adapter_index(Agent::Codex);
+        app.skip_judge_for_tests = true;
+        app.set_headless(true);
+        (app, sent, event_tx)
+    }
+
+    fn complete_fanout_requests(sent: &SentRequests, event_tx: mpsc::Sender<AgentOutput>) {
+        let sent = Arc::clone(sent);
+        tokio::spawn(async move {
+            let mut done = HashSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while tokio::time::Instant::now() < deadline {
+                let pending: Vec<(Agent, AgentRequest)> = {
+                    let lock = sent.lock().unwrap();
+                    lock.iter()
+                        .filter(|(agent, _)| !done.contains(agent))
+                        .cloned()
+                        .collect()
+                };
+                for (agent, req) in pending {
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta("fanout-answer".into()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    done.insert(agent);
+                }
+                if done.len() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    // TC-2911 / FR-2911
+    #[tokio::test]
+    async fn tc_2911_leg_without_read_only_mode_fails_not_writes() {
+        let write_only = dmuxai::custom_agent::CustomAgentSpec {
+            name: "nowrite".to_owned(),
+            command: vec!["sh".into(), "-c".into(), "{prompt}".into()],
+            ..Default::default()
+        };
+        assert!(!write_only.has_read_only_mode());
+        let _ = install_test_custom_agents();
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let order = vec!["cursor".into(), "nowrite".into()];
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "nowrite".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                order,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        let custom = outcome
+            .fanout
+            .as_ref()
+            .unwrap()
+            .legs
+            .iter()
+            .find(|leg| leg.agent == "nowrite")
+            .expect("nowrite leg");
+        assert_eq!(custom.status, dmuxai::fanout::LegStatus::Failed);
+        assert_eq!(custom.error_kind.as_deref(), Some("no_read_only_mode"));
+        let requests = sent.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(_, r)| r.policy == TurnPolicy::ReadOnly)
+                .count(),
+            1
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(agent, _)| { runner_name(*agent).eq_ignore_ascii_case("nowrite") }),
+            "custom agent without read-only mode must never be sent"
+        );
+    }
+
+    // TC-2912 / FR-2912
+    #[tokio::test]
+    async fn tc_2912_leg_prompt_and_conversation_are_isolated() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let prompt = "exact user prompt".to_owned();
+        let _ = app
+            .run_fanout_headless(
+                prompt.clone(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(_, r)| r.prompt == prompt));
+        assert!(
+            requests
+                .iter()
+                .all(|(_, r)| r.policy == TurnPolicy::ReadOnly)
+        );
+        let c0 = requests[0].1.conversation_id.as_str();
+        let c1 = requests[1].1.conversation_id.as_str();
+        assert_ne!(c0, c1);
+    }
+
+    // TC-2913 / FR-2913
+    #[tokio::test]
+    async fn tc_2913_failed_leg_tolerated_by_quorum() {
+        let legs = vec![
+            dmuxai::fanout::FanoutLegSpec {
+                runner: "cursor".into(),
+                model: None,
+            },
+            dmuxai::fanout::FanoutLegSpec {
+                runner: "codex".into(),
+                model: None,
+            },
+        ];
+        let order = vec!["cursor".into(), "codex".into()];
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                legs.clone(),
+                1,
+                Vec::new(),
+                order.clone(),
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        assert!(outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::OK);
+
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex, Agent::Cursor], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                legs,
+                2,
+                Vec::new(),
+                order,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.exit_code, dmuxai::agent_api::exit::FAILED);
+        assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
+    }
+
+    // TC-2914 / FR-2914
+    #[tokio::test]
+    async fn tc_2914_fallback_never_uses_runner_of_another_leg() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "cursor".to_owned(),
+                    model: None,
+                }]),
+                stall_timeout_secs: None,
+                stall_api_retries: None,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        let event_tx2 = event_tx.clone();
+        let sent2 = Arc::clone(&sent);
+        let event_tx3 = event_tx.clone();
+        let sent3 = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let req = {
+                    let lock = sent3.lock().unwrap();
+                    lock.iter()
+                        .find(|(a, _)| *a == Agent::Cursor)
+                        .map(|(_, r)| (r.conversation_id.clone(), r.turn_id.clone()))
+                };
+                if let Some((conversation_id, turn_id)) = req {
+                    let _ = event_tx3
+                        .send(AgentOutput {
+                            agent: Agent::Cursor,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let req = {
+                    let lock = sent2.lock().unwrap();
+                    lock.iter()
+                        .find(|(a, _)| *a == Agent::Agy)
+                        .map(|(_, r)| (r.conversation_id.clone(), r.turn_id.clone()))
+                };
+                if let Some((conversation_id, turn_id)) = req {
+                    let _ = event_tx2
+                        .send(AgentOutput {
+                            agent: Agent::Agy,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Error(AgentError::provider(
+                                "API error: model unavailable",
+                            )),
+                        })
+                        .await;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "agy".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["agy".into(), "cursor".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        let agy = outcome
+            .fanout
+            .as_ref()
+            .unwrap()
+            .legs
+            .iter()
+            .find(|leg| leg.agent == "agy")
+            .expect("agy leg");
+        assert_eq!(agy.status, dmuxai::fanout::LegStatus::Failed);
+        assert_eq!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .filter(|(a, _)| *a == Agent::Cursor)
+                .count(),
+            1
+        );
+    }
+
+    // TC-2917 / FR-2917
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2917_fanout_write_in_worktree_is_policy_error() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "fanout@test"][..],
+            &["config", "user.name", "fanout"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&workspace)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(workspace.join("tracked.txt"), "a").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::new(Mutex::new(Vec::new())),
+                    fail_send: false,
+                    fail_select_model: false,
+                    unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace.clone(),
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.set_headless(true);
+        let event_tx_bg = event_tx.clone();
+        let sent_bg = Arc::clone(&sent);
+        let workspace_bg = workspace.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if !sent_bg.lock().unwrap().is_empty() {
+                    std::fs::write(workspace_bg.join("dirty.txt"), "x").unwrap();
+                    complete_fanout_requests(&sent_bg, event_tx_bg);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error_kind.as_deref(), Some("policy"));
+    }
+
+    // TC-2918 / NFR-2910
+    #[tokio::test]
+    async fn tc_2918_no_agents_flag_takes_existing_path() {
+        let (mut app, sent, event_tx) = test_app_with_event_sender();
+        complete_first_headless_request(&sent, event_tx, "done");
+        let req = HeadlessRequest {
+            prompt: "hello".into(),
+            agent: Some("codex".into()),
+            mode: None,
+            graph: false,
+            approve_plan: false,
+            approve_plan_id: None,
+            allow_sensitive: false,
+            todo_id: None,
+            model: None,
+        };
+        let outcome = app
+            .run_headless(req, Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(outcome.ok, "{outcome:?}");
+        assert!(outcome.fanout.is_none());
+    }
+
+    // TC-2920 / FR-2920
+    #[tokio::test]
+    async fn tc_2920_judge_flag_requires_agents_and_read_only_runner() {
+        assert!(
+            crate::cli::parse(&["run".into(), "x".into(), "--judge".into(), "codex".into(),])
+                .is_err()
+        );
+        assert!(
+            crate::cli::parse(&[
+                "run".into(),
+                "x".into(),
+                "--agents".into(),
+                "cursor,codex".into(),
+                "--judge".into(),
+                "codex".into(),
+            ])
+            .is_ok()
+        );
+        install_test_custom_agents();
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Some(dmuxai::fanout::FanoutLegSpec {
+                    runner: "nowrite".into(),
+                    model: None,
+                }),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        assert_eq!(
+            outcome.aggregate_error.as_deref(),
+            Some("no_read_only_mode")
+        );
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    // TC-2921 / FR-2921
+    #[tokio::test]
+    async fn tc_2921_judge_skipped_with_fewer_than_two_ok_legs() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[Agent::Codex], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Some(dmuxai::fanout::FanoutLegSpec {
+                    runner: "agy".into(),
+                    model: None,
+                }),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        assert_eq!(outcome.aggregate_skipped.as_deref(), Some("too_few_legs"));
+        assert!(outcome.aggregate.is_none());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    // TC-2925 / FR-2925
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2925_judge_turn_is_read_only_and_guarded() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "fanout@test"][..],
+            &["config", "user.name", "fanout"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&workspace)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(workspace.join("tracked.txt"), "a").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let (mut app, sent, event_tx) =
+            test_app_with_engine_and_event_sender(engine, workspace.clone());
+        let main_conversation = app.conversation_id.clone();
+        app.set_headless(true);
+        let sent_bg = Arc::clone(&sent);
+        let workspace_bg = workspace.clone();
+        let aggregate = r#"{"recommendation":"aligned","agreements":[],"disagreements":[],"unique_findings":{}}"#;
+        tokio::spawn(async move {
+            let mut replied = HashSet::new();
+            for _ in 0..400 {
+                let pending: Vec<(Agent, AgentRequest)> = {
+                    let lock = sent_bg.lock().unwrap();
+                    lock.iter()
+                        .filter(|(agent, _)| !replied.contains(agent))
+                        .cloned()
+                        .collect()
+                };
+                for (agent, req) in pending {
+                    let text = if req.prompt.contains("Agent answers:") {
+                        std::fs::write(workspace_bg.join("judge-write.txt"), "w").unwrap();
+                        aggregate
+                    } else {
+                        "fanout-answer"
+                    };
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id.clone()),
+                            turn_id: Some(turn_id.clone()),
+                            event: AgentEvent::TextDelta(text.into()),
+                        })
+                        .await;
+                    let _ = event_tx
+                        .send(AgentOutput {
+                            agent,
+                            conversation_id: Some(conversation_id),
+                            turn_id: Some(turn_id),
+                            event: AgentEvent::Completed,
+                        })
+                        .await;
+                    replied.insert(agent);
+                }
+                if replied.len() >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                Some(dmuxai::fanout::FanoutLegSpec {
+                    runner: "agy".into(),
+                    model: None,
+                }),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        let requests = sent.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests
+                .iter()
+                .all(|(_, r)| r.policy == TurnPolicy::ReadOnly)
+        );
+        let judge_req = requests
+            .iter()
+            .find(|(_, r)| r.prompt.contains("Agent answers:"))
+            .expect("judge prompt");
+        assert!(judge_req.1.prompt.contains("<<<DATA-"));
+        assert_ne!(
+            judge_req.1.conversation_id.as_str(),
+            main_conversation.as_str()
+        );
+        assert_eq!(outcome.aggregate_error.as_deref(), Some("policy"));
+        assert!(outcome.aggregate.is_none());
+        assert!(
+            outcome
+                .fanout
+                .as_ref()
+                .unwrap()
+                .legs
+                .iter()
+                .filter(|leg| leg.status == dmuxai::fanout::LegStatus::Ok)
+                .count()
+                >= 2
+        );
+    }
+
+    // TC-2927 / NFR-2920
+    #[tokio::test]
+    async fn tc_2927_no_judge_flag_runs_no_judge_turn() {
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        complete_fanout_requests(&sent, event_tx);
+        let _ = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    fn init_git_workspace(dir: &std::path::Path) {
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "fanout@test"][..],
+            &["config", "user.name", "fanout"][..],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.join("tracked.txt"), "base\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-qm", "init"])
+            .current_dir(dir)
+            .status()
+            .unwrap();
+    }
+
+    // TC-2930 / FR-2930 (leg cwd via AgentRequest.working_directory)
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2930_write_flag_preconditions_and_leg_cwd() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::new(Mutex::new(Vec::new())),
+                    fail_send: false,
+                    fail_select_model: false,
+                    unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace.clone(),
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        app.set_headless(true);
+        let event_tx_bg = event_tx.clone();
+        let sent_bg = Arc::clone(&sent);
+        tokio::spawn(async move { complete_fanout_requests(&sent_bg, event_tx_bg) });
+        let write = dmuxai::fanout_worktree::FanoutWriteRunConfig {
+            run_id: "t2930".into(),
+            keep_worktrees: true,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            app.run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Some(write),
+            ),
+        )
+        .await
+        .expect("tc_2930 timed out");
+        let requests = sent.lock().unwrap();
+        for (_, req) in requests.iter() {
+            assert_eq!(req.policy, TurnPolicy::Agent);
+            let wt = req.working_directory.as_ref().expect("leg worktree cwd");
+            assert!(wt.ends_with("cursor") || wt.ends_with("codex"));
+            assert!(dmuxai::fanout_worktree::path_under_fanout(&workspace, wt));
+        }
+        dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2930"), false).expect("clean");
+    }
+
+    // TC-2931 / FR-2931
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2931_main_workspace_unchanged_by_write_fanout() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let before = dmuxai::workspace::git_worktree_fingerprint_sync(&workspace).unwrap();
+        let engine =
+            ConversationEngine::open(std::path::Path::new(":memory:"), &workspace).unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let adapters = Agent::all()
+            .into_iter()
+            .map(|agent| {
+                Box::new(RecordingAdapter {
+                    agent,
+                    sent: Arc::clone(&sent),
+                    cancelled: Arc::new(Mutex::new(Vec::new())),
+                    fail_send: false,
+                    fail_select_model: false,
+                    unsupported_modes: Vec::new(),
+                    selected_models: Arc::new(Mutex::new(Vec::new())),
+                }) as Box<dyn AgentAdapter>
+            })
+            .collect();
+        let (event_tx, event_rx) = event_channel();
+        let mut app = App::with_runtime(
+            adapters,
+            event_rx,
+            Vec::new(),
+            engine,
+            workspace.clone(),
+            DmuxSettings::default(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let event_tx_bg = event_tx.clone();
+        let sent_bg = Arc::clone(&sent);
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let wrote = {
+                    let lock = sent_bg.lock().unwrap();
+                    if let Some((_, req)) = lock.first() {
+                        if let Some(wt) = &req.working_directory {
+                            std::fs::write(wt.join("leg-out.txt"), "written\n").unwrap();
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if wrote {
+                    complete_fanout_requests(&sent_bg, event_tx_bg);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            app.run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Some(dmuxai::fanout_worktree::FanoutWriteRunConfig {
+                    run_id: "t2931".into(),
+                    keep_worktrees: false,
+                }),
+            ),
+        )
+        .await
+        .expect("tc_2931 timed out");
+        assert!(outcome.ok, "{outcome:?}");
+        let after = dmuxai::workspace::git_worktree_fingerprint_sync(&workspace).unwrap();
+        assert_eq!(before, after);
+        dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2931"), false).ok();
+    }
+
+    // TC-2938 / FR-2938
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2938_write_fanout_disables_runner_fallback() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        app.workspace_root = workspace.clone();
+        let mut fallback = dmuxai::runner_fallback::FallbackSettings::default();
+        fallback.runners.insert(
+            "agy".to_owned(),
+            dmuxai::runner_fallback::RunnerFallbackConfig {
+                chain: Some(vec![dmuxai::runner_fallback::FallbackTarget {
+                    runner: "cursor".to_owned(),
+                    model: None,
+                }]),
+                stall_timeout_secs: None,
+                stall_api_retries: None,
+            },
+        );
+        app.settings.runner_fallback = fallback;
+        let sent2 = Arc::clone(&sent);
+        let event_tx2 = event_tx.clone();
+        let workspace_for_task = workspace.clone();
+        tokio::spawn(async move {
+            let mut done = HashSet::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while tokio::time::Instant::now() < deadline {
+                let pending: Vec<(Agent, AgentRequest)> = {
+                    let lock = sent2.lock().unwrap();
+                    lock.iter()
+                        .filter(|(agent, _)| !done.contains(agent))
+                        .cloned()
+                        .collect()
+                };
+                for (agent, req) in pending {
+                    let conversation_id = req.conversation_id.clone();
+                    let turn_id = req.turn_id.clone();
+                    if agent == Agent::Agy {
+                        if let Some(wt) = &req.working_directory {
+                            assert!(dmuxai::fanout_worktree::path_under_fanout(
+                                &workspace_for_task,
+                                wt
+                            ));
+                        }
+                        let _ = event_tx2
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conversation_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Error(AgentError::provider("model unavailable")),
+                            })
+                            .await;
+                    } else {
+                        let _ = event_tx2
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conversation_id.clone()),
+                                turn_id: Some(turn_id.clone()),
+                                event: AgentEvent::TextDelta("ok".into()),
+                            })
+                            .await;
+                        let _ = event_tx2
+                            .send(AgentOutput {
+                                agent,
+                                conversation_id: Some(conversation_id),
+                                turn_id: Some(turn_id),
+                                event: AgentEvent::Completed,
+                            })
+                            .await;
+                    }
+                    done.insert(agent);
+                }
+                if done.contains(&Agent::Agy) && done.contains(&Agent::Codex) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(120),
+            app.run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "agy".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["agy".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Some(dmuxai::fanout_worktree::FanoutWriteRunConfig {
+                    run_id: "t2938".into(),
+                    keep_worktrees: false,
+                }),
+            ),
+        )
+        .await
+        .expect("tc_2938 timed out");
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|(a, _)| *a != Agent::Cursor),
+            "write fan-out must not fall back to another runner"
+        );
+        let agy_leg = outcome
+            .fanout
+            .as_ref()
+            .and_then(|f| f.legs.iter().find(|leg| leg.agent == "agy"))
+            .expect("agy leg");
+        assert_eq!(agy_leg.status, dmuxai::fanout::LegStatus::Failed);
+        dmuxai::fanout_worktree::fanout_clean(&workspace, Some("t2938"), false).ok();
+    }
+
+    // TC-2939 / NFR-2930
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn tc_2939_no_write_flag_creates_no_worktree() {
+        pin_test_state_dir();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        init_git_workspace(&workspace);
+        let (mut app, sent, event_tx) = fanout_recording_app(&[], &[]);
+        app.workspace_root = workspace.clone();
+        complete_fanout_requests(&sent, event_tx);
+        let _ = app
+            .run_fanout_headless(
+                "hello".into(),
+                vec![
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "cursor".into(),
+                        model: None,
+                    },
+                    dmuxai::fanout::FanoutLegSpec {
+                        runner: "codex".into(),
+                        model: None,
+                    },
+                ],
+                1,
+                Vec::new(),
+                vec!["cursor".into(), "codex".into()],
+                None,
+                Arc::new(AtomicBool::new(false)),
+                None,
+            )
+            .await;
+        let fanout_root = workspace.join(".dmuxai/fanout");
+        assert!(!fanout_root.exists() || std::fs::read_dir(fanout_root).unwrap().count() == 0);
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|(_, r)| r.working_directory.is_none())
+        );
     }
 
     // TC-1824 / FR-1824 (#212): a headless --read-only turn reaches every runner with
@@ -27961,7 +30721,7 @@ out3
         assert!(app.drain_dashboard_commands());
 
         let accepted = rx_reply.await.unwrap().unwrap();
-        assert_eq!(accepted.agent, "cursor");
+        assert_eq!(accepted.agent, dmuxai::runner_id::CURSOR_RUNNER_ID);
 
         let mut prompts = Vec::new();
         for _ in 0..50 {
@@ -28113,6 +30873,74 @@ out3
         }
     }
 
+    // TC-3010 / FR-3008
+    #[test]
+    fn tc_3010_pickers_offer_open_models_without_fast() {
+        let (mut app, _) = test_app();
+        app.apply_agent_event(
+            Agent::Cursor,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::new("claude-sonnet-5-5-high", "Claude Sonnet 5.5 High"),
+                    ModelInfo::new("grok-4.7-high", "Grok 4.7 High"),
+                    ModelInfo::new("composer-2.5-fast", "Composer 2.5 Fast"),
+                ],
+                selected: Some("claude-sonnet-5-5-high".to_owned()),
+                selected_effort: None,
+            },
+        );
+        app.apply_agent_event(
+            Agent::Agy,
+            AgentEvent::ModelsListed {
+                models: vec![
+                    ModelInfo::new("gemini-4-carbon-high", "Gemini 4 Carbon High"),
+                    ModelInfo::new("claude-sonnet-5-5-high", "Claude Sonnet 5.5 High"),
+                    ModelInfo::new("gemini-4-carbon-fast", "Gemini 4 Carbon Fast"),
+                ],
+                selected: Some("gemini-4-carbon-high".to_owned()),
+                selected_effort: None,
+            },
+        );
+
+        let session = app.session_view();
+        let cursor = session
+            .agents
+            .iter()
+            .find(|a| a.id == dmuxai::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
+        let cursor_ids: Vec<&str> = cursor.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(cursor_ids.contains(&"claude-sonnet-5-5-high"));
+        assert!(cursor_ids.contains(&"grok-4.7-high"));
+        assert!(!cursor_ids.iter().any(|id| id.contains("fast")));
+
+        let agy = session.agents.iter().find(|a| a.id == "agy").unwrap();
+        let agy_ids: Vec<&str> = agy.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(agy_ids.contains(&"gemini-4-carbon-high"));
+        assert!(agy_ids.contains(&"claude-sonnet-5-5-high"));
+        assert!(!agy_ids.iter().any(|id| id.contains("fast")));
+
+        app.selected = adapter_index(Agent::Cursor);
+        app.open_model_picker();
+        let rendered = render_text_at(&mut app, 80, 30);
+        assert!(rendered.contains("grok-4.7-high"));
+        assert!(!rendered.contains("composer-2.5-fast"));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_catalogs[&Agent::Cursor].selected.as_deref(),
+            Some("grok-4.7-high")
+        );
+
+        app.selected = adapter_index(Agent::Agy);
+        app.open_model_picker();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.model_catalogs[&Agent::Agy].selected.as_deref(),
+            Some("claude-sonnet-5-5-high")
+        );
+    }
+
     // Composer model menu: the session view carries the runner default model,
     // per-model default efforts for Codex only, and never a fast model or a
     // fast-named effort.
@@ -28194,7 +31022,11 @@ out3
         assert_eq!(codex.models[0].efforts, vec!["low", "medium", "high"]);
         assert_eq!(codex.models[0].default_effort.as_deref(), Some("medium"));
 
-        let cursor = session.agents.iter().find(|a| a.id == "cursor").unwrap();
+        let cursor = session
+            .agents
+            .iter()
+            .find(|a| a.id == dmuxai::runner_id::CURSOR_RUNNER_ID)
+            .unwrap();
         assert_eq!(cursor.default_model.as_deref(), Some(allowed));
         assert_eq!(cursor.models.len(), 1);
         assert!(
@@ -28510,7 +31342,7 @@ out3
             !session
                 .agents
                 .iter()
-                .find(|a| a.id == "cursor")
+                .find(|a| a.id == dmuxai::runner_id::CURSOR_RUNNER_ID)
                 .unwrap()
                 .allowed
         );
@@ -29685,7 +32517,7 @@ out3
     // TC-904 / FR-896
     #[test]
     fn tc_904_selecting_grok_requests_a_model_probe() {
-        let warnings = install_shared_test_registry();
+        let warnings = install_test_custom_agents();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -29950,7 +32782,7 @@ out3
         agents.push(Agent::Custom(1));
         let app = app_with_runner_agents(agents, with_custom);
         let first = &app.messages[0].content;
-        let listed = "Runners: cursor, agy, codex, opencode, grok.";
+        let listed = "Runners: cursor-agent, agy, codex, opencode, grok.";
         assert!(first.starts_with(listed), "{first}");
         assert!(first.contains("F3 to load a conversation"), "{first}");
         assert!(first.contains("/agent"), "{first}");
@@ -29977,7 +32809,7 @@ out3
         let plain = app_with_runner_agents(Agent::BUILTIN.to_vec(), DmuxSettings::default());
         let plain_first = &plain.messages[0].content;
         assert!(
-            plain_first.starts_with("Runners: cursor, agy, codex."),
+            plain_first.starts_with("Runners: cursor-agent, agy, codex."),
             "{plain_first}"
         );
         assert!(!plain_first.contains("grok"), "{plain_first}");
@@ -30408,7 +33240,7 @@ out3
         assert!(tiny.ends_with("just now"), "{tiny}");
         assert!(UnicodeWidthStr::width(tiny.as_str()) <= 10, "{tiny}");
 
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let (mut app, _sent) = test_app();
         app.settings.custom_agents = vec![dmuxai::custom_agent::CustomAgentSpec {
             name: "grok".to_owned(),
@@ -30738,9 +33570,10 @@ out3
         harness.app.resume_conversation(conv.as_str());
         assert_eq!(harness.app.selected, adapter_index(Agent::Agy));
         assert!(harness.app.messages.iter().any(|message| {
-            message
-                .content
-                .contains("Runner 'cursor' is not in allowed_runners; using 'agy'")
+            message.content.contains(&format!(
+                "Runner '{}' is not in allowed_runners; using 'agy'",
+                dmuxai::runner_id::CURSOR_RUNNER_ID
+            ))
         }));
     }
 
@@ -30810,7 +33643,7 @@ out3
                 id: "step-1".to_owned(),
                 role: dmuxai::graph::NodeRole::Implement,
                 job: "work".to_owned(),
-                runner: "cursor".to_owned(),
+                runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                 model_id: "composer-2.5".to_owned(),
                 requires_gate: false,
                 status: dmuxai::graph::GraphNodeStatus::Pending,
@@ -30822,6 +33655,7 @@ out3
             }],
             edges: vec![],
             tasks: vec![],
+            dynamic_cap: None,
         };
         harness.app.apply_runner_pin_to_plan(&mut plan);
         assert_eq!(plan.nodes[0].runner, "codex");
@@ -31468,7 +34302,7 @@ out3
             .collect();
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, "step-1");
-        assert_eq!(steps[0].runner, "cursor");
+        assert_eq!(steps[0].runner, dmuxai::runner_id::CURSOR_RUNNER_ID);
         assert_eq!(steps[0].job, "please verify the release notes");
         assert_eq!(steps[0].model_id, "composer-2.5");
 
@@ -31776,6 +34610,7 @@ out3
                 user_prompt: "ship".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -31809,6 +34644,7 @@ out3
                 user_prompt: "planning".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -32512,6 +35348,7 @@ out3
                 user_prompt: "ship".to_owned(),
                 limits: dmuxai::graph::GraphLimits::default(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
             },
@@ -33972,6 +36809,7 @@ out3
                 edges: Vec::new(),
                 limits: dmuxai::graph::default_limits(),
                 tasks: Vec::new(),
+                dynamic_cap: None,
             },
             conversation_id: app.conversation_id.to_string(),
             phase: GraphRunPhase::AwaitingApproval,
@@ -34011,7 +36849,7 @@ out3
     // pinned to Cursor's composer-2.5; it plans and runs on provider default.
     #[test]
     fn tc_1460_grok_follow_up_without_model_uses_provider_default() {
-        let warnings = install_shared_test_registry();
+        let warnings = install_test_custom_agents();
         assert_eq!(
             dmuxai::custom_agent::index_of("grok"),
             Some(0),
@@ -34084,7 +36922,7 @@ out3
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34151,7 +36989,7 @@ out3
         spec.name = "opencode-step".to_owned();
         spec.allowed_models = Some("^opencode/.*-free$".to_owned());
         spec.default_model = Some("opencode/beam-free".to_owned());
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34197,7 +37035,7 @@ out3
     // TC-1746 / FR-1729: catalog missing default_model pushes exact hint and turn is still sent
     #[test]
     fn tc_1746_catalog_missing_pushes_warning() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34223,7 +37061,7 @@ out3
     // TC-1747 / FR-1729: listed model and empty/not-loaded catalog produce no message
     #[test]
     fn tc_1747_catalog_listed_or_empty_no_message() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34254,7 +37092,7 @@ out3
     // TC-1748 / FR-1729: failing turn after NotListed warning gets hint
     #[test]
     fn tc_1748_notlisted_error_gets_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34284,7 +37122,7 @@ out3
     // turn had a catalog warning; only the hint is attached.
     #[test]
     fn tc_2129_generic_provider_error_keeps_provider_kind_with_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34318,7 +37156,7 @@ out3
     // TC-1749 / FR-1729 (#214): idle timeout for a listed model carries no "not offered" hint.
     #[test]
     fn tc_1749_idle_timeout_has_no_not_offered_hint_for_listed_model() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34353,7 +37191,7 @@ out3
     // TC-1749 / FR-1729 (#214): a model truly absent from a loaded list still gets the hint.
     #[test]
     fn tc_1749_absent_model_still_gets_not_offered_hint() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34386,7 +37224,7 @@ out3
     // TC-1748 / FR-1729: drain path captures model_unavailable kind
     #[test]
     fn tc_1748_drain_error_kind_is_model_unavailable() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34421,7 +37259,7 @@ out3
     // TC-1755 / FR-1731: resolver precedence explicit > selected > config > custom default > runner default
     #[test]
     fn tc_1755_resolver_precedence_config_model() {
-        let _ = install_shared_test_registry();
+        let _ = install_test_custom_agents();
         let idx = dmuxai::custom_agent::index_of("opencode-step")
             .expect("shared test registry has opencode-step");
         let agent = Agent::Custom(idx);
@@ -34484,9 +37322,10 @@ out3
     #[test]
     fn tc_1756_policy_unchanged() {
         let (mut app, _) = test_app();
-        app.settings
-            .runner_models
-            .insert("cursor".to_owned(), "composer-2.5-fast".to_owned());
+        app.settings.runner_models.insert(
+            dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
+            "composer-2.5-fast".to_owned(),
+        );
         app.model_catalogs.get_mut(&Agent::Cursor).unwrap().selected = None;
         assert_eq!(
             app.selected_run_model(Agent::Cursor),
@@ -34496,7 +37335,9 @@ out3
         assert!(
             dmuxai::model_policy::validate_model_for_runner("agy", "gemini-3.8-flash-high").is_ok()
         );
-        assert!(dmuxai::model_policy::validate_model_for_runner("agy", "gemini-4-argon").is_err());
+        assert!(
+            dmuxai::model_policy::validate_model_for_runner("agy", "gemini-4-argon-fast").is_err()
+        );
     }
 
     fn session_user_lines(app: &mut App) -> Vec<(String, Option<u64>)> {
@@ -36519,7 +39360,7 @@ out3
                     id: "step-a".to_owned(),
                     role: NodeRole::Research,
                     job: "a".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -36533,7 +39374,7 @@ out3
                     id: "step-b".to_owned(),
                     role: NodeRole::Test,
                     job: "b".to_owned(),
-                    runner: "cursor".to_owned(),
+                    runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
                     model_id: "composer-2.5".to_owned(),
                     skill: None,
                     requires_gate: false,
@@ -36551,6 +39392,7 @@ out3
                 ..dmuxai::graph::GraphLimits::default()
             },
             tasks: Vec::new(),
+            dynamic_cap: None,
         };
         app.graph_session = Some(GraphRunSession::new(GraphRun {
             plan,
@@ -36561,14 +39403,14 @@ out3
         }));
         let first = NodeAssignment {
             node_id: "step-a".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "a".to_owned(),
             role: NodeRole::Research,
         };
         let second = NodeAssignment {
             node_id: "step-b".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "b".to_owned(),
             role: NodeRole::Test,
@@ -36606,7 +39448,7 @@ out3
         assert_eq!(sent.lock().unwrap().len(), 1);
         let assignment = NodeAssignment {
             node_id: "step-2".to_owned(),
-            runner: "cursor".to_owned(),
+            runner: dmuxai::runner_id::CURSOR_RUNNER_ID.to_owned(),
             model_id: "composer-2.5".to_owned(),
             prompt: "second".to_owned(),
             role: NodeRole::Implement,
@@ -37397,6 +40239,7 @@ out3
             orchestrator_model: "composer-2.5".to_owned(),
             user_prompt: "graph fallback".to_owned(),
             tasks: Vec::new(),
+            dynamic_cap: None,
             nodes: vec![dmuxai::graph::GraphNode {
                 id: "step-1".to_owned(),
                 role: NodeRole::Implement,
@@ -37801,6 +40644,591 @@ out3
         assert_eq!(
             App::headless_answer_text(&mapped, &[]),
             "partial output of the failed runner\n\nfinal answer"
+        );
+    }
+
+    // TC-2941 / FR-2941: with dynamic_nodes = false or cap 0, markers are ignored,
+    // plan, its hash, and the run are byte-for-byte as before.
+    #[test]
+    fn tc_2941_marker_ignored_when_feature_off_or_cap_zero() {
+        let marker = "Finished step 1.\nDMUXAI_ADD_NODES: [{\"id\":\"extra-1\",\"role\":\"implement\",\"job\":\"extra\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = false;
+        let mut plan = two_step_cursor_chain_plan("p-2941", 1);
+        plan.dynamic_cap = None;
+        let plan_before = plan.clone();
+        app.start_graph_run(plan);
+
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            2,
+            "no nodes added when feature is off"
+        );
+        assert_eq!(session.run().plan.dynamic_cap, None);
+        assert!(
+            session.run().plan_history.is_empty(),
+            "no plan change recorded"
+        );
+        let last_agent_msg = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(
+            last_agent_msg.content.contains("DMUXAI_ADD_NODES"),
+            "marker not stripped when feature off"
+        );
+        let _ = plan_before;
+
+        // cap = 0: no scan, strip, or PlanChange even when dynamic_nodes = true
+        let (mut app2, sent2) = test_app();
+        app2.settings.graph_dynamic_nodes = true;
+        app2.settings.graph_dynamic_node_cap = 0;
+        let mut plan2 = two_step_cursor_chain_plan("p-2941-cap0", 1);
+        plan2.dynamic_cap = Some(0);
+        app2.start_graph_run(plan2);
+        complete_sent_graph_turn_with_text(&mut app2, &sent2, 0, marker);
+        let session2 = app2.graph_session.as_ref().unwrap();
+        assert_eq!(session2.run().plan.nodes.len(), 2);
+        assert!(session2.run().plan_history.is_empty());
+        let msg2 = app2
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(msg2.content.contains("DMUXAI_ADD_NODES"));
+    }
+
+    // TC-2942 / FR-2942: cap is in the plan hash and approval summary,
+    // and run never exceeds approved cap even if config changes later.
+    #[test]
+    fn tc_2942_cap_in_plan_hash_and_not_exceeded_after_config_change() {
+        // 1. Plan hash checks
+        let plan_none = HeadlessPendingPlan {
+            prompt: "task prompt".to_owned(),
+            tasks: Vec::new(),
+            steps: Vec::new(),
+            dynamic_cap: None,
+        };
+        let plan_cap1 = HeadlessPendingPlan {
+            prompt: "task prompt".to_owned(),
+            tasks: Vec::new(),
+            steps: Vec::new(),
+            dynamic_cap: Some(1),
+        };
+        let plan_cap3 = HeadlessPendingPlan {
+            prompt: "task prompt".to_owned(),
+            tasks: Vec::new(),
+            steps: Vec::new(),
+            dynamic_cap: Some(3),
+        };
+        let json_none = serde_json::to_string(&plan_none).unwrap();
+        let json_cap1 = serde_json::to_string(&plan_cap1).unwrap();
+        let json_cap3 = serde_json::to_string(&plan_cap3).unwrap();
+        assert_ne!(json_none, json_cap1);
+        assert_ne!(json_cap1, json_cap3);
+        let hash_none: String = dmuxai::docs::sha256_hex(json_none.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let hash_cap1: String = dmuxai::docs::sha256_hex(json_cap1.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        let hash_cap3: String = dmuxai::docs::sha256_hex(json_cap3.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        assert_ne!(hash_none, hash_cap1);
+        assert_ne!(hash_cap1, hash_cap3);
+
+        // 2. Approval summary check
+        let mut test_plan = two_step_cursor_chain_plan("p-2942", 1);
+        test_plan.dynamic_cap = Some(2);
+        let run = GraphRun {
+            plan: test_plan.clone(),
+            conversation_id: "c-2942".to_owned(),
+            phase: GraphRunPhase::AwaitingApproval,
+            approval: Some(Approval {
+                state: ApprovalState::Pending,
+                revisions: vec![PlanRevision {
+                    n: 1,
+                    source: "agent".to_owned(),
+                    steps: Vec::new(),
+                    added: Vec::new(),
+                    changed: Vec::new(),
+                    feedback: None,
+                    errors: None,
+                    raw: None,
+                }],
+                decided_by: None,
+                decided_at_ms: None,
+            }),
+            ..Default::default()
+        };
+        let lines = dmuxai::graph::approval_panel_lines_with_skills(&run, 80, &|_| Vec::new());
+        let joined = lines
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("dynamic cap 2"),
+            "approval summary includes cap"
+        );
+
+        // 3. Run with approved cap 1 does not exceed it even if config changes to 5
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 1;
+        let mut run_plan = two_step_cursor_chain_plan("p-2942-run", 1);
+        run_plan.dynamic_cap = Some(1);
+        app.start_graph_run(run_plan);
+
+        // Config changes later to cap 5
+        app.settings.graph_dynamic_node_cap = 5;
+
+        // Node outputs marker requesting 2 nodes (exceeding approved cap 1)
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"extra-1\",\"role\":\"implement\",\"job\":\"j1\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]},{\"id\":\"extra-2\",\"role\":\"test\",\"job\":\"j2\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            2,
+            "nodes rejected because approved cap was 1"
+        );
+        assert_eq!(session.run().plan_history.len(), 1);
+        assert!(!session.run().plan_history[0].applied);
+        assert!(
+            session.run().plan_history[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("cap")
+        );
+        assert_eq!(session.run().plan.dynamic_cap, Some(1));
+
+        // 4. HeadlessPlan JSON includes dynamic_cap
+        let hp = HeadlessPlan {
+            steps: Vec::new(),
+            tasks: Vec::new(),
+            dynamic_cap: Some(2),
+        };
+        assert!(serde_json::to_string(&hp).unwrap().contains("dynamic_cap"));
+
+        // 5. Cumulative cap: second marker from another node after cap exhausted
+        let (mut app3, sent3) = test_app();
+        app3.settings.graph_dynamic_nodes = true;
+        app3.settings.graph_dynamic_node_cap = 1;
+        let mut plan3 = two_step_cursor_chain_plan("p-2942-cum", 1);
+        plan3.dynamic_cap = Some(1);
+        app3.start_graph_run(plan3);
+        let ok_marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-a\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app3, &sent3, 0, ok_marker);
+        assert_eq!(
+            app3.graph_session.as_ref().unwrap().run().plan.nodes.len(),
+            3
+        );
+        let overflow = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-b\",\"role\":\"implement\",\"job\":\"j2\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app3, &sent3, 1, overflow);
+        assert_eq!(
+            app3.graph_session.as_ref().unwrap().run().plan.nodes.len(),
+            3
+        );
+        assert!(
+            app3.graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan_history
+                .iter()
+                .any(|c| !c.applied && c.error.as_ref().is_some_and(|e| e.contains("cap")))
+        );
+    }
+
+    // TC-2944 / FR-2944: accepted nodes appended in pending state, scheduled by executor,
+    // recorded as PlanChange with trigger dynamic_add, without re-approval.
+    #[test]
+    fn tc_2944_accepted_nodes_scheduled_and_recorded_as_plan_change() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 3;
+        let mut plan = two_step_cursor_chain_plan("p-2944", 1);
+        plan.dynamic_cap = Some(3);
+        app.start_graph_run(plan);
+
+        let marker = "Working on research.\nDMUXAI_ADD_NODES: [{\"id\":\"step-dyn\",\"role\":\"implement\",\"job\":\"dynamic job\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[\"step-1\"]}]\nResearch done.";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(session.run().plan.nodes.len(), 3, "dynamic node appended");
+        assert_eq!(session.run().dynamic_added, Some(1));
+        let dyn_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-dyn")
+            .unwrap();
+        assert_eq!(dyn_node.role, NodeRole::Implement);
+        assert_ne!(
+            session.run().phase,
+            GraphRunPhase::AwaitingApproval,
+            "no re-approval prompted"
+        );
+
+        assert_eq!(session.run().plan_history.len(), 1);
+        let change = &session.run().plan_history[0];
+        assert_eq!(change.kind, PlanChangeKind::DynamicAdd);
+        assert_eq!(change.trigger, Some(PlanChangeTrigger::DynamicAdd));
+        assert_eq!(change.after_node.as_deref(), Some("step-1"));
+        assert!(change.applied);
+        assert_eq!(change.added, vec!["step-dyn"]);
+
+        // Marker was stripped from agent message
+        let last_agent_msg = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(!last_agent_msg.content.contains("DMUXAI_ADD_NODES"));
+        assert!(last_agent_msg.content.contains("Research done."));
+        assert!(
+            !app.replan_summaries
+                .iter()
+                .any(|(_, t)| t.contains("DMUXAI_ADD_NODES"))
+        );
+
+        let dyn_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-dyn")
+            .unwrap();
+        assert_eq!(dyn_node.status, dmuxai::graph::GraphNodeStatus::Pending);
+        let actions = app.graph_session.as_mut().unwrap().schedule();
+        app.dispatch_graph_actions(actions);
+        assert!(
+            graph_node_requests(&sent).len() >= 2,
+            "step-dyn should be scheduled for dispatch"
+        );
+        assert!(app.last_graph_run.as_ref().is_some_and(|r| {
+            r.plan_history
+                .iter()
+                .any(|c| c.applied && c.added.contains(&"step-dyn".to_string()))
+        }));
+    }
+
+    // TC-2945 / FR-2945: with enforce_read_only_roles, added read-only roles run read-only.
+    // Added nodes cannot clear requires_gate for gated roles / sensitive keywords.
+    #[test]
+    fn tc_2945_added_nodes_keep_read_only_policy_and_gate() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 3;
+        app.settings.graph_enforce_read_only_roles = true;
+
+        let mut plan = two_step_cursor_chain_plan("p-2945", 1);
+        plan.dynamic_cap = Some(3);
+        app.start_graph_run(plan);
+
+        // Marker with one read-only node and one gated node (job contains sensitive keyword "deploy")
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-read\",\"role\":\"research\",\"job\":\"investigate logs\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]},{\"id\":\"dyn-gated\",\"role\":\"implement\",\"job\":\"deploy to production\",\"sensitive\":false,\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        let read_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "dyn-read")
+            .unwrap();
+        assert_eq!(
+            dmuxai::graph::node_turn_policy(read_node.role),
+            Some(dmuxai::graph::NodeTurnPolicy::ReadOnly)
+        );
+
+        let gated_node = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "dyn-gated")
+            .unwrap();
+        assert!(
+            gated_node.requires_gate,
+            "sensitive keyword forces requires_gate = true"
+        );
+    }
+
+    // TC-2946 / FR-2946: when [fanout] company_workspace = true, free runner is rejected.
+    #[test]
+    fn tc_2946_company_workspace_rejects_free_runner_marker() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 3;
+        app.settings.graph_allowed_runners = Some(vec!["cursor".to_owned(), "opencode".to_owned()]);
+        app.settings.fanout_company_workspace = true;
+        let mut plan = two_step_cursor_chain_plan("p-2946", 1);
+        plan.dynamic_cap = Some(3);
+        app.start_graph_run(plan);
+
+        app.settings.runner_models.insert(
+            "cursor".to_string(),
+            "opencode/glm-5.3-flash-free".to_string(),
+        );
+
+        // Resolved free model in company workspace
+        let marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-free\",\"role\":\"implement\",\"job\":\"work\",\"runner\":\"cursor\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            2,
+            "free runner marker rejected"
+        );
+        assert_eq!(session.run().plan_history.len(), 1);
+        let change = &session.run().plan_history[0];
+        assert!(!change.applied);
+        assert!(change.error.as_ref().unwrap().contains("free runner"));
+
+        // Step-1 still completed normally
+        let step1 = session
+            .run()
+            .plan
+            .nodes
+            .iter()
+            .find(|n| n.id == "step-1")
+            .unwrap();
+        assert_eq!(step1.status, dmuxai::graph::GraphNodeStatus::Completed);
+
+        // Builtin free agent (opencode) in company workspace
+        let (mut app3, sent3) = test_app();
+        app3.settings.graph_dynamic_nodes = true;
+        app3.settings.graph_dynamic_node_cap = 3;
+        app3.settings.fanout_company_workspace = true;
+        app3.settings.graph_allowed_runners =
+            Some(vec!["cursor".to_owned(), "opencode".to_owned()]);
+        app3.settings
+            .custom_agents
+            .push(dmuxai::custom_agent::CustomAgentSpec {
+                name: "opencode".to_string(),
+                builtin: true,
+                free: true,
+                ..Default::default()
+            });
+        let mut plan3 = two_step_cursor_chain_plan("p-2946-opencode", 1);
+        plan3.dynamic_cap = Some(3);
+        app3.start_graph_run(plan3);
+        let marker2 = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-oc\",\"role\":\"implement\",\"job\":\"work\",\"runner\":\"opencode\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app3, &sent3, 0, marker2);
+        let session3 = app3.graph_session.as_ref().unwrap();
+        assert_eq!(session3.run().plan.nodes.len(), 2);
+        assert!(
+            session3.run().plan_history[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("free runner")
+        );
+    }
+
+    // TC-2947 / FR-2947: a node may add nodes at most once; second marker rejected.
+    // A failed or cancelled node adds nothing.
+    #[test]
+    fn tc_2947_second_marker_and_failed_node_add_nothing() {
+        // Part 1: Second marker from same node
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = true;
+        app.settings.graph_dynamic_node_cap = 5;
+
+        let mut plan = two_step_cursor_chain_plan("p-2947", 1);
+        plan.dynamic_cap = Some(5);
+        app.start_graph_run(plan);
+
+        let marker1 = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-1\",\"role\":\"implement\",\"job\":\"j1\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, marker1);
+
+        assert_eq!(
+            app.graph_session.as_ref().unwrap().run().plan.nodes.len(),
+            3
+        );
+
+        // Attempt second marker from step-1
+        let marker2 = Ok(vec![dmuxai::graph::DynamicNodeSpec {
+            id: "dyn-2".to_owned(),
+            role: "implement".to_owned(),
+            job: "j2".to_owned(),
+            runner: "cursor".to_owned(),
+            model_id: Some("composer-2.5".to_owned()),
+            depends_on: Vec::new(),
+            sensitive: None,
+        }]);
+        app.handle_dynamic_add_nodes_marker("step-1", marker2);
+
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(
+            session.run().plan.nodes.len(),
+            3,
+            "second marker adds nothing"
+        );
+        assert_eq!(session.run().plan_history.len(), 2);
+        assert!(!session.run().plan_history[1].applied);
+        assert!(
+            session.run().plan_history[1]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("already added")
+        );
+
+        // Two markers in one reply rejected
+        let (mut app_multi, sent_multi) = test_app();
+        app_multi.settings.graph_dynamic_nodes = true;
+        app_multi.settings.graph_dynamic_node_cap = 5;
+        let mut plan_multi = two_step_cursor_chain_plan("p-2947-multi", 1);
+        plan_multi.dynamic_cap = Some(5);
+        app_multi.start_graph_run(plan_multi);
+        let two_in_one = "line1\nDMUXAI_ADD_NODES: [{\"id\":\"a\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]\nDMUXAI_ADD_NODES: [{\"id\":\"b\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app_multi, &sent_multi, 0, two_in_one);
+        assert_eq!(
+            app_multi
+                .graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan
+                .nodes
+                .len(),
+            2
+        );
+        assert!(
+            !app_multi
+                .graph_session
+                .as_ref()
+                .unwrap()
+                .run()
+                .plan_history
+                .iter()
+                .any(|c| c.applied)
+        );
+
+        // Part 2: Failed node with marker adds nothing
+        let (mut app2, sent2) = test_app();
+        app2.settings.graph_dynamic_nodes = true;
+        app2.settings.graph_dynamic_node_cap = 5;
+        let mut plan2 = two_step_cursor_chain_plan("p-2947-fail", 1);
+        plan2.dynamic_cap = Some(5);
+        app2.start_graph_run(plan2);
+
+        // Send TextDelta with marker, then Error event
+        let (agent, req) = sent2.lock().unwrap()[0].clone();
+        let fail_marker = "DMUXAI_ADD_NODES: [{\"id\":\"dyn-fail\",\"role\":\"implement\",\"job\":\"jf\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        app2.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::TextDelta(fail_marker.to_owned()),
+        });
+        app2.apply_agent_output(AgentOutput {
+            agent,
+            conversation_id: Some(ConversationId::new(req.conversation_id.as_str())),
+            turn_id: Some(TurnId::new(req.turn_id.as_str())),
+            event: AgentEvent::Error(AgentError::provider("node crashed")),
+        });
+
+        // Failed node added nothing
+        if let Some(s) = app2.graph_session.as_ref() {
+            assert_eq!(s.run().plan.nodes.len(), 2);
+            assert!(s.run().plan_history.is_empty());
+        }
+
+        // Rejection syncs last_graph_run
+        let (mut app4, sent4) = test_app();
+        app4.settings.graph_dynamic_nodes = true;
+        app4.settings.graph_dynamic_node_cap = 3;
+        let mut plan4 = two_step_cursor_chain_plan("p-2947-sync", 1);
+        plan4.dynamic_cap = Some(3);
+        app4.start_graph_run(plan4.clone());
+        app4.last_graph_run = Some(app4.graph_session.as_ref().unwrap().run().clone());
+        let bad = "DMUXAI_ADD_NODES: [{\"id\":\"step-1\",\"role\":\"implement\",\"job\":\"dup\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app4, &sent4, 0, bad);
+        assert_eq!(app4.last_graph_run.as_ref().unwrap().plan_history.len(), 1);
+    }
+
+    // TC-2948 / NFR-2940: with feature off, marker scanning does not run on node-finish path.
+    #[test]
+    fn tc_2948_no_marker_scan_when_feature_off() {
+        let (mut app, sent) = test_app();
+        app.settings.graph_dynamic_nodes = false;
+
+        let mut plan = two_step_cursor_chain_plan("p-2948", 1);
+        plan.dynamic_cap = None;
+        app.start_graph_run(plan);
+
+        // Text with malformed marker that would produce parse error if scanned
+        let raw_text = "Progress update.\nDMUXAI_ADD_NODES: [ { malformed json syntax ]\nAll done.";
+        complete_sent_graph_turn_with_text(&mut app, &sent, 0, raw_text);
+
+        // Feature is off: marker is NOT scanned, NOT parsed, NOT stripped, NO plan change recorded
+        let session = app.graph_session.as_ref().unwrap();
+        assert_eq!(session.run().plan.nodes.len(), 2);
+        assert!(
+            session.run().plan_history.is_empty(),
+            "no rejection or addition recorded"
+        );
+
+        // The text remains untouched in the agent message
+        let last_agent_msg = app
+            .messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, Role::Agent(_)))
+            .unwrap();
+        assert!(
+            last_agent_msg
+                .content
+                .contains("DMUXAI_ADD_NODES: [ { malformed json syntax ]")
+        );
+
+        // Single-agent quiet run: no scan even when feature is on
+        let (mut app_q, sent_q) = test_app();
+        app_q.settings.graph_dynamic_nodes = true;
+        app_q.settings.graph_dynamic_node_cap = 3;
+        let mut quiet_plan = two_step_cursor_chain_plan("p-2948-quiet", 1);
+        quiet_plan.nodes.truncate(1);
+        quiet_plan.edges.clear();
+        quiet_plan.dynamic_cap = Some(3);
+        app_q.start_graph_run(quiet_plan);
+        assert!(app_q.quiet_graph_run);
+        let raw = "DMUXAI_ADD_NODES: [{\"id\":\"x\",\"role\":\"implement\",\"job\":\"j\",\"runner\":\"cursor\",\"model_id\":\"composer-2.5\",\"depends_on\":[]}]";
+        complete_sent_graph_turn_with_text(&mut app_q, &sent_q, 0, raw);
+        assert!(
+            app_q
+                .last_graph_run
+                .as_ref()
+                .is_none_or(|r| r.plan_history.is_empty())
+        );
+        assert!(
+            app_q
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, Role::Agent(_)))
+                .unwrap()
+                .content
+                .contains("DMUXAI_ADD_NODES")
         );
     }
 }

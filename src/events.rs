@@ -116,6 +116,12 @@ pub fn last_event_seq(path: &Path) -> u64 {
 
 /// Reads events with `seq > since`, oldest first, skipping malformed lines and
 /// stopping after `limit` records.
+fn normalize_event_runner(record: &mut EventRecord) {
+    if let Some(runner) = record.runner.as_ref() {
+        record.runner = Some(crate::runner_id::canonical_runner_id(runner));
+    }
+}
+
 pub fn read_since(path: &Path, since: u64, limit: Option<usize>) -> Vec<EventRecord> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
@@ -130,12 +136,13 @@ pub fn read_since(path: &Path, since: u64, limit: Option<usize>) -> Vec<EventRec
         if line.is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<EventRecord>(line) else {
+        let Ok(mut record) = serde_json::from_str::<EventRecord>(line) else {
             continue;
         };
         if record.seq <= since {
             continue;
         }
+        normalize_event_runner(&mut record);
         events.push(record);
     }
     events
@@ -183,9 +190,10 @@ pub fn read_since_from(
         let line = String::from_utf8_lossy(&bytes[line_start..line_end]);
         let line = line.trim();
         if !line.is_empty()
-            && let Ok(record) = serde_json::from_str::<EventRecord>(line)
+            && let Ok(mut record) = serde_json::from_str::<EventRecord>(line)
             && record.seq > since
         {
+            normalize_event_runner(&mut record);
             events.push(record);
         }
         line_start = line_end + 1;
@@ -396,7 +404,9 @@ impl EventLog {
                 task: draft.task,
                 todo: draft.todo,
                 node: draft.node,
-                runner: draft.runner,
+                runner: draft
+                    .runner
+                    .map(|r| crate::runner_id::canonical_runner_id(&r)),
                 model: draft.model,
                 from_state: draft.from_state,
                 to_state: draft.to_state,
@@ -1320,6 +1330,38 @@ mod tests {
         let mut disabled = StallDetector::new(Duration::ZERO);
         disabled.busy("cursor", None, start);
         assert!(disabled.tick(start + Duration::from_secs(999)).is_empty());
+    }
+
+    // TC-3214 / FR-3208
+    #[test]
+    fn tc_3214_legacy_event_agent_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = events_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy_line = r#"{"v":1,"seq":1,"ts":"2026-10-17T11:22:33.456Z","ts_ms":1,"workspace":"ws","kind":"agent","runner":"cursor","to_state":"running"}"#;
+        std::fs::write(&path, format!("{legacy_line}\n")).unwrap();
+
+        let read = read_since(&path, 0, None);
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read[0].runner.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
+        // Existing file on disk is not rewritten.
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), legacy_line);
+
+        let fresh = EventDraft {
+            kind: "agent".to_owned(),
+            runner: Some("cursor".to_owned()),
+            to_state: "running".to_owned(),
+            ..Default::default()
+        };
+        let log = EventLog::open(dir.path(), "ws".to_owned());
+        let written = log.append(vec![fresh]).unwrap();
+        assert_eq!(
+            written[0].runner.as_deref(),
+            Some(crate::runner_id::CURSOR_RUNNER_ID)
+        );
     }
 
     // TC-2804 / FR-2804: run_id is optional, omitted when unset, shared across

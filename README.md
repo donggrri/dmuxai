@@ -317,7 +317,7 @@ Full reference: [docs/API.md](docs/API.md) — CLI, HTTP, MCP, events and `[noti
 
 ## Attach any agent CLI
 
-Built-in runners are Cursor (`cursor-agent`), AGY and Codex. **Any other headless
+Built-in runners are Cursor (id `cursor-agent`; legacy `cursor` is still accepted on input), AGY and Codex. **Any other headless
 agent CLI** (opencode, hermes, pi, Claude Code, ...) is attached with an
 `[[agents.custom]]` block in `dmuxai.toml` (repo) or `~/.config/dmuxai/dmuxai.toml`
 (user) — no Rust code. In a repo `dmuxai.toml`, custom agents require `dmuxai trust`
@@ -593,7 +593,7 @@ Controls:
 - `/conversations` or `F3`: list and load conversations for the current workspace
 - `/resume <id-prefix>`: load one conversation by a unique ID prefix
 - `/summarize`: compress the completed shared context for the selected agent
-- `/share <codex|cursor|agy>`: optionally replay a context import to one agent; ordinary turns are shared automatically
+- `/share <codex|cursor-agent|agy>`: optionally replay a context import to one agent; ordinary turns are shared automatically (legacy `cursor` alias accepted)
 - `/quit`: stop owned child processes, restore the terminal, and exit
 - `F2`: load and open that agent's model picker
 - Model picker `Up` / `Down`, `Enter`, `Esc`: move, select, or close; on Codex,
@@ -654,7 +654,7 @@ stall_api_retries = 3      # 0 disables
 ```
 
 `[runners.<id>]` and `[runners.default]` accept `fallback = ["<runner>", "<runner>:<model>", ...]`
-(runner ids like `agy`, `cursor`, `codex`, `opencode`, `grok`, or a custom agent name; model optional;
+(runner ids like `cursor-agent` (`cursor` alias), `agy`, `codex`, `opencode`, `grok`, or a custom agent name; model optional;
 another model of the same runner is allowed). An empty `fallback = []` disables the default chain
 for that runner; missing/empty means old behaviour. Workspace `dmuxai.toml` replaces the user entry
 per runner id. Invalid targets (unknown runner, disallowed model, duplicates) are dropped with a
@@ -670,7 +670,7 @@ Stall detection runs inside the agy and custom command adapters only when the ru
 non-empty chain: no model progress for `stall_timeout_secs` (keepalive lines do not count; the
 timer pauses while a tool runs), or `stall_api_retries` consecutive `API error (attempt N)`
 retry lines. Custom agents may set `stall_keepalive = "<regex>"` for keepalive-only stdout lines.
-ACP runners (codex/cursor/grok acp) have no stall detection.
+ACP runners (codex/cursor-agent/grok acp) have no stall detection.
 
 One pass through the original runner's chain per user turn; exhausted chains fail normally with a
 "fallback chain exhausted" line. Internal turns (planner, judge, triage, replan, summary) do not
@@ -771,7 +771,7 @@ A machine or workspace can constrain which runners are permitted to execute grap
 allowed_runners = ["agy", "opencode"]
 ```
 
-A machine can exclude `cursor` from the graph globally across all workspaces by setting `[graph] allowed_runners = ["agy", "opencode"]` in the user-level configuration:
+A machine can exclude Cursor from the graph globally across all workspaces by setting `[graph] allowed_runners = ["agy", "opencode"]` in the user-level configuration (`cursor-agent` in the list is the same runner):
 - `$XDG_CONFIG_HOME/dmuxai/dmuxai.toml` (fallback `~/.config/dmuxai/dmuxai.toml`)
 
 Exception: when `allowed_runners` is unset, every runner may take graph nodes

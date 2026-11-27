@@ -5,6 +5,21 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ## Unreleased
 
+### Added
+
+- **Decision board (v0.4.1, PR 1):** User-level coordinator board under `<state base>/board/` with lanes, rules, graph plan attach/edit, decisions, thread messages, blocking `board wait`, `dmuxai board` CLI, and MCP `board_*` tools (SPEC-decision-board FR-3100..FR-3115).
+- **Decision board dashboard (v0.4.1, PR 2):** Board center view (My decisions cards, kanban lanes, item drawer with plan editor, diff, chat, rules panel), HTTP `/api/board*` routes and live `GET /api/board/events` SSE on `dmuxai serve` and `dmuxai --web` (SPEC-decision-board FR-3120..FR-3126).
+- **Decision board runner & notifications (v0.4.1, PR 3 part A):** `board ask` / `board_ask`, `board run` / `board_run`, HTTP `POST /api/board/{id}/ask` and `/run` (`--web` only), board plan copies under `<state base>/board/plans/<hash>.json`, user-only `[board]` config, and background board notifications (`dmuxai.board.event.v1`) (SPEC-decision-board FR-3130..FR-3133, FR-3135, NFR-3130).
+- **Decision board drawer Ask planner & Run controls (v0.4.1, PR 3 part B):** Added Ask planner (`#board-ask-text`, `#board-ask`, `#board-ask-revise`, `#board-ask-busy`) and `#board-run` drawer controls in `--web`, hidden in view-only `serve` via `GET /api/board` `launch_allowed` (SPEC-decision-board FR-3134).
+- **Decision board human-only enforcement, `pending`, and `check` (v0.4.1, PR 3 part C):** Enforced human-only `owner` decisions/checks/moves into `auto`, refused `move` into `approved`/`rejected`, required `/dev/tty` item-id confirmation in CLI, removed MCP `board_decide`, required `Sec-Fetch-Site`/`Sec-Fetch-Mode`/`X-Dmuxai-Human: 1` on HTTP owner writes, and added `dmuxai board pending` / `board check` (`board_pending`, `GET /api/board/pending`, `POST /api/board/{id}/check`, dashboard "To check" group and "Mark checked" button) (SPEC-decision-board OQ-3104, FR-3137, FR-3138).
+- **Cursor runner id `cursor-agent` (SPEC-cursor-agent-keyword, FR-3200..FR-3209).** The canonical Cursor
+  runner id is now `cursor-agent` everywhere DmuxAI emits or stores an id (JSON, web API, events, run
+  journal, new conversation rows). The legacy spelling `cursor` is still accepted on read at every parse
+  boundary and normalizes to `cursor-agent`; existing on-disk data is not rewritten.
+  `dmuxai runners --json` reports `"id": "cursor-agent"` with `"aliases": ["cursor"]`. Config may use
+  `[runners.cursor-agent]` or legacy `[runners.cursor]`; when both tables set a key, `cursor-agent` wins
+  with one warning.
+
 ### Changed
 
 - **Loopback dashboard is tokenless by default (SPEC-web-local-access).** Local
@@ -12,6 +27,21 @@ All notable changes to dmuxai are listed here. Versions follow
   and optional `[web] require_token` / WSL host trust restore stricter modes.
   User-level `web.json` discovery under the state directory; `status --json`
   reports `token_required` and `source`.
+
+- **Breaking-ish: Cursor runner id in output (SPEC-cursor-agent-keyword, FR-3207).** Consumers that parsed
+  the Cursor runner as `"cursor"` in `runners`/`models`/`status` JSON, headless outcome fields, events,
+  progress lines, run-journal manifests, web snapshots and graph plans must expect `cursor-agent` instead.
+  Input and config may still use `cursor`; downgrade note: binaries older than this change do not treat
+  `cursor-agent` conversation rows or manifests as the Cursor runner—keep a backup before downgrading.
+
+- **Open model lists for Cursor and AGY (SPEC-open-model-lists, FR-3000..FR-3011).** Cursor and AGY now accept
+  and list every model their CLIs report (for example `claude-sonnet-5-5-high`, `grok-4.7-high`,
+  `gemini-4-carbon-high`). `dmuxai models`, the MCP `models` tool and the pickers use
+  `cursor-agent --list-models` / `agy models` with a 10 s timeout, a 60 s cache and a verified static
+  fallback. The Cursor default stays `composer-2.5`. Models whose id contains `fast` stay blocked for every
+  runner unless the **user** config sets `[models] allow_fast = true` (a workspace `[models]` table is
+  ignored; the dashboard and F2 pickers never offer fast ids). AGY `SelectModel` now validates through the
+  policy. Opencode, Codex, Grok and custom-agent policies are unchanged.
 
 ## [0.4.0] - 2026-11-24
 
