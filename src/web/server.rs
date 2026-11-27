@@ -93,6 +93,8 @@ pub struct DashboardServices {
     /// Runtime environment for the trust store used by dashboard config saves (FR-2226);
     /// `None` = `RuntimeEnv::from_process()`. Tests inject a temp state dir here.
     pub trust_env: Option<crate::runtime_env::RuntimeEnv>,
+    /// Override user-level board store base (`<dir>/board`); tests only (FR-3120).
+    pub board_base: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -798,6 +800,38 @@ async fn get_runs_js() -> impl IntoResponse {
             (HeaderName::from_static("x-content-type-options"), "nosniff"),
         ],
         crate::web::assets::RUNS_JS,
+    )
+}
+
+async fn get_board_js() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::BOARD_JS,
+    )
+}
+
+async fn get_board_css() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                HeaderName::from_static("content-security-policy"),
+                "default-src 'self'",
+            ),
+            (HeaderName::from_static("referrer-policy"), "no-referrer"),
+            (HeaderName::from_static("x-content-type-options"), "nosniff"),
+        ],
+        crate::web::assets::BOARD_CSS,
     )
 }
 
@@ -2290,6 +2324,8 @@ pub fn build_router_with_directory(
         .route("/api/runs", get(crate::web::runs_api::list))
         .route("/api/runs/{id}", get(crate::web::runs_api::detail))
         .route("/api/runs/{id}/stream", get(crate::web::runs_api::stream))
+        .route("/assets/board.js", get(get_board_js))
+        .route("/assets/board.css", get(get_board_css))
         .route("/api/todos", get(list_todos).post(create_todo))
         .route("/api/todos/{id}", patch(update_todo).delete(delete_todo))
         .route("/api/todos/{id}/run", post(run_todo))
@@ -2306,6 +2342,10 @@ pub fn build_router_with_directory(
         .route("/api/prompt", post(post_prompt))
         .route("/api/command", post(post_command))
         .merge(crate::web::docs_api::router(state.workspaces.clone()))
+        .merge(crate::web::board_api::router(
+            crate::web::board_api::board_base_from_services(&state.workspaces.focused().services),
+            crate::web::board_api::state_root_from_services(&state.workspaces.focused().services),
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_and_auth_middleware,
@@ -3493,6 +3533,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -3644,6 +3685,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(test_hub(), token.clone(), allowed_localhost(), services);
 
@@ -3788,6 +3830,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -3977,6 +4020,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = busy_router
@@ -4005,6 +4049,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = ok_router
@@ -4039,6 +4084,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = router
@@ -4073,6 +4119,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = router
@@ -4324,6 +4371,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -4604,6 +4652,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(hub.clone(), token.clone(), allowed_localhost(), services);
 
@@ -4670,6 +4719,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         };
         let server = start_server(config, hub).await.unwrap();
@@ -4779,6 +4829,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
 
@@ -5034,6 +5085,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -5131,6 +5183,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -5284,6 +5337,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
         let resp = no_store
@@ -5342,6 +5396,7 @@ mod tests {
                 docs: None,
                 jira: None,
                 trust_env: None,
+                board_base: None,
             },
         );
 
@@ -5798,6 +5853,7 @@ mod tests {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         };
         let config = ServerConfig {
             bind: "127.0.0.1".parse().unwrap(),

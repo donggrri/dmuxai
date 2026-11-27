@@ -180,6 +180,9 @@ pub struct BoardPlan {
     pub revision: u32,
     #[serde(default)]
     pub history: Vec<String>,
+    /// Steps from the revision immediately before the current one (dashboard diff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_steps: Option<Vec<crate::graph::PlanStep>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,6 +642,7 @@ mod tests {
                 }],
                 revision: 1,
                 history: vec![],
+                previous_steps: None,
             }),
             decision: Some(Decision {
                 verdict: Verdict::RequestChanges,

@@ -302,6 +302,7 @@ async fn model_menu_search_keyboard_and_no_fast_in_headless_chrome() {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         },
     };
     let server = start_server(config, hub).await.expect("start server");

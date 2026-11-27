@@ -196,6 +196,7 @@ async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         },
     };
     let server = start_server(config, hub.clone())

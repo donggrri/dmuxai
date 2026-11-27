@@ -477,6 +477,23 @@ Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
 MCP is rejected (exit `5`). CLI defaults to `by=owner` only when stdin and stdout
 are TTYs and `DMUXAI_RUN_ID` is unset.
 
+Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
+
+| Method | Path | Body / query | Success | Errors |
+| --- | --- | --- | --- | --- |
+| GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items}` | 400, 401, 403 |
+| GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` | `200` item | 400, 401, 403, 404, 409, 422 |
+| POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
+| POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |
+| POST | `/api/board/{id}/lane` | `{lane}` | `200` item | 400, 401, 403, 404 |
+| GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
+| PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
+| GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
+
+Dashboard writes act as `owner`. Invalid item ids return `400` before any store
+access.
+
 Exit codes match the headless agent API: usage `2`, not found `3`, conflict `4`,
 forbidden `5`, validation `1`, internal `6`.
 

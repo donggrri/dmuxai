@@ -8,6 +8,7 @@ All notable changes to dmuxai are listed here. Versions follow
 ### Added
 
 - **Decision board (v0.4.1, PR 1):** User-level coordinator board under `<state base>/board/` with lanes, rules, graph plan attach/edit, decisions, thread messages, blocking `board wait`, `dmuxai board` CLI, and MCP `board_*` tools (SPEC-decision-board FR-3100..FR-3115).
+- **Decision board dashboard (v0.4.1, PR 2):** Board center view (My decisions cards, kanban lanes, item drawer with plan editor, diff, chat, rules panel), HTTP `/api/board*` routes and live `GET /api/board/events` SSE on `dmuxai serve` and `dmuxai --web` (SPEC-decision-board FR-3120..FR-3126).
 - **Cursor runner id `cursor-agent` (SPEC-cursor-agent-keyword, FR-3200..FR-3209).** The canonical Cursor
   runner id is now `cursor-agent` everywhere DmuxAI emits or stores an id (JSON, web API, events, run
   journal, new conversation rows). The legacy spelling `cursor` is still accepted on read at every parse

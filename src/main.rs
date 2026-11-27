@@ -664,6 +664,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
                 trust_env: None,
+                board_base: None,
             }
         }
         Err(error) => {
@@ -679,6 +680,7 @@ async fn run_serve(options: WebOptions) -> Result<(), Box<dyn Error>> {
                 events_path: Some(dmuxai::events::events_path(&workspace_root)),
                 docs,
                 trust_env: None,
+                board_base: None,
             }
         }
     };

@@ -146,6 +146,7 @@ async fn run_scenario(scenario: Scenario) -> Option<Outcome> {
             docs: None,
             jira: None,
             trust_env: None,
+            board_base: None,
         },
     };
     let server = start_server(config, hub.clone())

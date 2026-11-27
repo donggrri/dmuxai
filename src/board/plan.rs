@@ -187,6 +187,7 @@ pub fn board_plan_from_pending(
         let drop = history.len() - PLAN_HISTORY_MAX;
         history.drain(..drop);
     }
+    let previous_steps = previous.map(|p| p.steps.clone());
     let mut plan = BoardPlan {
         hash,
         prompt: pending.prompt,
@@ -194,6 +195,7 @@ pub fn board_plan_from_pending(
         steps: pending.steps,
         revision,
         history,
+        previous_steps,
     };
     mask_board_plan(&mut plan);
     plan

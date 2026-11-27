@@ -44,7 +44,7 @@ The dashboard top bar grew to ten controls (Theme, Accent, Reset, Sessions, To-d
 
 | ID | Priority | Preconditions / trigger | Required observable result | Failure or boundary behavior | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| FR-2820 | Must | When the dashboard loads, | the top bar shows exactly these view controls in order: Runs, Diff, Chat, Workspace, More; the old top-level Sessions, To-dos, Graph, Memory, Skills, System prompts buttons, Theme select, Accent picker and Reset button are not in the top bar. | Keyboard: every control reachable with Tab; Esc closes menus and views as before. | TC-2820 |
+| FR-2820 | Must | When the dashboard loads, | the top bar shows exactly these view controls in order: Board (added by SPEC-decision-board FR-3122), Runs, Diff, Chat, Workspace, More; the old top-level Sessions, To-dos, Graph, Memory, Skills, System prompts buttons, Theme select, Accent picker and Reset button are not in the top bar. | Keyboard: every control reachable with Tab; Esc closes menus and views as before. | TC-2820 |
 | FR-2821 | Must | When More is opened, | a menu lists Sessions, Memory (with its On/Off badge), Skills, System prompts, Theme, Accent and Reset layout; choosing an item opens the same sidebar / popover / control as the old button did. | Esc or a click outside closes the menu; the menu button has `aria-haspopup="menu"` and `aria-expanded`. | TC-2821 |
 | FR-2822 | Must | When Workspace is clicked, | the right sidebar opens (or closes) and keeps its Files / To-dos tabs; the to-do count badge is shown on the Workspace button. | — | TC-2822 |
 | FR-2823 | Must | When a run with a graph is selected in Runs, | the detail shows the graph diagram for that run (the same renderer as the Graph view, read-only) plus a "Full graph" button that opens the large Graph view focused on that graph. | Runs without a graph show no diagram and no button. | TC-2823 |
@@ -58,7 +58,7 @@ The dashboard top bar grew to ten controls (Theme, Accent, Reset, Sessions, To-d
 
 | TC | FR | Level | Setup | Action | Expected | Test location |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-2820 | FR-2820 | browser | `serve` fixture | load dashboard | top-bar view controls are exactly Runs, Diff, Chat, Workspace, More | `tests/web_tab_trim.rs`: `tc_2820_top_bar_controls` |
+| TC-2820 | FR-2820 | browser | `serve` fixture | load dashboard | top-bar view controls are exactly Board, Runs, Diff, Chat, Workspace, More | `tests/web_tab_trim.rs`: `tc_2820_top_bar_controls` |
 | TC-2821 | FR-2821 | browser | `serve` fixture | open More, pick each item, Esc | each opens its sidebar/popover; Esc closes; aria attributes | `tests/web_tab_trim.rs`: `tc_2821_more_menu_items` |
 | TC-2822 | FR-2822 | browser | fixture with to-dos | click Workspace | sidebar opens with Files/To-dos tabs; badge shows count | `tests/web_tab_trim.rs`: `tc_2822_workspace_button` |
 | TC-2823 | FR-2823 | browser | run manifest with graph_id + graph fixture | select run | diagram rendered in detail; Full graph opens Graph view | `tests/web_runs_view.rs`: `tc_2823_runs_detail_graph_and_full_graph` |
