@@ -92,6 +92,131 @@ pub struct WorkspaceSettings {
     pub browse_roots: Vec<String>,
 }
 
+pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] =
+    &["needs_decision", "decision", "message", "run_finished"];
+
+/// Placeholder for unknown `[board]` TOML keys so `BoardSettings` keeps `Eq`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnknownBoardKey;
+
+impl<'de> serde::Deserialize<'de> for UnknownBoardKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self)
+    }
+}
+
+/// User-config `[board]` settings (SPEC-decision-board FR-3131). Read only from
+/// the user config, never from a workspace's `dmuxai.toml`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+pub struct BoardSettings {
+    #[serde(default)]
+    pub planner: Option<String>,
+    #[serde(default)]
+    pub notify_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub notify_webhook_url: Option<String>,
+    #[serde(default)]
+    pub notify_webhook_secret_env: Option<String>,
+    #[serde(default)]
+    pub notify_events: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownBoardKey>,
+}
+
+impl BoardSettings {
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for key in self.extra.keys() {
+            warnings.push(format!("unknown key '{key}' ignored"));
+        }
+        if let Some(planner) = &self.planner
+            && planner.trim().is_empty()
+        {
+            warnings.push("planner must not be empty".to_owned());
+        }
+        if let Some(url) = &self.notify_webhook_url
+            && !url.starts_with("http://")
+            && !url.starts_with("https://")
+        {
+            warnings.push("notify_webhook_url must start with http:// or https://".to_owned());
+        }
+        if self
+            .notify_command
+            .as_ref()
+            .is_some_and(|cmd| cmd.is_empty())
+        {
+            warnings.push("notify_command must not be empty".to_owned());
+        }
+        if let Some(events) = &self.notify_events {
+            for name in events {
+                if !VALID_BOARD_NOTIFY_EVENTS.contains(&name.as_str()) {
+                    warnings.push(format!(
+                        "notify_events entry '{name}' is not valid (expected {})",
+                        VALID_BOARD_NOTIFY_EVENTS.join(", ")
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    pub fn planner_agent_and_model(&self) -> (Option<String>, Option<String>) {
+        let Some(raw) = self.planner.as_deref() else {
+            return (None, None);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return (None, None);
+        }
+        if let Some((agent, model)) = trimmed.split_once(':') {
+            let agent = agent.trim();
+            let model = model.trim();
+            let agent = (!agent.is_empty()).then(|| agent.to_owned());
+            let model = (!model.is_empty()).then(|| model.to_owned());
+            (agent, model)
+        } else {
+            (Some(trimmed.to_owned()), None)
+        }
+    }
+
+    pub fn has_notify_target(&self) -> bool {
+        self.notify_command
+            .as_ref()
+            .is_some_and(|cmd| !cmd.is_empty())
+            || self.notify_webhook_url.as_deref().is_some_and(|url| {
+                let lower = url.trim().to_ascii_lowercase();
+                lower.starts_with("http://") || lower.starts_with("https://")
+            })
+    }
+
+    pub fn allows_event(&self, event: &str) -> bool {
+        self.notify_events
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|e| e == event))
+    }
+
+    pub fn load_user_only() -> Self {
+        Self::load_user_only_with_env(&RuntimeEnv::from_process())
+    }
+
+    pub fn load_user_only_with_env(env: &RuntimeEnv) -> Self {
+        let Some(user_path) = default_user_config_path_from(env) else {
+            return Self::default();
+        };
+        let Ok(contents) = std::fs::read_to_string(&user_path) else {
+            return Self::default();
+        };
+        toml::from_str::<DmuxToml>(&contents)
+            .ok()
+            .and_then(|parsed| parsed.board)
+            .unwrap_or_default()
+    }
+}
+
 /// Workspace-local and environment overrides for DmuxAI behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DmuxSettings {
@@ -151,6 +276,8 @@ pub struct DmuxSettings {
     pub notify: NotifySettings,
     /// User-config `[workspace]` settings (FR-870, FR-872).
     pub workspace: WorkspaceSettings,
+    /// User-config `[board]` settings (SPEC-decision-board FR-3131).
+    pub board: BoardSettings,
     /// Stage → skill mapping (SPEC-stage-skills).
     pub stage_skills: crate::stage_skills::StageSkillSettings,
     /// Problems found while reading dmuxai.toml, shown at startup.
@@ -218,6 +345,7 @@ struct DmuxToml {
     todo: Option<TodoToml>,
     jira: Option<JiraToml>,
     workspace: Option<WorkspaceSettings>,
+    board: Option<BoardSettings>,
     /// `[stages.<stage>]` skill mapping (SPEC-stage-skills FR-1500).
     stages: Option<std::collections::BTreeMap<String, crate::stage_skills::StageToml>>,
     /// `[skills]` sources (SPEC-stage-skills FR-1501).
@@ -535,6 +663,12 @@ impl DmuxSettings {
                     if let Some(ws) = parsed.workspace.take() {
                         settings.workspace = ws;
                     }
+                    if let Some(board) = parsed.board.take() {
+                        for warning in board.validate() {
+                            settings.config_warnings.push(format!("board: {warning}"));
+                        }
+                        settings.board = board;
+                    }
                     if let Some(models) = parsed.models.take()
                         && let Some(allow_fast) = models.allow_fast
                     {
@@ -571,6 +705,12 @@ impl DmuxSettings {
         if let Ok(contents) = std::fs::read_to_string(&config_path) {
             match toml::from_str::<DmuxToml>(&contents) {
                 Ok(mut parsed) => {
+                    if parsed.board.take().is_some() {
+                        settings.config_warnings.push(
+                            "[board] in workspace dmuxai.toml is ignored (user config only)"
+                                .to_owned(),
+                        );
+                    }
                     if parsed.models.is_some() {
                         settings
                             .config_warnings
@@ -2029,6 +2169,7 @@ impl Default for DmuxSettings {
             jira: None,
             ui: UiSettings::default(),
             web_theme: WebThemeSettings::default(),
+            board: BoardSettings::default(),
             notify: NotifySettings::default(),
             workspace: WorkspaceSettings::default(),
             stage_skills: Default::default(),
@@ -6214,6 +6355,97 @@ usbipd_attach = false
             "workspace wins"
         );
         assert_eq!(settings.terminal_serial_usbipd_attach, Some(false));
+    }
+
+    #[test]
+    fn tc_3131_board_config_user_only_and_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_dir = dir.path().join("user");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let user_cfg = user_dir.join("dmuxai.toml");
+        std::fs::write(
+            &user_cfg,
+            r#"[board]
+planner = "codex:gpt-5.4"
+notify_command = ["echo", "hi"]
+notify_webhook_url = "https://example.test/hook"
+notify_webhook_secret_env = "BOARD_SECRET"
+notify_events = ["needs_decision", "run_finished"]
+unknown_key = 42
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            r#"[board]
+planner = "cursor"
+notify_webhook_url = "ftp://bad"
+"#,
+        )
+        .unwrap();
+
+        let settings = DmuxSettings::load_with_user_config(&ws, Some(&user_cfg));
+        assert_eq!(settings.board.planner.as_deref(), Some("codex:gpt-5.4"));
+        assert_eq!(
+            settings.board.planner_agent_and_model(),
+            (Some("codex".to_owned()), Some("gpt-5.4".to_owned()))
+        );
+        assert_eq!(
+            settings.board.notify_command,
+            Some(vec!["echo".to_owned(), "hi".to_owned()])
+        );
+        assert_eq!(
+            settings.board.notify_webhook_url.as_deref(),
+            Some("https://example.test/hook")
+        );
+        assert_eq!(
+            settings.board.notify_webhook_secret_env.as_deref(),
+            Some("BOARD_SECRET")
+        );
+        assert!(settings.board.allows_event("needs_decision"));
+        assert!(!settings.board.allows_event("decision"));
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("unknown key 'unknown_key'")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("[board] in workspace dmuxai.toml is ignored")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+
+        let bad_board = BoardSettings {
+            planner: Some("   ".to_owned()),
+            notify_command: Some(vec![]),
+            notify_webhook_url: Some("ftp://invalid".to_owned()),
+            notify_webhook_secret_env: None,
+            notify_events: Some(vec!["bogus".to_owned()]),
+            extra: BTreeMap::new(),
+        };
+        let warnings = bad_board.validate();
+        assert_eq!(warnings.len(), 4, "warnings: {warnings:?}");
+        assert!(!bad_board.has_notify_target());
+
+        let env = RuntimeEnv {
+            xdg_config_home: Some(user_dir.clone()),
+            ..Default::default()
+        };
+        let user_cfg_dmuxai = user_dir.join("dmuxai");
+        std::fs::create_dir_all(&user_cfg_dmuxai).unwrap();
+        std::fs::copy(&user_cfg, user_cfg_dmuxai.join("dmuxai.toml")).unwrap();
+        let loaded = BoardSettings::load_user_only_with_env(&env);
+        assert_eq!(loaded.planner.as_deref(), Some("codex:gpt-5.4"));
+        assert!(loaded.has_notify_target());
     }
 
     // TC-3202 / FR-3202

@@ -11,7 +11,9 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
 use serde::{Deserialize, Serialize};
 
-use super::plan::{board_plan_from_pending, pending_hash_for_plan, read_pending_plan};
+use super::plan::{
+    board_plan_from_pending, pending_hash_for_plan, read_pending_plan, write_board_plan_copy,
+};
 use super::rules::RulesStore;
 use super::{
     BoardError, BoardItem, CLOSED_HIDE_DAYS, Decision, Kind, Lane, Source, THREAD_MAX,
@@ -119,6 +121,26 @@ pub enum WaitOutcome {
     },
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingItem {
+    pub id: String,
+    pub reason: String,
+    pub lane: Lane,
+    pub workspace_path: Option<String>,
+    pub repo_key: Option<String>,
+    pub title: String,
+    pub kind: Kind,
+    pub grade: Option<super::Grade>,
+    pub age_ms: u64,
+    pub updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingList {
+    pub items: Vec<PendingItem>,
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum EventKind {
@@ -128,6 +150,7 @@ enum EventKind {
     Plan,
     Decision,
     Message,
+    Checked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,17 +400,22 @@ impl BoardStore {
                 "plan hash must be 16 lowercase hex characters".to_owned(),
             ));
         }
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             if let Some(key) = &req.key
                 && let Some(existing) = store.find_item_by_key(key, req.source_bot.as_deref())?
             {
-                return Ok(existing);
+                return Ok((existing, false));
             }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
-                if req.by != "owner" && matches!(lane, Lane::Auto | Lane::Approved) {
+                if matches!(lane, Lane::Approved | Lane::Rejected) {
                     return Err(BoardError::Forbidden(
-                        "only the owner may set lane auto or approved".to_owned(),
+                        "cannot create item in approved or rejected (use board decide)".to_owned(),
+                    ));
+                }
+                if req.by != "owner" && lane == Lane::Auto {
+                    return Err(BoardError::Forbidden(
+                        "only the owner may set lane auto".to_owned(),
                     ));
                 }
                 lane
@@ -412,6 +440,7 @@ impl BoardStore {
                 options: req.options,
                 plan: None,
                 decision: None,
+                checked: None,
                 thread: Vec::new(),
                 run_ids: Vec::new(),
                 key: req.key.clone(),
@@ -425,14 +454,20 @@ impl BoardStore {
                 if computed != hash {
                     return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
                 }
+                write_board_plan_copy(&req.state_root, &store.base, &hash)?;
                 item.plan = Some(board_plan_from_pending(pending, hash, None));
                 store.clear_decision_on_plan_change(&mut item);
             }
             mask_item_fields(&mut item);
             store.save_item_inner(&item)?;
             store.append_event(&item.id, EventKind::Created, item.version, &req.by)?;
-            Ok(item)
-        })
+            let notify = item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", &req.by);
+        }
+        Ok(item)
     }
 
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<BoardItem>, BoardError> {
@@ -473,6 +508,105 @@ impl BoardStore {
         }
         items.sort_by_key(|item| std::cmp::Reverse(item.updated_ms));
         Ok(items)
+    }
+
+    /// List items waiting on human action, oldest first (FR-3137).
+    pub fn pending(&self, workspace: Option<&Path>) -> Result<PendingList, BoardError> {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(CLOSED_HIDE_DAYS * 86_400 * 1000);
+        let workspace_key = workspace
+            .map(normalize_workspace_path)
+            .transpose()
+            .map_err(|e| BoardError::Usage(e.to_string()))?;
+        let mut entries = Vec::new();
+        for entry in
+            fs::read_dir(&self.items_dir).map_err(|e| BoardError::Internal(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BoardError::Internal(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|e| BoardError::Internal(e.to_string()))?;
+            let item: BoardItem = serde_json::from_slice(&bytes)
+                .map_err(|e| BoardError::Internal(format!("invalid item: {e}")))?;
+            if let Some(ref ws) = workspace_key
+                && item.workspace.path.as_deref() != Some(ws.as_str())
+            {
+                continue;
+            }
+            let reason = match item.lane {
+                Lane::NeedsDecision => "decide",
+                Lane::Unknown if item.checked.is_none() && item.updated_ms >= cutoff => "failed",
+                Lane::Done if item.checked.is_none() && item.updated_ms >= cutoff => "check",
+                _ => continue,
+            };
+            entries.push(PendingItem {
+                id: item.id,
+                reason: reason.to_owned(),
+                lane: item.lane,
+                workspace_path: item.workspace.path,
+                repo_key: item.workspace.repo_key,
+                title: item.title,
+                kind: item.kind,
+                grade: item.grade,
+                age_ms: now.saturating_sub(item.updated_ms),
+                updated_ms: item.updated_ms,
+            });
+        }
+        entries.sort_by(|a, b| {
+            a.updated_ms
+                .cmp(&b.updated_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let count = entries.len();
+        Ok(PendingList {
+            items: entries,
+            count,
+        })
+    }
+
+    /// Mark a `done` or `unknown` item as checked by the owner (FR-3137, FR-3138).
+    pub fn check(&self, id: &str, text: Option<String>, by: &str) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        if by != "owner" {
+            return Err(BoardError::Forbidden(
+                "only the owner may check items".to_owned(),
+            ));
+        }
+        if let Some(t) = text.as_deref() {
+            super::validate_text_limit("text", t, super::TEXT_MAX)?;
+        }
+        let clean_text = text.and_then(|t| {
+            let trimmed = t.trim().to_owned();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        });
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if !matches!(item.lane, Lane::Done | Lane::Unknown) {
+                return Err(BoardError::Conflict(format!(
+                    "item in lane '{}' cannot be checked (must be done or unknown)",
+                    item.lane.as_str()
+                )));
+            }
+            let now = now_ms();
+            item.checked = Some(super::CheckedRecord {
+                by: by.to_owned(),
+                at_ms: now,
+                text: clean_text,
+            });
+            item.version += 1;
+            item.updated_ms = now;
+            store.save_item_inner(&item)?;
+            store.append_event(id, EventKind::Checked, item.version, by)?;
+            Ok(item)
+        })
     }
 
     pub fn update(&self, id: &str, req: UpdateItemRequest) -> Result<BoardItem, BoardError> {
@@ -535,7 +669,7 @@ impl BoardStore {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
         enforce_sensitive_lane_move(by, lane)?;
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if let Some(expected) = if_version
                 && item.version != expected
@@ -545,13 +679,22 @@ impl BoardStore {
                     item.version
                 )));
             }
+            let prev_lane = item.lane;
             item.lane = lane;
+            if prev_lane != lane || matches!(lane, Lane::Done | Lane::Unknown) {
+                item.checked = None;
+            }
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Lane, item.version, by)?;
-            Ok(item)
-        })
+            let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
+        }
+        Ok(item)
     }
 
     pub fn attach_plan(
@@ -564,13 +707,15 @@ impl BoardStore {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             let pending = read_pending_plan(state_root, hash)?;
             let computed = pending_hash_for_plan(&pending)?;
             if computed != hash {
                 return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
             }
+            write_board_plan_copy(state_root, &store.base, hash)?;
+            let prev_lane = item.lane;
             let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
@@ -578,8 +723,13 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
-            Ok(item)
-        })
+            let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
+        }
+        Ok(item)
     }
 
     pub fn edit_plan(
@@ -593,13 +743,15 @@ impl BoardStore {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
-        self.with_lock(|store| {
+        let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             let pending = read_pending_plan(_state_root, hash)?;
             let computed = pending_hash_for_plan(&pending)?;
             if computed != hash {
                 return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
             }
+            write_board_plan_copy(_state_root, &store.base, hash)?;
+            let prev_lane = item.lane;
             let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
@@ -607,8 +759,13 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
-            Ok(item)
-        })
+            let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
+            Ok((item, notify))
+        })?;
+        if notify_needs_decision {
+            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
+        }
+        Ok(item)
     }
 
     pub fn unmasked_prompt(&self, id: &str, hash: Option<&str>) -> Result<String, BoardError> {
@@ -644,7 +801,7 @@ impl BoardStore {
             .base
             .parent()
             .ok_or_else(|| BoardError::Internal("board store has no state parent".to_owned()))?;
-        let pending = read_pending_plan(state_root, &plan_hash)?;
+        let pending = super::plan::read_pending_or_board_copy(state_root, &self.base, &plan_hash)?;
         Ok(pending.prompt)
     }
 
@@ -793,25 +950,21 @@ impl BoardStore {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
-        self.with_lock(|store| {
+        if req.by != "owner" {
+            return Err(BoardError::Forbidden(
+                "only the owner may record decisions".to_owned(),
+            ));
+        }
+        let item = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
-            if req.by == "planner" {
-                return Err(BoardError::Forbidden(
-                    "planner cannot record decisions".to_owned(),
-                ));
-            }
-            if matches!(req.verdict, Verdict::Approve)
-                && req.by.starts_with("bot:")
-                && item.lane != Lane::Auto
-            {
-                return Err(BoardError::Forbidden(
-                    "bots may approve only items in the auto lane".to_owned(),
-                ));
-            }
             if matches!(req.verdict, Verdict::Approve)
                 && let Some(plan) = &item.plan
             {
-                let hash = req.plan_hash.as_deref().unwrap_or(plan.hash.as_str());
+                let Some(hash) = req.plan_hash.as_deref() else {
+                    return Err(BoardError::Conflict(
+                        "plan_hash is required to approve an item with a plan".to_owned(),
+                    ));
+                };
                 if hash != plan.hash {
                     return Err(BoardError::Conflict(
                         "plan hash does not match the current plan".to_owned(),
@@ -876,7 +1029,9 @@ impl BoardStore {
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Decision, item.version, &req.by)?;
             Ok(item)
-        })
+        })?;
+        super::notify::dispatch_board_event(&self.base, &item, "decision", &req.by);
+        Ok(item)
     }
 
     pub fn say(&self, id: &str, req: SayRequest) -> Result<BoardItem, BoardError> {
@@ -884,7 +1039,7 @@ impl BoardStore {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
         validate_message(&req.text)?;
-        self.with_lock(|store| {
+        let (item, from) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if item.thread.len() >= THREAD_MAX {
                 return Err(BoardError::Usage(format!(
@@ -901,8 +1056,74 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Message, item.version, &from)?;
+            Ok((item, from))
+        })?;
+        if from == "owner" {
+            super::notify::dispatch_board_event(&self.base, &item, "message", &from);
+        }
+        Ok(item)
+    }
+
+    /// Record the outcome of `board run` (FR-3133, FR-3135).
+    pub fn record_run_result(
+        &self,
+        id: &str,
+        run_id: Option<&str>,
+        exit_code: i32,
+        summary: Option<&str>,
+        by: &str,
+    ) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        let item = self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if let Some(rid) = run_id.map(str::trim).filter(|s| !s.is_empty())
+                && !item.run_ids.iter().any(|existing| existing == rid)
+            {
+                item.run_ids.push(rid.to_owned());
+            }
+            let run_label = run_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown");
+            let mut msg = if exit_code == 0 {
+                format!("Run {run_label} completed (exit 0).")
+            } else {
+                let mut m = format!("Run {run_label} failed (exit {exit_code}).");
+                if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+                    let masked = crate::run_journal::mask_sensitive_tokens(summary);
+                    let clipped: String = masked.chars().take(2000).collect();
+                    m.push(' ');
+                    m.push_str(&clipped);
+                }
+                m
+            };
+            if msg.chars().count() > super::TEXT_MAX {
+                msg = msg.chars().take(super::TEXT_MAX).collect();
+            }
+            if item.thread.len() >= THREAD_MAX {
+                item.thread.remove(0);
+            }
+            item.thread.push(ThreadMessage {
+                from: "run".to_owned(),
+                text: msg,
+                at_ms: now_ms(),
+            });
+            item.lane = if exit_code == 0 {
+                Lane::Done
+            } else {
+                Lane::Unknown
+            };
+            item.checked = None;
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            store.append_event(id, EventKind::Lane, item.version, by)?;
             Ok(item)
-        })
+        })?;
+        super::notify::dispatch_board_event(&self.base, &item, "run_finished", by);
+        Ok(item)
     }
 
     pub fn wait(&self, id: &str, filter: WaitFilter) -> Result<WaitOutcome, BoardError> {
@@ -1053,12 +1274,14 @@ fn wait_trigger_for_event_any(event: &BoardEvent, filter: &WaitFilter) -> Option
 }
 
 fn enforce_sensitive_lane_move(by: &str, lane: Lane) -> Result<(), BoardError> {
-    if by == "owner" || by == "planner" {
-        return Ok(());
-    }
-    if matches!(lane, Lane::Auto | Lane::Approved) {
+    if matches!(lane, Lane::Approved | Lane::Rejected) {
         return Err(BoardError::Forbidden(
-            "bots may not move items into auto or approved".to_owned(),
+            "cannot move item into approved or rejected (use board decide)".to_owned(),
+        ));
+    }
+    if lane == Lane::Auto && by != "owner" {
+        return Err(BoardError::Forbidden(
+            "only the owner may move items into auto".to_owned(),
         ));
     }
     Ok(())
@@ -1288,6 +1511,19 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(stale.exit_code(), crate::agent_api::exit::CONFLICT);
+        let missing_hash = store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(missing_hash.exit_code(), crate::agent_api::exit::CONFLICT);
         let bot_forbidden = store
             .decide(
                 &item.id,
@@ -1391,6 +1627,14 @@ mod tests {
             .unwrap_err();
         assert_eq!(bot_move.exit_code(), crate::agent_api::exit::FORBIDDEN);
 
+        let owner_move_approved = store
+            .move_lane(&item.id, Lane::Approved, "owner", None)
+            .unwrap_err();
+        assert_eq!(
+            owner_move_approved.exit_code(),
+            crate::agent_api::exit::FORBIDDEN
+        );
+
         let auto = store
             .add(AddItemRequest {
                 title: "dbg".to_owned(),
@@ -1411,7 +1655,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(auto.lane, Lane::Auto);
-        let auto_approved = store
+        let auto_bot_err = store
             .decide(
                 &auto.id,
                 DecideRequest {
@@ -1422,8 +1666,8 @@ mod tests {
                     by: "bot:x".to_owned(),
                 },
             )
-            .unwrap();
-        assert_eq!(auto_approved.lane, Lane::Approved);
+            .unwrap_err();
+        assert_eq!(auto_bot_err.exit_code(), crate::agent_api::exit::FORBIDDEN);
 
         use crate::board::{BoardCaller, resolve_actor};
         assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
@@ -1852,5 +2096,113 @@ mod tests {
             "list took {} ms",
             elapsed.as_millis()
         );
+    }
+
+    // TC-3137 / FR-3137: board pending lists decide, failed, check (oldest first, excluding >30d
+    // done/unknown), and board check records checked + event and removes from pending.
+    #[test]
+    fn tc_3137_board_pending_lists_decide_failed_check_and_check_clears() {
+        let (_dir, store, state) = test_store();
+        let ws1 = _dir.path().join("ws-one");
+        let ws2 = _dir.path().join("ws-two");
+        fs::create_dir_all(&ws1).unwrap();
+        fs::create_dir_all(&ws2).unwrap();
+
+        let make = |title: &str, lane: Lane, ws: &Path| {
+            store
+                .add(AddItemRequest {
+                    title: title.to_owned(),
+                    summary: String::new(),
+                    kind: Kind::Feature,
+                    grade: None,
+                    lane: Some(lane),
+                    source_bot: None,
+                    source_channel: None,
+                    source_ref: None,
+                    workspace: Some(ws.to_path_buf()),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                    by: "owner".to_owned(),
+                    state_root: state.clone(),
+                })
+                .unwrap()
+        };
+
+        let i_decide = make("needs decision", Lane::NeedsDecision, &ws1);
+        let i_failed = make("failed run", Lane::Unknown, &ws2);
+        let i_done = make("done unchecked", Lane::Done, &ws1);
+        let i_old_done = make("old done", Lane::Done, &ws1);
+        let _i_auto = make("auto item", Lane::Auto, &ws1);
+
+        // Set explicit updated_ms to verify oldest-first ordering and 30d cutoff.
+        let now = now_ms();
+        for (id, updated) in [
+            (&i_done.id, now - 3 * 3_600_000),
+            (&i_failed.id, now - 2 * 3_600_000),
+            (&i_decide.id, now - 600_000),
+            (&i_old_done.id, now - 35 * 86_400 * 1000),
+        ] {
+            let mut it = store.get(id).unwrap();
+            it.updated_ms = updated;
+            store.save_item_inner(&it).unwrap();
+        }
+
+        let all_pending = store.pending(None).unwrap();
+        assert_eq!(all_pending.count, 3);
+        let got: Vec<(&str, &str)> = all_pending
+            .items
+            .iter()
+            .map(|p| (p.id.as_str(), p.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (i_done.id.as_str(), "check"),
+                (i_failed.id.as_str(), "failed"),
+                (i_decide.id.as_str(), "decide"),
+            ]
+        );
+
+        let ws1_pending = store.pending(Some(&ws1)).unwrap();
+        assert_eq!(ws1_pending.count, 2);
+
+        // Check on needs_decision -> Conflict (exit 4).
+        let conflict = store.check(&i_decide.id, None, "owner").unwrap_err();
+        assert_eq!(conflict.exit_code(), crate::agent_api::exit::CONFLICT);
+
+        // Bot cannot check -> Forbidden (exit 5).
+        let forbidden = store.check(&i_done.id, None, "bot:coord").unwrap_err();
+        assert_eq!(forbidden.exit_code(), crate::agent_api::exit::FORBIDDEN);
+
+        // Owner checks done item -> records checked, appends checked event, removes from pending.
+        let checked_done = store
+            .check(&i_done.id, Some("looks good".to_owned()), "owner")
+            .unwrap();
+        assert_eq!(checked_done.checked.as_ref().unwrap().by, "owner");
+        assert_eq!(
+            checked_done.checked.as_ref().unwrap().text.as_deref(),
+            Some("looks good")
+        );
+        let events = store.list_events(0).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.item_id == i_done.id && e.kind == "checked" && e.by == "owner")
+        );
+
+        let after = store.pending(None).unwrap();
+        assert_eq!(after.count, 2);
+        assert!(!after.items.iter().any(|p| p.id == i_done.id));
+
+        let reopened = store
+            .move_lane(&i_done.id, Lane::NeedsDecision, "owner", None)
+            .unwrap();
+        assert!(reopened.checked.is_none());
+        let re_done = store
+            .move_lane(&i_done.id, Lane::Done, "bot:coord", None)
+            .unwrap();
+        assert!(re_done.checked.is_none());
     }
 }

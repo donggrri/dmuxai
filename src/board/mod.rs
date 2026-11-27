@@ -1,20 +1,23 @@
 //! User-level coordinator decision board (SPEC-decision-board FR-3100..FR-3115).
 
 mod mcp;
+pub mod notify;
 mod plan;
 mod rules;
+pub mod runner;
 mod store;
 
 pub use mcp::invoke as mcp_invoke;
 
 pub use plan::{
-    PendingPlanFile, edit_plan_from_json, pending_plan_path, read_pending_plan,
-    unmasked_prompt_from_item_plan,
+    PendingPlanFile, board_plan_copy_path, edit_plan_from_json, ensure_pending_plan_from_copy,
+    pending_plan_path, prune_old_plan_copies, read_pending_plan, unmasked_prompt_from_item_plan,
+    write_board_plan_copy,
 };
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{
-    AddItemRequest, BoardStore, DecideRequest, ListFilter, SayRequest, UpdateItemRequest,
-    WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
+    AddItemRequest, BoardStore, DecideRequest, ListFilter, PendingItem, PendingList, SayRequest,
+    UpdateItemRequest, WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
 };
 
 /// Who is invoking a board write (FR-3108 owner identity).
@@ -229,6 +232,14 @@ pub struct Decision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckedRecord {
+    pub by: String,
+    pub at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadMessage {
     pub from: String,
     pub text: String,
@@ -255,6 +266,8 @@ pub struct BoardItem {
     pub plan: Option<BoardPlan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<Decision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<CheckedRecord>,
     #[serde(default)]
     pub thread: Vec<ThreadMessage>,
     #[serde(default)]
@@ -349,12 +362,22 @@ pub fn resolve_actor(by: Option<&str>, caller: BoardCaller) -> Result<String, Bo
             BoardCaller::Dashboard => {}
         }
     }
-    if actor != "owner" && actor != "planner" && !actor.starts_with("bot:") {
+    if actor == "planner" {
+        return Err(BoardError::Forbidden(
+            "planner actor is reserved for internal board runner actions".to_owned(),
+        ));
+    }
+    if actor != "owner" && !actor.starts_with("bot:") {
         return Err(BoardError::Usage(format!(
-            "invalid --by '{actor}' (expected owner, planner, or bot:NAME)"
+            "invalid --by '{actor}' (expected owner or bot:NAME)"
         )));
     }
     Ok(actor)
+}
+
+/// Strip trailing CR/LF so stored plan prompts match `dmuxai run -` (`read_prompt`).
+pub fn normalize_plan_prompt(prompt: &str) -> String {
+    prompt.trim_end_matches(['\r', '\n']).to_owned()
 }
 
 /// Read a local file path or stdin when `path` is `-`.
@@ -380,6 +403,23 @@ pub fn actor_may_use_planner(actor: &str) -> bool {
 
 pub fn actor_is_owner(actor: &str) -> bool {
     actor == "owner"
+}
+
+/// Prompt-agnostic owner confirmation check for CLI TTY owner actions (FR-3138).
+pub fn confirm_owner_action(
+    id: &str,
+    verb: &str,
+    title: &str,
+    read_answer: impl FnOnce(&str) -> Result<String, BoardError>,
+) -> Result<(), BoardError> {
+    let prompt = format!("Type the item id to confirm {verb} {title}:");
+    let answer = read_answer(&prompt)?;
+    if answer.trim() != id {
+        return Err(BoardError::Forbidden(
+            "confirmation did not match item id".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_item_id_early(id: &str) -> Result<(), BoardError> {
@@ -445,6 +485,11 @@ pub fn mask_item_fields(item: &mut BoardItem) {
     }
     if let Some(decision) = item.decision.as_mut()
         && let Some(text) = decision.text.as_mut()
+    {
+        *text = crate::run_journal::mask_sensitive_tokens(text);
+    }
+    if let Some(checked) = item.checked.as_mut()
+        && let Some(text) = checked.text.as_mut()
     {
         *text = crate::run_journal::mask_sensitive_tokens(text);
     }
@@ -548,6 +593,14 @@ mod tests {
         assert!(validate_message(&"m".repeat(TEXT_MAX + 1)).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::Mcp).is_err());
         assert!(resolve_actor(Some("owner"), BoardCaller::CliNonTty).is_err());
+        assert!(matches!(
+            resolve_actor(Some("planner"), BoardCaller::Mcp),
+            Err(BoardError::Forbidden(_))
+        ));
+        assert!(matches!(
+            resolve_actor(Some("planner"), BoardCaller::CliNonTty),
+            Err(BoardError::Forbidden(_))
+        ));
         match resolve_actor(None, BoardCaller::CliTty) {
             Ok(actor) => assert_eq!(actor, "owner"),
             Err(BoardError::Forbidden(_)) => {}
@@ -652,6 +705,7 @@ mod tests {
                 by: "owner".to_owned(),
                 at_ms: 0,
             }),
+            checked: None,
             thread: vec![ThreadMessage {
                 from: "owner".to_owned(),
                 text: format!("thread {secret}"),

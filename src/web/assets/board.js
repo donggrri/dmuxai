@@ -6,6 +6,9 @@ var BOARD_TOKEN_KEY = 'dmuxai.token';
 var BOARD_LANES = [
   'auto', 'needs_decision', 'approved', 'in_progress', 'done', 'rejected', 'unknown'
 ];
+var BOARD_MOVABLE_LANES = [
+  'auto', 'needs_decision', 'in_progress', 'done', 'unknown'
+];
 var BOARD_LANE_LABELS = {
   auto: 'Auto',
   needs_decision: 'Needs decision',
@@ -26,6 +29,8 @@ var boardShowClosed = false;
 var boardWorkspaceFilter = '';
 var boardRulesOpen = false;
 var boardPlanConflict = false;
+var boardLaunchAllowed = false;
+var boardAskPending = {};
 
 function boardToken() {
   try { return window.sessionStorage.getItem(BOARD_TOKEN_KEY); } catch (err) { return null; }
@@ -47,9 +52,12 @@ function boardEl(tag, className, text) {
   return node;
 }
 
-function boardFetchJson(method, path, body) {
+function boardFetchJson(method, path, body, humanAction) {
   var tok = boardToken();
   var headers = tok ? { Authorization: 'Bearer ' + tok } : {};
+  if (humanAction === true) {
+    headers['X-Dmuxai-Human'] = '1';
+  }
   var init = { method: method || 'GET', headers: headers, cache: 'no-store' };
   if (body !== undefined) {
     headers['Content-Type'] = 'application/json';
@@ -181,6 +189,53 @@ function boardRenderMyDecisions(container, items) {
     row.appendChild(boardEl('p', 'empty', 'No items need your decision'));
   }
   container.appendChild(row);
+
+  var cutoffMs = Date.now() - 30 * 86400 * 1000;
+  var toCheck = [];
+  for (var ci = 0; ci < boardItems.length; ci++) {
+    var cItem = boardItems[ci];
+    if ((cItem.lane !== 'done' && cItem.lane !== 'unknown') || cItem.checked) { continue; }
+    if (!cItem.updated_ms || cItem.updated_ms < cutoffMs) { continue; }
+    if (boardWorkspaceFilter) {
+      var cWs = cItem.workspace && cItem.workspace.path ? cItem.workspace.path : '';
+      if (cWs.indexOf(boardWorkspaceFilter) < 0) { continue; }
+    }
+    toCheck.push(cItem);
+  }
+  toCheck.sort(function (a, b) {
+    var diff = (a.updated_ms || 0) - (b.updated_ms || 0);
+    if (diff !== 0) { return diff; }
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+  if (toCheck.length) {
+    var checkGroup = boardEl('div', 'board-to-check-group');
+    checkGroup.id = 'board-to-check-group';
+    checkGroup.appendChild(boardEl('h4', 'board-to-check-head', 'To check'));
+    var checkRow = boardEl('div', 'board-my-row');
+    for (var ti = 0; ti < toCheck.length; ti++) {
+      var chk = toCheck[ti];
+      var chkCard = boardEl('div', 'board-decision-card board-check-card');
+      chkCard.setAttribute('tabindex', '0');
+      chkCard.setAttribute('data-item-id', chk.id);
+      chkCard.appendChild(boardEl('div', 'board-decision-title', chk.title));
+      var chkMeta = [
+        boardBasename(chk.workspace && chk.workspace.path),
+        BOARD_LANE_LABELS[chk.lane] || chk.lane,
+        boardAgeMs(chk.updated_ms)
+      ].filter(Boolean).join(' · ');
+      chkCard.appendChild(boardEl('div', 'board-decision-meta', chkMeta));
+      var chkActions = boardEl('div', 'board-decision-actions');
+      var chkBtn = boardEl('button', 'btn btn-small btn-primary', 'Mark checked');
+      chkBtn.type = 'button';
+      chkBtn.setAttribute('data-board-action', 'check');
+      chkBtn.setAttribute('data-item-id', chk.id);
+      chkActions.appendChild(chkBtn);
+      chkCard.appendChild(chkActions);
+      checkRow.appendChild(chkCard);
+    }
+    checkGroup.appendChild(checkRow);
+    container.appendChild(checkGroup);
+  }
 }
 
 function boardRenderKanban(root, items) {
@@ -205,17 +260,26 @@ function boardRenderKanban(root, items) {
       menu.className = 'board-card-menu';
       menu.setAttribute('aria-label', 'Move lane');
       menu.setAttribute('data-item-id', item.id);
-      for (var mi = 0; mi < BOARD_LANES.length; mi++) {
+      if (item.lane === 'approved' || item.lane === 'rejected') {
+        var curOpt = document.createElement('option');
+        curOpt.value = '';
+        curOpt.textContent = BOARD_LANE_LABELS[item.lane] || item.lane;
+        curOpt.disabled = true;
+        curOpt.selected = true;
+        menu.appendChild(curOpt);
+      }
+      for (var mi = 0; mi < BOARD_MOVABLE_LANES.length; mi++) {
         var opt = document.createElement('option');
-        opt.value = BOARD_LANES[mi];
-        opt.textContent = BOARD_LANE_LABELS[BOARD_LANES[mi]] || BOARD_LANES[mi];
-        if (BOARD_LANES[mi] === item.lane) { opt.selected = true; }
+        opt.value = BOARD_MOVABLE_LANES[mi];
+        opt.textContent = BOARD_LANE_LABELS[BOARD_MOVABLE_LANES[mi]] || BOARD_MOVABLE_LANES[mi];
+        if (BOARD_MOVABLE_LANES[mi] === item.lane) { opt.selected = true; }
         menu.appendChild(opt);
       }
       menu.addEventListener('change', function (ev) {
         var sel = ev.target;
+        if (!sel.value) { return; }
         var id = sel.getAttribute('data-item-id');
-        boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/lane', { lane: sel.value })
+        boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/lane', { lane: sel.value }, true)
           .then(function () { boardRefreshList(); })
           .catch(function () { /* ignore */ });
       });
@@ -240,6 +304,9 @@ function boardRenderList() {
 function boardRefreshList() {
   var qs = boardShowClosed ? '?all=1' : '';
   return boardFetchJson('GET', '/api/board' + qs).then(function (data) {
+    if (data && typeof data.launch_allowed === 'boolean') {
+      boardLaunchAllowed = data.launch_allowed;
+    }
     boardItems = data && data.items ? data.items : [];
     boardRenderList();
     if (boardSelectedId) {
@@ -348,12 +415,41 @@ function boardRenderPlanTable(tbody, plan) {
   }
 }
 
+function boardCountPlannerMessages(item) {
+  if (!item || !item.thread) { return 0; }
+  var count = 0;
+  for (var i = 0; i < item.thread.length; i++) {
+    if (item.thread[i] && item.thread[i].from === 'planner') {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function boardIsItemRunnable(item) {
+  if (!boardLaunchAllowed || !item || !item.plan || !item.plan.hash) {
+    return false;
+  }
+  if (item.lane === 'auto') {
+    return true;
+  }
+  if (item.lane === 'approved' && item.decision && item.decision.plan_hash === item.plan.hash) {
+    return true;
+  }
+  return false;
+}
+
 function boardRenderDrawer(item) {
   var wrap = document.getElementById('board-drawer-wrap');
   var drawer = document.getElementById('board-drawer');
   if (!wrap || !drawer) { return; }
   wrap.hidden = false;
   wrap.classList.add('open');
+  var pendingAsk = boardAskPending[item.id];
+  if (pendingAsk && !pendingAsk.error && boardCountPlannerMessages(item) > pendingAsk.baselineCount) {
+    delete boardAskPending[item.id];
+    pendingAsk = null;
+  }
   drawer.textContent = '';
   drawer.appendChild(boardEl('h3', 'board-drawer-title', item.title));
   drawer.appendChild(boardEl('p', 'board-drawer-summary', item.summary || ''));
@@ -447,6 +543,34 @@ function boardRenderDrawer(item) {
     decisionLine = dParts.filter(Boolean).join(' · ');
   }
   drawer.appendChild(boardEl('p', 'board-decision-record', decisionLine));
+  if ((item.lane === 'done' || item.lane === 'unknown') && !item.checked) {
+    var checkWrap = boardEl('div', 'board-check-actions');
+    var checkBtn = boardEl('button', 'btn btn-small btn-primary', 'Mark checked');
+    checkBtn.type = 'button';
+    checkBtn.id = 'board-mark-checked';
+    checkBtn.addEventListener('click', function () { boardCheckItem(item.id); });
+    checkWrap.appendChild(checkBtn);
+    drawer.appendChild(checkWrap);
+  } else if (item.checked) {
+    var chkLine = 'Checked by ' + (item.checked.by || 'owner');
+    if (item.checked.text) { chkLine += ' · ' + item.checked.text; }
+    drawer.appendChild(boardEl('p', 'board-checked-record', chkLine));
+  }
+  var runWrap = boardEl('div', 'board-run-actions');
+  var runnable = boardIsItemRunnable(item);
+  runWrap.hidden = !runnable;
+  var runBtn = boardEl('button', 'btn btn-small btn-primary', 'Run');
+  runBtn.type = 'button';
+  runBtn.id = 'board-run';
+  runBtn.hidden = !runnable;
+  runWrap.appendChild(runBtn);
+  var runErr = boardEl('div', 'board-run-error');
+  runErr.id = 'board-run-error';
+  runErr.setAttribute('aria-live', 'polite');
+  runWrap.appendChild(runErr);
+  drawer.appendChild(runWrap);
+  runBtn.addEventListener('click', function () { boardRunItem(item); });
+
   var chat = boardEl('section', 'board-chat');
   chat.setAttribute('aria-label', 'Side chat');
   var thread = boardEl('div', 'board-chat-thread');
@@ -483,6 +607,114 @@ function boardRenderDrawer(item) {
       boardSendChat(item.id);
     }
   });
+
+  var askSec = boardEl('section', 'board-ask');
+  askSec.id = 'board-ask-section';
+  askSec.setAttribute('aria-label', 'Ask planner');
+  askSec.hidden = !boardLaunchAllowed;
+  var askLabel = boardEl('label', 'board-ask-label', 'Ask planner');
+  askLabel.setAttribute('for', 'board-ask-text');
+  askSec.appendChild(askLabel);
+  var askTa = document.createElement('textarea');
+  askTa.id = 'board-ask-text';
+  askTa.className = 'board-ask-text';
+  askTa.rows = 2;
+  askTa.setAttribute('aria-label', 'Ask planner');
+  askSec.appendChild(askTa);
+  var askActions = boardEl('div', 'board-ask-actions');
+  var askBtn = boardEl('button', 'btn btn-small', 'Ask');
+  askBtn.type = 'button';
+  askBtn.id = 'board-ask';
+  var reviseBtn = boardEl('button', 'btn btn-small btn-primary', 'Ask & revise plan');
+  reviseBtn.type = 'button';
+  reviseBtn.id = 'board-ask-revise';
+  if (!item.plan) { reviseBtn.disabled = true; }
+  var isBusy = !!(pendingAsk && !pendingAsk.error);
+  if (isBusy) {
+    askBtn.disabled = true;
+    reviseBtn.disabled = true;
+  }
+  askActions.appendChild(askBtn);
+  askActions.appendChild(reviseBtn);
+  askSec.appendChild(askActions);
+  var askBusy = boardEl('div', 'board-ask-busy');
+  askBusy.id = 'board-ask-busy';
+  askBusy.setAttribute('aria-live', 'polite');
+  askBusy.setAttribute('role', 'status');
+  if (pendingAsk && pendingAsk.error) {
+    askBusy.hidden = false;
+    askBusy.classList.add('board-ask-error');
+    askBusy.textContent = pendingAsk.error;
+  } else if (isBusy) {
+    askBusy.hidden = false;
+    askBusy.textContent = 'Asking planner\u2026';
+  } else {
+    askBusy.hidden = true;
+  }
+  askSec.appendChild(askBusy);
+  drawer.appendChild(askSec);
+  askBtn.addEventListener('click', function () { boardAskPlanner(item.id, false); });
+  reviseBtn.addEventListener('click', function () { boardAskPlanner(item.id, true); });
+}
+
+function boardAskPlanner(id, revise) {
+  if (!boardLaunchAllowed) { return; }
+  var ta = document.getElementById('board-ask-text');
+  if (!ta || !ta.value.trim()) { return; }
+  var text = ta.value.trim();
+  var item = boardFindItem(id);
+  var baselineCount = boardCountPlannerMessages(item);
+  boardAskPending[id] = { baselineCount: baselineCount, error: null };
+  var busy = document.getElementById('board-ask-busy');
+  var askBtn = document.getElementById('board-ask');
+  var reviseBtn = document.getElementById('board-ask-revise');
+  if (askBtn) { askBtn.disabled = true; }
+  if (reviseBtn) { reviseBtn.disabled = true; }
+  if (busy) {
+    busy.classList.remove('board-ask-error');
+    busy.hidden = false;
+    busy.textContent = 'Asking planner\u2026';
+  }
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', {
+    text: text,
+    revise: !!revise
+  }).then(function () {
+    var curTa = document.getElementById('board-ask-text');
+    if (curTa) { curTa.value = ''; }
+  }).catch(function (err) {
+    var msg = (err && err.message) ? err.message : 'Ask failed';
+    boardAskPending[id] = { baselineCount: baselineCount, error: msg };
+    var curBusy = document.getElementById('board-ask-busy');
+    var curAsk = document.getElementById('board-ask');
+    var curRevise = document.getElementById('board-ask-revise');
+    if (curAsk) { curAsk.disabled = false; }
+    if (curRevise) {
+      var curItem = boardFindItem(id);
+      curRevise.disabled = !(curItem && curItem.plan);
+    }
+    if (curBusy) {
+      curBusy.classList.add('board-ask-error');
+      curBusy.hidden = false;
+      curBusy.textContent = msg;
+    }
+  });
+}
+
+function boardRunItem(item) {
+  if (!boardLaunchAllowed || !boardIsItemRunnable(item)) { return; }
+  if (!window.confirm('Run this plan now?')) { return; }
+  var errEl = document.getElementById('board-run-error');
+  if (errEl) { errEl.textContent = ''; }
+  var body = item.plan && item.plan.hash ? { plan_hash: item.plan.hash } : {};
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(item.id) + '/run', body)
+    .then(function () {
+      boardRefreshList();
+    })
+    .catch(function (err) {
+      if (errEl) {
+        errEl.textContent = (err && err.message) ? err.message : 'Run failed';
+      }
+    });
 }
 
 function boardCollectSteps() {
@@ -597,6 +829,14 @@ function boardFindItem(id) {
   return boardSelectedItem && boardSelectedItem.id === id ? boardSelectedItem : null;
 }
 
+function boardCheckItem(id) {
+  return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/check', {}, true)
+    .then(function () {
+      boardRefreshList();
+    })
+    .catch(function () { /* ignore */ });
+}
+
 function boardDecide(id, verdict, extra) {
   extra = extra || {};
   var body = { verdict: verdict };
@@ -606,7 +846,7 @@ function boardDecide(id, verdict, extra) {
   if (src && src.plan && src.plan.hash) {
     body.plan_hash = src.plan.hash;
   }
-  return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/decision', body)
+  return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/decision', body, true)
     .then(function () {
       boardPlanConflict = false;
       boardRefreshList();
@@ -667,7 +907,7 @@ function boardSaveRules(panel) {
   if (!area) { return; }
   try {
     var body = JSON.parse(area.value);
-    boardFetchJson('PUT', '/api/board/rules', body).then(function () {
+    boardFetchJson('PUT', '/api/board/rules', body, true).then(function () {
       area.classList.remove('board-rules-error');
     }).catch(function () {
       area.classList.add('board-rules-error');
@@ -787,6 +1027,10 @@ function boardOnActionClick(e) {
   if (action === 'reject') {
     if (!window.confirm('Reject this item?')) { return true; }
     boardDecide(id, 'reject');
+    return true;
+  }
+  if (action === 'check') {
+    boardCheckItem(id);
     return true;
   }
   return false;

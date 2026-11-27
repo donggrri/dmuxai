@@ -172,6 +172,28 @@ pub enum BoardOp {
     Rules {
         set: Option<String>,
     },
+    Ask {
+        id: String,
+        text: String,
+        revise: bool,
+        agent: Option<String>,
+        model: Option<String>,
+        by: Option<String>,
+    },
+    Run {
+        id: String,
+        detach: bool,
+        by: Option<String>,
+        exec_prepared: bool,
+        plan_hash: Option<String>,
+    },
+    Pending {
+        workspace: Option<PathBuf>,
+    },
+    Check {
+        id: String,
+        text: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +317,10 @@ Subcommands:
   events     List board events (--since SEQ)
   prompt     Print unmasked plan prompt for piping into run
   rules      Print or replace classification rules (owner only for --set)
+  ask        Ask the planner a question or request a plan revision
+  run        Execute an approved or auto item's graph plan
+  pending    List items waiting for human action
+  check      Mark a done or unknown item as checked (owner only)
 
 Run `dmuxai board <subcommand> --help` for details.
 ";
@@ -350,6 +376,22 @@ Usage: dmuxai board prompt <id> [--hash H] [--json]
 
 pub const BOARD_RULES_USAGE: &str = "\
 Usage: dmuxai board rules [--set FILE|-] [--json]
+";
+
+pub const BOARD_ASK_USAGE: &str = "\
+Usage: dmuxai board ask <id> --text T|- [--revise] [--agent A] [--model M] [--by ACTOR] [--json]
+";
+
+pub const BOARD_RUN_USAGE: &str = "\
+Usage: dmuxai board run <id> [--detach] [--by ACTOR] [--json]
+";
+
+pub const BOARD_PENDING_USAGE: &str = "\
+Usage: dmuxai board pending [--workspace DIR] [--json]
+";
+
+pub const BOARD_CHECK_USAGE: &str = "\
+Usage: dmuxai board check <id> [--text T] [--json]
 ";
 
 pub const RUN_USAGE: &str = "\
@@ -761,6 +803,10 @@ pub fn board_subcommand_usage(subcommand: &str) -> &'static str {
         "events" => BOARD_EVENTS_USAGE,
         "prompt" => BOARD_PROMPT_USAGE,
         "rules" => BOARD_RULES_USAGE,
+        "ask" => BOARD_ASK_USAGE,
+        "run" => BOARD_RUN_USAGE,
+        "pending" => BOARD_PENDING_USAGE,
+        "check" => BOARD_CHECK_USAGE,
         _ => BOARD_USAGE,
     }
 }
@@ -2036,6 +2082,159 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 },
             })
         }
+        "pending" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--workspace"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, false)?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Pending {
+                    workspace: parsed
+                        .flags
+                        .get("--workspace")
+                        .and_then(|v| v.clone())
+                        .map(PathBuf::from),
+                },
+            })
+        }
+        "check" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--text"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board check needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Check {
+                    id,
+                    text: parsed.flags.get("--text").cloned().flatten(),
+                },
+            })
+        }
+        "ask" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--text"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--revise"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--agent"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--model"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--by"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board ask needs an id".to_owned())?;
+            let text = parsed
+                .flags
+                .get("--text")
+                .and_then(|v| v.clone())
+                .ok_or_else(|| "--text is required".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Ask {
+                    id,
+                    text,
+                    revise: parsed.flags.contains_key("--revise"),
+                    agent: parsed.flags.get("--agent").cloned().flatten(),
+                    model: parsed.flags.get("--model").cloned().flatten(),
+                    by: parsed.flags.get("--by").cloned().flatten(),
+                },
+            })
+        }
+        "run" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--detach"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--by"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--exec-prepared"],
+                    takes_value: false,
+                    hidden: true,
+                },
+                FlagSpec {
+                    names: &["--plan-hash"],
+                    takes_value: true,
+                    hidden: true,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board run needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Run {
+                    id,
+                    detach: parsed.flags.contains_key("--detach"),
+                    by: parsed.flags.get("--by").cloned().flatten(),
+                    exec_prepared: parsed.flags.contains_key("--exec-prepared"),
+                    plan_hash: parsed.flags.get("--plan-hash").cloned().flatten(),
+                },
+            })
+        }
         other => Err(format!("unknown board subcommand '{other}'")),
     }
 }
@@ -2979,26 +3178,121 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
             }
         }
         BoardOp::Rules { .. } => {}
+        BoardOp::Ask { id, text, .. } => {
+            check_id(id)?;
+            if text.trim() != "-" {
+                validate_message(text).map_err(ApiError::from)?;
+            }
+        }
+        BoardOp::Run { id, plan_hash, .. } => {
+            check_id(id)?;
+            if let Some(hash) = plan_hash {
+                check_hash(hash)?;
+            }
+        }
+        BoardOp::Pending { .. } => {}
+        BoardOp::Check { id, text } => {
+            check_id(id)?;
+            if let Some(t) = text {
+                validate_text_limit("text", t, TEXT_MAX).map_err(ApiError::from)?;
+            }
+        }
     }
     Ok(())
 }
 
+fn prompt_tty_confirmation(prompt: &str) -> Result<String, dmuxai::board::BoardError> {
+    use dmuxai::board::BoardError;
+    use std::io::{BufRead, BufReader, Write};
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| {
+            BoardError::Forbidden(format!("cannot open /dev/tty for confirmation: {e}"))
+        })?;
+    write!(tty, "{prompt} ")
+        .and_then(|_| tty.flush())
+        .map_err(|e| BoardError::Forbidden(format!("failed to write /dev/tty: {e}")))?;
+    let mut line = String::new();
+    BufReader::new(tty)
+        .read_line(&mut line)
+        .map_err(|e| BoardError::Forbidden(format!("failed to read /dev/tty: {e}")))?;
+    Ok(line.trim().to_owned())
+}
+
+fn confirm_owner_action_cli(id: &str, verb: &str, title: &str) -> Result<(), ApiError> {
+    dmuxai::board::confirm_owner_action(id, verb, title, prompt_tty_confirmation)
+        .map_err(ApiError::from)
+}
+
+fn run_board_move(
+    store: &dmuxai::board::BoardStore,
+    id: &str,
+    lane: dmuxai::board::Lane,
+    by: &str,
+    if_version: Option<u32>,
+    confirm: impl FnOnce(&str, &str, &str) -> Result<(), ApiError>,
+) -> Result<dmuxai::board::BoardItem, ApiError> {
+    if by == "planner" {
+        return Err(ApiError::new(
+            exit::FORBIDDEN,
+            "planner cannot move items".to_owned(),
+        ));
+    }
+    if lane == dmuxai::board::Lane::Auto && by == "owner" {
+        let existing = store.get(id).map_err(ApiError::from)?;
+        confirm(id, "move to auto", &existing.title)?;
+    }
+    store
+        .move_lane(id, lane, by, if_version)
+        .map_err(ApiError::from)
+}
+
+fn format_pending_age(age_ms: u64) -> String {
+    let mins = age_ms / 60_000;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hrs = mins / 60;
+    if hrs < 48 {
+        return format!("{hrs}h");
+    }
+    format!("{}d", hrs / 24)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    text.chars().take(max).collect()
+}
+
 fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
-    use dmuxai::board::{
-        AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
-        UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, default_actor_by,
-        resolve_actor, wait_ready_json,
-    };
-    use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
     use std::io::IsTerminal;
 
-    let json_out = command.json;
-    let is_tty = std::io::stdin().is_terminal();
+    let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let caller = if is_tty {
-        BoardCaller::CliTty
+        dmuxai::board::BoardCaller::CliTty
     } else {
-        BoardCaller::CliNonTty
+        dmuxai::board::BoardCaller::CliNonTty
     };
+    execute_board_with_caller(workspace_root, command, caller)
+}
+
+fn execute_board_with_caller(
+    workspace_root: &Path,
+    command: BoardCommand,
+    caller: dmuxai::board::BoardCaller,
+) -> i32 {
+    use dmuxai::board::{
+        AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, SayRequest,
+        UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome, resolve_actor,
+        wait_ready_json,
+    };
+    use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
+
+    let json_out = command.json;
     let state_root = match dmuxai::state_path::state_base() {
         Ok(path) => path,
         Err(error) => {
@@ -3049,7 +3343,10 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     summary
                 };
                 let ws = workspace.unwrap_or_else(|| workspace_root.to_path_buf());
-                let by = default_actor_by(caller);
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
+                if lane == Some(Lane::Auto) && by == "owner" {
+                    confirm_owner_action_cli("auto", "add to auto lane", &title)?;
+                }
                 let item = store
                     .add(AddItemRequest {
                         title,
@@ -3136,7 +3433,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 run_id,
                 if_version,
             } => {
-                let by = default_actor_by(caller);
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
                 let summary = summary.map(|s| read_prompt(&s)).transpose()?;
                 let grade = grade
                     .map(|g| {
@@ -3187,15 +3484,8 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 let lane = Lane::parse(&lane)
                     .ok_or_else(|| ApiError::new(exit::USAGE, "invalid lane".to_owned()))?;
                 let by = resolve_actor(None, caller).map_err(ApiError::from)?;
-                if dmuxai::board::actor_may_use_planner(&by) {
-                    return Err(ApiError::new(
-                        exit::FORBIDDEN,
-                        "planner cannot move items".to_owned(),
-                    ));
-                }
-                let item = store
-                    .move_lane(&id, lane, &by, if_version)
-                    .map_err(ApiError::from)?;
+                let item =
+                    run_board_move(&store, &id, lane, &by, if_version, confirm_owner_action_cli)?;
                 if json_out {
                     print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 }
@@ -3229,6 +3519,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                         } else {
                             dmuxai::board::unmasked_prompt_from_item_plan(
                                 &state_root,
+                                store.base(),
                                 item.plan.as_ref(),
                             )
                             .map_err(ApiError::from)?
@@ -3280,13 +3571,16 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     ));
                 }
                 let mut plan_hash = plan_hash;
-                if matches!(verdict, Verdict::Approve)
-                    && plan_hash.is_none()
-                    && caller == BoardCaller::CliTty
-                    && let Ok(item) = store.get(&id)
-                    && let Some(plan) = item.plan.as_ref()
-                {
-                    plan_hash = Some(plan.hash.clone());
+                if by == "owner" {
+                    let existing = store.get(&id).map_err(ApiError::from)?;
+                    if matches!(verdict, Verdict::Approve)
+                        && plan_hash.is_none()
+                        && caller == BoardCaller::CliTty
+                        && let Some(plan) = existing.plan.as_ref()
+                    {
+                        plan_hash = Some(plan.hash.clone());
+                    }
+                    confirm_owner_action_cli(&id, verdict.as_str(), &existing.title)?;
                 }
                 let item = store
                     .decide(
@@ -3438,6 +3732,7 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                     let text =
                         dmuxai::board::read_path_or_stdin(&source).map_err(ApiError::from)?;
                     let rules = compile_rules_from_set_text(&text).map_err(ApiError::from)?;
+                    confirm_owner_action_cli("rules", "set board rules", "rules")?;
                     store
                         .with_rules_lock(|| rules_store.save(&rules))
                         .map_err(ApiError::from)?;
@@ -3457,9 +3752,147 @@ fn execute_board(workspace_root: &Path, command: BoardCommand) -> i32 {
                 }
                 Ok(())
             }
+            BoardOp::Ask {
+                id,
+                text,
+                revise,
+                agent,
+                model,
+                by,
+            } => {
+                let text = read_prompt(&text)?;
+                let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
+                let item = dmuxai::board::runner::ask_item(
+                    &store,
+                    dmuxai::board::runner::AskParams {
+                        id,
+                        text,
+                        revise,
+                        agent,
+                        model,
+                        by,
+                        state_root,
+                    },
+                )
+                .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                } else if let Some(last) = item.thread.last() {
+                    println!("{}", last.text);
+                }
+                Ok(())
+            }
+            BoardOp::Run {
+                id,
+                detach,
+                by,
+                exec_prepared,
+                plan_hash,
+            } => {
+                let by = if exec_prepared {
+                    let actor = by
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("bot:coordinator")
+                        .to_owned();
+                    if actor == "planner" {
+                        return Err(ApiError::new(
+                            exit::FORBIDDEN,
+                            "planner cannot run items".to_owned(),
+                        ));
+                    }
+                    if actor != "owner" && !actor.starts_with("bot:") {
+                        return Err(ApiError::new(
+                            exit::USAGE,
+                            format!("invalid --by '{actor}' (expected owner or bot:NAME)"),
+                        ));
+                    }
+                    actor
+                } else {
+                    resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?
+                };
+                let item = if exec_prepared {
+                    let hash = plan_hash.ok_or_else(|| {
+                        ApiError::new(
+                            exit::USAGE,
+                            "--exec-prepared requires --plan-hash".to_owned(),
+                        )
+                    })?;
+                    dmuxai::board::runner::run_item_execute_prepared(
+                        &store,
+                        &id,
+                        &hash,
+                        &by,
+                        &state_root,
+                    )
+                    .map_err(ApiError::from)?
+                } else {
+                    let prepared = dmuxai::board::runner::run_item_prepare(
+                        &store,
+                        dmuxai::board::runner::RunParams {
+                            id,
+                            expected_plan_hash: None,
+                            by,
+                            state_root,
+                        },
+                    )
+                    .map_err(ApiError::from)?;
+                    if detach {
+                        dmuxai::board::runner::launch_detached_board_run(&store, prepared)
+                            .map_err(ApiError::from)?
+                    } else {
+                        dmuxai::board::runner::run_item_execute(&store, prepared)
+                            .map_err(ApiError::from)?
+                    }
+                };
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                } else {
+                    println!("{}\t{}", item.id, item.lane.as_str());
+                }
+                Ok(())
+            }
+            BoardOp::Pending { workspace } => {
+                let pending = store
+                    .pending(workspace.as_deref())
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&pending).unwrap_or(Value::Null));
+                } else {
+                    for item in &pending.items {
+                        let ws_base = item
+                            .workspace_path
+                            .as_deref()
+                            .and_then(|p| Path::new(p).file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "-".to_owned());
+                        let title = truncate_chars(&item.title, 80);
+                        let age = format_pending_age(item.age_ms);
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            item.id, item.reason, ws_base, title, age
+                        );
+                    }
+                    println!("{} pending", pending.count);
+                }
+                Ok(())
+            }
+            BoardOp::Check { id, text } => {
+                dmuxai::board::validate_item_id_early(&id).map_err(ApiError::from)?;
+                let by = resolve_actor(Some("owner"), caller).map_err(ApiError::from)?;
+                let existing = store.get(&id).map_err(ApiError::from)?;
+                confirm_owner_action_cli(&id, "check", &existing.title)?;
+                let item = store.check(&id, text, &by).map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
         }
     })();
 
+    dmuxai::board::notify::wait_for_pending(std::time::Duration::from_secs(10));
     match result {
         Ok(()) => exit::OK,
         Err(error) => fail(error, json_out),
@@ -3845,16 +4278,25 @@ fn term_request_op(op: &TermOp) -> RequestOp {
             argv,
             serial,
             ..
-        } => RequestOp::Open {
-            name: name.clone(),
-            kind: *kind,
-            cwd: cwd.as_ref().map(|path| path.display().to_string()),
-            env: env.clone(),
-            cols: *cols,
-            rows: *rows,
-            argv: argv.clone(),
-            serial: serial.clone(),
-        },
+        } => {
+            let mut env = env.clone();
+            if let Ok(run_id) = std::env::var(dmuxai::term::policy::RUN_ID_ENV)
+                && !run_id.trim().is_empty()
+            {
+                env.retain(|(k, _)| k != dmuxai::term::policy::RUN_ID_ENV);
+                env.push((dmuxai::term::policy::RUN_ID_ENV.to_owned(), run_id));
+            }
+            RequestOp::Open {
+                name: name.clone(),
+                kind: *kind,
+                cwd: cwd.as_ref().map(|path| path.display().to_string()),
+                env,
+                cols: *cols,
+                rows: *rows,
+                argv: argv.clone(),
+                serial: serial.clone(),
+            }
+        }
         TermOp::Send {
             name,
             text,
@@ -4632,6 +5074,17 @@ async fn run_headless(
     }
     let sink = build_event_sink(workspace_root, &settings);
     let run_id = dmuxai::run_journal::generate_run_id();
+    struct RunIdEnvGuard(Option<std::ffi::OsString>);
+    impl Drop for RunIdEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prev) => unsafe { std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, prev) },
+                None => unsafe { std::env::remove_var(dmuxai::term::policy::RUN_ID_ENV) },
+            }
+        }
+    }
+    let _run_id_env_guard = RunIdEnvGuard(std::env::var_os(dmuxai::term::policy::RUN_ID_ENV));
+    unsafe { std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, &run_id) };
     sink.log().set_run_id(Some(run_id.clone()));
     let first_seq = sink.log().last_seq() + 1;
     let workspace = dmuxai::workspace::normalize_workspace_path(workspace_root)
@@ -6462,12 +6915,161 @@ mod tests {
     fn tc_3114_board_help_lists_subcommands() {
         for sub in [
             "add", "list", "show", "update", "move", "plan", "decide", "say", "wait", "events",
-            "prompt", "rules",
+            "prompt", "rules", "ask", "run", "pending", "check",
         ] {
             assert!(BOARD_USAGE.contains(sub), "BOARD_USAGE missing {sub}");
         }
         assert!(board_subcommand_usage("add").contains("--title"));
         assert!(board_subcommand_usage("wait").contains("--timeout"));
+        assert!(board_subcommand_usage("pending").contains("--workspace"));
+        assert!(board_subcommand_usage("check").contains("--text"));
+    }
+
+    // TC-3138 / FR-3105, FR-3110, FR-3133, FR-3138: CLI non-TTY add --lane auto -> 5,
+    // TTY move reaches confirmation, and exec-prepared works without TTY.
+    #[test]
+    fn tc_3138_cli_add_auto_move_confirm_and_exec_prepared_non_tty() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+
+        // 1. Non-TTY board add --lane auto -> exit 5 (Forbidden).
+        let add_auto_exit = execute_board_with_caller(
+            &ws,
+            BoardCommand {
+                op: BoardOp::Add {
+                    title: "Auto from non-tty".to_owned(),
+                    summary: String::new(),
+                    kind: "feature".to_owned(),
+                    grade: None,
+                    lane: Some("auto".to_owned()),
+                    bot: None,
+                    channel: None,
+                    ref_url: None,
+                    workspace: Some(ws.clone()),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                },
+                json: true,
+            },
+            dmuxai::board::BoardCaller::CliNonTty,
+        );
+        assert_eq!(add_auto_exit, exit::FORBIDDEN);
+
+        // 2. TTY move to auto reaches confirmation prompt (injectable prompt).
+        let store = dmuxai::board::BoardStore::open(state.join("board")).unwrap();
+        let item = store
+            .add(dmuxai::board::AddItemRequest {
+                title: "Move me".to_owned(),
+                summary: String::new(),
+                kind: dmuxai::board::Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let mut prompted = false;
+        let mismatch = run_board_move(
+            &store,
+            &item.id,
+            dmuxai::board::Lane::Auto,
+            "owner",
+            None,
+            |id, verb, title| {
+                prompted = true;
+                dmuxai::board::confirm_owner_action(id, verb, title, |_| Ok("wrong".to_owned()))
+                    .map_err(ApiError::from)
+            },
+        )
+        .unwrap_err();
+        assert!(prompted, "TTY move to auto must reach confirmation");
+        assert_eq!(mismatch.code, exit::FORBIDDEN);
+
+        let moved = run_board_move(
+            &store,
+            &item.id,
+            dmuxai::board::Lane::Auto,
+            "owner",
+            None,
+            |id, verb, title| {
+                dmuxai::board::confirm_owner_action(id, verb, title, |_| Ok(id.to_owned()))
+                    .map_err(ApiError::from)
+            },
+        )
+        .unwrap();
+        assert_eq!(moved.lane, dmuxai::board::Lane::Auto);
+
+        // 3. --exec-prepared --by owner works without TTY even when DMUXAI_RUN_ID is set.
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"t","done_check":"d","size":"small","depends_on":[]}],"steps":[{"id":"s1","role":"implement","job":"j","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) =
+            dmuxai::board::edit_plan_from_json(&ws, &state, "ship", plan_json, None).unwrap();
+        store
+            .attach_plan(&item.id, &hash, &state, "bot:test")
+            .unwrap();
+        let prepared = dmuxai::board::runner::run_item_prepare(
+            &store,
+            dmuxai::board::runner::RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(hash.clone()),
+                by: "owner".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        prepared.guard.disarm();
+
+        let fake_bin = dir.path().join("fake-exec.sh");
+        std::fs::write(
+            &fake_bin,
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}\\n'\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).unwrap();
+        }
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin);
+            std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, "run-123");
+        }
+        let exec_exit = execute_board_with_caller(
+            &ws,
+            BoardCommand {
+                op: BoardOp::Run {
+                    id: item.id.clone(),
+                    detach: false,
+                    by: Some("owner".to_owned()),
+                    exec_prepared: true,
+                    plan_hash: Some(hash),
+                },
+                json: true,
+            },
+            dmuxai::board::BoardCaller::CliNonTty,
+        );
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var(dmuxai::term::policy::RUN_ID_ENV);
+            std::env::remove_var("DMUXAI_STATE_DIR");
+        }
+        assert_eq!(exec_exit, exit::OK);
+        assert_eq!(store.get(&item.id).unwrap().lane, dmuxai::board::Lane::Done);
     }
 
     // TC-3201 / FR-3201

@@ -6,10 +6,10 @@ use serde_json::{Value, json};
 
 use super::edit_plan_from_json;
 use super::{
-    AddItemRequest, BoardCaller, DecideRequest, Grade, Kind, Lane, ListFilter, OPTIONS_MAX,
-    SayRequest, TEXT_MAX, UpdateItemRequest, Verdict, WaitFilter, WaitFor, WaitOutcome,
-    resolve_actor, validate_item_id_early, validate_message, validate_new_text, validate_options,
-    validate_ref_url, validate_text_limit, wait_ready_json, wait_ready_json_any,
+    AddItemRequest, BoardCaller, Grade, Kind, Lane, ListFilter, SayRequest, TEXT_MAX,
+    UpdateItemRequest, WaitFilter, WaitFor, WaitOutcome, resolve_actor, validate_item_id_early,
+    validate_message, validate_new_text, validate_options, validate_ref_url, validate_text_limit,
+    wait_ready_json, wait_ready_json_any,
 };
 use crate::agent_api::{ApiError, exit, open_board_store};
 
@@ -121,7 +121,7 @@ pub fn invoke(workspace_root: &std::path::Path, name: &str, args: &Value) -> Val
             Ok(v) => board_ok_json(v),
             Err(e) => board_err_json(e),
         },
-        "board_decide" => match board_decide(args) {
+        "board_pending" => match board_pending(args) {
             Ok(v) => board_ok_json(v),
             Err(e) => board_err_json(e),
         },
@@ -138,6 +138,14 @@ pub fn invoke(workspace_root: &std::path::Path, name: &str, args: &Value) -> Val
             Err(e) => board_err_json(e),
         },
         "board_events" => match board_events(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
+        "board_ask" => match board_ask(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
+        "board_run" => match board_run(args) {
             Ok(v) => board_ok_json(v),
             Err(e) => board_err_json(e),
         },
@@ -326,9 +334,13 @@ fn board_plan(workspace_root: &std::path::Path, args: &Value) -> Result<Value, A
         let prompt = if let Some(prompt) = str_arg(args, "prompt") {
             super::read_path_or_stdin(prompt).map_err(ApiError::from)?
         } else {
-            super::plan::unmasked_prompt_from_item_plan(&state_root, item.plan.as_ref())
-                .map_err(ApiError::from)?
-                .unwrap_or_default()
+            super::plan::unmasked_prompt_from_item_plan(
+                &state_root,
+                store.base(),
+                item.plan.as_ref(),
+            )
+            .map_err(ApiError::from)?
+            .unwrap_or_default()
         };
         if prompt.trim().is_empty() {
             return Err(ApiError::new(
@@ -363,59 +375,13 @@ fn board_plan(workspace_root: &std::path::Path, args: &Value) -> Result<Value, A
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }
 
-fn board_decide(args: &Value) -> Result<Value, ApiError> {
-    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
-    validate_item_id_early(id).map_err(ApiError::from)?;
-    let verdict = match str_arg(args, "verdict") {
-        Some(v) => Verdict::parse(v).ok_or_else(|| usage(format!("invalid verdict '{v}'")))?,
-        None => return Err(usage("verdict is required")),
-    };
-    let text = str_arg(args, "text");
-    let option = args
-        .get("option")
-        .and_then(Value::as_u64)
-        .map(|n| n as usize);
-    let plan_hash = str_arg(args, "plan_hash");
-    match verdict {
-        Verdict::RequestChanges => {
-            let text = text
-                .filter(|t| !t.trim().is_empty())
-                .ok_or_else(|| usage("request_changes needs --text"))?;
-            validate_message(text).map_err(ApiError::from)?;
-        }
-        Verdict::Answer => {
-            if text.is_none_or(|t| t.trim().is_empty()) && option.is_none() {
-                return Err(usage("answer needs --text or --option"));
-            }
-            if let Some(text) = text {
-                validate_message(text).map_err(ApiError::from)?;
-            }
-            if let Some(idx) = option
-                && idx >= OPTIONS_MAX
-            {
-                return Err(usage("option index out of range"));
-            }
-        }
-        Verdict::Approve | Verdict::Reject => {}
-    }
-    if let Some(hash) = plan_hash {
-        validate_plan_hash_arg(hash)?;
-    }
-    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
+fn board_pending(args: &Value) -> Result<Value, ApiError> {
+    let workspace = str_arg(args, "workspace").map(PathBuf::from);
     let store = open_board_store()?;
-    let item = store
-        .decide(
-            id,
-            DecideRequest {
-                verdict,
-                text: text.map(str::to_owned),
-                option,
-                plan_hash: plan_hash.map(str::to_owned),
-                by,
-            },
-        )
+    let pending = store
+        .pending(workspace.as_deref())
         .map_err(ApiError::from)?;
-    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+    Ok(serde_json::to_value(pending).unwrap_or(Value::Null))
 }
 
 fn board_say(args: &Value) -> Result<Value, ApiError> {
@@ -521,4 +487,56 @@ fn board_wait(args: &Value) -> Result<Value, ApiError> {
         WaitOutcome::Ready { item, event } => wait_ready_json(&event, &item),
         WaitOutcome::TimedOut { version } => json!({ "timed_out": true, "version": version }),
     })
+}
+
+fn board_ask(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
+    validate_item_id_early(id).map_err(ApiError::from)?;
+    let text = str_arg(args, "text")
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| usage("text is required"))?;
+    validate_message(text).map_err(ApiError::from)?;
+    let revise = args.get("revise").and_then(Value::as_bool).unwrap_or(false);
+    let agent = str_arg(args, "agent").map(str::to_owned);
+    let model = str_arg(args, "model").map(str::to_owned);
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
+    let state_root = crate::state_path::state_base()
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
+    let store = open_board_store()?;
+    let item = super::runner::ask_item(
+        &store,
+        super::runner::AskParams {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            revise,
+            agent,
+            model,
+            by,
+            state_root,
+        },
+    )
+    .map_err(ApiError::from)?;
+    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+}
+
+fn board_run(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
+    validate_item_id_early(id).map_err(ApiError::from)?;
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
+    let state_root = crate::state_path::state_base()
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
+    let store = open_board_store()?;
+    let prepared = super::runner::run_item_prepare(
+        &store,
+        super::runner::RunParams {
+            id: id.to_owned(),
+            expected_plan_hash: None,
+            by,
+            state_root,
+        },
+    )
+    .map_err(ApiError::from)?;
+    let item =
+        super::runner::launch_detached_board_run(&store, prepared).map_err(ApiError::from)?;
+    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }

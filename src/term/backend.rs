@@ -78,6 +78,11 @@ impl PtyBackend {
         for variable in INTERNAL_ENV_VARS {
             command.env_remove(variable);
         }
+        if let Ok(run_id) = std::env::var(crate::term::policy::RUN_ID_ENV)
+            && !run_id.trim().is_empty()
+        {
+            command.env(crate::term::policy::RUN_ID_ENV, run_id);
+        }
         for (key, value) in &spec.env {
             command.env(key, value);
         }
