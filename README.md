@@ -161,6 +161,20 @@ the workspace's default routing is used. See
 [docs/API.md](docs/API.md#decision-board) for CLI, MCP, and `[board]`
 notification settings.
 
+When the owner approves an item that has an attached plan, the deciding process
+immediately starts a detached `board run` (`in_progress`) and notifies any
+configured `[board]` hook with `bot`, `verdict`, and `auto_run: true`. Set
+`[board] auto_run_on_approve = false` in your user config
+(`~/.config/dmuxai/dmuxai.toml`) to opt out (default `true`). View-only
+`dmuxai serve` never launches runs and logs `auto-run skipped: view-only dashboard`
+to the item's thread.
+
+For coordinator bots: after `board wait` returns an `approve` decision, check
+the item's `lane`; if it is already `in_progress`, the board started the run —
+do **not** call `board run` again (it would fail with a conflict). Only call
+`board run` when `auto_run_on_approve = false` or `auto_run.started` is
+`false`. Details: [docs/API.md](docs/API.md#decision-board).
+
 ### Themes and colors
 
 ![Dashboard in the light theme with a custom accent](docs/images/web-dashboard-light.png)

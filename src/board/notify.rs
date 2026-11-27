@@ -79,15 +79,35 @@ pub struct BoardNotifyEvent {
     pub lane: String,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
     pub by: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_run: Option<bool>,
     pub at_ms: u64,
 }
 
 impl BoardNotifyEvent {
     pub fn from_item(item: &BoardItem, event: &str, by: &str, at_ms: u64) -> Self {
+        let bot = item
+            .source
+            .bot
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(mask_sensitive_tokens);
+        let verdict = if event == "decision" {
+            item.decision
+                .as_ref()
+                .map(|d| d.verdict.as_str().to_owned())
+        } else {
+            None
+        };
         Self {
             schema: BOARD_EVENT_SCHEMA,
             event: event.to_owned(),
@@ -95,11 +115,28 @@ impl BoardNotifyEvent {
             title: mask_sensitive_tokens(&item.title),
             lane: item.lane.as_str().to_owned(),
             kind: item.kind.as_str().to_owned(),
+            bot,
             workspace_path: item.workspace.path.as_deref().map(mask_sensitive_tokens),
             by: mask_sensitive_tokens(by),
             plan_hash: item.plan.as_ref().map(|p| p.hash.clone()),
+            verdict,
+            auto_run: None,
             at_ms,
         }
+    }
+
+    pub fn from_item_with_auto_run(
+        item: &BoardItem,
+        event: &str,
+        by: &str,
+        at_ms: u64,
+        auto_run: bool,
+    ) -> Self {
+        let mut payload = Self::from_item(item, event, by, at_ms);
+        if event == "decision" && auto_run {
+            payload.auto_run = Some(true);
+        }
+        payload
     }
 }
 
@@ -130,7 +167,39 @@ pub fn dispatch_board_event_with_settings(
     }
     let at_ms = now_ms();
     let payload = BoardNotifyEvent::from_item(item, event, by, at_ms);
-    let body = match serde_json::to_string(&payload) {
+    spawn_notify_delivery(board_base, item, at_ms, &payload, settings);
+}
+
+/// Dispatch a `decision` notification, optionally setting `auto_run: true` when
+/// owner approval started a detached run (SPEC-board-approve-autorun FR-3231).
+pub fn dispatch_decision_event(board_base: &Path, item: &BoardItem, by: &str, auto_run: bool) {
+    let settings = BoardSettings::load_user_only();
+    dispatch_decision_event_with_settings(board_base, item, by, auto_run, &settings);
+}
+
+pub fn dispatch_decision_event_with_settings(
+    board_base: &Path,
+    item: &BoardItem,
+    by: &str,
+    auto_run: bool,
+    settings: &BoardSettings,
+) {
+    if !settings.has_notify_target() || !settings.allows_event("decision") {
+        return;
+    }
+    let at_ms = now_ms();
+    let payload = BoardNotifyEvent::from_item_with_auto_run(item, "decision", by, at_ms, auto_run);
+    spawn_notify_delivery(board_base, item, at_ms, &payload, settings);
+}
+
+fn spawn_notify_delivery(
+    board_base: &Path,
+    item: &BoardItem,
+    at_ms: u64,
+    payload: &BoardNotifyEvent,
+    settings: &BoardSettings,
+) {
+    let body = match serde_json::to_string(payload) {
         Ok(json) => json,
         Err(_) => return,
     };
@@ -401,5 +470,143 @@ mod tests {
             }
         }
         assert_eq!(before, after, "no notifier thread should spawn");
+    }
+
+    // TC-3231 / FR-3231: decision notify payload carries masked bot, verdict, and optional auto_run.
+    #[test]
+    fn tc_3231_decision_notify_payload_has_bot_verdict_and_auto_run() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        std::fs::create_dir_all(xdg_cfg.join("dmuxai")).unwrap();
+        ensure_dir(&board_base).unwrap();
+
+        let out_file = dir.path().join("decision-notify.jsonl");
+        let script = dir.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
+                out_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        std::fs::write(
+            xdg_cfg.join("dmuxai").join("dmuxai.toml"),
+            format!("[board]\nnotify_command = [\"{}\"]\n", script.display()),
+        )
+        .unwrap();
+
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg) };
+
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "Wake bot".to_owned(),
+                summary: "secret summary sk-summary-hidden-123".to_owned(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coordinator sk-bot-secret-999".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(dir.path().to_path_buf()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coordinator".to_owned(),
+                state_root: state,
+            })
+            .unwrap();
+        store
+            .say(
+                &item.id,
+                crate::board::SayRequest {
+                    text: "private thread body".to_owned(),
+                    from: "bot:coordinator".to_owned(),
+                },
+            )
+            .unwrap();
+
+        let decided = store
+            .decide_without_notify(
+                &item.id,
+                crate::board::DecideRequest {
+                    verdict: crate::board::Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        dispatch_decision_event(&board_base, &decided, "owner", true);
+
+        // Also verify request_changes without auto_run omits auto_run and keeps verdict.
+        let req_changes = store
+            .decide_without_notify(
+                &item.id,
+                crate::board::DecideRequest {
+                    verdict: crate::board::Verdict::RequestChanges,
+                    text: Some("revise step 1".to_owned()),
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        dispatch_decision_event(&board_base, &req_changes, "owner", false);
+
+        wait_for_pending(Duration::from_secs(5));
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let raw = std::fs::read_to_string(&out_file).expect("notify output should exist");
+        let events: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .filter(|v| v["item_id"] == item.id)
+            .collect();
+        let item_serialized = serde_json::to_string(&events).unwrap();
+        assert!(!item_serialized.contains("sk-bot-secret-999"));
+        assert!(!item_serialized.contains("sk-summary-hidden-123"));
+        assert!(!item_serialized.contains("private thread body"));
+
+        let needs_ev = events
+            .iter()
+            .find(|v| v["event"] == "needs_decision")
+            .expect("needs_decision event");
+        assert!(needs_ev["bot"].as_str().unwrap().contains("coordinator"));
+        assert!(needs_ev.get("verdict").is_none());
+        assert!(needs_ev.get("auto_run").is_none());
+
+        let approve_ev = events
+            .iter()
+            .find(|v| v["event"] == "decision" && v["verdict"] == "approve")
+            .expect("approve decision event");
+        assert!(approve_ev["bot"].as_str().unwrap().contains("coordinator"));
+        assert_eq!(approve_ev["auto_run"], true);
+
+        let changes_ev = events
+            .iter()
+            .find(|v| v["event"] == "decision" && v["verdict"] == "request_changes")
+            .expect("request_changes decision event");
+        assert_eq!(changes_ev["verdict"], "request_changes");
+        assert!(changes_ev.get("auto_run").is_none());
     }
 }

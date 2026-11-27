@@ -1013,6 +1013,23 @@ function boardCheckItem(id) {
     .catch(function () { /* ignore */ });
 }
 
+function boardShowDecisionNotice(autoRun) {
+  var text = 'Approved';
+  if (autoRun && autoRun.started) {
+    text = 'Approved — run started';
+  } else if (autoRun && autoRun.reason) {
+    text = 'Approved — auto-run skipped: ' + autoRun.reason;
+  }
+  var el = document.getElementById('board-notice');
+  if (el) {
+    el.textContent = text;
+    el.hidden = false;
+  }
+  if (typeof window.showMsg === 'function') {
+    window.showMsg(text, false);
+  }
+}
+
 function boardDecide(id, verdict, extra) {
   extra = extra || {};
   var body = { verdict: verdict };
@@ -1023,8 +1040,11 @@ function boardDecide(id, verdict, extra) {
     body.plan_hash = src.plan.hash;
   }
   return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/decision', body, true)
-    .then(function () {
+    .then(function (data) {
       boardPlanConflict = false;
+      if (verdict === 'approve') {
+        boardShowDecisionNotice(data && data.auto_run);
+      }
       boardRefreshList();
     })
     .catch(function (err) {

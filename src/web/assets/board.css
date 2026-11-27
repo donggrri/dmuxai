@@ -499,6 +499,10 @@ body.board-modal-open {
   color: var(--error-text);
 }
 
+.board-notice[hidden] {
+  display: none !important;
+}
+
 @media (max-width: 900px) {
   .board-drawer-wrap {
     padding: 8px;

@@ -128,9 +128,14 @@ impl<'de> serde::Deserialize<'de> for UnknownBoardKey {
     }
 }
 
-/// User-config `[board]` settings (SPEC-decision-board FR-3131). Read only from
-/// the user config, never from a workspace's `dmuxai.toml`.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+fn default_board_true() -> bool {
+    true
+}
+
+/// User-config `[board]` settings (SPEC-decision-board FR-3131,
+/// SPEC-board-approve-autorun OQ-3231). Read only from the user config, never
+/// from a workspace's `dmuxai.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BoardSettings {
     #[serde(default)]
     pub planner: Option<String>,
@@ -142,8 +147,24 @@ pub struct BoardSettings {
     pub notify_webhook_secret_env: Option<String>,
     #[serde(default)]
     pub notify_events: Option<Vec<String>>,
+    #[serde(default = "default_board_true")]
+    pub auto_run_on_approve: bool,
     #[serde(flatten)]
     pub extra: BTreeMap<String, UnknownBoardKey>,
+}
+
+impl Default for BoardSettings {
+    fn default() -> Self {
+        Self {
+            planner: None,
+            notify_command: None,
+            notify_webhook_url: None,
+            notify_webhook_secret_env: None,
+            notify_events: None,
+            auto_run_on_approve: true,
+            extra: BTreeMap::new(),
+        }
+    }
 }
 
 impl BoardSettings {
@@ -6669,11 +6690,13 @@ notify_webhook_url = "ftp://bad"
             notify_webhook_url: Some("ftp://invalid".to_owned()),
             notify_webhook_secret_env: None,
             notify_events: Some(vec!["bogus".to_owned()]),
+            auto_run_on_approve: true,
             extra: BTreeMap::new(),
         };
         let warnings = bad_board.validate();
         assert_eq!(warnings.len(), 4, "warnings: {warnings:?}");
         assert!(!bad_board.has_notify_target());
+        assert!(settings.board.auto_run_on_approve);
 
         let env = RuntimeEnv {
             xdg_config_home: Some(user_dir.clone()),
@@ -6685,6 +6708,22 @@ notify_webhook_url = "ftp://bad"
         let loaded = BoardSettings::load_user_only_with_env(&env);
         assert_eq!(loaded.planner.as_deref(), Some("codex:gpt-5.4"));
         assert!(loaded.has_notify_target());
+        assert!(loaded.auto_run_on_approve);
+
+        // OQ-3231: `[board] auto_run_on_approve = false` from user config overrides default true;
+        // workspace `[board] auto_run_on_approve = false` is ignored.
+        std::fs::write(&user_cfg, "[board]\nauto_run_on_approve = false\n").unwrap();
+        let opt_out = DmuxSettings::load_with_user_config(&ws, Some(&user_cfg));
+        assert!(!opt_out.board.auto_run_on_approve);
+
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[board]\nauto_run_on_approve = false\n",
+        )
+        .unwrap();
+        let ws_ignored =
+            DmuxSettings::load_with_user_config(&ws, Some(&dir.path().join("missing.toml")));
+        assert!(ws_ignored.board.auto_run_on_approve);
     }
 
     // TC-3202 / FR-3202

@@ -2598,6 +2598,9 @@ mod tests {
         assert!(BOARD_JS.contains("To check"));
         assert!(BOARD_JS.contains("board-mark-checked"));
         assert!(BOARD_JS.contains("/check"));
+        assert!(INDEX_HTML.contains("id=\"board-notice\""));
+        assert!(BOARD_JS.contains("Approved — run started"));
+        assert!(BOARD_JS.contains("Approved — auto-run skipped: "));
     }
 
     // TC-3412 (FR-3412, FR-3413)

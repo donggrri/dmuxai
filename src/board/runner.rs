@@ -495,7 +495,6 @@ pub fn ask_item_execute(
         guard,
         params,
     } = prepared;
-    let _guard = guard;
     let ws_str = workspace.to_string_lossy().into_owned();
     let timeout = child_timeout();
 
@@ -529,6 +528,8 @@ pub fn ask_item_execute(
         };
         let masked = mask_sensitive_tokens(&raw_answer);
         let answer: String = masked.chars().take(TEXT_MAX).collect();
+        // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
+        drop(guard);
         return store.say(
             &params.id,
             SayRequest {
@@ -560,6 +561,8 @@ pub fn ask_item_execute(
         let rev = updated.plan.as_ref().map(|p| p.revision).unwrap_or(0);
         let steps = updated.plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
         let msg = format!("Revised plan to revision {rev} ({new_hash}, {steps} steps).");
+        // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
+        drop(guard);
         return store.say(
             &params.id,
             SayRequest {
@@ -579,6 +582,8 @@ pub fn ask_item_execute(
         msg.push(' ');
         msg.push_str(&clipped);
     }
+    // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
+    drop(guard);
     store.say(
         &params.id,
         SayRequest {
@@ -808,6 +813,92 @@ pub fn launch_detached_board_run(
             let msg = format!("failed to spawn detached board run: {e}");
             let _ = store.record_run_result(&prepared.item.id, None, 1, Some(&msg), &prepared.by);
             Err(BoardError::Internal(msg))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AutoRunOutcome {
+    pub started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AutoRunOutcome {
+    pub fn not_started() -> Self {
+        Self {
+            started: false,
+            reason: None,
+        }
+    }
+}
+
+/// Start a detached `board run` immediately after an owner `approve` decision
+/// when the item has a plan, `[board] auto_run_on_approve` is enabled, and
+/// launching is allowed (SPEC-board-approve-autorun FR-3232..FR-3235, NFR-3230).
+/// Never writes a `decision` or `checked` record and never moves into
+/// `approved` or `rejected`.
+pub fn auto_run_after_owner_approve(
+    store: &BoardStore,
+    item: &BoardItem,
+    state_root: &Path,
+    launch_allowed: bool,
+) -> AutoRunOutcome {
+    let Some(decision) = item.decision.as_ref() else {
+        return AutoRunOutcome::not_started();
+    };
+    if decision.verdict != Verdict::Approve || decision.by != "owner" {
+        return AutoRunOutcome::not_started();
+    }
+    if item.plan.is_none() {
+        return AutoRunOutcome::not_started();
+    }
+    let settings = BoardSettings::load_user_only();
+    if !settings.auto_run_on_approve {
+        return AutoRunOutcome {
+            started: false,
+            reason: Some("auto_run_on_approve is false".to_owned()),
+        };
+    }
+    if !launch_allowed {
+        let reason = "view-only dashboard".to_owned();
+        let _ = store.append_run_message(&item.id, &format!("auto-run skipped: {reason}"));
+        return AutoRunOutcome {
+            started: false,
+            reason: Some(reason),
+        };
+    }
+    let prepared = match run_item_prepare(
+        store,
+        RunParams {
+            id: item.id.clone(),
+            expected_plan_hash: decision.plan_hash.clone(),
+            by: "owner".to_owned(),
+            state_root: state_root.to_path_buf(),
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let reason = mask_sensitive_tokens(&err.to_string());
+            let _ = store.append_run_message(&item.id, &format!("auto-run skipped: {reason}"));
+            return AutoRunOutcome {
+                started: false,
+                reason: Some(reason),
+            };
+        }
+    };
+    match launch_detached_board_run(store, prepared) {
+        Ok(_) => AutoRunOutcome {
+            started: true,
+            reason: None,
+        },
+        Err(err) => {
+            let reason = mask_sensitive_tokens(&err.to_string());
+            let _ = store.append_run_message(&item.id, &format!("auto-run skipped: {reason}"));
+            AutoRunOutcome {
+                started: false,
+                reason: Some(reason),
+            }
         }
     }
 }
@@ -1475,5 +1566,407 @@ exit 0
             Err(err) => err,
         };
         assert_eq!(err.exit_code(), crate::agent_api::exit::CONFLICT);
+    }
+
+    // TC-3233 / FR-3233: auto-run is only triggered from owner approve paths, never by
+    // non-approve verdicts, non-owner decisions, no-plan items, say/ask/plan/move/update/rules/MCP.
+    #[test]
+    fn tc_3233_auto_run_only_from_owner_approve_paths() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&xdg_cfg).unwrap();
+        ensure_dir(&board).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("DMUXAI_STATE_DIR");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg);
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+        }
+
+        let store = BoardStore::open(board.clone()).unwrap();
+        let (_, hash) =
+            edit_plan_from_json(&ws, &state, "ship", &sample_plan_json(), None).unwrap();
+
+        // 1. Item without a plan approved by owner -> not started, no side effects.
+        let no_plan = store
+            .add(AddItemRequest {
+                title: "no plan".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let decided_no_plan = store
+            .decide_without_notify(
+                &no_plan.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let outcome = auto_run_after_owner_approve(&store, &decided_no_plan, &state, true);
+        assert_eq!(outcome, AutoRunOutcome::not_started());
+        assert_eq!(store.get(&no_plan.id).unwrap().lane, Lane::Approved);
+        assert!(!BoardLockGuard::is_active(&board, "runs", &no_plan.id));
+
+        // 2. Non-approve verdicts (reject, request_changes, answer) -> not started, no side effects.
+        let item = store
+            .add(AddItemRequest {
+                title: "feature".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec!["optA".to_owned()],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        for req in [
+            DecideRequest {
+                verdict: Verdict::RequestChanges,
+                text: Some("fix step".to_owned()),
+                option: None,
+                plan_hash: Some(hash.clone()),
+                by: "owner".to_owned(),
+            },
+            DecideRequest {
+                verdict: Verdict::Answer,
+                text: None,
+                option: Some(0),
+                plan_hash: Some(hash.clone()),
+                by: "owner".to_owned(),
+            },
+            DecideRequest {
+                verdict: Verdict::Reject,
+                text: None,
+                option: None,
+                plan_hash: Some(hash.clone()),
+                by: "owner".to_owned(),
+            },
+        ] {
+            let decided = store.decide_without_notify(&item.id, req).unwrap();
+            let before_thread = decided.thread.len();
+            let outcome = auto_run_after_owner_approve(&store, &decided, &state, true);
+            assert_eq!(outcome, AutoRunOutcome::not_started());
+            assert_eq!(store.get(&item.id).unwrap().thread.len(), before_thread);
+            assert!(!BoardLockGuard::is_active(&board, "runs", &item.id));
+        }
+
+        // 3. Non-owner decision struct -> refused without side effects.
+        let mut forged = store.get(&item.id).unwrap();
+        forged.lane = Lane::Approved;
+        forged.decision = Some(crate::board::Decision {
+            verdict: Verdict::Approve,
+            text: None,
+            option: None,
+            plan_hash: Some(hash.clone()),
+            by: "bot:coord".to_owned(),
+            at_ms: 1,
+        });
+        assert_eq!(
+            auto_run_after_owner_approve(&store, &forged, &state, true),
+            AutoRunOutcome::not_started()
+        );
+        assert!(!BoardLockGuard::is_active(&board, "runs", &item.id));
+
+        // 4. say, ask, plan, move, update, rules, and MCP paths leave lane/locks untouched
+        //    and never write a decision or checked record.
+        store
+            .move_lane(&item.id, Lane::NeedsDecision, "owner", None)
+            .unwrap();
+        let approved = store
+            .decide_without_notify(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(approved.lane, Lane::Approved);
+
+        store
+            .say(
+                &item.id,
+                SayRequest {
+                    text: "note".to_owned(),
+                    from: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.get(&item.id).unwrap().lane, Lane::Approved);
+        assert!(!BoardLockGuard::is_active(&board, "runs", &item.id));
+
+        let fake_ask = write_fake_runner(
+            dir.path(),
+            "fake-ask.sh",
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"text\":\"answer\"}\\n'\nexit 0\n",
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_ask) };
+        ask_item(
+            &store,
+            AskParams {
+                id: item.id.clone(),
+                text: "question".to_owned(),
+                revise: false,
+                agent: None,
+                model: None,
+                by: "owner".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        assert_eq!(store.get(&item.id).unwrap().lane, Lane::Approved);
+        assert!(!BoardLockGuard::is_active(&board, "runs", &item.id));
+
+        // MCP paths (add, say, update, move, plan) and unknown board_decide never auto-run.
+        let mcp_decide = crate::board::mcp_invoke(
+            &ws,
+            "board_decide",
+            &serde_json::json!({ "id": item.id, "verdict": "approve" }),
+        );
+        assert_eq!(mcp_decide["ok"], false);
+        let mcp_say = crate::board::mcp_invoke(
+            &ws,
+            "board_say",
+            &serde_json::json!({ "id": item.id, "text": "from mcp" }),
+        );
+        assert_eq!(mcp_say["ok"], true);
+        assert_eq!(store.get(&item.id).unwrap().lane, Lane::Approved);
+        assert!(!BoardLockGuard::is_active(&board, "runs", &item.id));
+
+        // Attaching a new plan clears decision and moves back to needs_decision, never auto-runs.
+        let (_, hash2) =
+            edit_plan_from_json(&ws, &state, "ship v2", &sample_plan_json(), None).unwrap();
+        let mcp_plan = crate::board::mcp_invoke(
+            &ws,
+            "board_plan",
+            &serde_json::json!({ "id": item.id, "hash": hash2 }),
+        );
+        assert_eq!(mcp_plan["ok"], true);
+        let after_plan = store.get(&item.id).unwrap();
+        assert_eq!(after_plan.lane, Lane::NeedsDecision);
+        assert!(after_plan.decision.is_none());
+        assert!(after_plan.checked.is_none());
+        assert!(!BoardLockGuard::is_active(&board, "runs", &item.id));
+
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_state {
+                Some(v) => std::env::set_var("DMUXAI_STATE_DIR", v),
+                None => std::env::remove_var("DMUXAI_STATE_DIR"),
+            }
+        }
+    }
+
+    // TC-3234 / FR-3234: auto-run keeps every FR-3133 check; on plan change, active ask/run lock,
+    // missing workspace, or wrong lane it skips with a masked `run` thread message and never starts.
+    #[test]
+    fn tc_3234_auto_run_skipped_when_plan_changed_or_busy() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&xdg_cfg).unwrap();
+        ensure_dir(&board).unwrap();
+
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg) };
+
+        let store = BoardStore::open(board.clone()).unwrap();
+        let (_, hash1) =
+            edit_plan_from_json(&ws, &state, "ship 1", &sample_plan_json(), None).unwrap();
+        let (_, hash2) =
+            edit_plan_from_json(&ws, &state, "ship 2", &sample_plan_json(), None).unwrap();
+
+        let item = store
+            .add(AddItemRequest {
+                title: "skip cases".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash1.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let approved = store
+            .decide_without_notify(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash1),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+
+        // 1. Active ask lock -> skipped with `run` message, lane remains approved.
+        {
+            let _ask_lock = BoardLockGuard::acquire(&board, "asks", &item.id, "asking").unwrap();
+            let outcome = auto_run_after_owner_approve(&store, &approved, &state, true);
+            assert!(!outcome.started);
+            let reason = outcome.reason.expect("expected skip reason");
+            assert!(reason.contains("ask"), "reason: {reason}");
+            let cur = store.get(&item.id).unwrap();
+            assert_eq!(cur.lane, Lane::Approved);
+            let last = cur.thread.last().unwrap();
+            assert_eq!(last.from, "run");
+            assert!(last.text.starts_with("auto-run skipped: "));
+        }
+
+        // 2. Active run lock -> skipped with `run` message, lane remains approved.
+        {
+            let _run_lock = BoardLockGuard::acquire(&board, "runs", &item.id, "running").unwrap();
+            let outcome = auto_run_after_owner_approve(&store, &approved, &state, true);
+            assert!(!outcome.started);
+            let reason = outcome.reason.expect("expected skip reason");
+            assert!(reason.contains("run"), "reason: {reason}");
+            let cur = store.get(&item.id).unwrap();
+            assert_eq!(cur.lane, Lane::Approved);
+            assert!(
+                cur.thread
+                    .last()
+                    .unwrap()
+                    .text
+                    .starts_with("auto-run skipped: ")
+            );
+        }
+
+        // 3. Plan changed after decision -> skipped with `run` message.
+        store
+            .attach_plan(&item.id, &hash2, &state, "bot:coord")
+            .unwrap();
+        let outcome = auto_run_after_owner_approve(&store, &approved, &state, true);
+        assert!(!outcome.started);
+        assert!(outcome.reason.is_some());
+        let cur = store.get(&item.id).unwrap();
+        assert_ne!(cur.lane, Lane::InProgress);
+        assert!(
+            cur.thread
+                .last()
+                .unwrap()
+                .text
+                .starts_with("auto-run skipped: ")
+        );
+        assert!(cur.checked.is_none());
+
+        // 4. Item without workspace -> skipped and secrets in path/reason are masked.
+        let no_ws_item = store
+            .add(AddItemRequest {
+                title: "no ws".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: None,
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash2.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let no_ws_approved = store
+            .decide_without_notify(
+                &no_ws_item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash2),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let outcome = auto_run_after_owner_approve(&store, &no_ws_approved, &state, true);
+        assert!(!outcome.started);
+        let reason = outcome.reason.expect("expected skip reason");
+        assert!(reason.contains("workspace"), "reason: {reason}");
+        let cur_no_ws = store.get(&no_ws_item.id).unwrap();
+        assert_eq!(cur_no_ws.lane, Lane::Approved);
+        assert!(
+            cur_no_ws
+                .thread
+                .last()
+                .unwrap()
+                .text
+                .starts_with("auto-run skipped: ")
+        );
+
+        // Masking check on `append_run_message`: sensitive tokens in reason are masked.
+        let masked = store
+            .append_run_message(
+                &no_ws_item.id,
+                "auto-run skipped: bad token sk-secret-token-12345",
+            )
+            .unwrap();
+        assert!(
+            !masked
+                .thread
+                .last()
+                .unwrap()
+                .text
+                .contains("sk-secret-token-12345")
+        );
+
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
     }
 }

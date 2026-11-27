@@ -947,6 +947,20 @@ impl BoardStore {
     }
 
     pub fn decide(&self, id: &str, req: DecideRequest) -> Result<BoardItem, BoardError> {
+        let by = req.by.clone();
+        let item = self.decide_without_notify(id, req)?;
+        super::notify::dispatch_decision_event(&self.base, &item, &by, false);
+        Ok(item)
+    }
+
+    /// Record a decision and append `EventKind::Decision` to `events.jsonl`
+    /// without dispatching `[board]` notify yet (used when owner approval
+    /// attempts auto-run first so notify can carry `auto_run: true`).
+    pub fn decide_without_notify(
+        &self,
+        id: &str,
+        req: DecideRequest,
+    ) -> Result<BoardItem, BoardError> {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
@@ -955,7 +969,7 @@ impl BoardStore {
                 "only the owner may record decisions".to_owned(),
             ));
         }
-        let item = self.with_lock(|store| {
+        self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if matches!(req.verdict, Verdict::Approve)
                 && let Some(plan) = &item.plan
@@ -1029,9 +1043,33 @@ impl BoardStore {
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Decision, item.version, &req.by)?;
             Ok(item)
-        })?;
-        super::notify::dispatch_board_event(&self.base, &item, "decision", &req.by);
-        Ok(item)
+        })
+    }
+
+    /// Append a masked `run` thread message without changing the item's lane or
+    /// writing a decision/checked record (SPEC-board-approve-autorun FR-3234, FR-3235).
+    pub fn append_run_message(&self, id: &str, text: &str) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        let masked = crate::run_journal::mask_sensitive_tokens(text);
+        let msg: String = masked.chars().take(super::TEXT_MAX).collect();
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if item.thread.len() >= THREAD_MAX {
+                item.thread.remove(0);
+            }
+            item.thread.push(ThreadMessage {
+                from: "run".to_owned(),
+                text: msg,
+                at_ms: now_ms(),
+            });
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            store.append_event(id, EventKind::Message, item.version, "run")?;
+            Ok(item)
+        })
     }
 
     pub fn say(&self, id: &str, req: SayRequest) -> Result<BoardItem, BoardError> {
@@ -2204,5 +2242,154 @@ mod tests {
             .move_lane(&i_done.id, Lane::Done, "bot:coord", None)
             .unwrap();
         assert!(re_done.checked.is_none());
+    }
+
+    // TC-3230 / FR-3230: owner decision appends decision event before return so blocked wait
+    // and wait --any wake within <= 1 s (assert <= 1.5 s for scheduler jitter).
+    #[test]
+    fn tc_3230_owner_decision_wakes_blocked_wait_within_one_second() {
+        let (_dir, store, state) = test_store();
+        let item = store
+            .add(AddItemRequest {
+                title: "wake wait".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coordinator".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: None,
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coordinator".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+
+        let store_wait = BoardStore::open(store.base().to_path_buf()).unwrap();
+        let id = item.id.clone();
+        let handle = thread::spawn(move || {
+            store_wait
+                .wait(
+                    &id,
+                    WaitFilter {
+                        since_version: item.version,
+                        timeout_secs: 10,
+                        wait_for: WaitFor::Decision,
+                        waiter: "bot:coordinator".to_owned(),
+                    },
+                )
+                .unwrap()
+        });
+
+        thread::sleep(Duration::from_millis(150));
+        let decided_at = Instant::now();
+        store
+            .decide(
+                &item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+
+        match handle.join().unwrap() {
+            WaitOutcome::Ready { item: got, event } => {
+                let wake_elapsed = decided_at.elapsed();
+                assert!(
+                    wake_elapsed <= Duration::from_millis(1500),
+                    "blocked wait took {:?} after decide",
+                    wake_elapsed
+                );
+                assert_eq!(event.kind, "decision");
+                assert_eq!(event.by, "owner");
+                assert_eq!(
+                    got.decision.as_ref().map(|d| d.verdict),
+                    Some(Verdict::Approve)
+                );
+            }
+            WaitOutcome::TimedOut { .. } => panic!("expected wait to wake on decision"),
+        }
+
+        // wait_any --for decision likewise wakes within <= 1.5 s.
+        let item2 = store
+            .add(AddItemRequest {
+                title: "wake wait_any".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coordinator".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: None,
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coordinator".to_owned(),
+                state_root: state,
+            })
+            .unwrap();
+        let since_seq = store
+            .list_events(0)
+            .unwrap()
+            .last()
+            .map(|e| e.seq)
+            .unwrap_or(0);
+        let store_any = BoardStore::open(store.base().to_path_buf()).unwrap();
+        let handle_any = thread::spawn(move || {
+            store_any
+                .wait_any(
+                    since_seq,
+                    WaitFilter {
+                        since_version: 0,
+                        timeout_secs: 10,
+                        wait_for: WaitFor::Decision,
+                        waiter: "bot:coordinator".to_owned(),
+                    },
+                )
+                .unwrap()
+        });
+
+        thread::sleep(Duration::from_millis(150));
+        let decided_any_at = Instant::now();
+        store
+            .decide(
+                &item2.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+
+        match handle_any.join().unwrap() {
+            Some((event, got)) => {
+                let wake_elapsed = decided_any_at.elapsed();
+                assert!(
+                    wake_elapsed <= Duration::from_millis(1500),
+                    "blocked wait_any took {:?} after decide",
+                    wake_elapsed
+                );
+                assert_eq!(event.item_id, item2.id);
+                assert_eq!(event.kind, "decision");
+                assert_eq!(
+                    got.decision.as_ref().map(|d| d.verdict),
+                    Some(Verdict::Approve)
+                );
+            }
+            None => panic!("expected wait_any to wake on decision"),
+        }
     }
 }
