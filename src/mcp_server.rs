@@ -328,6 +328,28 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "board_session",
+            "description": "Read-only work session of a decision board item: session links, the latest run's conversation and its provider binding agents and statuses.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_link",
+            "description": "Link an existing run (from the item's workspace run journal) to a decision board item as a run session link.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id", "run_id"]
+            }
+        },
+        {
             "name": "runs_list",
             "description": "List this workspace's recorded runs newest first (same fields as GET /api/runs: run_id, origin, status, runner/model, created_at_ms, elapsed_ms, exit code, error_kind, graph_id, stale, stalled).",
             "inputSchema": {
@@ -552,6 +574,8 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_events",
                 "board_ask",
                 "board_run",
+                "board_session",
+                "board_link",
                 "runs_list",
                 "runs_show",
             ];
@@ -739,6 +763,8 @@ mod tests {
             ),
             ("board_prompt", &["id", "hash"]),
             ("board_events", &["since"]),
+            ("board_session", &["id"]),
+            ("board_link", &["id", "run_id", "by"]),
         ];
         let ok_call = call(
             &stub,

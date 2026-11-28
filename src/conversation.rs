@@ -2942,6 +2942,41 @@ pub fn list_repo_db_conversations(
         .collect()
 }
 
+/// Read-only provider binding agents and statuses of one conversation
+/// (SPEC-board-work-session FR-3823). Never selects `provider_session_id`,
+/// never creates or migrates the database; `Ok(None)` when the file is missing
+/// or its schema is unknown.
+pub fn read_binding_statuses(
+    db_path: &Path,
+    conversation_id: &str,
+) -> Result<Option<Vec<(String, BindingStatus)>>, ConversationError> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_millis(250))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        return Ok(None);
+    }
+    let mut stmt = connection.prepare(
+        "SELECT agent, status FROM provider_bindings WHERE conversation_id = ?1 ORDER BY agent",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| {
+        let agent: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        Ok((agent, BindingStatus::from_db(&status)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(Some(out))
+}
+
 /// Read-only transcript loader for a single conversation in a repo database (FR-2982).
 /// Opens SQLite read-only and never runs migrations.
 pub fn read_repo_conversation_snapshot(

@@ -438,6 +438,8 @@ Tools (`tools/list`):
 | `board_prompt` | `id`, optional `hash` | `{prompt}` unmasked text from `graph-pending/` |
 | `board_ask` | `id`, `text` (required); `revise`, `agent`, `model`, `by` | Item with planner answer or revised plan (blocks up to 900 s) |
 | `board_run` | `id` (required); `by` | `in_progress` item (detached; records run id and moves to `done`/`unknown` on exit) |
+| `board_session` | `id` | Read-only `{item_id, work_session, sessions, bindings, warning?}`; `bindings` are `{agent, status}` only |
+| `board_link` | `id`, `run_id` (required); `by` | Item with a `run` session link read from that run's manifest (unknown run → exit 3) |
 | `runs_list` | `status` (string or array of run statuses), `limit` (1–200, default 50) | `{runs}` like `dmuxai runs list --json`; invalid status or limit → `exit_code: 2` |
 | `runs_show` | `run_id` (required), `progress` (0–200, default 50) | `{run, manifest, graph, approval, progress}` like `GET /api/runs/{id}`; unknown run → `exit_code: 3`, invalid id → `exit_code: 2` |
 
@@ -478,7 +480,23 @@ Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
 (`--if-version`), `plan`, `prompt`, `decide`, `check` (`--text`), `pending`
 (`--workspace`), `say`, `wait`, `events`, `rules`, `ask` (`--text`, `--revise`,
-`--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
+`--agent`, `--model`, `--by`), `run` (`--detach`, `--by`), `session`, `link`
+(`--run-id`).
+
+Work sessions ([SPEC-board-work-session](specs/SPEC-board-work-session.md)):
+every item has `sessions`, a list (at most 50, oldest dropped) of links to
+where its board runs and asks did their work: `{kind: "run"|"ask", run_id?,
+conversation_id?, graph_id?, workspace_path, agent?, model?, status, exit_code?,
+started_ms, ended_ms?, md_paths[]}`. `status` is `running` while the child runs,
+then `completed`, `failed`, `cancelled` or `awaiting_approval`. `md_paths` lists
+up to 50 workspace-relative `.md` files whose `git status` changed during a run
+(empty outside git). `dmuxai board session <id> [--json]` prints the work session
+(the latest `run` link with a conversation) and, read from the workspace
+conversation database without creating or migrating it, each provider binding's
+`agent` and `status` (`active`/`stale`) — never the provider session id. A
+missing workspace or database gives `bindings: []` and a `warning`.
+`dmuxai board link <id> --run-id R` adds a `run` link from run `R`'s manifest in
+the item's workspace (unknown run → exit `3`, invalid id → exit `2`).
 Approval is **always human-only**: `decide` (every verdict, in every lane),
 `check`, `move` into `auto`, and `rules --set` require `owner` (dashboard browser
 request, or CLI with stdin and stdout on a TTY, `DMUXAI_RUN_ID` unset, and typed
@@ -538,6 +556,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
 | GET | `/api/board/pending` | `?workspace=` | `200` `{items, count}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| GET | `/api/board/{id}/session` | — | `200` `{item_id, work_session, sessions, bindings, warning?}` (read-only) | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item + `auto_run` | 400, 401, 403, 404, 409, 422 |
 | POST | `/api/board/{id}/check` | `{text?}` (human headers required) | `200` item | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
@@ -563,6 +582,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | --- | --- | --- | --- | --- |
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| GET | `/api/board/{id}/session` | — | `200` `{item_id, work_session, sessions, bindings, warning?}` (read-only) | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` | `200` item | 400, 401, 403, 404, 409, 422 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |

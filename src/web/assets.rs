@@ -2566,6 +2566,42 @@ mod tests {
         assert!(INDEX_HTML.contains("/assets/board.css"));
     }
 
+    // TC-3825 / FR-3825: the board modal renders a "Work session" section
+    // (newest first) with Run, Graph, Open in Chat (--web only) and MD links,
+    // built with textContent and href-less buttons so no token leaks into a link.
+    #[test]
+    fn tc_3825_board_work_session_section() {
+        let start = BOARD_JS
+            .find("function boardRenderWorkSession")
+            .expect("work session renderer");
+        let end = BOARD_JS[start..]
+            .find("\nfunction boardRenderDrawer")
+            .map(|i| start + i)
+            .expect("renderer end");
+        let section = &BOARD_JS[start..end];
+        assert!(section.contains("'Work session'"));
+        assert!(section.contains("item.sessions.slice().reverse()"));
+        assert!(section.contains("'Run'") && section.contains("window.dmuxaiOpenRun"));
+        assert!(section.contains("'Graph'") && section.contains("window.dmuxaiShowGraphRun"));
+        assert!(section.contains("'Open in Chat'"));
+        assert!(section.contains("link.conversation_id && boardLaunchAllowed"));
+        assert!(section.contains("if (link.run_id)") && section.contains("if (link.graph_id)"));
+        assert!(section.contains("window.dmuxaiOpenMdViewer"));
+        assert!(section.contains("boardAgeMs("));
+        for forbidden in ["innerHTML", "insertAdjacentHTML", "href", "token"] {
+            assert!(
+                !section.contains(forbidden),
+                "work session uses {forbidden}"
+            );
+        }
+        assert!(BOARD_JS.contains("boardRenderWorkSession(drawer, item);"));
+        assert!(BOARD_JS.contains("prepare_open_conversation"));
+        assert!(BOARD_JS.contains("switcher(workspace, { conversation: conversation })"));
+        assert!(RUNS_JS.contains("window.dmuxaiOpenRun = function"));
+        assert!(BOARD_CSS.contains(".board-work-session-list"));
+        assert!(BOARD_CSS.contains(".board-session-link"));
+    }
+
     // TC-3123 / FR-3123: drawer plan edit, chat, stale approve notice.
     #[test]
     fn tc_3123_board_drawer_plan_edit_chat_and_stale_approve_conflict() {

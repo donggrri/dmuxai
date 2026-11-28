@@ -5,6 +5,7 @@ pub mod notify;
 mod plan;
 mod rules;
 pub mod runner;
+pub mod session;
 mod store;
 
 pub use mcp::invoke as mcp_invoke;
@@ -45,6 +46,10 @@ pub const OPTION_MAX: usize = 200;
 pub const THREAD_MAX: usize = 500;
 pub const PLAN_HISTORY_MAX: usize = 20;
 pub const CLOSED_HIDE_DAYS: u64 = 30;
+/// Session links kept per item; the oldest is dropped first (FR-3820).
+pub const SESSIONS_MAX: usize = 50;
+/// Changed Markdown paths kept per session link (FR-3821).
+pub const SESSION_MD_PATHS_MAX: usize = 50;
 
 /// `b` + 12 lowercase hex (`^b[0-9a-f]{12}$`).
 pub fn valid_item_id(id: &str) -> bool {
@@ -266,6 +271,49 @@ pub struct ThreadMessage {
     pub at_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    Run,
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    AwaitingApproval,
+}
+
+/// Where a board run or ask did its work (SPEC-board-work-session FR-3820).
+/// Never holds a provider session id or any path outside the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLink {
+    pub kind: SessionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_id: Option<String>,
+    pub workspace_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    pub started_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+    #[serde(default)]
+    pub md_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardItem {
     pub id: String,
@@ -292,6 +340,8 @@ pub struct BoardItem {
     pub thread: Vec<ThreadMessage>,
     #[serde(default)]
     pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub sessions: Vec<SessionLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,6 +557,9 @@ pub fn mask_item_fields(item: &mut BoardItem) {
     }
     for msg in &mut item.thread {
         msg.text = crate::run_journal::mask_sensitive_tokens(&msg.text);
+    }
+    for link in &mut item.sessions {
+        session::mask_link(link);
     }
     if let Some(decision) = item.decision.as_mut()
         && let Some(text) = decision.text.as_mut()
@@ -738,6 +791,7 @@ mod tests {
                 at_ms: 0,
             }],
             run_ids: vec![],
+            sessions: vec![],
             key: None,
             spec_review: None,
             awaiting_approval_revision: None,
