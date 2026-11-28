@@ -1019,6 +1019,89 @@ mod tests {
         assert!(body.contains(&id));
     }
 
+    // TC-3807 / SPEC-board-approval-hardening FR-3807: `POST /plan` answers 409
+    // while a live run holds the `in_progress` item, and works after the run ends.
+    #[tokio::test]
+    async fn tc_3807_http_plan_refused_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&ws, &state, "ship it", plan_json, None).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "running".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        store
+            .decide_without_notify(
+                &item.id,
+                crate::board::DecideRequest {
+                    verdict: crate::board::Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let prepared = crate::board::runner::run_item_prepare(
+            &store,
+            crate::board::runner::RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(hash.clone()),
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+
+        let token = "boardtesttoken";
+        let router = test_router(board.clone(), state.clone(), token);
+        let post_plan = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/board/{}/plan", item.id))
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("X-Dmuxai-Human", "1")
+                .body(axum::body::Body::from(
+                    r#"{"steps":[{"id":"step-1","role":"implement","job":"edit more","runner":"cursor","depends_on":[],"task":"task-1"}]}"#,
+                ))
+                .unwrap()
+        };
+        let resp = router.clone().oneshot(post_plan()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let current = store.get(&item.id).unwrap();
+        assert_eq!(current.lane, Lane::InProgress);
+        assert_eq!(current.plan.as_ref().unwrap().hash, hash);
+
+        drop(prepared);
+        let resp = router.clone().oneshot(post_plan()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        assert_ne!(store.get(&item.id).unwrap().plan.unwrap().hash, hash);
+    }
+
     // TC-3121 / FR-3121: SSE replay and tail.
     #[tokio::test]
     async fn tc_3121_board_sse_replays_since_and_streams_new_events() {

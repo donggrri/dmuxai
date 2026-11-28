@@ -340,6 +340,24 @@ async fn deliver_command(
     .await;
 }
 
+/// The notify hook child: scrubbed env, and the parent's `DMUXAI_RUN_ID` when a
+/// run is active (SPEC-board-approval-hardening FR-3804).
+pub(crate) fn hook_command(command: &[String], cwd: &Path) -> Option<tokio::process::Command> {
+    let program = command.first()?;
+    let mut cmd = tokio::process::Command::new(program);
+    crate::process::apply_child_env_policy_tokio(&mut cmd);
+    if let Some(run_id) = crate::process::current_run_id() {
+        cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
+    }
+    cmd.args(&command[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    Some(cmd)
+}
+
 pub(crate) async fn deliver_command_json(
     command: &[String],
     cwd: &Path,
@@ -348,18 +366,9 @@ pub(crate) async fn deliver_command_json(
     timeout: Duration,
     log_path: &Path,
 ) {
-    let Some(program) = command.first() else {
+    let Some(mut cmd) = hook_command(command, cwd) else {
         return;
     };
-    let mut cmd = tokio::process::Command::new(program);
-    crate::process::apply_child_env_policy_tokio(&mut cmd);
-    cmd.args(&command[1..])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
