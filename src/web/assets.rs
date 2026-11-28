@@ -2705,6 +2705,7 @@ mod tests {
         assert!(MEMORY_JS.contains("api('POST', path, undefined, true)"));
         assert!(!MEMORY_JS.contains("{ text: text, target: target }, true)"));
         assert!(!MEMORY_JS.contains("api('GET', '/api/memory', undefined, true)"));
+    }
 
     // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
     #[test]
