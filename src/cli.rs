@@ -24,6 +24,7 @@ use crate::app::{App, HeadlessOutcome, HeadlessRequest};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCommand {
     Run(RunOptions),
+    SpecReview(SpecReviewCommand),
     TodoAdd {
         title: String,
         body: String,
@@ -303,12 +304,26 @@ pub struct RunOptions {
     pub write: bool,
     pub keep_worktrees: bool,
     pub no_spec_first: bool,
+    /// FR-3701: skip the human spec review for this run only.
+    pub no_spec_review: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
-pub const SUBCOMMANDS: [&str; 13] = [
-    "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models", "term",
-    "board", "fanout",
+pub const SUBCOMMANDS: [&str; 14] = [
+    "run",
+    "todo",
+    "status",
+    "events",
+    "mcp",
+    "init",
+    "trust",
+    "runs",
+    "runners",
+    "models",
+    "term",
+    "board",
+    "fanout",
+    "spec-review",
 ];
 
 pub const BOARD_USAGE: &str = "\
@@ -424,6 +439,7 @@ Options:
   --model M                Model id for the runner
   --approve-plan           Approve a pending plan and confirm sensitive gates
   --no-spec-first          Disable spec-first workflow for this run only
+  --no-spec-review         Skip the human spec review for this run only
   --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
   --allow-sensitive        Confirm every sensitive gate
   --graph                  Use the graph planner
@@ -448,6 +464,7 @@ Options for `todo run`:
   --model M                Model id for the runner
   --approve-plan           Approve a pending plan and confirm sensitive gates
   --no-spec-first          Disable spec-first workflow for this run only
+  --no-spec-review         Skip the human spec review for this run only
   --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
   --allow-sensitive        Confirm every sensitive gate
   --graph                  Use the graph planner
@@ -541,6 +558,300 @@ Options:
   -h, --help               Print help information
 ";
 
+pub const SPEC_REVIEW_USAGE: &str = "\
+Usage: dmuxai spec-review list [--json] [--all]
+       dmuxai spec-review show <id> [--json]
+       dmuxai spec-review approve <id> [--json]
+       dmuxai spec-review request-changes <id> --text <feedback> [--json]
+       dmuxai spec-review reject <id> [--text <reason>] [--json]
+
+List, read and decide human spec reviews that pause spec-first runs. Deciding
+needs an interactive terminal (or the dashboard); an agent run cannot decide.
+
+Subcommands:
+  list                     Pending reviews (id, workspace, round, spec paths, age)
+  show <id>                The record and the spec files (each capped at 256 KB)
+  approve <id>             Let the run continue with the implementation steps
+  request-changes <id>     Send feedback; the spec step runs again
+  reject <id>              End the run; no implementation step runs
+
+Options:
+  --all                    list: include decided, expired and cancelled reviews
+  --text TEXT              Feedback (required for request-changes) or reason (reject)
+  --json                   Print machine-readable JSON on stdout
+  -h, --help               Print help information
+";
+
+pub const SPEC_REVIEW_LIST_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--all"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const SPEC_REVIEW_SHOW_FLAGS: &[FlagSpec] = &[FlagSpec {
+    names: &["--json"],
+    takes_value: false,
+    hidden: false,
+}];
+
+pub const SPEC_REVIEW_DECIDE_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--text"],
+        takes_value: true,
+        hidden: false,
+    },
+];
+
+/// `dmuxai spec-review ...` (SPEC-spec-review-gate FR-3709).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecReviewCommand {
+    List {
+        all: bool,
+        json: bool,
+    },
+    Show {
+        id: String,
+        json: bool,
+    },
+    Decide {
+        id: String,
+        verdict: dmuxai::graph::spec_review::Verdict,
+        text: Option<String>,
+        json: bool,
+    },
+}
+
+fn parse_spec_review(rest: &[String]) -> Result<SpecReviewCommand, String> {
+    use dmuxai::graph::spec_review::Verdict;
+    let Some(sub) = rest.first() else {
+        return Err("spec-review needs list, show, approve, request-changes or reject".to_owned());
+    };
+    let args = &rest[1..];
+    let single_id = |parsed: &ParsedFlags, name: &str| -> Result<String, String> {
+        let Some(id) = parsed.positionals.first().cloned() else {
+            return Err(format!("spec-review {name} needs a review id"));
+        };
+        if let Some(extra) = parsed.positionals.get(1) {
+            return Err(format!("unexpected argument '{extra}'"));
+        }
+        Ok(id)
+    };
+    match sub.as_str() {
+        "list" => {
+            let parsed = parse_flags(args, SPEC_REVIEW_LIST_FLAGS, false)?;
+            Ok(SpecReviewCommand::List {
+                all: parsed.flags.contains_key("--all"),
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        "show" => {
+            let parsed = parse_flags(args, SPEC_REVIEW_SHOW_FLAGS, true)?;
+            Ok(SpecReviewCommand::Show {
+                id: single_id(&parsed, "show")?,
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        name @ ("approve" | "request-changes" | "reject") => {
+            let parsed = parse_flags(args, SPEC_REVIEW_DECIDE_FLAGS, true)?;
+            let verdict = match name {
+                "approve" => Verdict::Approve,
+                "request-changes" => Verdict::RequestChanges,
+                _ => Verdict::Reject,
+            };
+            let text = parsed.flags.get("--text").cloned().flatten();
+            if verdict == Verdict::Approve && text.is_some() {
+                return Err("approve takes no --text".to_owned());
+            }
+            if verdict == Verdict::RequestChanges
+                && text.as_deref().is_none_or(|t| t.trim().is_empty())
+            {
+                return Err("request-changes needs --text <feedback>".to_owned());
+            }
+            Ok(SpecReviewCommand::Decide {
+                id: single_id(&parsed, name)?,
+                verdict,
+                text,
+                json: parsed.flags.contains_key("--json"),
+            })
+        }
+        other => Err(format!("unknown spec-review subcommand '{other}'")),
+    }
+}
+
+/// Human-only rule of FR-3708: the board's owner check (stdin and stdout on a
+/// TTY, `DMUXAI_RUN_ID` unset) with the spec review wording.
+fn spec_review_human_actor() -> Result<(), dmuxai::graph::spec_review::ReviewError> {
+    dmuxai::board::resolve_actor(Some("owner"), dmuxai::board::BoardCaller::CliTty)
+        .map(|_| ())
+        .map_err(|_| {
+            dmuxai::graph::spec_review::ReviewError::Forbidden(
+                "spec review decisions need an interactive terminal or the dashboard".to_owned(),
+            )
+        })
+}
+
+fn spec_review_age(created_ms: u64) -> String {
+    let secs = dmuxai::graph::spec_review::unix_now_ms().saturating_sub(created_ms) / 1000;
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5400 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+fn spec_review_fail(error: dmuxai::graph::spec_review::ReviewError, json_out: bool) -> i32 {
+    fail(
+        ApiError::new(error.exit_code(), error.to_string()),
+        json_out,
+    )
+}
+
+fn spec_review_record_json(
+    record: &dmuxai::graph::spec_review::SpecReviewRecord,
+    with_files: bool,
+) -> Value {
+    let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "age_secs".to_owned(),
+            json!(
+                dmuxai::graph::spec_review::unix_now_ms().saturating_sub(record.created_ms) / 1000
+            ),
+        );
+        if with_files {
+            let files = dmuxai::graph::spec_review::read_spec_files(record);
+            object.insert(
+                "spec_files".to_owned(),
+                serde_json::to_value(files).unwrap_or(Value::Null),
+            );
+        }
+    }
+    value
+}
+
+/// Runs `dmuxai spec-review ...` against the record store; it needs no workspace.
+fn execute_spec_review(command: SpecReviewCommand) -> i32 {
+    use dmuxai::graph::spec_review::{
+        DecideRequest, ReviewError, SpecReviewStore, valid_review_id,
+    };
+    let json_out = match &command {
+        SpecReviewCommand::List { json, .. }
+        | SpecReviewCommand::Show { json, .. }
+        | SpecReviewCommand::Decide { json, .. } => *json,
+    };
+    // The id is validated before any filesystem access (FR-3709).
+    if let SpecReviewCommand::Show { id, .. } | SpecReviewCommand::Decide { id, .. } = &command
+        && !valid_review_id(id)
+    {
+        return spec_review_fail(
+            ReviewError::Usage(format!("invalid review id '{id}'")),
+            json_out,
+        );
+    }
+    if matches!(command, SpecReviewCommand::Decide { .. })
+        && let Err(error) = spec_review_human_actor()
+    {
+        return spec_review_fail(error, json_out);
+    }
+    let store = match SpecReviewStore::open_default() {
+        Ok(store) => store,
+        Err(error) => return spec_review_fail(error, json_out),
+    };
+    match command {
+        SpecReviewCommand::List { all, json } => {
+            let records = store.list(all);
+            if json {
+                let items: Vec<Value> = records
+                    .iter()
+                    .map(|record| spec_review_record_json(record, false))
+                    .collect();
+                print_json(&json!({ "reviews": items }));
+            } else {
+                for record in &records {
+                    println!(
+                        "{}\t{}\t{}\tround {}\t{}\t{}",
+                        record.review_id,
+                        record.status.as_str(),
+                        record.workspace,
+                        record.round,
+                        record.spec_paths.join(","),
+                        spec_review_age(record.created_ms)
+                    );
+                }
+            }
+            exit::OK
+        }
+        SpecReviewCommand::Show { id, json } => match store.load(&id) {
+            Ok(record) => {
+                if json {
+                    print_json(&spec_review_record_json(&record, true));
+                } else {
+                    println!("review: {}", record.review_id);
+                    println!("status: {}", record.status.as_str());
+                    println!("round: {} of {}", record.round, record.max_rounds);
+                    println!("workspace: {}", record.workspace);
+                    println!("prompt: {}", record.prompt_summary);
+                    println!("digest: {}", record.spec_digest);
+                    if let Some(feedback) = &record.feedback {
+                        println!("feedback: {feedback}");
+                    }
+                    for file in dmuxai::graph::spec_review::read_spec_files(&record) {
+                        println!("\n--- {} ---", file.path);
+                        if file.missing {
+                            println!("(missing)");
+                        } else {
+                            println!("{}", file.content);
+                            if file.truncated {
+                                println!("(truncated at 256 KB)");
+                            }
+                        }
+                    }
+                }
+                exit::OK
+            }
+            Err(error) => spec_review_fail(error, json),
+        },
+        SpecReviewCommand::Decide {
+            id,
+            verdict,
+            text,
+            json,
+        } => {
+            let request = DecideRequest {
+                verdict,
+                text: text.as_deref(),
+                spec_digest: None,
+                by: "owner",
+            };
+            match store.decide(&id, &request) {
+                Ok(record) => {
+                    if json {
+                        print_json(&spec_review_record_json(&record, false));
+                    } else {
+                        println!("{}\t{}", record.review_id, record.status.as_str());
+                    }
+                    exit::OK
+                }
+                Err(error) => spec_review_fail(error, json),
+            }
+        }
+    }
+}
+
 pub const FANOUT_USAGE: &str = "\
 Usage: dmuxai fanout clean [<run_id>|--all]
 
@@ -585,6 +896,7 @@ pub fn subcommand_usage(name: &str) -> Option<&'static str> {
         "runners" => Some(RUNNERS_USAGE),
         "models" => Some(MODELS_USAGE),
         "fanout" => Some(FANOUT_USAGE),
+        "spec-review" => Some(SPEC_REVIEW_USAGE),
         _ => None,
     }
 }
@@ -979,6 +1291,11 @@ pub const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--no-spec-review"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
         names: &["--approve-plan-id"],
         takes_value: true,
         hidden: false,
@@ -1039,6 +1356,11 @@ pub const TODO_RUN_FLAGS: &[FlagSpec] = &[
     },
     FlagSpec {
         names: &["--no-spec-first"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--no-spec-review"],
         takes_value: false,
         hidden: false,
     },
@@ -1284,6 +1606,7 @@ fn parse_run_options_with_flags(
         write: parsed.flags.contains_key("--write"),
         keep_worktrees: parsed.flags.contains_key("--keep-worktrees"),
         no_spec_first: parsed.flags.contains_key("--no-spec-first"),
+        no_spec_review: parsed.flags.contains_key("--no-spec-review"),
     };
     if options.write && options.agents.is_none() {
         return Err("--write requires --agents".to_owned());
@@ -1532,6 +1855,7 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             })
         }
         "term" => parse_term(rest).map(AgentCommand::Term),
+        "spec-review" => parse_spec_review(rest).map(AgentCommand::SpecReview),
         "board" => parse_board(rest).map(AgentCommand::Board),
         "fanout" => {
             let Some(sub) = rest.first() else {
@@ -4037,6 +4361,11 @@ fn fail(error: ApiError, json_out: bool) -> i32 {
 
 /// Runs an agent subcommand and returns the process exit code.
 pub async fn execute(command: AgentCommand) -> i32 {
+    // FR-3709: spec reviews live in the state directory; no workspace needed.
+    let command = match command {
+        AgentCommand::SpecReview(command) => return execute_spec_review(command),
+        other => other,
+    };
     let workspace_root = match dmuxai::workspace::resolve_workspace_root() {
         Ok(root) => root,
         Err(error) => {
@@ -4298,6 +4627,7 @@ pub async fn execute(command: AgentCommand) -> i32 {
         }
         AgentCommand::Term(command) => execute_term(&workspace_root, command),
         AgentCommand::Board(command) => execute_board(&workspace_root, command),
+        AgentCommand::SpecReview(command) => execute_spec_review(command),
         AgentCommand::FanoutClean { run_id, all } => {
             match dmuxai::fanout_worktree::fanout_clean(&workspace_root, run_id.as_deref(), all) {
                 Ok(()) => exit::OK,
@@ -4988,6 +5318,10 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
     if !outcome.fallbacks.is_empty() {
         value["fallbacks"] = json!(outcome.fallbacks);
     }
+    // FR-3717: the spec review state, omitted when the run requested none.
+    if let Some(review) = &outcome.spec_review {
+        value["spec_review"] = json!(review);
+    }
     value
 }
 
@@ -5339,8 +5673,21 @@ async fn run_headless(
             }
         }
     });
-    let progress_copy = std::sync::Mutex::new(progress_copy);
+    let progress_copy = Arc::new(std::sync::Mutex::new(progress_copy));
     let journal_handle = Arc::new(std::sync::Mutex::new(journal_pair));
+
+    // FR-3710: `spec_review_*` events go to the run journal copy only.
+    let spec_review_copy = Arc::clone(&progress_copy);
+    let spec_review_warned = Arc::clone(&progress_warned);
+    app.set_spec_review_journal(Box::new(move |line: &str| {
+        let mut guard = spec_review_copy.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(writer) = guard.as_mut()
+            && let Err(err) = writer.append_line(line)
+            && !spec_review_warned.swap(true, Ordering::SeqCst)
+        {
+            eprintln!("warning: run journal unavailable: {err}");
+        }
+    }));
 
     let progress_opt = options.progress;
     let progress_warned_sink = Arc::clone(&progress_warned);
@@ -5469,6 +5816,7 @@ async fn run_headless(
         todo_id,
         model: options.model.clone(),
         no_spec_first: options.no_spec_first,
+        no_spec_review: options.no_spec_review,
     };
     let mut outcome = app.run_headless(request, cancel).await;
     app.shutdown().await;
@@ -5557,6 +5905,9 @@ fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
     }
     if args.graph {
         argv.push("--graph".into());
+    }
+    if args.no_spec_review {
+        argv.push("--no-spec-review".into());
     }
     if args.no_spec_first {
         argv.push("--no-spec-first".into());
@@ -6156,6 +6507,7 @@ mod tests {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            spec_review: None,
             fanout: Some(dmuxai::fanout::FanoutReport {
                 min_ok: 2,
                 judge_enabled: false,
@@ -6251,6 +6603,7 @@ mod tests {
                 model: None,
                 duration_ms: 12,
             }),
+            spec_review: None,
             fanout: Some(dmuxai::fanout::FanoutReport {
                 min_ok: 1,
                 judge_enabled: true,
@@ -6395,6 +6748,7 @@ mod tests {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            spec_review: None,
         };
         let json = outcome_json(&outcome, 1, 2);
         assert_eq!(json["error"], "boom");
@@ -6423,6 +6777,7 @@ mod tests {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            spec_review: None,
         };
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());
@@ -6524,6 +6879,87 @@ mod tests {
         assert!(RUN_USAGE.contains("--no-spec-first"));
     }
 
+    // TC-3701 / FR-3701: `--no-spec-review` is parsed for run and todo run and
+    // forwarded by the MCP child argv; it never implies plan approval.
+    #[test]
+    fn tc_3701_no_spec_review_flag_parsed() {
+        match parse(&args(&[
+            "run",
+            "--agent",
+            "codex",
+            "--no-spec-review",
+            "ship",
+        ])) {
+            Ok(AgentCommand::Run(run)) => {
+                assert!(run.no_spec_review);
+                assert!(!run.no_spec_first && !run.approve_plan);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&args(&["todo", "run", "t1", "--no-spec-review"])) {
+            Ok(AgentCommand::TodoRun { run, .. }) => assert!(run.no_spec_review),
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&args(&["run", "--approve-plan", "ship"])) {
+            Ok(AgentCommand::Run(run)) => {
+                assert!(!run.no_spec_review, "--approve-plan keeps the review")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(RUN_USAGE.contains("--no-spec-review"));
+        assert!(TODO_USAGE.contains("--no-spec-review"));
+        let argv = mcp_run_argv(&RunArgs {
+            prompt: Some("x".to_owned()),
+            agent: None,
+            model: None,
+            approve_plan: true,
+            approve_plan_id: None,
+            allow_sensitive: false,
+            graph: false,
+            todo_id: None,
+            no_spec_first: false,
+            no_spec_review: true,
+        });
+        assert!(argv.contains(&"--no-spec-review".to_owned()), "{argv:?}");
+    }
+
+    // TC-3708 / FR-3708: deciding from a non-TTY process is forbidden (exit 5);
+    // the subcommand parses decide verbs and rejects empty feedback.
+    #[test]
+    fn tc_3708_spec_review_decide_needs_a_tty() {
+        let code = execute_spec_review(SpecReviewCommand::Decide {
+            id: "run-abc".to_owned(),
+            verdict: dmuxai::graph::spec_review::Verdict::Approve,
+            text: None,
+            json: true,
+        });
+        assert_eq!(code, exit::FORBIDDEN, "cargo test has no TTY");
+        assert!(spec_review_human_actor().is_err());
+        assert_eq!(
+            parse(&args(&["spec-review", "approve", "run-abc"])),
+            Ok(AgentCommand::SpecReview(SpecReviewCommand::Decide {
+                id: "run-abc".to_owned(),
+                verdict: dmuxai::graph::spec_review::Verdict::Approve,
+                text: None,
+                json: false,
+            }))
+        );
+        assert!(parse(&args(&["spec-review", "request-changes", "run-abc"])).is_err());
+        assert!(
+            parse(&args(&[
+                "spec-review",
+                "request-changes",
+                "run-abc",
+                "--text",
+                "  "
+            ]))
+            .is_err()
+        );
+        assert!(parse(&args(&["spec-review", "bogus"])).is_err());
+        assert!(SUBCOMMANDS.contains(&"spec-review"));
+        assert!(subcommand_usage("spec-review").is_some());
+    }
+
     #[test]
     fn tc_1769_flag_table_parses_run_flags_and_progress() {
         assert_eq!(
@@ -6587,6 +7023,7 @@ mod tests {
             graph: false,
             todo_id: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         assert_eq!(
             mcp_run_argv(&args),
@@ -6614,6 +7051,7 @@ mod tests {
             graph: false,
             todo_id: Some("t1".into()),
             no_spec_first: false,
+            no_spec_review: false,
         };
         assert_eq!(
             mcp_run_argv(&todo),
@@ -7224,6 +7662,7 @@ mod tests {
                     todo_id: None,
                     model: None,
                     no_spec_first: false,
+                    no_spec_review: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )

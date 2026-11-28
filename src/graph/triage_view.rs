@@ -619,6 +619,7 @@ mod tests {
             todo_id: None,
             dynamic_cap: None,
             dynamic_added: None,
+            spec_review: None,
         }
     }
 
