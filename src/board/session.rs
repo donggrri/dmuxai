@@ -83,13 +83,9 @@ fn clean_label(value: Option<&str>) -> Option<String> {
     (!label.is_empty()).then_some(label)
 }
 
-/// Workspace-relative `.md` path without `..`, absolute or `.dmuxai/` parts.
-fn safe_md_path(path: &str) -> bool {
-    if path.is_empty()
-        || path.len() > MD_PATH_MAX
-        || path.chars().any(char::is_control)
-        || !path.to_ascii_lowercase().ends_with(".md")
-    {
+/// Workspace-relative path without `..`, absolute or `.dmuxai/` parts.
+fn safe_rel_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > MD_PATH_MAX || path.chars().any(char::is_control) {
         return false;
     }
     let parsed = Path::new(path);
@@ -99,6 +95,11 @@ fn safe_md_path(path: &str) -> bool {
     parsed
         .components()
         .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Workspace-relative `.md` path without `..`, absolute or `.dmuxai/` parts.
+fn safe_md_path(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".md") && safe_rel_path(path)
 }
 
 /// Re-validates a link before it is stored: ids keep their charset, labels are
@@ -111,6 +112,7 @@ pub(crate) fn mask_link(link: &mut SessionLink) {
     link.model = clean_label(link.model.as_deref());
     link.md_paths.retain(|p| safe_md_path(p));
     link.md_paths.truncate(SESSION_MD_PATHS_MAX);
+    link.mode = link.mode.take().filter(|m| m == "edit");
 }
 
 /// A `running` link appended when a board run starts (FR-3820).
@@ -128,6 +130,7 @@ pub fn running_link(kind: SessionKind, workspace: &Path, started_ms: u64) -> Ses
         started_ms,
         ended_ms: None,
         md_paths: Vec::new(),
+        mode: None,
     }
 }
 
@@ -163,9 +166,51 @@ pub fn md_snapshot(workspace: &Path) -> Option<MdSnapshot> {
     Some(MdSnapshot { entries })
 }
 
-/// `.md` paths whose `git status` differs between `before` and `after`,
-/// sorted and capped at [`SESSION_MD_PATHS_MAX`] (FR-3821).
-pub fn changed_md_paths(before: Option<&MdSnapshot>, after: Option<&MdSnapshot>) -> Vec<String> {
+/// Files read for a content fingerprint; larger files use size and mtime only.
+const FINGERPRINT_READ_MAX: u64 = 1024 * 1024;
+
+fn file_fingerprint(path: &Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return "-".to_owned();
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    meta.len().hash(&mut hasher);
+    if let Ok(modified) = meta.modified()
+        && let Ok(since) = modified.duration_since(UNIX_EPOCH)
+    {
+        since.as_nanos().hash(&mut hasher);
+    }
+    if meta.is_file()
+        && meta.len() <= FINGERPRINT_READ_MAX
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        bytes.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// [`md_snapshot`] plus a content fingerprint of every listed file, so a file
+/// that was already dirty is still reported when an edit turn changes it
+/// again (SPEC-md-viewer-chat FR-3844).
+pub fn change_snapshot(workspace: &Path) -> Option<MdSnapshot> {
+    let mut snapshot = md_snapshot(workspace)?;
+    for (path, status) in snapshot.entries.iter_mut() {
+        if safe_rel_path(path) {
+            status.push(' ');
+            status.push_str(&file_fingerprint(&workspace.join(path)));
+        }
+    }
+    Some(snapshot)
+}
+
+/// Workspace-relative paths whose snapshot entry differs between `before`
+/// and `after`, sorted and capped at `max` (FR-3844).
+pub fn changed_paths(
+    before: Option<&MdSnapshot>,
+    after: Option<&MdSnapshot>,
+    max: usize,
+) -> Vec<String> {
     let (Some(before), Some(after)) = (before, after) else {
         return Vec::new();
     };
@@ -182,8 +227,24 @@ pub fn changed_md_paths(before: Option<&MdSnapshot>, after: Option<&MdSnapshot>)
     }
     changed
         .into_iter()
+        .filter(|p| safe_rel_path(p))
+        .take(max)
+        .collect()
+}
+
+/// `.md` paths whose `git status` differs between `before` and `after`,
+/// sorted and capped at [`SESSION_MD_PATHS_MAX`] (FR-3821).
+pub fn changed_md_paths(before: Option<&MdSnapshot>, after: Option<&MdSnapshot>) -> Vec<String> {
+    md_paths_of(&changed_paths(before, after, usize::MAX))
+}
+
+/// The `.md` entries of `paths`, capped at [`SESSION_MD_PATHS_MAX`].
+pub fn md_paths_of(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
         .filter(|p| safe_md_path(p))
         .take(SESSION_MD_PATHS_MAX)
+        .cloned()
         .collect()
 }
 
@@ -301,6 +362,7 @@ pub fn link_from_manifest(workspace_path: &str, manifest: &RunManifest) -> Sessi
         started_ms: manifest.created_at_ms,
         ended_ms: manifest.completed_at_ms,
         md_paths: Vec::new(),
+        mode: None,
     };
     apply_manifest(&mut link, manifest);
     mask_link(&mut link);

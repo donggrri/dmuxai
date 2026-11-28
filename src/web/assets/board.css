@@ -602,3 +602,134 @@ body.board-modal-open {
     max-height: 94vh;
   }
 }
+/* SPEC-md-viewer-chat FR-3840: chat docked beside the Markdown viewer for a
+   board item file (right on wide screens, below on narrow ones). */
+.md-viewer-main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.md-viewer-main > .md-viewer-body {
+  min-width: 0;
+}
+
+.md-viewer-card.md-viewer-with-chat {
+  width: min(1320px, 96vw);
+}
+
+.md-viewer-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 360px;
+  flex-shrink: 0;
+  min-height: 0;
+  padding: 12px;
+  border-inline-start: 1px solid var(--line);
+}
+
+.md-viewer-chat-head {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.md-viewer-chat-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+  min-height: 4rem;
+  overflow: auto;
+}
+
+.md-viewer-chat-empty {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.md-viewer-chat-msg-owner {
+  align-self: flex-end;
+  text-align: right;
+}
+
+.md-viewer-chat-sender {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.md-viewer-chat-bubble {
+  padding: 0.4rem 0.55rem;
+  border-radius: 8px;
+  background: var(--bg-chip);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: 0.85rem;
+  text-align: left;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.md-viewer-chat-msg-owner .md-viewer-chat-bubble {
+  background: var(--current-bg);
+  border-color: var(--btn-primary-line);
+}
+
+.md-viewer-chat-modes {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+
+.md-viewer-chat-mode-btn[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.md-viewer-chat-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font: inherit;
+}
+
+.md-viewer-chat-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: end;
+}
+
+.md-viewer-chat-resume {
+  font-size: 0.8rem;
+  max-width: 12rem;
+}
+
+.md-viewer-chat-resume[hidden],
+.md-viewer-chat-status[hidden] {
+  display: none;
+}
+
+.md-viewer-chat-status {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.md-viewer-chat-status.md-viewer-chat-error {
+  color: var(--error-text);
+}
+
+@media (max-width: 900px) {
+  .md-viewer-main {
+    flex-direction: column;
+  }
+
+  .md-viewer-chat {
+    width: auto;
+    max-height: 45vh;
+    border-inline-start: 0;
+    border-top: 1px solid var(--line);
+  }
+}

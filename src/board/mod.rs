@@ -293,6 +293,9 @@ pub struct SessionLink {
     pub ended_ms: Option<u64>,
     #[serde(default)]
     pub md_paths: Vec<String>,
+    /// `edit` for an edit turn from the viewer chat (SPEC-md-viewer-chat FR-3844).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

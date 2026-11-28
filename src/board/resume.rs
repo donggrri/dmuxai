@@ -228,6 +228,49 @@ pub fn board_summary_context(
     (md_paths, thread)
 }
 
+/// Summary seeding the new conversation of an edit turn on an item without a
+/// work session (SPEC-md-viewer-chat FR-3842): the item summary, plan steps,
+/// changed Markdown files and thread tail, bounded and masked as FR-3831.
+pub fn item_seed_summary(item: &BoardItem) -> String {
+    let mut md_paths: Vec<String> = Vec::new();
+    for link in &item.sessions {
+        for path in &link.md_paths {
+            if !md_paths.contains(path) {
+                md_paths.push(path.clone());
+            }
+        }
+    }
+    md_paths.truncate(SESSION_MD_PATHS_MAX);
+    let steps = item
+        .plan
+        .as_ref()
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .map(|step| SummaryStep {
+                    id: step.id.clone(),
+                    role: step.role.to_string(),
+                    runner: step.runner.clone(),
+                    status: "planned".to_owned(),
+                    last_text: None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let start = item.thread.len().saturating_sub(THREAD_TAIL);
+    build_work_session_summary(&SummaryInput {
+        conversation_id: format!("none (board item {})", item.id),
+        stored_summary: Some(item.summary.clone()).filter(|s| !s.trim().is_empty()),
+        steps,
+        last_reply: None,
+        md_paths,
+        thread: item.thread[start..]
+            .iter()
+            .map(|m| (m.from.clone(), m.text.clone()))
+            .collect(),
+    })
+}
+
 /// Default agent of a follow-up (OQ-3831): the runner of the work session's
 /// last implement step, else the run's resolved runner.
 pub fn default_ask_agent(link: &SessionLink) -> Option<String> {

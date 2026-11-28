@@ -496,7 +496,7 @@ Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
 (`--if-version`), `plan`, `prompt`, `decide`, `check` (`--text`), `pending`
 (`--workspace`), `say`, `wait`, `events`, `rules`, `ask` (`--text`, `--revise`,
-`--resume`, `--agent`, `--model`, `--by`), `run` (`--detach`, `--by`), `session`,
+`--resume`, `--edit`, `--file`, `--agent`, `--model`, `--by`), `run` (`--detach`, `--by`), `session`,
 `link` (`--run-id`).
 
 Ask in the work session ([SPEC-board-ask-resume](specs/SPEC-board-ask-resume.md)):
@@ -524,6 +524,32 @@ Ask in the work session ([SPEC-board-ask-resume](specs/SPEC-board-ask-resume.md)
 - `--json`/MCP results add `resume: {mode: "native"|"summary"|"off", agent}`.
 - Asks always pass `--read-only` and never pass `--allow-sensitive` or
   `--trust-workspace-config`.
+
+File context and edit turns ([SPEC-md-viewer-chat](specs/SPEC-md-viewer-chat.md)):
+`board ask <id> --text T [--file P] [--edit]` (HTTP ask body `file`, `mode`).
+
+- `--file P` / `file` adds a "File in question" section to the prompt with the
+  path and its content, masked and only when the file is at most 64 KiB of
+  UTF-8 text; larger files send only the path. The path follows the
+  Markdown viewer rules (inside the item workspace, or an allowed `.md` under
+  home): out of bounds is `403` / exit `5`, missing is `404` / exit `3`.
+- `--edit` / `mode: "edit"` runs one write turn in the work session:
+  `dmuxai -C <ws> run --conversation <work conversation> --agent A
+  --no-spec-first --json -` with the same hybrid resume, never `--read-only`,
+  `--allow-sensitive`, `--trust-workspace-config` or `--approve-plan`. Without
+  a work session it starts a new conversation seeded with the item summary.
+  Exit `7` is reported as "needs approval — not applied".
+- HTTP `mode: "edit"` needs the human browser headers (`Sec-Fetch-Site:
+  same-origin`, `Sec-Fetch-Mode`, `X-Dmuxai-Human: 1`), otherwise `403`. CLI
+  `--edit` is owner-only (TTY, `DMUXAI_RUN_ID` unset, typed item-id
+  confirmation), otherwise exit `5`. MCP `board_ask` has no edit and rejects
+  `edit`/`mode`.
+- An edit is refused with `409` / exit `4` while the item is `in_progress`
+  with a live run, and with `--revise`.
+- After the turn the planner thread message lists the changed files (git
+  status before/after, at most 50), and the ask session link has
+  `mode: "edit"` and the changed `.md` paths. `--json` adds `mode: "edit"` and
+  `changed_paths`. Lane, plan, decision and `checked` are unchanged.
 
 Work sessions ([SPEC-board-work-session](specs/SPEC-board-work-session.md)):
 every item has `sessions`, a list (at most 50, oldest dropped) of links to
@@ -577,7 +603,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
 | PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
 | GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
-| POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?,resume?}` | `202` item plus planned `resume` (`--web` only) | 400, 401, 403, 404, 409 |
+| POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?,resume?,file?,mode?}` (`mode`: `ask`\|`edit`) | `202` item plus planned `resume`, `mode`, `file` (`--web` only) | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/run` | `{plan_hash?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
 
 Dashboard writes act as `owner`. Owner writes (`POST /decision`, `POST /check`,

@@ -26,6 +26,8 @@
 //   -> `tc_2553_tc_link_base_requires_strong_links_for_changed_tcs`.
 // FR-2555 / TC-2554: scripts/gate.sh TC-link step uses --base origin/main when ref exists
 //   -> `tc_2554_gate_tc_links_step_uses_base`.
+// FR-3846 / TC-3846: SPEC-board-ux-042 FR-3420 carries the SPEC-md-viewer-chat
+//   amendment note -> `tc_3846_fr3420_amended`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -1204,4 +1206,21 @@ fn tc_1807_gate_script_browser_command_uses_web_targets() {
         cmd.find("--no-fail-fast") < cmd.find(" -- "),
         "--no-fail-fast must be passed to cargo, before the test-arg separator:\n{cmd}"
     );
+}
+
+#[test]
+fn tc_3846_fr3420_amended() {
+    let text = fs::read_to_string(Path::new(SPECS_DIR).join("SPEC-board-ux-042.md"))
+        .expect("read SPEC-board-ux-042.md");
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("| FR-3420 |"))
+        .expect("FR-3420 row");
+    for needle in [
+        "Amended by SPEC-md-viewer-chat FR-3842/FR-3845",
+        "asks stay read-only",
+        "never write a decision or check",
+    ] {
+        assert!(row.contains(needle), "FR-3420 row lacks {needle:?}:\n{row}");
+    }
 }

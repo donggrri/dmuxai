@@ -1,6 +1,6 @@
 # SPEC: Chat beside the Markdown viewer, with edits in the work session
 
-Status: approved (Dongjin 2026-11-28)
+Status: implemented
 Owner: Dongjin
 Created: 2026-11-28
 Baseline: `068b920` + SPEC-board-work-session + SPEC-board-ask-resume

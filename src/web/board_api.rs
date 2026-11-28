@@ -513,10 +513,18 @@ struct AskBody {
     /// `auto` (default), `native`, `fresh` or `off` (SPEC-board-ask-resume FR-3832).
     #[serde(default)]
     resume: Option<String>,
+    /// Markdown file in question, resolved like `/api/md/view` against the
+    /// item workspace (SPEC-md-viewer-chat FR-3841).
+    #[serde(default)]
+    file: Option<String>,
+    /// `ask` (default) or `edit` (FR-3842; human browser headers required).
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn board_ask(
     State(state): State<BoardApiState>,
+    headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     axum::Json(body): axum::Json<AskBody>,
 ) -> Response {
@@ -525,6 +533,14 @@ async fn board_ask(
             StatusCode::FORBIDDEN,
             "view-only dashboard cannot run board asks",
         );
+    }
+    let edit = match body.mode.as_deref().map(str::trim) {
+        None | Some("ask") => false,
+        Some("edit") => true,
+        Some(_) => return error_json(StatusCode::BAD_REQUEST, "mode must be ask or edit"),
+    };
+    if edit && let Some(resp) = human_browser_rejection(&headers) {
+        return resp;
     }
     if !valid_item_id(&id) {
         return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
@@ -557,14 +573,16 @@ async fn board_ask(
         state_root,
         resume,
     };
+    let extra = crate::board::runner::AskExtra::new(body.file, edit);
     match with_store(board_base.clone(), move |store| {
-        crate::board::runner::ask_item_prepare(store, params)
+        crate::board::runner::ask_item_prepare_with(store, params, extra)
     })
     .await
     {
         Ok(prepared) => {
             let item = prepared.item.clone();
             let planned = prepared.planned_resume();
+            let file = prepared.file.as_ref().map(|f| f.path.clone());
             std::thread::spawn(move || {
                 if let Ok(bg_store) = open_store(&board_base) {
                     let _ = crate::board::runner::ask_item_execute(&bg_store, prepared);
@@ -573,6 +591,10 @@ async fn board_ask(
             let mut body = item_response(item);
             if let Some(resume) = planned {
                 body["resume"] = serde_json::json!(resume);
+            }
+            body["mode"] = serde_json::json!(if edit { "edit" } else { "ask" });
+            if let Some(file) = file {
+                body["file"] = serde_json::json!(file);
             }
             json_ok(StatusCode::ACCEPTED, &body)
         }
@@ -2135,5 +2157,323 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `--web` router (asks allowed) over `board`/`state`.
+    fn web_ask_router(board: PathBuf, state: PathBuf, token: &str) -> axum::Router {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let services = DashboardServices {
+            board_base: Some(board),
+            web_attached: true,
+            trust_env: Some(crate::runtime_env::RuntimeEnv {
+                dmuxai_state_dir: Some(state),
+                ..crate::runtime_env::RuntimeEnv::from_process()
+            }),
+            ..DashboardServices::default()
+        };
+        build_router_with(
+            hub,
+            token.to_string(),
+            Some(vec!["localhost:7420".to_string()]),
+            services,
+        )
+    }
+
+    fn add_ws_item(store: &BoardStore, state: &Path, ws: &Path, title: &str) -> BoardItem {
+        store
+            .add(AddItemRequest {
+                title: title.to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.to_path_buf()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.to_path_buf(),
+            })
+            .unwrap()
+    }
+
+    /// Fake child saving its prompt to `<dir>/prompt.txt` and argv to
+    /// `<dir>/argv.log`, answering like `run --json`.
+    fn recording_child(dir: &Path) -> PathBuf {
+        let bin = dir.join("fake-record.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncat > \"{dir}/prompt.txt\"\nprintf '%s\\n' \"$*\" >> \"{dir}/argv.log\"\nprintf '{{\"ok\":true,\"exit_code\":0,\"text\":\"It says hello\"}}\\n'\nexit 0\n",
+                dir = dir.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+        bin
+    }
+
+    fn ask_request(
+        id: &str,
+        token: &str,
+        body: &str,
+        human: bool,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{id}/ask"))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json");
+        if human {
+            builder = builder
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("X-Dmuxai-Human", "1");
+        }
+        builder
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    async fn wait_for_planner(store: &BoardStore, id: &str, count: usize) -> BoardItem {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let item = store.get(id).unwrap();
+            if item.thread.iter().filter(|m| m.from == "planner").count() >= count
+                && !crate::board::runner::BoardLockGuard::is_active(store.base(), "asks", id)
+            {
+                return item;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for the planner answer"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // TC-3841 / FR-3841: an ask with `file` adds a `File in question` section
+    // with the workspace-relative path and the masked content; the answer is
+    // tagged with the path; a path outside the item workspace (or a hidden
+    // home path) is 403; an over-size file sends only the path.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3841_ask_with_file_context() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(ws.join("docs")).unwrap();
+        fs::write(
+            ws.join("docs/spec.md"),
+            "# Spec\n\nSPEC BODY\nkey: Bearer sk-secret-123456\n",
+        )
+        .unwrap();
+        fs::write(ws.join("docs/big.md"), "B".repeat(70 * 1024)).unwrap();
+        fs::write(dir.path().join("outside.md"), "OUTSIDE").unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let item = add_ws_item(&store, &state, &ws, "file ask");
+        let child = recording_child(dir.path());
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &child) };
+        let token = "boardtesttoken";
+        let router = web_ask_router(board.clone(), state.clone(), token);
+
+        let outside = dir.path().join("outside.md");
+        for file in [
+            outside.to_string_lossy().into_owned(),
+            "../outside.md".to_owned(),
+        ] {
+            let body = serde_json::json!({"text": "what?", "file": file}).to_string();
+            let resp = router
+                .clone()
+                .oneshot(ask_request(&item.id, token, &body, false))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{file}");
+        }
+        assert!(
+            !dir.path().join("prompt.txt").exists(),
+            "a refused ask spawns nothing"
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(ask_request(
+                &item.id,
+                token,
+                r#"{"text":"what is this?","file":"docs/spec.md"}"#,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let accepted: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(accepted["file"], "docs/spec.md");
+        assert_eq!(accepted["mode"], "ask");
+        let answered = wait_for_planner(&store, &item.id, 1).await;
+        let prompt = fs::read_to_string(dir.path().join("prompt.txt")).unwrap();
+        assert!(
+            prompt.contains("File in question\nPath: docs/spec.md\n"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("SPEC BODY"), "{prompt}");
+        assert!(!prompt.contains("sk-secret-123456"), "{prompt}");
+        let last = answered.thread.last().unwrap();
+        assert_eq!(last.text, "[file \u{b7} docs/spec.md] It says hello");
+        assert!(
+            answered
+                .thread
+                .iter()
+                .any(|m| m.text == "[file \u{b7} docs/spec.md] what is this?")
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(ask_request(
+                &item.id,
+                token,
+                r#"{"text":"and this?","file":"docs/big.md"}"#,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        wait_for_planner(&store, &item.id, 2).await;
+        let prompt = fs::read_to_string(dir.path().join("prompt.txt")).unwrap();
+        assert!(
+            prompt.contains("Path: docs/big.md\nContent not included"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("BBBB"),
+            "over-size content must not be sent"
+        );
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    // TC-3842 / FR-3842: `mode: "edit"` needs the human browser headers (403
+    // without), then runs an edit turn in the work conversation (202; argv has
+    // `--conversation`, `--no-spec-first`, no `--read-only`); an unknown mode
+    // is 400 and an item in progress with a live run is 409.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3842_edit_turn_requires_human_and_resumes() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(ws.join("docs")).unwrap();
+        fs::write(ws.join("docs/spec.md"), "# Spec\n").unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let item = add_ws_item(&store, &state, &ws, "edit http");
+        let mut link = crate::board::session::running_link(
+            crate::board::SessionKind::Run,
+            &ws,
+            crate::board::session::now_ms(),
+        );
+        link.conversation_id = Some("conv-http".to_owned());
+        link.agent = Some("cursor-agent".to_owned());
+        store.append_session(&item.id, link, "planner").unwrap();
+        let child = recording_child(dir.path());
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &child) };
+        let token = "boardtesttoken";
+        let router = web_ask_router(board.clone(), state.clone(), token);
+        let edit_body = r#"{"text":"tighten it","mode":"edit","file":"docs/spec.md"}"#;
+
+        let resp = router
+            .clone()
+            .oneshot(ask_request(&item.id, token, edit_body, false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = router
+            .clone()
+            .oneshot(ask_request(
+                &item.id,
+                token,
+                r#"{"text":"x","mode":"write"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(!dir.path().join("argv.log").exists());
+
+        let resp = router
+            .clone()
+            .oneshot(ask_request(&item.id, token, edit_body, true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let accepted: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(accepted["mode"], "edit");
+        assert_eq!(accepted["resume"]["mode"], "summary");
+        assert_eq!(accepted["resume"]["agent"], "cursor-agent");
+        let answered = wait_for_planner(&store, &item.id, 1).await;
+        let argv = fs::read_to_string(dir.path().join("argv.log")).unwrap();
+        assert!(argv.contains("--conversation conv-http"), "{argv}");
+        assert!(argv.contains("--agent cursor-agent"), "{argv}");
+        assert!(argv.contains("--no-spec-first"), "{argv}");
+        assert!(!argv.contains("--read-only"), "{argv}");
+        assert_eq!(
+            answered.sessions.last().unwrap().mode.as_deref(),
+            Some("edit")
+        );
+
+        // Live board run on an approved item -> 409.
+        let running = add_ws_item(&store, &state, &ws, "running");
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&ws, &state, "ship it", plan_json, None).unwrap();
+        store
+            .attach_plan(&running.id, &hash, &state, "bot:test")
+            .unwrap();
+        store
+            .decide(
+                &running.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let prepared = crate::board::runner::run_item_prepare(
+            &store,
+            crate::board::runner::RunParams {
+                id: running.id.clone(),
+                expected_plan_hash: Some(hash),
+                by: "owner".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        let resp = router
+            .clone()
+            .oneshot(ask_request(
+                &running.id,
+                token,
+                r#"{"text":"edit now","mode":"edit"}"#,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        drop(prepared);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
     }
 }

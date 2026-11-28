@@ -523,6 +523,12 @@ fn board_wait(args: &Value) -> Result<Value, ApiError> {
 }
 
 fn board_ask(args: &Value) -> Result<Value, ApiError> {
+    // SPEC-md-viewer-chat FR-3845: edit turns are owner-only, never MCP.
+    if args.get("edit").is_some() || args.get("mode").is_some() {
+        return Err(usage(
+            "board_ask has no edit mode; edits are owner-only (dashboard or TTY CLI)",
+        ));
+    }
     let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
     validate_item_id_early(id).map_err(ApiError::from)?;
     let text = str_arg(args, "text")
@@ -664,5 +670,31 @@ mod tests {
             std::env::remove_var("DMUXAI_STATE_DIR");
             std::env::remove_var("DMUXAI_DATA_DIR");
         }
+    }
+
+    // TC-3845 / FR-3845: MCP `board_ask` has no edit mode: an `edit` or
+    // `mode` argument is a usage error before any store access or child, and
+    // the tool schema offers neither.
+    #[test]
+    fn tc_3845_mcp_has_no_edit() {
+        let ws = std::path::Path::new(".");
+        for args in [
+            json!({"id": "b000000000001", "text": "fix it", "mode": "edit"}),
+            json!({"id": "b000000000001", "text": "fix it", "edit": true}),
+            json!({"id": "b000000000001", "text": "fix it", "mode": "ask"}),
+        ] {
+            let out = invoke(ws, "board_ask", &args);
+            assert_eq!(out["ok"], false, "{out}");
+            assert_eq!(out["exit_code"], exit::USAGE, "{out}");
+        }
+        let tools = crate::mcp_server::tool_definitions();
+        let ask = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "board_ask")
+            .expect("board_ask tool");
+        let props = ask["inputSchema"]["properties"].as_object().unwrap();
+        assert!(!props.contains_key("edit") && !props.contains_key("mode"));
     }
 }

@@ -155,6 +155,14 @@ your message and asks the planner read-only, posting the answer in the thread
 (`dmuxai board wait`) without running an agent; in view-only `dmuxai serve`,
 **Send** is always store-only.
 
+In `dmuxai --web`, a Markdown file opened from the item popup (summary, thread
+or Work session links) shows a chat beside the viewer with the item's messages
+about that file. **Ask** (default) asks the planner with the file as context;
+**Edit** asks the agent to change the file in the item's work session, then
+reloads the viewer and lists the changed files in the thread. Edits never
+approve plans or change the item's lane or decision. From a terminal, the
+owner can run `dmuxai board ask <id> --edit --file <path> --text …`.
+
 Configure `[board] planner = "<agent>"` (or `"<agent>:<model>"`) in your user
 `dmuxai.toml` to choose which planner agent answers board questions; otherwise
 the workspace's default routing is used. See

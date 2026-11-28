@@ -192,6 +192,10 @@ pub enum BoardOp {
         by: Option<String>,
         /// SPEC-board-ask-resume FR-3832.
         resume: dmuxai::board::resume::ResumeMode,
+        /// Owner-only edit turn in the work session (SPEC-md-viewer-chat FR-3845).
+        edit: bool,
+        /// Markdown file in question (FR-3841).
+        file: Option<String>,
     },
     Run {
         id: String,
@@ -412,7 +416,7 @@ Usage: dmuxai board rules [--set FILE|-] [--json]
 ";
 
 pub const BOARD_ASK_USAGE: &str = "\
-Usage: dmuxai board ask <id> --text T|- [--revise] [--resume auto|native|fresh|off] [--agent A] [--model M] [--by ACTOR] [--json]
+Usage: dmuxai board ask <id> --text T|- [--revise] [--resume auto|native|fresh|off] [--edit] [--file P] [--agent A] [--model M] [--by ACTOR] [--json]
 ";
 
 pub const BOARD_RUN_USAGE: &str = "\
@@ -2317,6 +2321,16 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     hidden: false,
                 },
                 FlagSpec {
+                    names: &["--edit"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--file"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
                     names: &["--agent"],
                     takes_value: true,
                     hidden: false,
@@ -2353,16 +2367,24 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 Some(raw) => dmuxai::board::resume::ResumeMode::parse(&raw)
                     .ok_or_else(|| "--resume must be auto, native, fresh or off".to_owned())?,
             };
+            let revise = parsed.flags.contains_key("--revise");
+            let edit = parsed.flags.contains_key("--edit");
+            let file = parsed.flags.get("--file").cloned().flatten();
+            if revise && (edit || file.is_some()) {
+                return Err("--revise cannot be used with --edit or --file".to_owned());
+            }
             Ok(BoardCommand {
                 json: parsed.flags.contains_key("--json"),
                 op: BoardOp::Ask {
                     id,
                     text,
-                    revise: parsed.flags.contains_key("--revise"),
+                    revise,
                     agent: parsed.flags.get("--agent").cloned().flatten(),
                     model: parsed.flags.get("--model").cloned().flatten(),
                     by: parsed.flags.get("--by").cloned().flatten(),
                     resume,
+                    edit,
+                    file,
                 },
             })
         }
@@ -4041,10 +4063,26 @@ fn execute_board_with_caller(
                 model,
                 by,
                 resume,
+                edit,
+                file,
             } => {
+                let by = if edit {
+                    // SPEC-md-viewer-chat FR-3845: owner only, confirmed by typing the id.
+                    if by.as_deref().is_some_and(|b| b.trim() != "owner") {
+                        return Err(ApiError::new(
+                            exit::FORBIDDEN,
+                            "board ask --edit is owner-only".to_owned(),
+                        ));
+                    }
+                    let by = resolve_actor(Some("owner"), caller).map_err(ApiError::from)?;
+                    let existing = store.get(&id).map_err(ApiError::from)?;
+                    confirm_owner_action_cli(&id, "edit in", &existing.title)?;
+                    by
+                } else {
+                    resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?
+                };
                 let text = read_prompt(&text)?;
-                let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
-                let answer = dmuxai::board::runner::ask_item_report(
+                let answer = dmuxai::board::runner::ask_item_report_with(
                     &store,
                     dmuxai::board::runner::AskParams {
                         id,
@@ -4056,14 +4094,21 @@ fn execute_board_with_caller(
                         state_root,
                         resume,
                     },
+                    dmuxai::board::runner::AskExtra::new(file, edit),
                 )
                 .map_err(ApiError::from)?;
                 let item = &answer.item;
                 if json_out {
-                    print_json(&dmuxai::board::resume::ask_answer_json(
-                        item,
-                        answer.resume.as_ref(),
-                    ));
+                    let mut value =
+                        dmuxai::board::resume::ask_answer_json(item, answer.resume.as_ref());
+                    if edit && let Some(map) = value.as_object_mut() {
+                        map.insert("mode".to_owned(), Value::from("edit"));
+                        map.insert(
+                            "changed_paths".to_owned(),
+                            serde_json::json!(answer.changed_paths),
+                        );
+                    }
+                    print_json(&value);
                 } else if let Some(last) = item.thread.last() {
                     println!("{}", last.text);
                 }
@@ -7069,6 +7114,122 @@ mod tests {
             .is_err()
         );
         assert!(BOARD_ASK_USAGE.contains("--resume auto|native|fresh|off"));
+    }
+
+    // TC-3845 / FR-3845: `board ask --edit [--file P]` parses, is refused with
+    // `--revise`, and is owner-only: a non-TTY caller, a TTY caller with
+    // DMUXAI_RUN_ID set and a bot actor all exit 5 before any message or child.
+    #[test]
+    fn tc_3845_cli_edit_owner_only() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+
+        match parse(&args(&[
+            "board",
+            "ask",
+            "b000000000001",
+            "--edit",
+            "--text",
+            "fix",
+            "--file",
+            "docs/x.md",
+        ])) {
+            Ok(AgentCommand::Board(BoardCommand {
+                op: BoardOp::Ask { edit, file, .. },
+                ..
+            })) => {
+                assert!(edit);
+                assert_eq!(file.as_deref(), Some("docs/x.md"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            parse(&args(&[
+                "board",
+                "ask",
+                "b000000000001",
+                "--edit",
+                "--revise",
+                "--text",
+                "x"
+            ]))
+            .is_err()
+        );
+        assert!(BOARD_ASK_USAGE.contains("[--edit] [--file P]"));
+
+        let store = dmuxai::board::BoardStore::open(state.join("board")).unwrap();
+        let item = store
+            .add(dmuxai::board::AddItemRequest {
+                title: "Edit me".to_owned(),
+                summary: String::new(),
+                kind: dmuxai::board::Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let marker = dir.path().join("spawned");
+        let fake_bin = dir.path().join("fake-edit.sh");
+        std::fs::write(
+            &fake_bin,
+            format!("#!/bin/sh\ntouch \"{}\"\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_bin, perms).unwrap();
+        }
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+        let edit = |by: Option<&str>, caller| {
+            execute_board_with_caller(
+                &ws,
+                BoardCommand {
+                    op: BoardOp::Ask {
+                        id: item.id.clone(),
+                        text: "fix it".to_owned(),
+                        revise: false,
+                        agent: None,
+                        model: None,
+                        by: by.map(str::to_owned),
+                        resume: dmuxai::board::resume::ResumeMode::Auto,
+                        edit: true,
+                        file: None,
+                    },
+                    json: true,
+                },
+                caller,
+            )
+        };
+        let non_tty = edit(None, dmuxai::board::BoardCaller::CliNonTty);
+        let bot = edit(Some("bot:coord"), dmuxai::board::BoardCaller::CliTty);
+        unsafe { std::env::set_var(dmuxai::term::policy::RUN_ID_ENV, "run-3845") };
+        let in_run = edit(None, dmuxai::board::BoardCaller::CliTty);
+        unsafe {
+            std::env::remove_var(dmuxai::term::policy::RUN_ID_ENV);
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var("DMUXAI_STATE_DIR");
+        }
+        assert_eq!(non_tty, exit::FORBIDDEN);
+        assert_eq!(bot, exit::FORBIDDEN);
+        assert_eq!(in_run, exit::FORBIDDEN);
+        assert!(store.get(&item.id).unwrap().thread.is_empty());
+        assert!(!marker.exists(), "a refused edit spawns no child");
     }
 
     // TC-2550 / FR-2550: --approve-plan-id must be exactly 16 lowercase hex

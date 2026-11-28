@@ -2632,6 +2632,68 @@ mod tests {
         assert!(BOARD_CSS.contains(".board-chat-mode"));
     }
 
+    // TC-3840 / FR-3840, FR-3841, FR-3842, FR-3844, NFR-3840: the viewer docks
+    // a chat only for links inside the open item modal in `--web` (board.js
+    // context hook); it has the item's thread messages about the path, a
+    // textarea, Ask/Edit (default Ask), the FR-3836 resume selector and Send
+    // (Ctrl/Cmd+Enter); Send posts `file` (+ `mode: "edit"` with the human
+    // header); the poll runs only while an answer is pending and stops when
+    // the viewer closes; an edit reloads the file; only the server HTML uses
+    // innerHTML.
+    #[test]
+    fn tc_3840_md_viewer_chat_panel() {
+        let ctx_fn = js_between(
+            BOARD_JS,
+            "window.dmuxaiMdViewerItemContext",
+            "function boardRenderWorkSession",
+        );
+        assert!(ctx_fn.contains("if (!boardLaunchAllowed || !boardSelectedId"));
+        assert!(ctx_fn.contains("trigger.closest('#board-drawer')"));
+        assert!(ctx_fn.contains("resumeOptions: BOARD_CHAT_RESUME_OPTIONS"));
+        assert!(ctx_fn.contains("hasWorkSession: boardHasWorkSession(item)"));
+        assert!(ctx_fn.contains("fetchJson: boardFetchJson"));
+
+        assert!(MD_VIEWER_JS.contains("window.dmuxaiMdViewerItemContext(trigger)"));
+        assert!(MD_VIEWER_JS.contains("if (ctx) { mountChat(ctx); }"));
+        assert!(MD_VIEWER_JS.contains("panel.id = 'md-viewer-chat';"));
+        assert!(MD_VIEWER_JS.contains("input.id = 'md-viewer-chat-input';"));
+        assert!(MD_VIEWER_JS.contains("'Ask'") && MD_VIEWER_JS.contains("'Edit'"));
+        assert!(MD_VIEWER_JS.contains("mode: 'ask',"));
+        assert!(MD_VIEWER_JS.contains("resumeSel.hidden = !ctx.hasWorkSession;"));
+        assert!(MD_VIEWER_JS.contains("e.key === 'Enter' && (e.ctrlKey || e.metaKey)"));
+        assert!(
+            MD_VIEWER_JS
+                .contains("candidates.some(function (c) { return m.text.indexOf(c) !== -1; })")
+        );
+
+        let send_fn = js_between(MD_VIEWER_JS, "function chatSend", "function mountChat");
+        assert!(send_fn.contains("var body = { text: text, file: currentPath };"));
+        assert!(send_fn.contains("if (edit) { body.mode = 'edit'; }"));
+        assert!(send_fn.contains("'/ask', body, edit)"));
+        let fetch_fn = js_between(
+            BOARD_JS,
+            "function boardFetchJson",
+            "function boardBasename",
+        );
+        assert!(fetch_fn.contains("if (humanAction === true)"));
+        assert!(fetch_fn.contains("headers['X-Dmuxai-Human'] = '1';"));
+
+        let close_fn = js_between(MD_VIEWER_JS, "function closeViewer", "function showStatus");
+        assert!(close_fn.contains("teardownChat();"));
+        let poll_fn = js_between(MD_VIEWER_JS, "function startChatPoll", "function chatSend");
+        assert!(
+            poll_fn.contains("chat !== state || !backdrop || backdrop.hidden || !state.pending")
+        );
+        assert!(MD_VIEWER_JS.contains("CHAT_POLL_MS = 3000"));
+        assert!(!MD_VIEWER_JS.contains("EventSource"));
+        assert!(MD_VIEWER_JS.contains("if (wasEdit && currentPath) { loadFile(currentPath); }"));
+        assert_eq!(MD_VIEWER_JS.matches("innerHTML").count(), 1);
+
+        assert!(BOARD_CSS.contains(".md-viewer-chat {"));
+        assert!(BOARD_CSS.contains(".md-viewer-card.md-viewer-with-chat"));
+        assert!(BOARD_CSS.contains("border-top: 1px solid var(--line);"));
+    }
+
     // TC-3123 / FR-3123: drawer plan edit, chat, stale approve notice.
     #[test]
     fn tc_3123_board_drawer_plan_edit_chat_and_stale_approve_conflict() {

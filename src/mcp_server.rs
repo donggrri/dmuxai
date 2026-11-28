@@ -39,7 +39,7 @@ pub trait McpBackend {
     fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
 }
 
-fn tool_definitions() -> Value {
+pub(crate) fn tool_definitions() -> Value {
     json!([
         {
             "name": "todo_add",
@@ -300,7 +300,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "board_ask",
-            "description": "Ask the planner a question on a decision board item or request a plan revision (blocks up to 900s). With a work session the ask continues it read-only; the result has resume.mode (native, summary, off).",
+            "description": "Ask the planner a question on a decision board item or request a plan revision (blocks up to 900s). With a work session the ask continues it read-only; the result has resume.mode (native, summary, off). Edit turns are owner-only and not available over MCP.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

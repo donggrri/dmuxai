@@ -589,12 +589,46 @@ pub struct AskResumePlan {
     pub expected_mode: &'static str,
 }
 
+/// Content of the file in question carried into an ask prompt
+/// (SPEC-md-viewer-chat FR-3841).
+pub const ASK_FILE_MAX_BYTES: u64 = 64 * 1024;
+/// First line of the prompt section naming the file in question (FR-3841).
+pub const ASK_FILE_HEADER: &str = "File in question";
+/// Changed paths reported after an edit turn (FR-3844).
+pub const EDIT_CHANGED_PATHS_MAX: usize = 50;
+/// Panel and thread text of an edit turn stopped at exit 7 (FR-3843).
+pub const EDIT_NEEDS_APPROVAL: &str = "needs approval \u{2014} not applied";
+
+/// Viewer-chat additions to an ask (SPEC-md-viewer-chat FR-3841, FR-3842).
+#[derive(Debug, Clone, Default)]
+pub struct AskExtra {
+    /// Markdown file the message is about, resolved like `/api/md/view`.
+    pub file: Option<String>,
+    /// Write turn in the work session. Callers allow it only for the owner
+    /// (human browser headers or a confirmed TTY, FR-3842/FR-3845).
+    pub edit: bool,
+    /// Home folder for the FR-3415 home rule.
+    pub home: Option<PathBuf>,
+}
+
+impl AskExtra {
+    pub fn new(file: Option<String>, edit: bool) -> Self {
+        Self {
+            file: file.filter(|f| !f.trim().is_empty()),
+            edit,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+}
+
 pub struct PreparedAsk {
     pub item: BoardItem,
     pub workspace: PathBuf,
     pub guard: BoardLockGuard,
     pub params: AskParams,
     pub resume: Option<AskResumePlan>,
+    pub file: Option<crate::docs::md_view::MdFileContext>,
+    pub edit: bool,
 }
 
 impl PreparedAsk {
@@ -609,7 +643,7 @@ impl PreparedAsk {
                 agent: Some(plan.agent.clone()),
             },
             None => ResumeReport {
-                mode: "off".to_owned(),
+                mode: if self.edit { "summary" } else { "off" }.to_owned(),
                 agent: self.params.agent.clone(),
             },
         })
@@ -621,6 +655,61 @@ impl PreparedAsk {
 pub struct AskAnswer {
     pub item: BoardItem,
     pub resume: Option<ResumeReport>,
+    /// Workspace-relative paths an edit turn changed (FR-3844).
+    pub changed_paths: Vec<String>,
+}
+
+impl AskAnswer {
+    fn new(item: BoardItem, resume: Option<ResumeReport>) -> Self {
+        Self {
+            item,
+            resume,
+            changed_paths: Vec::new(),
+        }
+    }
+}
+
+fn md_view_error(error: crate::docs::md_view::MdViewError) -> BoardError {
+    use crate::docs::md_view::MdViewError;
+    let message = format!("file: {}", error.message());
+    match error {
+        MdViewError::BadInput(_) => BoardError::Usage(message),
+        MdViewError::Forbidden(_) => BoardError::Forbidden(message),
+        MdViewError::NotFound => BoardError::NotFound(message),
+        MdViewError::TooLarge | MdViewError::Io => BoardError::Internal(message),
+    }
+}
+
+/// `[file · P] ` / `[edit · P] ` tag that ties a thread message to the file
+/// of the viewer chat (FR-3841, FR-3844).
+fn file_tag(file: Option<&crate::docs::md_view::MdFileContext>, edit: bool) -> String {
+    match file {
+        Some(file) => format!(
+            "[{} \u{b7} {}] ",
+            if edit { "edit" } else { "file" },
+            file.path
+        ),
+        None if edit => "[edit] ".to_owned(),
+        None => String::new(),
+    }
+}
+
+fn file_prompt_section(file: &crate::docs::md_view::MdFileContext) -> String {
+    let mut section = format!("\n{ASK_FILE_HEADER}\nPath: {}\n", file.path);
+    match file.content.as_deref() {
+        Some(content) => {
+            section.push_str("Current content:\n----- begin file -----\n");
+            section.push_str(&mask_sensitive_tokens(content));
+            if !content.ends_with('\n') {
+                section.push('\n');
+            }
+            section.push_str("----- end file -----\n");
+        }
+        None => section.push_str(
+            "Content not included (over 64 KiB or not UTF-8); read the file from the workspace.\n",
+        ),
+    }
+    section
 }
 
 fn binding_is_active(
@@ -719,10 +808,45 @@ fn plan_ask_resume(
 pub const NO_ACTIVE_BINDING: &str = "no_active_binding";
 
 pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<PreparedAsk, BoardError> {
+    ask_item_prepare_with(store, params, AskExtra::default())
+}
+
+/// [`ask_item_prepare`] with a file in question and/or an edit turn
+/// (SPEC-md-viewer-chat FR-3841..FR-3844).
+pub fn ask_item_prepare_with(
+    store: &BoardStore,
+    params: AskParams,
+    extra: AskExtra,
+) -> Result<PreparedAsk, BoardError> {
     validate_item_id_early(&params.id)?;
     validate_message(&params.text)?;
+    if params.revise && (extra.edit || extra.file.is_some()) {
+        return Err(BoardError::Usage(
+            "--revise cannot be used with --edit or --file".to_owned(),
+        ));
+    }
     let existing = store.get(&params.id)?;
     let workspace = require_item_workspace(&existing)?;
+    if extra.edit
+        && existing.lane == Lane::InProgress
+        && BoardLockGuard::is_active(store.base(), "runs", &params.id)
+    {
+        return Err(BoardError::Conflict(
+            "cannot edit while a board run is in progress for this item".to_owned(),
+        ));
+    }
+    let file = match extra.file.as_deref() {
+        Some(raw) => Some(
+            crate::docs::md_view::md_file_context(
+                raw,
+                &workspace,
+                extra.home.as_deref(),
+                ASK_FILE_MAX_BYTES,
+            )
+            .map_err(md_view_error)?,
+        ),
+        None => None,
+    };
     if params.revise && existing.plan.is_none() {
         return Err(BoardError::Usage(
             "cannot --revise an item without a plan".to_owned(),
@@ -743,10 +867,11 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
         &params.id,
         "an ask is already running for this item",
     )?;
+    let tagged = format!("{}{}", file_tag(file.as_ref(), extra.edit), params.text);
     let item = store.say(
         &params.id,
         SayRequest {
-            text: params.text.clone(),
+            text: tagged.chars().take(TEXT_MAX).collect(),
             from: params.by.clone(),
         },
     )?;
@@ -756,6 +881,8 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
         guard,
         params,
         resume,
+        file,
+        edit: extra.edit,
     })
 }
 
@@ -800,6 +927,78 @@ fn build_follow_up_prompt(item: &BoardItem, question: &str) -> String {
     )
 }
 
+/// Child argv of an edit turn (SPEC-md-viewer-chat FR-3842, FR-3843): the
+/// write turn policy (no `--read-only`), one agent turn without spec-first,
+/// and never `--allow-sensitive`, `--trust-workspace-config` or
+/// `--approve-plan`. With a work session it continues that conversation
+/// (hybrid resume); without one it starts a new conversation.
+pub fn edit_turn_run_args(
+    workspace: &Path,
+    plan: Option<&AskResumePlan>,
+    agent: Option<&str>,
+    model: Option<&str>,
+    item_id: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        "run".to_owned(),
+    ];
+    if let Some(plan) = plan {
+        args.push("--conversation".to_owned());
+        args.push(plan.conversation_id.clone());
+    }
+    let agent = plan.map(|p| p.agent.as_str()).or(agent);
+    if let Some(a) = agent {
+        args.push("--agent".to_owned());
+        args.push(a.to_owned());
+    }
+    args.push("--no-spec-first".to_owned());
+    args.push("--json".to_owned());
+    if let (Some(m), Some(_)) = (model, agent) {
+        args.push("--model".to_owned());
+        args.push(m.to_owned());
+    }
+    if let Some(plan) = plan {
+        if plan.force_fresh {
+            args.push("--fresh-session".to_owned());
+        }
+        args.push("--board-item".to_owned());
+        args.push(item_id.to_owned());
+    }
+    args.push("-".to_owned());
+    args
+}
+
+fn build_edit_prompt(
+    item: &BoardItem,
+    request: &str,
+    file: Option<&crate::docs::md_view::MdFileContext>,
+    seed: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    if let Some(seed) = seed {
+        prompt.push_str(seed);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&format!(
+        "Edit request from the decision board about \"{}\".",
+        item.title
+    ));
+    if let Some(file) = file {
+        prompt.push_str(&format!(" Change the file {} as requested.", file.path));
+    }
+    prompt.push_str(
+        " Keep the changes focused on this request and do not touch unrelated files.\n\nRequest:\n",
+    );
+    prompt.push_str(request);
+    prompt.push('\n');
+    if let Some(file) = file {
+        prompt.push_str(&file_prompt_section(file));
+    }
+    prompt
+}
+
 pub fn ask_run_args(workspace: &Path, agent: Option<&str>, model: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "-C".to_owned(),
@@ -837,14 +1036,21 @@ pub fn ask_item_execute_report(
         guard,
         params,
         resume,
+        file,
+        edit,
     } = prepared;
+    if edit {
+        return execute_edit_turn(store, item, workspace, guard, params, resume, file);
+    }
     let ws_str = workspace.to_string_lossy().into_owned();
     let timeout = child_timeout();
     let started_ms = session::now_ms();
+    let tag = file_tag(file.as_ref(), false);
+    let file_section = file.as_ref().map(file_prompt_section).unwrap_or_default();
 
     if let Some(plan) = resume {
         let args = ask_resume_run_args(&workspace, &plan, params.model.as_deref(), &params.id);
-        let prompt = build_follow_up_prompt(&item, &params.text);
+        let prompt = build_follow_up_prompt(&item, &params.text) + &file_section;
         let mut outcome =
             spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
         if !plan.fork && outcome.links.conversation_id.is_none() {
@@ -864,6 +1070,7 @@ pub fn ask_item_execute_report(
             .clone()
             .unwrap_or_else(|| plan.expected_mode.to_owned());
         let mut answer = format!("[{mode} resume · {}] ", plan.agent);
+        answer.push_str(&tag);
         if plan.fork {
             answer.push_str("(new conversation; a board run is in progress) ");
         }
@@ -878,13 +1085,13 @@ pub fn ask_item_execute_report(
                 from: "planner".to_owned(),
             },
         )?;
-        return Ok(AskAnswer {
+        return Ok(AskAnswer::new(
             item,
-            resume: Some(ResumeReport {
+            Some(ResumeReport {
                 mode,
                 agent: Some(plan.agent),
             }),
-        });
+        ));
     }
 
     if !params.revise {
@@ -894,7 +1101,7 @@ pub fn ask_item_execute_report(
         let model = params.model.or(cfg_model);
         let args = ask_run_args(&workspace, agent.as_deref(), model.as_deref());
 
-        let prompt = build_ask_prompt(&item, &params.text);
+        let prompt = build_ask_prompt(&item, &params.text) + &file_section;
         let outcome = spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
         append_ask_link(
             store,
@@ -905,7 +1112,7 @@ pub fn ask_item_execute_report(
             agent.as_deref(),
             model.as_deref(),
         );
-        let raw_answer = ask_answer_text(outcome);
+        let raw_answer = tag + &ask_answer_text(outcome);
         let masked = mask_sensitive_tokens(&raw_answer);
         let answer: String = masked.chars().take(TEXT_MAX).collect();
         // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
@@ -917,13 +1124,13 @@ pub fn ask_item_execute_report(
                 from: "planner".to_owned(),
             },
         )?;
-        return Ok(AskAnswer {
+        return Ok(AskAnswer::new(
             item,
-            resume: Some(ResumeReport {
+            Some(ResumeReport {
                 mode: "off".to_owned(),
                 agent,
             }),
-        });
+        ));
     }
 
     let plan = item
@@ -967,7 +1174,7 @@ pub fn ask_item_execute_report(
                     from: "planner".to_owned(),
                 },
             )
-            .map(|item| AskAnswer { item, resume: None });
+            .map(|item| AskAnswer::new(item, None));
     }
 
     let mut msg = format!(
@@ -990,7 +1197,144 @@ pub fn ask_item_execute_report(
                 from: "planner".to_owned(),
             },
         )
-        .map(|item| AskAnswer { item, resume: None })
+        .map(|item| AskAnswer::new(item, None))
+}
+
+/// Edit turn in the work session (SPEC-md-viewer-chat FR-3842..FR-3844). It
+/// only appends a thread message and an `ask` session link with
+/// `mode: "edit"`; lane, plan, decision and checked record stay as they are.
+fn execute_edit_turn(
+    store: &BoardStore,
+    item: BoardItem,
+    workspace: PathBuf,
+    guard: BoardLockGuard,
+    params: AskParams,
+    resume: Option<AskResumePlan>,
+    file: Option<crate::docs::md_view::MdFileContext>,
+) -> Result<AskAnswer, BoardError> {
+    let started_ms = session::now_ms();
+    let (agent, model) = match &resume {
+        Some(plan) => (Some(plan.agent.clone()), params.model.clone()),
+        None => {
+            let (cfg_agent, cfg_model) = BoardSettings::load_user_only().planner_agent_and_model();
+            let agent = params.agent.clone().or(cfg_agent);
+            let model = params.model.clone().or(cfg_model);
+            (agent, model)
+        }
+    };
+    let seed = resume
+        .is_none()
+        .then(|| super::resume::item_seed_summary(&item));
+    let args = edit_turn_run_args(
+        &workspace,
+        resume.as_ref(),
+        agent.as_deref(),
+        model.as_deref(),
+        &params.id,
+    );
+    let prompt = build_edit_prompt(&item, &params.text, file.as_ref(), seed.as_deref());
+    let before = session::change_snapshot(&workspace);
+    let mut outcome = spawn_child_dmuxai(
+        &workspace,
+        &args,
+        &prompt,
+        child_timeout(),
+        &params.state_root,
+    )?;
+    let after = session::change_snapshot(&workspace);
+    let changed = session::changed_paths(before.as_ref(), after.as_ref(), EDIT_CHANGED_PATHS_MAX);
+    if let Some(plan) = &resume
+        && outcome.links.conversation_id.is_none()
+    {
+        outcome.links.conversation_id = Some(plan.conversation_id.clone());
+    }
+
+    let mut link = session::running_link(SessionKind::Ask, &workspace, started_ms);
+    link.agent = agent.clone();
+    link.model = model.clone();
+    link.mode = Some("edit".to_owned());
+    let link = session::finished_link(
+        link,
+        outcome.run_id.as_deref(),
+        outcome.exit_code,
+        &outcome.links,
+        session::md_paths_of(&changed),
+    );
+    let _ = store.append_session(&params.id, link, "planner");
+
+    let mode = outcome
+        .resume_mode
+        .clone()
+        .or_else(|| resume.as_ref().map(|p| p.expected_mode.to_owned()))
+        .unwrap_or_else(|| "summary".to_owned());
+    let agent_label = agent
+        .clone()
+        .or_else(|| outcome.links.agent.clone())
+        .unwrap_or_else(|| "default".to_owned());
+    let mut text = format!(
+        "[{mode} resume \u{b7} {agent_label}] {}",
+        file_tag(file.as_ref(), true)
+    );
+    if resume.is_none() {
+        text.push_str("(new conversation seeded with a summary) ");
+    }
+    text.push_str(&edit_answer_text(&outcome));
+    if changed.is_empty() {
+        text.push_str("\n\nNo files changed.");
+    } else {
+        text.push_str("\n\nChanged files:");
+        for path in &changed {
+            text.push_str("\n- ");
+            text.push_str(path);
+        }
+    }
+    let masked = mask_sensitive_tokens(&text);
+    drop(guard);
+    let item = store.say(
+        &params.id,
+        SayRequest {
+            text: masked.chars().take(TEXT_MAX).collect(),
+            from: "planner".to_owned(),
+        },
+    )?;
+    Ok(AskAnswer {
+        item,
+        resume: Some(ResumeReport {
+            mode,
+            agent: Some(agent_label),
+        }),
+        changed_paths: changed,
+    })
+}
+
+fn edit_answer_text(outcome: &ChildOutcome) -> String {
+    let detail = outcome
+        .summary
+        .as_deref()
+        .or(outcome.text.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(2000).collect::<String>());
+    match outcome.exit_code {
+        0 => outcome
+            .text
+            .clone()
+            .or_else(|| outcome.summary.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "edit turn finished".to_owned()),
+        code => {
+            let mut msg = if code == 7 {
+                EDIT_NEEDS_APPROVAL.to_owned()
+            } else {
+                format!("edit failed (exit {code})")
+            };
+            if let Some(detail) = detail {
+                msg.push_str(": ");
+                msg.push_str(&detail);
+            }
+            msg
+        }
+    }
 }
 
 fn ask_answer_text(outcome: ChildOutcome) -> String {
@@ -1043,7 +1387,15 @@ pub fn ask_item(store: &BoardStore, params: AskParams) -> Result<BoardItem, Boar
 }
 
 pub fn ask_item_report(store: &BoardStore, params: AskParams) -> Result<AskAnswer, BoardError> {
-    let prepared = ask_item_prepare(store, params)?;
+    ask_item_report_with(store, params, AskExtra::default())
+}
+
+pub fn ask_item_report_with(
+    store: &BoardStore,
+    params: AskParams,
+    extra: AskExtra,
+) -> Result<AskAnswer, BoardError> {
+    let prepared = ask_item_prepare_with(store, params, extra)?;
     ask_item_execute_report(store, prepared)
 }
 
@@ -3433,5 +3785,254 @@ exit 0
         assert_eq!(after.lane, before.lane);
         assert_eq!(after.decision, before.decision);
         assert_eq!(after.checked, before.checked);
+    }
+
+    fn edit_extra(file: Option<&str>) -> AskExtra {
+        AskExtra {
+            file: file.map(str::to_owned),
+            edit: true,
+            home: None,
+        }
+    }
+
+    /// Fake child logging argv/env to `argv.log` and the prompt to
+    /// `prompt.txt`, then running `body` (cwd is the workspace).
+    fn edit_child(h: &Hardening, name: &str, body: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let log = h.dir.path().join(format!("{name}-argv.log"));
+        let prompt = h.dir.path().join(format!("{name}-prompt.txt"));
+        let child = write_fake_runner(
+            h.dir.path(),
+            &format!("{name}.sh"),
+            &format!(
+                "#!/bin/sh\ncat > \"{prompt}\"\nprintf '%s | env:%s\\n' \"$*\" \"$(env | grep -c -e DMUXAI_ALLOW_SENSITIVE -e DMUXAI_TRUST_WORKSPACE_CONFIG)\" >> \"{log}\"\n{body}",
+                prompt = prompt.display(),
+                log = log.display()
+            ),
+        );
+        (child, log, prompt)
+    }
+
+    // TC-3843 / FR-3843, FR-3842: an edit turn runs `run --conversation C
+    // --agent A --no-spec-first --json` with the write policy (no
+    // `--read-only`) and never --allow-sensitive/--trust-workspace-config/
+    // --approve-plan (argv or env); exit 7 is reported as "needs approval —
+    // not applied" (masked) and approves nothing; other exits show the error;
+    // without a work session it starts a new summary-seeded conversation.
+    #[test]
+    fn tc_3843_edit_turn_policy_and_exit7() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+        let before = h.store.get(&item.id).unwrap();
+        let (child, log, _prompt) = edit_child(
+            &h,
+            "edit-exit7",
+            "printf '{\"ok\":false,\"exit_code\":7,\"error\":\"sensitive gate: Bearer sk-secret-123456\",\"run_id\":\"2222222222222222\",\"conversation_id\":\"conv-x\",\"resume\":{\"mode\":\"native\",\"agent\":\"cursor-agent\"}}\\n'\nexit 7\n",
+        );
+
+        let answer = with_board_env(&child, &data, || {
+            ask_item_report_with(
+                &h.store,
+                resume_ask(&h, &item, ResumeMode::Auto),
+                edit_extra(None),
+            )
+        })
+        .unwrap();
+        let argv = last_argv(&log);
+        assert!(
+            argv.contains(
+                "run --conversation conv-x --agent cursor-agent --no-spec-first --json --board-item"
+            ),
+            "{argv}"
+        );
+        for forbidden in [
+            "--read-only",
+            "--allow-sensitive",
+            "--trust-workspace-config",
+            "--approve-plan",
+            "--fork-summary",
+        ] {
+            assert!(!argv.contains(forbidden), "{forbidden}: {argv}");
+        }
+        assert!(argv.ends_with("env:0"), "{argv}");
+        let last = answer.item.thread.last().unwrap();
+        assert_eq!(last.from, "planner");
+        assert!(
+            last.text.starts_with(
+                "[native resume \u{b7} cursor-agent] [edit] needs approval \u{2014} not applied"
+            ),
+            "{}",
+            last.text
+        );
+        assert!(!last.text.contains("sk-secret-123456"), "{}", last.text);
+        let link = answer.item.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.mode.as_deref(), Some("edit"));
+        assert_eq!(link.exit_code, Some(7));
+        assert_eq!(link.status, crate::board::SessionStatus::AwaitingApproval);
+        let after = h.store.get(&item.id).unwrap();
+        assert_eq!(after.lane, before.lane);
+        assert_eq!(after.plan, before.plan);
+        assert_eq!(after.decision, before.decision);
+        assert_eq!(after.checked, before.checked);
+
+        // Failure: another exit code shows the masked error.
+        let (crash, _, _) = edit_child(
+            &h,
+            "edit-crash",
+            "echo 'boom token=sk-secret-123456' >&2\nexit 1\n",
+        );
+        let failed = with_board_env(&crash, &data, || {
+            ask_item_report_with(
+                &h.store,
+                resume_ask(&h, &item, ResumeMode::Auto),
+                edit_extra(None),
+            )
+        })
+        .unwrap();
+        let text = &failed.item.thread.last().unwrap().text;
+        assert!(text.contains("edit failed (exit 1): boom"), "{text}");
+        assert!(!text.contains("sk-secret-123456"), "{text}");
+
+        // Boundary: without a work session the turn starts a new conversation
+        // whose prompt begins with the item summary.
+        let bare = hardening_item(&h, Lane::NeedsDecision);
+        let (ok, ok_log, ok_prompt) = edit_child(
+            &h,
+            "edit-ok",
+            "printf '{\"ok\":true,\"exit_code\":0,\"text\":\"done\"}\\n'\nexit 0\n",
+        );
+        let fresh = with_board_env(&ok, &data, || {
+            ask_item_report_with(
+                &h.store,
+                AskParams {
+                    agent: Some("cursor-agent".to_owned()),
+                    ..resume_ask(&h, &bare, ResumeMode::Auto)
+                },
+                edit_extra(None),
+            )
+        })
+        .unwrap();
+        let argv = last_argv(&ok_log);
+        assert!(
+            argv.contains("run --agent cursor-agent --no-spec-first --json -"),
+            "{argv}"
+        );
+        assert!(!argv.contains("--conversation") && !argv.contains("--read-only"));
+        let prompt = fs::read_to_string(&ok_prompt).unwrap();
+        assert!(
+            prompt.starts_with(super::super::resume::WORK_SUMMARY_HEADER),
+            "{prompt}"
+        );
+        assert_eq!(fresh.resume.as_ref().unwrap().mode, "summary");
+
+        // Failure: an edit never revises the plan.
+        let revise = AskParams {
+            revise: true,
+            ..resume_ask(&h, &item, ResumeMode::Auto)
+        };
+        let err = ask_item_prepare_with(&h.store, revise, edit_extra(None))
+            .err()
+            .expect("edit + revise must be refused");
+        assert_eq!(err.exit_code(), crate::agent_api::exit::USAGE);
+    }
+
+    // TC-3844 / FR-3844: after an edit turn the changed workspace-relative
+    // paths (git status before/after, already-dirty files included, at most
+    // 50) are listed in the thread and the result, an `ask` link with
+    // `mode: "edit"` records the changed `.md` files, and lane, plan,
+    // decision and checked record are unchanged; a live board run is a
+    // conflict.
+    #[test]
+    fn tc_3844_edit_turn_records_changes() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let git = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&h.ws)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        fs::create_dir_all(h.ws.join("docs")).unwrap();
+        fs::write(h.ws.join("docs/spec.md"), "# Spec\n\nold line\n").unwrap();
+        fs::write(h.ws.join("docs/other.md"), "# Other\n").unwrap();
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+        let before = h.store.get(&item.id).unwrap();
+        let (child, _log, prompt) = edit_child(
+            &h,
+            "edit-changes",
+            "if grep -q BULK \"$(dirname \"$0\")/edit-changes-prompt.txt\"; then\n  mkdir -p bulk\n  i=0\n  while [ $i -lt 60 ]; do echo x > bulk/f$i.txt; i=$((i+1)); done\nelse\n  printf 'new line\\n' >> docs/spec.md\n  mkdir -p notes\n  echo hi > notes/new.txt\nfi\n\
+             printf '{\"ok\":true,\"exit_code\":0,\"text\":\"Updated the spec.\",\"run_id\":\"3333333333333333\",\"conversation_id\":\"conv-x\",\"resume\":{\"mode\":\"native\",\"agent\":\"cursor-agent\"}}\\n'\nexit 0\n",
+        );
+
+        let answer = with_board_env(&child, &data, || {
+            ask_item_report_with(
+                &h.store,
+                AskParams {
+                    text: "add a line".to_owned(),
+                    ..resume_ask(&h, &item, ResumeMode::Auto)
+                },
+                edit_extra(Some("docs/spec.md")),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            answer.changed_paths,
+            vec!["docs/spec.md".to_owned(), "notes/new.txt".to_owned()]
+        );
+        let prompt_text = fs::read_to_string(&prompt).unwrap();
+        assert!(prompt_text.contains("Change the file docs/spec.md as requested."));
+        assert!(prompt_text.contains("old line"), "{prompt_text}");
+        let thread = &answer.item.thread;
+        let owner = &thread[thread.len() - 2];
+        assert_eq!(owner.text, "[edit \u{b7} docs/spec.md] add a line");
+        let last = thread.last().unwrap();
+        assert_eq!(
+            last.text,
+            "[native resume \u{b7} cursor-agent] [edit \u{b7} docs/spec.md] Updated the spec.\n\nChanged files:\n- docs/spec.md\n- notes/new.txt"
+        );
+        let link = answer.item.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.mode.as_deref(), Some("edit"));
+        assert_eq!(link.md_paths, vec!["docs/spec.md".to_owned()]);
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-x"));
+        let after = h.store.get(&item.id).unwrap();
+        assert_eq!(after.lane, before.lane);
+        assert_eq!(after.plan, before.plan);
+        assert_eq!(after.decision, before.decision);
+        assert_eq!(after.checked, before.checked);
+
+        // Boundary: at most 50 changed paths are reported.
+        let bulk = with_board_env(&child, &data, || {
+            ask_item_report_with(
+                &h.store,
+                AskParams {
+                    text: "BULK".to_owned(),
+                    ..resume_ask(&h, &item, ResumeMode::Auto)
+                },
+                edit_extra(None),
+            )
+        })
+        .unwrap();
+        assert_eq!(bulk.changed_paths.len(), EDIT_CHANGED_PATHS_MAX);
+        assert!(bulk.changed_paths.iter().all(|p| p.starts_with("bulk/")));
+
+        // Failure: an edit during a live board run is a conflict and spawns
+        // nothing.
+        let approved = hardening_item(&h, Lane::Approved);
+        let running = prepare(&h, &approved);
+        let err = ask_item_prepare_with(
+            &h.store,
+            resume_ask(&h, &approved, ResumeMode::Auto),
+            edit_extra(None),
+        )
+        .err()
+        .expect("edit during a run must be refused");
+        assert_eq!(err.exit_code(), crate::agent_api::exit::CONFLICT);
+        drop(running);
     }
 }

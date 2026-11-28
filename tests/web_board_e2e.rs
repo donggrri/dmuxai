@@ -163,6 +163,11 @@ case "$*" in
     printf '{"ok":true,"exit_code":0,"error":null,"text":"Planner answer: ok"}\n'
     exit 0
     ;;
+  *"--no-spec-first"*)
+    printf '\nEDITED_BY_FAKE_DM3844\n' >> "$2/docs/notes.md"
+    printf '{"ok":true,"exit_code":0,"error":null,"text":"Edited notes"}\n'
+    exit 0
+    ;;
   *"--graph"*)
     if [ -n "${FAKE_GRAPH_SLEEP:-}" ]; then sleep "${FAKE_GRAPH_SLEEP}"; fi
     printf '{"ok":true,"exit_code":0,"error":null,"text":"run ok","run_id":"a1b2c3d4e5f6789012345678abcdef01"}\n'
@@ -1751,4 +1756,253 @@ with sync_playwright() as p:
     assert!(log.contains("--fresh-session"), "{log}");
     assert!(log.contains("--read-only"), "{log}");
     assert!(!log.contains("--allow-sensitive"), "{log}");
+}
+
+// TC-3840 / FR-3840, FR-3841, NFR-3840: in `--web` the Markdown viewer opened
+// from the item modal's Work session md link docks a chat with the item's
+// thread messages about that path, a textarea, Ask/Edit (Ask pressed), the
+// resume selector and Send; Ask posts `file` and the planner answer appears
+// in the panel. The viewer opened outside an item context, or from `serve`,
+// has no chat panel.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3840_viewer_chat_panel_only_for_item_context_in_web() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let _ = fs::remove_file(&env.argv_log);
+    let (id, data) = seed_work_session(&env);
+    let item_path = env.state.join("board/items").join(format!("{id}.json"));
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(&item_path).expect("item json")).expect("item");
+    raw["thread"] = serde_json::json!([
+        { "from": "owner", "text": "please review docs/notes.md wording", "at_ms": 1 },
+        { "from": "owner", "text": "unrelated note about the deploy", "at_ms": 2 }
+    ]);
+    fs::write(&item_path, serde_json::to_vec_pretty(&raw).unwrap()).expect("write item");
+    let data_dir = data.to_string_lossy().into_owned();
+
+    let probe = format!(
+        r##"{OPEN_BOARD}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    bodies = []
+    page.on("request", lambda r: bodies.append(r.post_data or "")
+            if r.method == "POST" and r.url.endswith("/ask") else None)
+    open_board(page)
+    open_item(page)
+    page.locator('#board-work-session .board-session-md').first.click()
+    page.wait_for_selector("#md-viewer-backdrop:not([hidden])", timeout=20000)
+    page.wait_for_function(
+        "() => document.querySelector('#md-viewer-body').innerText.includes('link-free')",
+        timeout=20000)
+    panel = page.evaluate("""() => {{
+      const c = document.getElementById('md-viewer-chat');
+      if (!c) {{ return null; }}
+      return {{
+        msgs: [...c.querySelectorAll('.md-viewer-chat-bubble')].map(b => b.textContent),
+        ask: document.getElementById('md-viewer-chat-ask').getAttribute('aria-pressed'),
+        edit: document.getElementById('md-viewer-chat-edit').getAttribute('aria-pressed'),
+        input: !!document.getElementById('md-viewer-chat-input'),
+        resume_hidden: document.getElementById('md-viewer-chat-resume').hidden,
+        send: !!document.getElementById('md-viewer-chat-send'),
+      }};
+    }}""")
+    answer = None
+    if panel is not None:
+        page.fill("#md-viewer-chat-input", "is the heading right?")
+        page.keyboard.press("Control+Enter")
+        page.wait_for_function(
+            """() => [...document.querySelectorAll('#md-viewer-chat .md-viewer-chat-bubble')]
+                 .some(b => b.textContent.includes('Planner answer: ok'))""",
+            timeout=20000)
+        answer = True
+    page.keyboard.press("Escape")
+    page.wait_for_function(
+        "() => document.getElementById('md-viewer-backdrop').hidden", timeout=5000)
+    closed_panel = page.evaluate("() => !!document.getElementById('md-viewer-chat')")
+    page.keyboard.press("Escape")
+    page.wait_for_function(
+        "() => !document.getElementById('board-drawer-wrap').classList.contains('open')",
+        timeout=5000)
+    page.evaluate("() => window.dmuxaiOpenMdViewer('docs/notes.md', document.body)")
+    page.wait_for_function(
+        "() => document.querySelector('#md-viewer-body').innerText.includes('link-free')",
+        timeout=20000)
+    plain_panel = page.evaluate("() => !!document.getElementById('md-viewer-chat')")
+    browser.close()
+    print(json.dumps({{"ok": True, "panel": panel, "answer": answer,
+                      "closed_panel": closed_panel, "plain_panel": plain_panel,
+                      "bodies": bodies}}))
+"##
+    );
+
+    {
+        let (_guard, url) = start_web(&env, &[("DMUXAI_DATA_DIR", data_dir.as_str())]);
+        let result = run_probe(&python, &chrome, &probe, &[&url, &id]);
+        assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+        let panel = &result["panel"];
+        assert!(panel.is_object(), "{result}");
+        let msgs: Vec<&str> = panel["msgs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m.as_str())
+            .collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("please review docs/notes.md")),
+            "{result}"
+        );
+        assert!(!msgs.iter().any(|m| m.contains("deploy")), "{result}");
+        assert_eq!(panel["ask"], "true", "{result}");
+        assert_eq!(panel["edit"], "false", "{result}");
+        assert_eq!(panel["input"].as_bool(), Some(true), "{result}");
+        assert_eq!(panel["resume_hidden"].as_bool(), Some(false), "{result}");
+        assert_eq!(panel["send"].as_bool(), Some(true), "{result}");
+        assert_eq!(result["answer"].as_bool(), Some(true), "{result}");
+        assert_eq!(result["closed_panel"].as_bool(), Some(false), "{result}");
+        assert_eq!(result["plain_panel"].as_bool(), Some(false), "{result}");
+        let body: serde_json::Value =
+            serde_json::from_str(result["bodies"][0].as_str().unwrap_or("{}")).unwrap_or_default();
+        let file = body["file"].as_str().unwrap_or_default();
+        assert!(file.ends_with("/ws/docs/notes.md"), "{result}");
+        assert!(body.get("mode").is_none(), "{result}");
+        let log = argv_log_text(&env);
+        assert!(log.contains("--read-only"), "{log}");
+        assert!(!log.contains("--no-spec-first"), "{log}");
+    }
+
+    let (_guard, url) = start_serve(&env, &[("DMUXAI_DATA_DIR", data_dir.as_str())]);
+    let serve_probe = format!(
+        r##"{OPEN_BOARD}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    open_board(page)
+    open_item(page)
+    page.locator('#board-work-session .board-session-md').first.click()
+    page.wait_for_selector("#md-viewer-backdrop:not([hidden])", timeout=20000)
+    page.wait_for_function(
+        "() => !document.querySelector('.md-viewer-card').innerText.includes('Loading')",
+        timeout=20000)
+    panel = page.evaluate("() => !!document.getElementById('md-viewer-chat')")
+    browser.close()
+    print(json.dumps({{"ok": True, "panel": panel}}))
+"##
+    );
+    let result = run_probe(&python, &chrome, &serve_probe, &[&url, &id]);
+    assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["panel"].as_bool(), Some(false), "{result}");
+}
+
+// TC-3844 / FR-3842, FR-3843, FR-3844: Edit mode in the viewer chat sends
+// `mode: "edit"` with the human header, the child runs the work conversation
+// without `--read-only` or approval flags, the viewer reloads the edited file,
+// the planner reply lists the changed file and the item keeps its lane,
+// decision and plan.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3844_viewer_edit_reloads_file_and_lists_changes() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let _ = fs::remove_file(&env.argv_log);
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&env.workspace)
+        .status()
+        .expect("git init");
+    assert!(git.success());
+    let (id, data) = seed_work_session(&env);
+    let before = board_show(&env, &id);
+    let data_dir = data.to_string_lossy().into_owned();
+    let (_guard, url) = start_web(&env, &[("DMUXAI_DATA_DIR", data_dir.as_str())]);
+
+    let script = format!(
+        r##"{OPEN_BOARD}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    reqs = []
+    page.on("request", lambda r: reqs.append({{
+        "body": r.post_data or "", "human": r.headers.get("x-dmuxai-human")}})
+            if r.method == "POST" and r.url.endswith("/ask") else None)
+    open_board(page)
+    open_item(page)
+    page.locator('#board-work-session .board-session-md').first.click()
+    page.wait_for_function(
+        "() => document.querySelector('#md-viewer-body').innerText.includes('link-free')",
+        timeout=20000)
+    page.click('#md-viewer-chat-edit')
+    pressed = page.evaluate(
+        "() => document.getElementById('md-viewer-chat-edit').getAttribute('aria-pressed')")
+    page.fill("#md-viewer-chat-input", "append the marker")
+    page.click('#md-viewer-chat-send')
+    page.wait_for_function(
+        "() => document.querySelector('#md-viewer-body').innerText.includes('EDITED_BY_FAKE_DM3844')",
+        timeout=20000)
+    page.wait_for_function(
+        """() => [...document.querySelectorAll('#md-viewer-chat .md-viewer-chat-bubble')]
+             .some(b => b.textContent.includes('Changed files:'))""",
+        timeout=20000)
+    reply = page.evaluate("""() => [...document.querySelectorAll(
+        '#md-viewer-chat .md-viewer-chat-bubble')].pop().textContent""")
+    browser.close()
+    print(json.dumps({{"ok": True, "pressed": pressed, "reqs": reqs, "reply": reply}}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, &id]);
+    assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["pressed"], "true", "{result}");
+    let req = &result["reqs"][0];
+    assert_eq!(req["human"], "1", "{result}");
+    let body: serde_json::Value =
+        serde_json::from_str(req["body"].as_str().unwrap_or("{}")).unwrap_or_default();
+    assert_eq!(body["mode"], "edit", "{result}");
+    let file = body["file"].as_str().unwrap_or_default();
+    assert!(file.ends_with("/ws/docs/notes.md"), "{result}");
+    let reply = result["reply"].as_str().unwrap_or_default();
+    assert!(reply.contains("Edited notes"), "{reply}");
+    assert!(reply.contains("- docs/notes.md"), "{reply}");
+
+    let log = argv_log_text(&env);
+    let edit_line = log
+        .lines()
+        .find(|l| l.contains("--no-spec-first"))
+        .unwrap_or_else(|| panic!("no edit argv: {log}"));
+    assert!(edit_line.contains("--conversation conv-e2e"), "{edit_line}");
+    assert!(edit_line.contains("--json -"), "{edit_line}");
+    for banned in [
+        "--read-only",
+        "--allow-sensitive",
+        "--trust-workspace-config",
+        "--approve-plan",
+    ] {
+        assert!(!edit_line.contains(banned), "{edit_line}");
+    }
+
+    let after = board_show(&env, &id);
+    for key in ["lane", "decision", "plan", "checked"] {
+        assert_eq!(after.get(key), before.get(key), "{key}: {after}");
+    }
+    let edit_link = after["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["mode"] == "edit")
+        .unwrap_or_else(|| panic!("no edit session link: {after}"));
+    assert_eq!(edit_link["kind"], "ask", "{after}");
+    assert_eq!(
+        edit_link["md_paths"],
+        serde_json::json!(["docs/notes.md"]),
+        "{after}"
+    );
 }

@@ -612,6 +612,29 @@ function boardHasWorkSession(item) {
   return sessions.some(function (link) { return link && link.kind === 'run' && !!link.conversation_id; });
 }
 
+// SPEC-md-viewer-chat FR-3840: the Markdown viewer docks a chat only for a
+// link inside the open item modal, and only in `--web`.
+window.dmuxaiMdViewerItemContext = function (trigger) {
+  if (!boardLaunchAllowed || !boardSelectedId || !trigger || !trigger.closest) { return null; }
+  if (!trigger.closest('#board-drawer')) { return null; }
+  var item = boardSelectedItem || boardFindItem(boardSelectedId);
+  if (!item || item.id !== boardSelectedId) { return null; }
+  return {
+    itemId: item.id,
+    workspace: (item.workspace && item.workspace.path) || '',
+    thread: Array.isArray(item.thread) ? item.thread : [],
+    hasWorkSession: boardHasWorkSession(item),
+    resumeOptions: BOARD_CHAT_RESUME_OPTIONS,
+    fetchJson: boardFetchJson,
+    onItem: function (fresh) {
+      if (!fresh || boardSelectedId !== fresh.id) { return; }
+      boardSelectedItem = fresh;
+      boardRenderDrawer(fresh);
+      boardRefreshList();
+    }
+  };
+};
+
 function boardRenderWorkSession(drawer, item) {
   var sessions = Array.isArray(item.sessions) ? item.sessions.slice().reverse() : [];
   if (!sessions.length) { return; }

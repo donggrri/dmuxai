@@ -126,6 +126,19 @@ pub fn resolve_md_view_path(
     workspace_root: &Path,
     home: Option<&Path>,
 ) -> Result<PathBuf, MdViewError> {
+    let (canonical, len) = resolve_md_path_any_size(raw, workspace_root, home)?;
+    if len > MAX_MD_VIEW_BYTES {
+        return Err(MdViewError::TooLarge);
+    }
+    Ok(canonical)
+}
+
+/// FR-3415 confinement without the size cap: the canonical path and its size.
+fn resolve_md_path_any_size(
+    raw: &str,
+    workspace_root: &Path,
+    home: Option<&Path>,
+) -> Result<(PathBuf, u64), MdViewError> {
     if raw.contains('\0') {
         return Err(MdViewError::BadInput("invalid path"));
     }
@@ -197,11 +210,53 @@ pub fn resolve_md_view_path(
         return Err(MdViewError::Forbidden("only .md files can be viewed"));
     }
 
-    if metadata.len() > MAX_MD_VIEW_BYTES {
-        return Err(MdViewError::TooLarge);
-    }
+    Ok((canonical, metadata.len()))
+}
 
-    Ok(canonical)
+/// A Markdown file named by a board chat ask (SPEC-md-viewer-chat FR-3841).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdFileContext {
+    /// Workspace-relative path (`~/…` under home), as `/api/md/view` shows it.
+    pub path: String,
+    /// UTF-8 content when the file is at most `max_bytes`; unmasked.
+    pub content: Option<String>,
+}
+
+/// Resolves `raw` with the `/api/md/view` rules (FR-3415) against the item
+/// workspace and reads its content when it is at most `max_bytes`. A larger
+/// or non-UTF-8 file yields the path only.
+pub fn md_file_context(
+    raw: &str,
+    workspace_root: &Path,
+    home: Option<&Path>,
+    max_bytes: u64,
+) -> Result<MdFileContext, MdViewError> {
+    let (canonical, len) = resolve_md_path_any_size(raw, workspace_root, home)?;
+    let canonical_ws = std::fs::canonicalize(workspace_root).map_err(|_| MdViewError::Io)?;
+    let canonical_home = valid_home(home);
+    let path = format_display_path(raw, &canonical, &canonical_ws, canonical_home.as_deref());
+    if len > max_bytes {
+        return Ok(MdFileContext {
+            path,
+            content: None,
+        });
+    }
+    let file = File::open(&canonical).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            MdViewError::NotFound
+        } else {
+            MdViewError::Io
+        }
+    })?;
+    verify_opened_file(&file, &canonical, &canonical_ws, canonical_home.as_deref())?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| MdViewError::Io)?;
+    let content = (bytes.len() as u64 <= max_bytes)
+        .then(|| String::from_utf8(bytes).ok())
+        .flatten();
+    Ok(MdFileContext { path, content })
 }
 
 fn format_display_path(
