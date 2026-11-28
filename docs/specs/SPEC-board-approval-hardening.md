@@ -60,20 +60,19 @@ changing any owner-facing workflow.
 | FR-3806 | Must | Given a run finishes for an item | Then the item moves to `done`/`unknown` only if its lane is still `in_progress` and its plan hash still equals the hash that was run; otherwise the lane and plan are left as they are and a `run` thread message records the exit code and that the result was not applied | — | TC-3806 |
 | FR-3807 | Must | Given an item in `in_progress` with a live run lock | Then `board plan` (attach or edit), `POST /plan` and `board ask --revise` are refused with conflict (exit 4 / HTTP 409) | After the run ends the operations work again | TC-3807 |
 | FR-3808 | Must | Given a long-lived process (MCP server, dashboard) launches a detached board run | Then the child is reaped when it exits (no zombie remains), and the run lock stores the child pid so a stale-lock check sees a dead child as stale | — | TC-3808 |
-| FR-3809 | Must | Given the existing owner flows (dashboard Approve with auto-run, TTY `board decide` then `board run`, auto lane run by a bot) | Then they behave exactly as before | — | TC-3809 |
-| NFR-3800 | Must | Any `run`, board or term command | No measurable added latency (one extra small file write per board run); `run` without board involvement is unchanged | — | TC-3809 |
+| FR-3809 | Must | Given the existing owner flows (dashboard Approve with auto-run, TTY `board decide` then `board run`, auto lane run by a bot) | Then they behave exactly as before | — | TC-3801, TC-3802 |
+| NFR-3800 | Must | Any `run`, board or term command | No measurable added latency (one extra small file write per board run); `run` without board involvement is unchanged | — | TC-3800 |
 
 ## 5. Acceptance scenarios and test design
 
 | Test ID | Requirement IDs | Type | Setup / Given | Action / When | Oracle / Then | Automated location or command |
 | --- | --- | --- | --- | --- | --- | --- |
-| TC-3800 | FR-3800 | unit | Temp board, approved item | `run_item_prepare` | Lock is 0600 and holds token hash, plan hash, actor; launcher argv has no token | `src/board/runner.rs` `tc_3800_prepare_writes_token_hash_not_argv` |
-| TC-3801 | FR-3801 | unit + cli | Approved item, prepared lock | exec-prepared with no token, wrong token, `--by owner` without token, valid token twice | Only the first valid call runs; others exit 5 and leave the item unchanged | `src/board/runner.rs` / `src/cli.rs` `tc_3801_exec_prepared_requires_launch_token` |
-| TC-3802 | FR-3802 | unit | Items in `needs_decision`, `rejected`, approved with stale hash, `auto` | Force lane to `in_progress` in the store, then exec-prepared with a valid token | Only approved-matching and auto items run | `src/board/runner.rs` `tc_3802_exec_prepared_checks_decision` |
+| TC-3800 | FR-3800, NFR-3800 | unit | Temp board, approved item | `run_item_prepare` | Lock is 0600 and holds token hash, plan hash, actor; launcher argv has no token | `src/board/runner.rs` `tc_3800_prepare_writes_token_hash_not_argv` |
+| TC-3801 | FR-3801, FR-3809 | unit + cli | Approved item, prepared lock | exec-prepared with no token, wrong token, `--by owner` without token, valid token twice | Only the first valid call runs; others exit 5 and leave the item unchanged | `src/board/runner.rs` / `src/cli.rs` `tc_3801_exec_prepared_requires_launch_token` |
+| TC-3802 | FR-3802, FR-3809 | unit | Items in `needs_decision`, `rejected`, approved with stale hash, `auto` | Force lane to `in_progress` in the store, then exec-prepared with a valid token | Only approved-matching and auto items run | `src/board/runner.rs` `tc_3802_exec_prepared_checks_decision` |
 | TC-3803 | FR-3803 | unit + http | `needs_decision` item | Bot `move in_progress` via CLI/MCP/HTTP | exit 5 / 403; approved item path unaffected | `src/board/store.rs` `tc_3803_move_into_in_progress_restricted` |
 | TC-3804 | FR-3804 | unit | Parent env with `DMUXAI_RUN_ID` | Build custom agent command, ACP spawn command, fan-out leg command, notify command | Each has `DMUXAI_RUN_ID` | `src/custom_agent.rs` etc. `tc_3804_run_id_on_all_children` |
 | TC-3805 | FR-3805 | integration | Session opened without run id | `term send`/`exec` with `DMUXAI_RUN_ID` set; reopen | exit 5 forbidden; reopened session keeps its run id | `tests/term_cli.rs` `tc_3805_run_caller_cannot_type_into_human_session` |
 | TC-3806 | FR-3806 | unit | Item rejected / re-planned while running | `record_run_result` exit 0 | Lane/plan unchanged; thread note added | `src/board/store.rs` `tc_3806_run_result_respects_newer_state` |
 | TC-3807 | FR-3807 | unit + http | `in_progress` item with live lock | attach/edit plan, POST /plan, ask --revise | exit 4 / 409 | `src/board/store.rs` `tc_3807_plan_change_refused_while_running` |
 | TC-3808 | FR-3808 | unit | Launcher in-process | Launch a short child, wait | No zombie (`/proc/<pid>/stat` state not `Z` or pid gone); lock has pid | `src/board/runner.rs` `tc_3808_detached_child_reaped` |
-| TC-3809 | FR-3809, NFR-3800 | unit | Existing approve/auto-run fixtures | Run existing board tests (TC-3133, TC-3138, TC-3232..3235) | Pass unchanged in intent | existing tests |
