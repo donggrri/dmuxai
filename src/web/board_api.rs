@@ -59,7 +59,7 @@ where
         launch_allowed,
     };
     Router::new()
-        .route("/api/board", get(board_list))
+        .route("/api/board", get(board_list).post(board_create))
         .route("/api/board/pending", get(board_pending))
         .route("/api/board/events", get(board_events_sse))
         .route(
@@ -193,6 +193,88 @@ async fn board_list(
                 launch_allowed,
             },
         ),
+        Err(error) => board_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateBody {
+    title: String,
+    kind: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+/// `POST /api/board` (SPEC-board-intake FR-3861, FR-3865): create an item as
+/// the owner; with `prompt` (only where launching is allowed, `--web`) the
+/// planner runs detached and the item answers `202` with `planning`.
+async fn board_create(
+    State(state): State<BoardApiState>,
+    axum::Json(body): axum::Json<CreateBody>,
+) -> Response {
+    let Some(kind) = crate::board::Kind::parse(&body.kind) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid kind");
+    };
+    let prompt = body.prompt.filter(|p| !p.trim().is_empty());
+    if prompt.is_some() && !state.launch_allowed {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "view-only dashboard cannot start planning runs",
+        );
+    }
+    let workspace = body
+        .workspace
+        .map(|w| w.trim().to_owned())
+        .filter(|w| !w.is_empty())
+        .map(PathBuf::from);
+    if prompt.is_some() && workspace.is_none() {
+        return error_json(StatusCode::BAD_REQUEST, "workspace is required with prompt");
+    }
+    let by = match resolve_actor(None, BoardCaller::Dashboard) {
+        Ok(actor) => actor,
+        Err(error) => return board_error_response(error),
+    };
+    let req = crate::board::AddItemRequest {
+        title: body.title,
+        summary: body.summary.unwrap_or_default(),
+        kind,
+        grade: None,
+        lane: None,
+        source_bot: None,
+        source_channel: None,
+        source_ref: None,
+        workspace,
+        recommendation: None,
+        options: Vec::new(),
+        plan_hash: None,
+        key: None,
+        by,
+        state_root: state.state_root.clone(),
+    };
+    let planning = prompt.is_some();
+    match with_store(state.board_base.clone(), move |store| match prompt {
+        Some(prompt) => crate::board::runner::intake_add(
+            store,
+            req,
+            &prompt,
+            crate::board::runner::IntakeMode::Detached,
+        ),
+        None => store.add(req),
+    })
+    .await
+    {
+        Ok(item) => {
+            let status = if planning {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::CREATED
+            };
+            json_ok(status, &item_response(item))
+        }
         Err(error) => board_error_response(error),
     }
 }
@@ -921,6 +1003,73 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_string(resp).await;
         assert!(body.contains(&id));
+    }
+
+    // TC-3861 / SPEC-board-intake FR-3861, FR-3865: `POST /api/board` creates an
+    // item as the dashboard owner (201); a `prompt` launches a planner, so it is
+    // refused in view-only `serve` (403) and nothing is created; bad kind → 400.
+    #[tokio::test]
+    async fn tc_3861_http_board_create_and_prompt_refused_in_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let token = "boardtesttoken";
+        let router = test_router(board.clone(), state.clone(), token);
+        let post = |body: String| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/board")
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .header("X-Dmuxai-Human", "1")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        let ws_json = serde_json::to_string(&ws).unwrap();
+
+        let resp = router
+            .clone()
+            .oneshot(post(format!(
+                r#"{{"title":"from dashboard","kind":"feature","workspace":{ws_json}}}"#
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(created["title"], "from dashboard");
+        assert!(created.get("planning").is_none(), "{created}");
+
+        let resp = router
+            .clone()
+            .oneshot(post(format!(
+                r#"{{"title":"with prompt","kind":"feature","workspace":{ws_json},"prompt":"plan it"}}"#
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = router
+            .clone()
+            .oneshot(post(r#"{"title":"bad kind","kind":"nope"}"#.to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let all = crate::board::ListFilter {
+            include_all: true,
+            ..Default::default()
+        };
+        let titles: Vec<String> = store
+            .list(&all)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert_eq!(titles, ["from dashboard"]);
     }
 
     // TC-3807 / SPEC-board-approval-hardening FR-3807: `POST /plan` answers 409

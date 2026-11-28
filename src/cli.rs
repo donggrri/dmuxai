@@ -119,6 +119,13 @@ pub enum BoardOp {
         options: Vec<String>,
         plan_hash: Option<String>,
         key: Option<String>,
+        prompt: Option<String>,
+        detach: bool,
+    },
+    /// Hidden detached planner of `board add --prompt --detach`
+    /// (SPEC-board-intake FR-3861); the prompt comes on stdin.
+    Intake {
+        id: String,
     },
     List {
         lanes: Vec<String>,
@@ -303,6 +310,7 @@ pub struct RunOptions {
     pub write: bool,
     pub keep_worktrees: bool,
     pub no_spec_first: bool,
+    pub plan_only: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
@@ -340,7 +348,10 @@ Run `dmuxai board <subcommand> --help` for details.
 pub const BOARD_ADD_USAGE: &str = "\
 Usage: dmuxai board add --title T [--summary S|-] --kind K [--grade G] [--lane L] \
 [--bot NAME] [--channel C] [--ref URL] [-C DIR] [--recommend TEXT] [--option TEXT]... \
-[--plan-hash H] [--key K] [--json]
+[--plan-hash H | --prompt P|- [--detach]] [--key K] [--json]
+
+--prompt runs the planner (`run --graph --plan-only`) in the item's workspace and
+attaches its plan; --detach returns at once with planning.state = planning.
 ";
 
 pub const BOARD_LIST_USAGE: &str = "\
@@ -427,6 +438,7 @@ Options:
   --approve-plan-id HASH   Run a plan saved by a previous exit 7 (requires --graph)
   --allow-sensitive        Confirm every sensitive gate
   --graph                  Use the graph planner
+  --plan-only              Always plan and stop at the approval gate (exit 7; requires --graph)
   --progress               Stream one JSON line per agent activity to stderr
   --json                   Print machine-readable JSON on stdout
   --trust-workspace-config Trust workspace configuration without prompting
@@ -984,6 +996,11 @@ pub const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--plan-only"],
+        takes_value: false,
+        hidden: false,
+    },
+    FlagSpec {
         names: &["--allow-sensitive"],
         takes_value: false,
         hidden: false,
@@ -1284,7 +1301,23 @@ fn parse_run_options_with_flags(
         write: parsed.flags.contains_key("--write"),
         keep_worktrees: parsed.flags.contains_key("--keep-worktrees"),
         no_spec_first: parsed.flags.contains_key("--no-spec-first"),
+        plan_only: parsed.flags.contains_key("--plan-only"),
     };
+    // FR-3866: plan-only never executes, so it rejects every flag that approves
+    // or bypasses the planner.
+    if options.plan_only {
+        if parsed.flags.contains_key("--approve-plan") || options.approve_plan_id.is_some() {
+            return Err(
+                "--plan-only cannot be used with --approve-plan or --approve-plan-id".to_owned(),
+            );
+        }
+        if options.agent.is_some() || options.agents.is_some() {
+            return Err("--plan-only cannot be used with --agent or --agents".to_owned());
+        }
+        if !options.graph {
+            return Err("--plan-only requires --graph".to_owned());
+        }
+    }
     if options.write && options.agents.is_none() {
         return Err("--write requires --agents".to_owned());
     }
@@ -1635,6 +1668,16 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     hidden: false,
                 },
                 FlagSpec {
+                    names: &["--prompt"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--detach"],
+                    takes_value: false,
+                    hidden: false,
+                },
+                FlagSpec {
                     names: &["--json"],
                     takes_value: false,
                     hidden: false,
@@ -1679,7 +1722,21 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     options,
                     plan_hash: parsed.flags.get("--plan-hash").cloned().flatten(),
                     key: parsed.flags.get("--key").cloned().flatten(),
+                    prompt: parsed.flags.get("--prompt").cloned().flatten(),
+                    detach: parsed.flags.contains_key("--detach"),
                 },
+            })
+        }
+        "intake" => {
+            let parsed = parse_flags(rest, BOARD_JSON_FLAG, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board intake needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Intake { id },
             })
         }
         "list" => {
@@ -3101,10 +3158,24 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
             recommendation,
             options,
             plan_hash,
+            prompt,
+            detach,
             ..
         } => {
             if Kind::parse(kind).is_none() {
                 return Err(usage("invalid --kind"));
+            }
+            if prompt.is_some() && plan_hash.is_some() {
+                return Err(usage("--prompt cannot be used with --plan-hash"));
+            }
+            if *detach && prompt.is_none() {
+                return Err(usage("--detach requires --prompt"));
+            }
+            if prompt.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                return Err(usage("--prompt must not be empty"));
+            }
+            if prompt.as_deref().is_some_and(|p| p.trim() == "-") && summary.trim() == "-" {
+                return Err(usage("--prompt - and --summary - cannot both read stdin"));
             }
             if let Some(grade) = grade
                 && Grade::parse(grade).is_none()
@@ -3131,7 +3202,7 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
                 }
             }
         }
-        BoardOp::Show { id } => check_id(id)?,
+        BoardOp::Show { id } | BoardOp::Intake { id } => check_id(id)?,
         BoardOp::Update {
             id,
             title,
@@ -3443,6 +3514,8 @@ fn execute_board_with_caller(
                 options,
                 plan_hash,
                 key,
+                prompt,
+                detach,
             } => {
                 let kind = Kind::parse(&kind)
                     .ok_or_else(|| ApiError::new(exit::USAGE, "invalid --kind".to_owned()))?;
@@ -3472,25 +3545,39 @@ fn execute_board_with_caller(
                 if lane == Some(Lane::Auto) && by == "owner" {
                     confirm_owner_action_cli("auto", "add to auto lane", &title)?;
                 }
-                let item = store
-                    .add(AddItemRequest {
-                        title,
-                        summary,
-                        kind,
-                        grade,
-                        lane,
-                        source_bot: bot,
-                        source_channel: channel,
-                        source_ref: ref_url,
-                        workspace: Some(ws),
-                        recommendation,
-                        options,
-                        plan_hash,
-                        key,
-                        by,
-                        state_root: state_root.clone(),
-                    })
-                    .map_err(ApiError::from)?;
+                let prompt = prompt.map(|p| read_prompt(&p)).transpose()?;
+                let req = AddItemRequest {
+                    title,
+                    summary,
+                    kind,
+                    grade,
+                    lane,
+                    source_bot: bot,
+                    source_channel: channel,
+                    source_ref: ref_url,
+                    workspace: Some(ws),
+                    recommendation,
+                    options,
+                    plan_hash,
+                    key,
+                    by,
+                    state_root: state_root.clone(),
+                };
+                let item = match prompt {
+                    Some(prompt) => {
+                        let mode = if detach {
+                            dmuxai::board::runner::IntakeMode::Detached
+                        } else {
+                            dmuxai::board::runner::IntakeMode::Blocking
+                        };
+                        dmuxai::board::runner::intake_add(&store, req, &prompt, mode)
+                    }
+                    None => store.add(req),
+                }
+                .map_err(ApiError::from)?;
+                if !json_out && let Some(warning) = item.planning_warning() {
+                    eprintln!("warning: {warning}");
+                }
                 if json_out {
                     print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 } else {
@@ -3543,6 +3630,26 @@ fn execute_board_with_caller(
                         "{}",
                         serde_json::to_string_pretty(&item).unwrap_or_default()
                     );
+                    if let Some(warning) = item.planning_warning() {
+                        eprintln!("warning: {warning}");
+                    }
+                }
+                Ok(())
+            }
+            BoardOp::Intake { id } => {
+                let token = dmuxai::board::runner::take_launch_token_from_env();
+                let mut prompt = String::new();
+                let _ = io::stdin().read_to_string(&mut prompt);
+                let item = dmuxai::board::runner::intake_execute_prepared(
+                    &store,
+                    &id,
+                    token.as_deref(),
+                    prompt.trim_end_matches(['\r', '\n']),
+                    &state_root,
+                )
+                .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
                 }
                 Ok(())
             }
@@ -3977,10 +4084,16 @@ fn execute_board_with_caller(
                             .unwrap_or_else(|| "-".to_owned());
                         let title = truncate_chars(&item.title, 80);
                         let age = format_pending_age(item.age_ms);
-                        println!(
-                            "{}\t{}\t{}\t{}\t{}",
-                            item.id, item.reason, ws_base, title, age
-                        );
+                        match item.warning.as_deref() {
+                            Some(warning) => println!(
+                                "{}\t{}\t{}\t{}\t{}\twarning: {warning}",
+                                item.id, item.reason, ws_base, title, age
+                            ),
+                            None => println!(
+                                "{}\t{}\t{}\t{}\t{}",
+                                item.id, item.reason, ws_base, title, age
+                            ),
+                        }
                     }
                     println!("{} pending", pending.count);
                 }
@@ -4968,6 +5081,13 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
     if let Some(plan_hash) = &outcome.plan_hash {
         value["plan_hash"] = json!(plan_hash);
     }
+    // SPEC-board-intake FR-3860: where the pending plan came from.
+    if let Some(plan_source) = &outcome.plan_source {
+        value["plan_source"] = json!(plan_source);
+    }
+    if let Some(planner_error) = &outcome.planner_error {
+        value["planner_error"] = json!(planner_error);
+    }
     // FR-2119: the runner fallbacks of this run, omitted when there were none.
     if !outcome.fallbacks.is_empty() {
         value["fallbacks"] = json!(outcome.fallbacks);
@@ -5473,6 +5593,7 @@ async fn run_headless(
         todo_id,
         model: options.model.clone(),
         no_spec_first: options.no_spec_first,
+        plan_only: options.plan_only,
     };
     let mut outcome = app.run_headless(request, cancel).await;
     app.shutdown().await;
@@ -5564,6 +5685,9 @@ fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
     }
     if args.no_spec_first {
         argv.push("--no-spec-first".into());
+    }
+    if args.plan_only {
+        argv.push("--plan-only".into());
     }
     argv.push("--json".into());
     if args.todo_id.is_none() {
@@ -6153,6 +6277,8 @@ mod tests {
             triage: None,
             plan: None,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
@@ -6244,6 +6370,8 @@ mod tests {
             triage: None,
             plan: None,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
@@ -6391,6 +6519,8 @@ mod tests {
             triage: None,
             plan: None,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: None,
             run_id: Some("0123456789abcdef".to_owned()),
             fallbacks: Vec::new(),
@@ -6419,6 +6549,8 @@ mod tests {
             triage: None,
             plan: None,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
@@ -6591,6 +6723,7 @@ mod tests {
             graph: false,
             todo_id: None,
             no_spec_first: false,
+            plan_only: false,
         };
         assert_eq!(
             mcp_run_argv(&args),
@@ -6618,6 +6751,7 @@ mod tests {
             graph: false,
             todo_id: Some("t1".into()),
             no_spec_first: false,
+            plan_only: false,
         };
         assert_eq!(
             mcp_run_argv(&todo),
@@ -7228,6 +7362,7 @@ mod tests {
                     todo_id: None,
                     model: None,
                     no_spec_first: false,
+                    plan_only: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -7339,6 +7474,8 @@ mod tests {
                     options: vec![],
                     plan_hash: None,
                     key: None,
+                    prompt: None,
+                    detach: false,
                 },
                 json: true,
             },
@@ -7380,6 +7517,89 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // TC-3861 / SPEC-board-intake FR-3861: `board add --prompt P|- [--detach]`
+    // parses; `--prompt` with `--plan-hash`, `--detach` without `--prompt`, an
+    // empty prompt and a missing workspace are usage errors (exit 2) before any
+    // item exists.
+    #[test]
+    fn tc_3861_cli_board_add_prompt_flags() {
+        let cmd = parse(&args(&[
+            "board", "add", "--title", "Ship", "--kind", "feature", "--prompt", "-", "--detach",
+            "--json",
+        ]))
+        .unwrap();
+        let AgentCommand::Board(command) = cmd else {
+            panic!("not a board command");
+        };
+        match &command.op {
+            BoardOp::Add { prompt, detach, .. } => {
+                assert_eq!(prompt.as_deref(), Some("-"));
+                assert!(*detach);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(prevalidate_board_command(&command).is_ok());
+        assert!(board_subcommand_usage("add").contains("--prompt"));
+
+        let refused = |extra: &[&str]| {
+            let mut argv = vec!["board", "add", "--title", "Ship", "--kind", "feature"];
+            argv.extend_from_slice(extra);
+            argv.push("--json");
+            match parse(&args(&argv)) {
+                Ok(AgentCommand::Board(command)) => {
+                    prevalidate_board_command(&command).err().map(|e| e.code)
+                }
+                Ok(other) => panic!("unexpected {other:?}"),
+                Err(_) => Some(exit::USAGE),
+            }
+        };
+        assert_eq!(
+            refused(&["--prompt", "p", "--plan-hash", "0123456789abcdef"]),
+            Some(exit::USAGE)
+        );
+        assert_eq!(refused(&["--detach"]), Some(exit::USAGE));
+        assert_eq!(refused(&["--prompt", "  "]), Some(exit::USAGE));
+        assert_eq!(
+            refused(&["--prompt", "-", "--summary", "-"]),
+            Some(exit::USAGE)
+        );
+
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+        let code = execute_board(
+            dir.path(),
+            BoardCommand {
+                op: BoardOp::Add {
+                    title: "t".to_owned(),
+                    summary: String::new(),
+                    kind: "feature".to_owned(),
+                    grade: None,
+                    lane: None,
+                    bot: None,
+                    channel: None,
+                    ref_url: None,
+                    workspace: Some(dir.path().join("missing")),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                    prompt: Some("plan it".to_owned()),
+                    detach: false,
+                },
+                json: true,
+            },
+        );
+        unsafe { std::env::remove_var("DMUXAI_STATE_DIR") };
+        assert_eq!(code, exit::USAGE);
+        let items = state.join("board").join("items");
+        assert!(
+            !items.exists() || std::fs::read_dir(&items).unwrap().next().is_none(),
+            "a refused intake must not create an item"
+        );
     }
 
     // TC-3114 / FR-3114: board help lists subcommands.
@@ -7427,6 +7647,8 @@ mod tests {
                     options: vec![],
                     plan_hash: None,
                     key: None,
+                    prompt: None,
+                    detach: false,
                 },
                 json: true,
             },

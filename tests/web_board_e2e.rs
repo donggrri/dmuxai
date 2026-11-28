@@ -163,6 +163,11 @@ case "$*" in
     printf '{"ok":true,"exit_code":0,"error":null,"text":"Planner answer: ok"}\n'
     exit 0
     ;;
+  *"--plan-only"*)
+    if [ -n "${FAKE_PLAN_SLEEP:-}" ]; then sleep "${FAKE_PLAN_SLEEP}"; fi
+    printf '{"ok":false,"exit_code":7,"error":null,"plan_hash":"%s","plan_source":"%s","planner_error":"planner exited 3"}\n' "${FAKE_PLAN_HASH:-}" "${FAKE_PLAN_SOURCE:-planner}"
+    exit 7
+    ;;
   *"--graph"*)
     if [ -n "${FAKE_GRAPH_SLEEP:-}" ]; then sleep "${FAKE_GRAPH_SLEEP}"; fi
     printf '{"ok":true,"exit_code":0,"error":null,"text":"run ok","run_id":"a1b2c3d4e5f6789012345678abcdef01"}\n'
@@ -1463,4 +1468,162 @@ with sync_playwright() as p:
         log.trim().is_empty(),
         "view-only serve must not invoke planner/run child: {log}"
     );
+}
+
+const OPEN_BOARD_VIEW: &str = r#"
+import json, sys
+from playwright.sync_api import sync_playwright
+
+chrome, url = sys.argv[1], sys.argv[2]
+
+def open_board_view(page):
+    page.goto(url, wait_until='domcontentloaded', timeout=20000)
+    if page.locator('#sessions-sidebar.open').count():
+        page.click('#sessions-close')
+    page.wait_for_selector('#board-toggle', timeout=20000)
+    page.click('#board-toggle')
+    page.wait_for_selector('#board:not([hidden])', timeout=20000)
+    page.wait_for_function(
+        "() => !!document.querySelector('#board-kanban .board-lane, #board-my-decisions .board-my-row')",
+        timeout=20000)
+"#;
+
+// TC-3865 / SPEC-board-intake FR-3865, FR-3861, FR-3862: in `--web` the
+// "New task" form (workspace prefilled with the current one) creates the item
+// through `POST /api/board`; its card shows `Planning…` until the SSE update
+// brings the attached plan, and a fallback plan shows the warning.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3865_new_task_form_plans_card() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let _ = fs::remove_file(&env.argv_log);
+    let (_, hash) = dmuxai::board::edit_plan_from_json(
+        &env.workspace,
+        &env.state,
+        "intake prompt",
+        BOARD_PLAN_JSON,
+        None,
+    )
+    .expect("pending plan");
+    let (_guard, url) = start_web(
+        &env,
+        &[
+            ("FAKE_PLAN_HASH", hash.as_str()),
+            ("FAKE_PLAN_SOURCE", "fallback"),
+            ("FAKE_PLAN_SLEEP", "3"),
+        ],
+    );
+    let workspace = env.workspace.to_string_lossy().into_owned();
+
+    let script = format!(
+        r##"{OPEN_BOARD_VIEW}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 900}})
+    open_board_view(page)
+    page.wait_for_selector('#board-new-task:not([hidden])', timeout=20000)
+    page.click('#board-new-task')
+    page.wait_for_selector('#board-new-task-form:not([hidden])', timeout=5000)
+    prefilled = page.input_value('#board-new-workspace')
+    page.fill('#board-new-title', 'Intake from form')
+    page.select_option('#board-new-kind', 'feature')
+    page.fill('#board-new-prompt', 'implement the intake form')
+    page.click('#board-new-submit')
+    card = '[data-item-id]:has-text("Intake from form")'
+    page.wait_for_selector(card + ' .board-planning', timeout=10000)
+    planning_text = page.inner_text(card + ' .board-planning')
+    form_hidden = page.evaluate("() => document.getElementById('board-new-task-form').hidden")
+    page.wait_for_selector(card + ' .board-planning-warning', timeout=30000)
+    warning_text = page.inner_text(card + ' .board-planning-warning')
+    still_planning = page.locator(card + ' .board-planning').count()
+    item_id = page.get_attribute(card, 'data-item-id')
+    browser.close()
+    print(json.dumps({{
+        "prefilled": prefilled,
+        "planning_text": planning_text,
+        "form_hidden": form_hidden,
+        "warning_text": warning_text,
+        "still_planning": still_planning,
+        "item_id": item_id,
+    }}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url]);
+    assert_eq!(
+        result["prefilled"].as_str(),
+        Some(workspace.as_str()),
+        "{result}"
+    );
+    assert_eq!(
+        result["planning_text"].as_str(),
+        Some("Planning\u{2026}"),
+        "{result}"
+    );
+    assert_eq!(result["form_hidden"].as_bool(), Some(true), "{result}");
+    assert_eq!(
+        result["warning_text"].as_str(),
+        Some("planner unavailable — fallback plan"),
+        "{result}"
+    );
+    assert_eq!(result["still_planning"].as_u64(), Some(0), "{result}");
+    let id = result["item_id"].as_str().expect("item id");
+    let shown = board_show(&env, id);
+    assert_eq!(shown["planning"]["state"], "planned", "{shown}");
+    assert_eq!(shown["planning"]["plan_source"], "fallback", "{shown}");
+    assert_eq!(
+        shown["plan"]["hash"].as_str(),
+        Some(hash.as_str()),
+        "{shown}"
+    );
+    let log = argv_log_text(&env);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("run --graph --plan-only --json -")),
+        "{log}"
+    );
+}
+
+// TC-3865 / SPEC-board-intake FR-3865: the "New task" button stays hidden in
+// view-only `serve`, and a prompt create there is refused (403) without
+// starting a planner.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3865_new_task_hidden_in_serve() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let _ = fs::remove_file(&env.argv_log);
+    let (_guard, url) = start_serve(&env, &[]);
+    let workspace = env.workspace.to_string_lossy().into_owned();
+
+    let script = format!(
+        r##"{OPEN_BOARD_VIEW}
+workspace = sys.argv[3]
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 900}})
+    open_board_view(page)
+    page.wait_for_timeout(500)
+    hidden = page.evaluate("() => document.getElementById('board-new-task').hidden")
+    form_hidden = page.evaluate("() => document.getElementById('board-new-task-form').hidden")
+    status = page.evaluate("""(ws) => boardFetchJson('POST', '/api/board',
+      {{ title: 't', kind: 'feature', workspace: ws, prompt: 'p' }}, true)
+      .then(() => 200, (err) => err.status)""", workspace)
+    browser.close()
+    print(json.dumps({{"hidden": hidden, "form_hidden": form_hidden, "status": status}}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, &workspace]);
+    assert_eq!(result["hidden"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["form_hidden"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["status"].as_u64(), Some(403), "{result}");
+    assert!(argv_log_text(&env).trim().is_empty());
 }

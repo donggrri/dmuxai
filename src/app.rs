@@ -1076,6 +1076,8 @@ pub struct HeadlessRequest {
     pub todo_id: Option<String>,
     pub model: Option<String>,
     pub no_spec_first: bool,
+    /// SPEC-board-intake FR-3866: always plan, never execute (exit 7).
+    pub plan_only: bool,
 }
 
 /// FR-2545: persisted plan document for `--approve-plan-id`.
@@ -1086,6 +1088,16 @@ struct HeadlessPendingPlan {
     steps: Vec<PlanStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dynamic_cap: Option<usize>,
+}
+
+/// Upper bound of `planner_error` in the exit-7 JSON (SPEC-board-intake FR-3860).
+const PLANNER_ERROR_MAX: usize = 500;
+
+/// A pending plan written to `graph-pending/<hash>.json` (FR-2545, FR-3860).
+struct SavedPendingPlan {
+    hash: String,
+    source: &'static str,
+    planner_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1130,6 +1142,12 @@ pub struct HeadlessOutcome {
     /// FR-2545: content hash of the saved pending graph plan (exit 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_hash: Option<String>,
+    /// SPEC-board-intake FR-3860: `planner` or `fallback` for a saved pending plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_source: Option<String>,
+    /// FR-3860: masked planner failure (≤ 500 chars) behind a fallback plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<HeadlessSystemPrompt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1169,6 +1187,8 @@ impl HeadlessOutcome {
             triage: None,
             plan: None,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
@@ -15171,26 +15191,50 @@ impl App {
     }
 
     /// FR-2545: writes the awaiting graph plan plus its hash under the state dir.
+    #[cfg(test)]
     fn headless_write_pending_plan(&mut self) -> Option<String> {
-        let (prompt, tasks, steps, dynamic_cap) = {
+        self.headless_save_pending_plan().map(|saved| saved.hash)
+    }
+
+    fn headless_save_pending_plan(&mut self) -> Option<SavedPendingPlan> {
+        let (prompt, tasks, steps, dynamic_cap, fallback, planner_error) = {
             let run = self.last_graph_run.as_ref()?;
             if run.phase != GraphRunPhase::AwaitingApproval {
                 return None;
             }
             // FR-2551: save the latest revision without validation errors —
-            // the same revision plan approval would execute.
+            // the same revision plan approval would execute. SPEC-board-intake
+            // FR-3860 (#375): a fallback revision carries the planner failure in
+            // `errors` but is approvable, so it is saved too.
             let revision = run
                 .approval
                 .as_ref()?
                 .revisions
                 .iter()
                 .rev()
-                .find(|revision| revision.errors.is_none())?;
+                .find(|revision| revision.errors.is_none() || revision.source == "fallback")?;
+            let fallback = revision.source == "fallback"
+                || run
+                    .triage
+                    .as_ref()
+                    .is_some_and(|triage| triage.source == TriageSource::Fallback);
+            let planner_error = fallback
+                .then(|| revision.errors.as_ref().map(|lines| lines.join("; ")))
+                .flatten()
+                .map(|text| {
+                    dmuxai::run_journal::mask_sensitive_tokens(text.trim())
+                        .chars()
+                        .take(PLANNER_ERROR_MAX)
+                        .collect::<String>()
+                })
+                .filter(|text| !text.is_empty());
             (
                 run.plan.user_prompt.clone(),
                 run.plan.tasks.clone(),
                 revision.steps.clone(),
                 run.plan.dynamic_cap,
+                fallback,
+                planner_error,
             )
         };
         let pending = HeadlessPendingPlan {
@@ -15227,7 +15271,11 @@ impl App {
             self.push_system(format!("Could not save the pending plan: {error}"));
             return None;
         }
-        Some(hash)
+        Some(SavedPendingPlan {
+            hash,
+            source: if fallback { "fallback" } else { "planner" },
+            planner_error,
+        })
     }
 
     /// FR-2546: loads a persisted plan for `--approve-plan-id` and starts it
@@ -15400,6 +15448,29 @@ impl App {
     }
 
     fn headless_submit_prompt(&mut self, req: &HeadlessRequest) -> Result<(), RunTodoError> {
+        // SPEC-board-intake FR-3866: plan like `/plan` (no judge, no trivial
+        // shortcut, prompt never read as a slash command); the idle action stops
+        // at the approval gate.
+        if req.plan_only {
+            let agent = self.adapters[self.selected].agent();
+            if self.refuse_plan_gate_prompt(req.prompt.clone()) {
+                return Ok(());
+            }
+            self.begin_user_prompt_turn();
+            self.begin_planning(
+                req.prompt.clone(),
+                agent,
+                Route::Complex,
+                "plan-only".to_owned(),
+                TriageSource::Override,
+                None,
+                Uuid::new_v4().to_string(),
+                0,
+                0,
+                Some(OverrideKind::Plan),
+            );
+            return Ok(());
+        }
         if is_slash_command(&req.prompt) {
             if self.submit_precheck(&req.prompt) {
                 self.submit_text(req.prompt.clone());
@@ -15505,7 +15576,8 @@ impl App {
             ));
         }
         if phase == GraphRunPhase::AwaitingApproval {
-            if (self.headless_read_only || req.approve_plan) && !approved_plan {
+            // FR-3866: a plan-only run never approves its own plan.
+            if (self.headless_read_only || req.approve_plan) && !approved_plan && !req.plan_only {
                 if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
                     let message = Self::plan_decision_notice(error);
                     return HeadlessIdleAction::Exit(Box::new(
@@ -15522,24 +15594,27 @@ impl App {
             }
             // Without --approve-plan, or a second gate after the approved plan
             // (a sensitive replan revision): stop with exit 7, never exit 0.
-            if !req.approve_plan || approved_plan {
+            if req.plan_only || !req.approve_plan || approved_plan {
                 let (_, plan) = self.headless_plan_snapshot();
                 let text = plan
                     .as_ref()
                     .map(Self::headless_plan_text)
                     .unwrap_or_default();
                 // FR-2545: save the exact plan before the awaiting run is cancelled.
-                let plan_hash = self.headless_write_pending_plan();
+                let saved = self.headless_save_pending_plan();
                 self.headless_cancel_awaiting_plan(HEADLESS_APPROVAL_NOTE);
-                return HeadlessIdleAction::Exit(Box::new(
-                    self.headless_outcome_exit_7(
-                        conversation_id,
-                        agent_label,
-                        HEADLESS_APPROVAL_NOTE,
-                        text,
-                    )
-                    .with_plan_hash(plan_hash),
-                ));
+                let mut outcome = self.headless_outcome_exit_7(
+                    conversation_id,
+                    agent_label,
+                    HEADLESS_APPROVAL_NOTE,
+                    text,
+                );
+                if let Some(saved) = saved {
+                    outcome.plan_source = Some(saved.source.to_owned());
+                    outcome.planner_error = saved.planner_error;
+                    outcome = outcome.with_plan_hash(Some(saved.hash));
+                }
+                return HeadlessIdleAction::Exit(Box::new(outcome));
             }
         }
         HeadlessIdleAction::Done
@@ -16237,6 +16312,8 @@ impl App {
             triage: None,
             plan: None,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: None,
             run_id: None,
             fallbacks: Vec::new(),
@@ -16428,7 +16505,8 @@ impl App {
         self.graph_session = None;
         self.headless_triage = None;
 
-        let is_sync_slash = req.todo_id.is_none() && is_slash_command(&req.prompt);
+        let is_sync_slash =
+            req.todo_id.is_none() && !req.plan_only && is_slash_command(&req.prompt);
 
         let is_direct_headless =
             req.agent.is_some() && !req.graph && req.todo_id.is_none() && !is_sync_slash;
@@ -16860,6 +16938,8 @@ impl App {
             triage,
             plan,
             plan_hash: None,
+            plan_source: None,
+            planner_error: None,
             system_prompt: self.system_prompt_applied.clone(),
             run_id: None,
             fallbacks: self.fallback_history[start_fallbacks_len..].to_vec(),
@@ -27821,6 +27901,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -27995,6 +28076,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         releaser.join().unwrap();
@@ -28073,6 +28155,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
 
@@ -28117,6 +28200,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         lock.release();
@@ -28161,6 +28245,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -28203,6 +28288,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         lock.release();
@@ -28281,6 +28367,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
 
@@ -28337,6 +28424,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
         assert!(!outcome.ok);
@@ -28356,6 +28444,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -28426,6 +28515,7 @@ out3
                 todo_id: None,
                 model: Some("gemini-4-argon-fast".to_owned()),
                 no_spec_first: false,
+                plan_only: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28449,6 +28539,7 @@ out3
                 todo_id: None,
                 model: Some("composer-2.5-fast".to_owned()),
                 no_spec_first: false,
+                plan_only: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28508,6 +28599,7 @@ out3
             todo_id: None,
             model: Some("gemini-3.8-flash-high".to_owned()),
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -28577,6 +28669,7 @@ out3
             todo_id: None,
             model: model.map(str::to_owned),
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29048,6 +29141,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29795,6 +29889,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29874,6 +29969,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -29915,6 +30011,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
             .await
@@ -30106,6 +30203,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -30226,6 +30324,7 @@ out3
                 todo_id: None,
                 model: None,
                 no_spec_first: true,
+                plan_only: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(outcome.ok, "chat_enabled={chat_enabled}");
@@ -30369,6 +30468,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert_eq!(outcome.exit_code, 0);
@@ -30439,6 +30539,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome2 = app_no_sink.run_headless(req2, cancel2).await;
         assert_eq!(outcome2.exit_code, 0);
@@ -30612,6 +30713,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -30691,6 +30793,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -30721,6 +30824,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req_gated, Arc::clone(&cancel)).await;
         assert_eq!(outcome.exit_code, 7);
@@ -30772,6 +30876,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome2 = app.run_headless(req_approved, cancel).await;
         assert_eq!(outcome2.exit_code, 0);
@@ -30798,6 +30903,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert_eq!(outcome.exit_code, 7);
@@ -30861,6 +30967,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok, "read-only turn must not be gated: {outcome:?}");
@@ -30921,6 +31028,7 @@ out3
                 todo_id: None,
                 model: None,
                 no_spec_first: false,
+                plan_only: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(
@@ -31050,6 +31158,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok, "board ask must not exit 7: {outcome:?}");
@@ -31103,6 +31212,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -31182,6 +31292,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -32871,6 +32982,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outcome = app.run_headless(req, cancel).await;
@@ -34558,6 +34670,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
 
         let result = app.headless_submit_prompt(&req);
@@ -37225,6 +37338,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         }
     }
 
@@ -40458,6 +40572,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            plan_only: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         let sp = outcome
@@ -42011,6 +42126,7 @@ out3
                     todo_id: None,
                     model: None,
                     no_spec_first: false,
+                    plan_only: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -42039,6 +42155,7 @@ out3
                     todo_id: None,
                     model: None,
                     no_spec_first: false,
+                    plan_only: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )

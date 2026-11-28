@@ -28,7 +28,7 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--plan-only` (with `--graph`), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
@@ -57,6 +57,15 @@ Notes:
   `--allow-sensitive`, or `--agent` with `--approve-plan` on a one-step run, to
   confirm sensitive gates headlessly. JSON includes `triage` and, when applicable,
   `plan`.
+- `run --graph --plan-only` always plans, like the `/plan` slash command: the
+  judge's simple route and the trivial-prompt shortcut are skipped, no step is
+  executed, and the run ends with exit `7` and `plan_hash` (manifest
+  `awaiting_approval`). With `--approve-plan`, `--approve-plan-id`, `--agent` or
+  `--agents`, or without `--graph`, it is a usage error (exit `2`). See
+  [SPEC-board-intake](specs/SPEC-board-intake.md) FR-3866.
+- Every exit-`7` plan, including a fallback plan when the judge or planner
+  failed, is saved to `graph-pending/<hash>.json` and can be run with
+  `--approve-plan-id <hash>` (FR-3860, #375).
 - `dmuxai trust` manages workspace configuration trust:
   - `dmuxai trust`: Interactive prompt in a TTY asking to trust the workspace configuration, displaying actual restricted key values (showing secret environment variable names only, never values).
   - `dmuxai trust --status [--json]`: Reports trust status (`trusted`, `untrusted`, `not_needed`, or `no_workspace_config`), SHA-256 hash, restricted keys, and detailed key-value definitions in JSON mode.
@@ -113,6 +122,9 @@ Notes:
 | `todo` | object\|null | To-do after a `todo run` |
 | `triage` | object\|null | Judge/fallback/override verdict (`source`: `judge`, `fallback`, or `override`) when a graph run started |
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
+| `plan_hash` | string | Exit 7 plan approval: hash of `graph-pending/<hash>.json` for `--approve-plan-id`; omitted otherwise |
+| `plan_source` | string | With `plan_hash`: `"planner"` or `"fallback"` (judge or planner failed; heuristic plan) |
+| `planner_error` | string | With a fallback plan: the masked planner/judge failure, at most 500 characters; omitted otherwise |
 | `events` | object | `first_seq`/`last_seq` written for this run; both `null` when the run wrote no events |
 | `fallbacks` | array | Optional list of handovers: `{from_runner, from_model, reason, detail, to_runner, to_model}` (`to_*` null when the chain is exhausted); omitted when empty |
 
@@ -418,11 +430,11 @@ Tools (`tools/list`):
 | --- | --- | --- |
 | `todo_add` | `title` (required), `body` | Created to-do |
 | `todo_list` | `status` (`open`\|`running`\|`done`) | Array of to-dos |
-| `run` | `prompt`, `agent`, `model`, `approve_plan`, `allow_sensitive`, `graph`, `todo_id` | Run outcome JSON (same keys as `run --json`), plus `approval_required: true` when the child exits `7`. The fields forward to the same child flags as the CLI: `model` → `--model` (requires `agent`, conflicts with `graph`), `approve_plan` → `--approve-plan`, `allow_sensitive` → `--allow-sensitive`. `agent` and `graph` are mutually exclusive. The deprecated `mode` argument is rejected with a removed-mode tool error; the MCP server never passes `--mode` or `--read-only`. |
+| `run` | `prompt`, `agent`, `model`, `approve_plan`, `allow_sensitive`, `graph`, `plan_only`, `todo_id` | Run outcome JSON (same keys as `run --json`), plus `approval_required: true` when the child exits `7`. The fields forward to the same child flags as the CLI: `model` → `--model` (requires `agent`, conflicts with `graph`), `approve_plan` → `--approve-plan`, `allow_sensitive` → `--allow-sensitive`, `plan_only` → `--plan-only` (requires `graph`; conflicts with `approve_plan`, `approve_plan_id`, `agent` and `todo_id`). `agent` and `graph` are mutually exclusive. The deprecated `mode` argument is rejected with a removed-mode tool error; the MCP server never passes `--mode` or `--read-only`. |
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
 | `models` | `agent` (optional) | Available models and runner policy JSON (same as `dmuxai models --json`) |
-| `board_add` | `title`, `kind` (required); `summary`, `grade`, `lane`, `plan_hash`, `workspace`, `by`, … | Created board item JSON (`exit_code` in errors) |
+| `board_add` | `title`, `kind` (required); `summary`, `grade`, `lane`, `plan_hash` or `prompt`, `workspace`, `by`, … | Created board item JSON (`exit_code` in errors); with `prompt` the item is returned in `planning.state = "planning"` and a detached planner attaches the plan |
 | `board_list` | `lane[]`, `all`, `workspace` | Item array |
 | `board_show` | `id` | One item |
 | `board_update` | `id`, optional fields, `if_version` | Updated item |
@@ -463,13 +475,14 @@ the owner through `dmuxai board …` or MCP `board_*` tools.
 
 Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 
-1. `dmuxai -C <repo> run --graph --json -` — on exit `7`, take `plan_hash`.
-2. `dmuxai board add -C <repo> --title … --kind feature --plan-hash <hash> --bot coordinator --json`.
+1. One-call intake: `dmuxai board add -C <repo> --title … --kind feature --prompt - --bot coordinator --json` (prompt on stdin; add `--detach` to return at once). The board runs `dmuxai -C <repo> run --graph --plan-only --json -` (limit 900 s, one planning run per item) and attaches the plan; `planning.state` goes `planning` → `planned` or `failed`. A fallback plan carries the warning `planner unavailable — fallback plan` in `board show`, `board pending` and the dashboard ([SPEC-board-intake](specs/SPEC-board-intake.md)).
+2. Two-call alternative: `dmuxai -C <repo> run --graph --json -` — on exit `7`, take `plan_hash` — then `dmuxai board add -C <repo> --title … --kind feature --plan-hash <hash> --bot coordinator --json`. `--prompt` and `--plan-hash` are mutually exclusive (exit `2`); with `--key`, an existing item is returned without a second planning run.
 3. Lane `auto`: `dmuxai board run <id>` (replaces the manual `board prompt` pipe).
 4. Lane `needs_decision`: `dmuxai board wait <id> --for any` (or `board wait --any`); on `approve`, the board starts the run itself (moving the item to `in_progress`), so only call `dmuxai board run <id>` if `[board] auto_run_on_approve = false` or the lane is still `approved`; on `request_changes` or messages, revise with `dmuxai board ask <id> --revise --text …` (or `board plan --edit`) and reply with `board say`. A failed run moves to `unknown` and can be retried with the same hash from `<state base>/board/plans/<hash>.json`.
 5. Bots poll with `dmuxai board events --since S`; plan prompts stay unmasked only under `graph-pending/<hash>.json` (and board plan copies `<state base>/board/plans/<hash>.json`).
 
-Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
+Subcommands: `add` (`--key` for idempotency, `--prompt P|-` and `--detach` for
+planner intake), `list`, `show`, `update`, `move`
 (`--if-version`), `plan`, `prompt`, `decide`, `check` (`--text`), `pending`
 (`--workspace`), `say`, `wait`, `events`, `rules`, `ask` (`--text`, `--revise`,
 `--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
@@ -500,6 +513,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | Method | Path | Body / query | Success | Errors |
 | --- | --- | --- | --- | --- |
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
+| POST | `/api/board` | `{title, kind, summary?, workspace?, prompt?}` | `201` item; with `prompt` (`--web` only, needs `workspace`) `202` item in `planning` | 400, 401, 403 |
 | GET | `/api/board/pending` | `?workspace=` | `200` `{items, count}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item + `auto_run` | 400, 401, 403, 404, 409, 422 |

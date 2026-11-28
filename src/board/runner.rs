@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use super::{
-    BoardError, BoardItem, BoardStore, Lane, ListFilter, SayRequest, TEXT_MAX, Verdict,
-    ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies,
-    validate_item_id_early, validate_message,
+    AddItemRequest, BoardError, BoardItem, BoardStore, FALLBACK_PLAN_WARNING, Lane, ListFilter,
+    Planning, PlanningState, SayRequest, TEXT_MAX, Verdict, ensure_pending_plan_from_copy,
+    normalize_plan_prompt, prune_old_plan_copies, validate_item_id_early, validate_message,
 };
 use crate::process::{apply_child_cwd, apply_child_env_policy};
 use crate::run_journal::{mask_sensitive_tokens, valid_run_id};
@@ -51,16 +51,34 @@ fn run_lock_path(board_base: &Path, id: &str) -> PathBuf {
     board_base.join("runs").join(format!("{id}.lock"))
 }
 
-/// Reads the run lock of item `id`; `None` when missing or not a JSON record.
-pub fn read_run_lock(board_base: &Path, id: &str) -> Option<RunLock> {
-    let text = fs::read_to_string(run_lock_path(board_base, id)).ok()?;
+/// Lock id of the intake planning run of item `id` under `runs/`
+/// (SPEC-board-intake FR-3864).
+fn intake_lock_id(id: &str) -> String {
+    format!("{id}.plan")
+}
+
+fn intake_lock_path(board_base: &Path, id: &str) -> PathBuf {
+    run_lock_path(board_base, &intake_lock_id(id))
+}
+
+fn read_lock_at(path: &Path) -> Option<RunLock> {
+    let text = fs::read_to_string(path).ok()?;
     serde_json::from_str(text.trim()).ok()
 }
 
-fn write_run_lock(board_base: &Path, id: &str, lock: &RunLock) -> Result<(), BoardError> {
+fn write_lock_at(board_base: &Path, path: &Path, lock: &RunLock) -> Result<(), BoardError> {
     crate::board::store::ensure_dir(&board_base.join("runs"))?;
     let bytes = serde_json::to_vec(lock).map_err(|e| BoardError::Internal(e.to_string()))?;
-    crate::board::store::atomic_write(&run_lock_path(board_base, id), &bytes)
+    crate::board::store::atomic_write(path, &bytes)
+}
+
+/// Reads the run lock of item `id`; `None` when missing or not a JSON record.
+pub fn read_run_lock(board_base: &Path, id: &str) -> Option<RunLock> {
+    read_lock_at(&run_lock_path(board_base, id))
+}
+
+fn write_run_lock(board_base: &Path, id: &str, lock: &RunLock) -> Result<(), BoardError> {
+    write_lock_at(board_base, &run_lock_path(board_base, id), lock)
 }
 
 /// 64 lowercase hex characters. UUID v4 draws from the OS CSPRNG (`getrandom`),
@@ -194,19 +212,30 @@ impl BoardLockGuard {
         plan_hash: &str,
         launch_token: Option<&str>,
     ) -> Result<(Self, RunLock), BoardError> {
-        let refused = || {
-            BoardError::Forbidden(
-                "board run --exec-prepared needs the launch token of a prepared run; start runs with `board run`"
-                    .to_owned(),
-            )
-        };
+        Self::take_over_at(
+            store,
+            &run_lock_path(store.base(), id),
+            plan_hash,
+            launch_token,
+            "board run --exec-prepared needs the launch token of a prepared run; start runs with `board run`",
+        )
+    }
+
+    fn take_over_at(
+        store: &BoardStore,
+        path: &Path,
+        plan_hash: &str,
+        launch_token: Option<&str>,
+        refused_msg: &str,
+    ) -> Result<(Self, RunLock), BoardError> {
+        let refused = || BoardError::Forbidden(refused_msg.to_owned());
         let token = launch_token
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .ok_or_else(refused)?;
         let presented = launch_token_sha256(token);
         store.with_store_lock(|| {
-            let mut lock = read_run_lock(store.base(), id).ok_or_else(refused)?;
+            let mut lock = read_lock_at(path).ok_or_else(refused)?;
             let expected = lock.token_sha256.as_deref().ok_or_else(refused)?;
             if lock.plan_hash != plan_hash
                 || !constant_time_eq(presented.as_bytes(), expected.as_bytes())
@@ -215,10 +244,10 @@ impl BoardLockGuard {
             }
             lock.token_sha256 = None;
             lock.pid = std::process::id();
-            write_run_lock(store.base(), id, &lock)?;
+            write_lock_at(store.base(), path, &lock)?;
             Ok((
                 Self {
-                    path: run_lock_path(store.base(), id),
+                    path: path.to_path_buf(),
                 },
                 lock,
             ))
@@ -243,6 +272,9 @@ pub struct ChildOutcome {
     pub plan_hash: Option<String>,
     pub text: Option<String>,
     pub summary: Option<String>,
+    /// `plan_source` / `planner_error` of an exit-7 outcome (SPEC-board-intake FR-3860).
+    pub plan_source: Option<String>,
+    pub planner_error: Option<String>,
 }
 
 fn resolve_child_bin() -> Result<PathBuf, BoardError> {
@@ -280,6 +312,30 @@ fn child_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn parse_child_value(stdout: &str) -> Option<Value> {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .or_else(|| {
+            trimmed
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        })
+        .filter(Value::is_object)
+}
+
+fn child_str_field(val: Option<&Value>, key: &str) -> Option<String> {
+    val?.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 fn parse_child_json(
     stdout: &str,
 ) -> (
@@ -292,13 +348,7 @@ fn parse_child_json(
     if trimmed.is_empty() {
         return (None, None, None, None);
     }
-    let parsed = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
-        trimmed
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-    });
-    let Some(val) = parsed.filter(Value::is_object) else {
+    let Some(val) = parse_child_value(trimmed) else {
         return (
             None,
             None,
@@ -457,12 +507,15 @@ pub fn spawn_child_dmuxai(
     if summary.is_none() && !stderr.trim().is_empty() {
         summary = Some(stderr.trim().to_owned());
     }
+    let value = parse_child_value(&stdout);
     Ok(ChildOutcome {
         exit_code,
         run_id,
         plan_hash,
         text,
         summary,
+        plan_source: child_str_field(value.as_ref(), "plan_source"),
+        planner_error: child_str_field(value.as_ref(), "planner_error"),
     })
 }
 
@@ -901,16 +954,41 @@ pub fn run_item_execute(
 
 /// Point the run lock at the detached child while its token is still unused,
 /// so a stale-lock check sees a dead child as stale (FR-3808).
-fn record_launched_pid(store: &BoardStore, id: &str, pid: u32) {
+fn record_launched_pid(store: &BoardStore, lock_path: &Path, pid: u32) {
     let _ = store.with_store_lock(|| {
-        if let Some(mut lock) = read_run_lock(store.base(), id)
+        if let Some(mut lock) = read_lock_at(lock_path)
             && lock.token_sha256.is_some()
         {
             lock.pid = pid;
-            write_run_lock(store.base(), id, &lock)?;
+            write_lock_at(store.base(), lock_path, &lock)?;
         }
         Ok(())
     });
+}
+
+/// State dir, run id and launch token env plus `setsid` for a detached board
+/// child (FR-3133, FR-3800).
+fn apply_detached_child(cmd: &mut Command, state_root: &Path, launch_token: &str) {
+    apply_state_dir_env(cmd, state_root);
+    let run_id = std::env::var(crate::term::policy::RUN_ID_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(crate::run_journal::generate_run_id);
+    cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
+    cmd.env(LAUNCH_TOKEN_ENV, launch_token);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is async-signal-safe and detaches into a new session.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 }
 
 /// Wait for the detached child on a background thread so a long-lived parent
@@ -958,29 +1036,14 @@ pub fn launch_detached_board_run(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    apply_state_dir_env(&mut cmd, &prepared.state_root);
-    let run_id = std::env::var(crate::term::policy::RUN_ID_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(crate::run_journal::generate_run_id);
-    cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
-    cmd.env(LAUNCH_TOKEN_ENV, &prepared.launch_token);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid() is async-signal-safe and detaches into a new session.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    apply_detached_child(&mut cmd, &prepared.state_root, &prepared.launch_token);
     match cmd.spawn() {
         Ok(child) => {
-            record_launched_pid(store, &prepared.item.id, child.id());
+            record_launched_pid(
+                store,
+                &run_lock_path(store.base(), &prepared.item.id),
+                child.id(),
+            );
             reap_detached_child(child);
             prepared.guard.disarm();
             Ok(prepared.item)
@@ -1176,6 +1239,352 @@ pub fn run_item_execute_prepared(
             state_root: state_root.to_path_buf(),
             launch_token: String::new(),
         },
+    )
+}
+
+const PLANNING_ERROR_MAX: usize = 500;
+const PLANNING_DETAIL_MAX: usize = 2000;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn masked_clip(text: &str, max: usize) -> String {
+    mask_sensitive_tokens(text.trim())
+        .chars()
+        .take(max)
+        .collect()
+}
+
+/// Intake planner child argv: always plan, never approve or widen trust
+/// (SPEC-board-intake FR-3861, FR-3864, FR-3866).
+pub fn intake_run_args(workspace: &Path) -> Vec<String> {
+    vec![
+        "-C".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--graph".to_owned(),
+        "--plan-only".to_owned(),
+        "--json".to_owned(),
+        "-".to_owned(),
+    ]
+}
+
+/// Whether `board add --prompt` waits for the planner (CLI) or returns at
+/// once with `planning.state = planning` (`--detach`, MCP, HTTP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntakeMode {
+    Blocking,
+    Detached,
+}
+
+/// An intake planning run holding `runs/<id>.plan.lock` (FR-3864).
+pub struct PreparedIntake {
+    pub id: String,
+    guard: BoardLockGuard,
+    launch_token: String,
+}
+
+fn record_intake_failure(
+    store: &BoardStore,
+    id: &str,
+    started_ms: u64,
+    error: &str,
+) -> Result<BoardItem, BoardError> {
+    let detail = masked_clip(error, PLANNING_DETAIL_MAX);
+    store.set_planning(
+        id,
+        Planning {
+            state: PlanningState::Failed,
+            started_ms,
+            ended_ms: Some(now_ms()),
+            plan_source: None,
+            error: Some(masked_clip(error, PLANNING_ERROR_MAX)),
+            warning: None,
+        },
+        Some(&format!("Planning failed: {detail}")),
+    )
+}
+
+/// `board add --prompt` (SPEC-board-intake FR-3861, FR-3863): create the item,
+/// mark it `planning` and run the planner on `prompt` in its workspace. An
+/// existing item with the same key is returned without a second planning run.
+pub fn intake_add(
+    store: &BoardStore,
+    req: AddItemRequest,
+    prompt: &str,
+    mode: IntakeMode,
+) -> Result<BoardItem, BoardError> {
+    if req.plan_hash.is_some() {
+        return Err(BoardError::Usage(
+            "--prompt cannot be used with --plan-hash".to_owned(),
+        ));
+    }
+    if prompt.trim().is_empty() {
+        return Err(BoardError::Usage("prompt must not be empty".to_owned()));
+    }
+    let workspace = req
+        .workspace
+        .clone()
+        .ok_or_else(|| BoardError::Usage("a prompt intake needs a workspace".to_owned()))?;
+    if !workspace.is_dir() {
+        return Err(BoardError::Usage(format!(
+            "board item workspace '{}' does not exist",
+            workspace.display()
+        )));
+    }
+    let state_root = req.state_root.clone();
+    let (item, created) = store.add_reporting_created(req)?;
+    if !created {
+        return Ok(item);
+    }
+    let started_ms = now_ms();
+    store.set_planning(
+        &item.id,
+        Planning {
+            state: PlanningState::Planning,
+            started_ms,
+            ended_ms: None,
+            plan_source: None,
+            error: None,
+            warning: None,
+        },
+        None,
+    )?;
+    let prepared = match intake_prepare(store, &item.id) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let _ = record_intake_failure(store, &item.id, started_ms, &err.to_string());
+            return Err(err);
+        }
+    };
+    match mode {
+        IntakeMode::Blocking => intake_execute(store, prepared, prompt, &state_root),
+        IntakeMode::Detached => launch_detached_intake(store, prepared, prompt, &state_root),
+    }
+}
+
+/// Take the per-item planning lock (FR-3864): a second planning run on the
+/// same item is a conflict (exit 4 / HTTP 409).
+pub fn intake_prepare(store: &BoardStore, id: &str) -> Result<PreparedIntake, BoardError> {
+    validate_item_id_early(id)?;
+    let guard = BoardLockGuard::acquire(
+        store.base(),
+        "runs",
+        &intake_lock_id(id),
+        "a planning run is already in progress for this item",
+    )?;
+    let launch_token = generate_launch_token();
+    write_lock_at(
+        store.base(),
+        &intake_lock_path(store.base(), id),
+        &RunLock {
+            pid: std::process::id(),
+            token_sha256: Some(launch_token_sha256(&launch_token)),
+            plan_hash: String::new(),
+            actor: "planner".to_owned(),
+            created_ms: now_ms(),
+            prepared_lane: None,
+        },
+    )?;
+    Ok(PreparedIntake {
+        id: id.to_owned(),
+        guard,
+        launch_token,
+    })
+}
+
+/// Run `dmuxai -C <ws> run --graph --plan-only --json -` and attach the plan
+/// of an exit 7 (FR-3106 validation, FR-3130 plan copy); any other result marks
+/// the planning `failed` with a masked error (FR-3861, FR-3862).
+pub fn intake_execute(
+    store: &BoardStore,
+    prepared: PreparedIntake,
+    prompt: &str,
+    state_root: &Path,
+) -> Result<BoardItem, BoardError> {
+    let PreparedIntake { id, guard, .. } = prepared;
+    let _guard = guard;
+    let item = store.get(&id)?;
+    let started_ms = item
+        .planning
+        .as_ref()
+        .map(|p| p.started_ms)
+        .unwrap_or_else(now_ms);
+    let workspace = match require_item_workspace(&item) {
+        Ok(ws) => ws,
+        Err(err) => {
+            let _ = record_intake_failure(store, &id, started_ms, &err.to_string());
+            return Err(err);
+        }
+    };
+    let outcome = match spawn_child_dmuxai(
+        &workspace,
+        &intake_run_args(&workspace),
+        prompt,
+        child_timeout(),
+        state_root,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = record_intake_failure(store, &id, started_ms, &err.to_string());
+            return Err(err);
+        }
+    };
+    let hash = match outcome.plan_hash.as_deref() {
+        Some(hash) if outcome.exit_code == 7 => hash.to_owned(),
+        _ => {
+            let mut error = if outcome.exit_code == 124 {
+                "planner timed out (exit 124)".to_owned()
+            } else {
+                format!("planner exited {}", outcome.exit_code)
+            };
+            if outcome.exit_code == 7 {
+                error.push_str(" without a plan hash");
+            }
+            if let Some(detail) = outcome
+                .summary
+                .as_deref()
+                .or(outcome.text.as_deref())
+                .filter(|s| !s.trim().is_empty())
+            {
+                error.push_str(": ");
+                error.push_str(detail);
+            }
+            return record_intake_failure(store, &id, started_ms, &error);
+        }
+    };
+    let attached = match store.attach_plan(&id, &hash, state_root, "planner") {
+        Ok(item) => item,
+        Err(err) => {
+            return record_intake_failure(
+                store,
+                &id,
+                started_ms,
+                &format!("could not attach plan {hash}: {err}"),
+            );
+        }
+    };
+    let fallback = outcome.plan_source.as_deref() == Some("fallback");
+    let steps = attached.plan.as_ref().map_or(0, |p| p.steps.len());
+    let mut message = format!(
+        "Planned {steps} step{} (plan {hash}).",
+        if steps == 1 { "" } else { "s" }
+    );
+    if fallback {
+        message.push_str(&format!(" Warning: {FALLBACK_PLAN_WARNING}."));
+        if let Some(error) = outcome
+            .planner_error
+            .as_deref()
+            .filter(|e| !e.trim().is_empty())
+        {
+            message.push_str(" Planner error: ");
+            message.push_str(&masked_clip(error, PLANNING_ERROR_MAX));
+        }
+    }
+    store.set_planning(
+        &id,
+        Planning {
+            state: PlanningState::Planned,
+            started_ms,
+            ended_ms: Some(now_ms()),
+            plan_source: Some(if fallback { "fallback" } else { "planner" }.to_owned()),
+            error: None,
+            warning: fallback.then(|| FALLBACK_PLAN_WARNING.to_owned()),
+        },
+        Some(&message),
+    )
+}
+
+/// Spawn the detached hidden `board intake <id>` (setsid, prompt on stdin,
+/// launch token only in [`LAUNCH_TOKEN_ENV`]) and return the `planning` item.
+pub fn launch_detached_intake(
+    store: &BoardStore,
+    prepared: PreparedIntake,
+    prompt: &str,
+    state_root: &Path,
+) -> Result<BoardItem, BoardError> {
+    let started_ms = store
+        .get(&prepared.id)
+        .ok()
+        .and_then(|item| item.planning.map(|p| p.started_ms))
+        .unwrap_or_else(now_ms);
+    let fail = |msg: String| {
+        let _ = record_intake_failure(store, &prepared.id, started_ms, &msg);
+        BoardError::Internal(msg)
+    };
+    let bin = resolve_self_bin().map_err(|err| fail(err.to_string()))?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("board")
+        .arg("intake")
+        .arg(&prepared.id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_detached_child(&mut cmd, state_root, &prepared.launch_token);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| fail(format!("failed to spawn detached planning run: {e}")))?;
+    // Written before returning: a CLI parent exits right after this call.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+    record_launched_pid(
+        store,
+        &intake_lock_path(store.base(), &prepared.id),
+        child.id(),
+    );
+    reap_detached_child(child);
+    let PreparedIntake { id, guard, .. } = prepared;
+    guard.disarm();
+    store.get(&id)
+}
+
+/// Body of the detached `board intake <id>`: the presented launch token must
+/// match the planning lock, and the item must still be `planning`.
+pub fn intake_execute_prepared(
+    store: &BoardStore,
+    id: &str,
+    launch_token: Option<&str>,
+    prompt: &str,
+    state_root: &Path,
+) -> Result<BoardItem, BoardError> {
+    validate_item_id_early(id)?;
+    let (guard, _lock) = BoardLockGuard::take_over_at(
+        store,
+        &intake_lock_path(store.base(), id),
+        "",
+        launch_token,
+        "board intake needs the launch token of a prepared planning run; use `board add --prompt`",
+    )?;
+    let item = store.get(id)?;
+    let Some(planning) = item
+        .planning
+        .as_ref()
+        .filter(|p| p.state == PlanningState::Planning)
+    else {
+        return Err(BoardError::Conflict(
+            "item is not waiting for a planning run".to_owned(),
+        ));
+    };
+    if prompt.trim().is_empty() {
+        let started_ms = planning.started_ms;
+        drop(guard);
+        let _ = record_intake_failure(store, id, started_ms, "the intake prompt is empty");
+        return Err(BoardError::Usage("the intake prompt is empty".to_owned()));
+    }
+    intake_execute(
+        store,
+        PreparedIntake {
+            id: id.to_owned(),
+            guard,
+            launch_token: String::new(),
+        },
+        prompt,
+        state_root,
     )
 }
 
@@ -2553,5 +2962,285 @@ exit 0
         assert!(wait_for(Duration::from_secs(3), || {
             !BoardLockGuard::is_active(&h.board, "runs", &item.id)
         }));
+    }
+
+    fn intake_request(h: &Hardening, title: &str, key: Option<&str>) -> AddItemRequest {
+        AddItemRequest {
+            title: title.to_owned(),
+            summary: String::new(),
+            kind: Kind::Feature,
+            grade: None,
+            lane: None,
+            source_bot: Some("coord".to_owned()),
+            source_channel: None,
+            source_ref: None,
+            workspace: Some(h.ws.clone()),
+            recommendation: None,
+            options: vec![],
+            plan_hash: None,
+            key: key.map(str::to_owned),
+            by: "bot:coord".to_owned(),
+            state_root: h.state.clone(),
+        }
+    }
+
+    /// Fake `dmuxai run --graph --plan-only --json -`: saves stdin, argv and
+    /// selected env under `dir`, then prints an exit-7 outcome for `hash`.
+    fn fake_planner_child(dir: &Path, hash: &str, source: &str) -> PathBuf {
+        write_fake_runner(
+            dir,
+            &format!("fake-planner-{source}.sh"),
+            &format!(
+                "#!/bin/sh\ncat > \"{d}/planner_stdin.txt\"\nprintf '%s\\n' \"$@\" > \"{d}/planner_argv.txt\"\nprintf 'web=%s\\nrun=%s\\nlaunch=%s\\n' \"$DMUXAI_WEB_TOKEN\" \"$DMUXAI_RUN_ID\" \"$DMUXAI_BOARD_LAUNCH_TOKEN\" > \"{d}/planner_env.txt\"\nprintf '{{\"ok\":false,\"exit_code\":7,\"plan_hash\":\"{hash}\",\"plan_source\":\"{source}\",\"planner_error\":\"planner exited 3 sk-ant-secret1234567890abcdef\"}}\\n'\nexit 7\n",
+                d = dir.display(),
+            ),
+        )
+    }
+
+    // TC-3861 / SPEC-board-intake FR-3861: `board add --prompt` creates the item
+    // in `planning`, runs the plan-only planner on the prompt and attaches its
+    // plan (FR-3106 / FR-3130); detached intake returns `planning` and the
+    // token-checked `board intake` finishes it; planner failures mark the item
+    // `failed` with a masked error; invalid input creates nothing.
+    #[test]
+    fn tc_3861_board_add_prompt_plans() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let prompt = "ship the intake feature\nwith two lines";
+        let fake = fake_planner_child(h.dir.path(), &h.hash, "planner");
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake) };
+
+        let item = intake_add(
+            &h.store,
+            intake_request(&h, "blocking intake", None),
+            prompt,
+            IntakeMode::Blocking,
+        )
+        .unwrap();
+        let planning = item.planning.as_ref().expect("planning status");
+        assert_eq!(planning.state, PlanningState::Planned);
+        assert_eq!(planning.plan_source.as_deref(), Some("planner"));
+        assert!(planning.warning.is_none());
+        assert!(planning.ended_ms.is_some());
+        assert_eq!(item.plan.as_ref().unwrap().hash, h.hash);
+        assert_eq!(item.lane, Lane::NeedsDecision);
+        assert_eq!(item.planning_warning(), None);
+        let last = item.thread.last().unwrap();
+        assert_eq!(last.from, "planner");
+        assert!(last.text.contains("Planned 1 step"), "{}", last.text);
+        assert_eq!(
+            fs::read_to_string(h.dir.path().join("planner_stdin.txt")).unwrap(),
+            prompt
+        );
+
+        // Detached: the parent returns `planning`; the hidden `board intake`
+        // child gets the prompt on stdin and the token only in the env.
+        let argv_file = h.dir.path().join("intake_argv.txt");
+        let token_file = h.dir.path().join("intake_token.txt");
+        let stdin_file = h.dir.path().join("intake_stdin.txt");
+        let fake_self = write_fake_runner(
+            h.dir.path(),
+            "fake-self-intake.sh",
+            &format!(
+                "#!/bin/sh\ncat > \"{s}\"\nprintf '%s\\n' \"$@\" > \"{a}\"\nprintf '%s' \"$DMUXAI_BOARD_LAUNCH_TOKEN\" > \"{t}.tmp\"\nmv \"{t}.tmp\" \"{t}\"\nexit 0\n",
+                s = stdin_file.display(),
+                a = argv_file.display(),
+                t = token_file.display(),
+            ),
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self) };
+        let detached = intake_add(
+            &h.store,
+            intake_request(&h, "detached intake", None),
+            prompt,
+            IntakeMode::Detached,
+        );
+        unsafe { std::env::remove_var("DMUXAI_BOARD_SELF_BIN") };
+        let detached = detached.unwrap();
+        assert_eq!(
+            detached.planning.as_ref().unwrap().state,
+            PlanningState::Planning
+        );
+        assert!(detached.plan.is_none());
+        assert!(wait_for(Duration::from_secs(3), || token_file.exists()));
+        let token = fs::read_to_string(&token_file).unwrap();
+        let argv = fs::read_to_string(&argv_file).unwrap();
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            ["board", "intake", detached.id.as_str()]
+        );
+        assert!(!argv.contains(&token));
+        assert_eq!(fs::read_to_string(&stdin_file).unwrap(), prompt);
+        let wrong = intake_execute_prepared(
+            &h.store,
+            &detached.id,
+            Some("00ff00ff00ff00ff00ff00ff00ff00ff"),
+            prompt,
+            &h.state,
+        )
+        .unwrap_err();
+        assert_eq!(wrong.exit_code(), crate::agent_api::exit::FORBIDDEN);
+        let done = intake_execute_prepared(&h.store, &detached.id, Some(&token), prompt, &h.state)
+            .unwrap();
+        assert_eq!(
+            done.planning.as_ref().unwrap().state,
+            PlanningState::Planned
+        );
+        assert_eq!(done.plan.as_ref().unwrap().hash, h.hash);
+
+        // Planner failure: exit 1 with a secret in the error is masked.
+        let failing = write_fake_runner(
+            h.dir.path(),
+            "fake-planner-fail.sh",
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":false,\"exit_code\":1,\"summary\":\"boom sk-ant-secret1234567890abcdef\"}\\n'\nexit 1\n",
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &failing) };
+        let failed = intake_add(
+            &h.store,
+            intake_request(&h, "failing intake", None),
+            prompt,
+            IntakeMode::Blocking,
+        )
+        .unwrap();
+        let planning = failed.planning.as_ref().unwrap();
+        assert_eq!(planning.state, PlanningState::Failed);
+        let error = planning.error.as_deref().unwrap();
+        assert!(error.contains("planner exited 1"), "{error}");
+        assert!(!error.contains("sk-ant-secret1234567890abcdef"), "{error}");
+        assert!(failed.plan.is_none());
+        assert!(
+            failed
+                .thread
+                .last()
+                .unwrap()
+                .text
+                .starts_with("Planning failed:"),
+            "{:?}",
+            failed.thread.last()
+        );
+
+        // Invalid input is refused before any item exists.
+        let all = crate::board::store::ListFilter {
+            include_all: true,
+            ..Default::default()
+        };
+        let before = h.store.list(&all).unwrap().len();
+        let mut missing_ws = intake_request(&h, "no workspace", None);
+        missing_ws.workspace = Some(h.dir.path().join("missing"));
+        let mut with_hash = intake_request(&h, "with hash", None);
+        with_hash.plan_hash = Some(h.hash.clone());
+        for (req, text) in [
+            (missing_ws, prompt),
+            (with_hash, prompt),
+            (intake_request(&h, "empty prompt", None), "  \n"),
+        ] {
+            let err = intake_add(&h.store, req, text, IntakeMode::Blocking).unwrap_err();
+            assert_eq!(err.exit_code(), crate::agent_api::exit::USAGE);
+        }
+        assert_eq!(h.store.list(&all).unwrap().len(), before);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    // TC-3863 / SPEC-board-intake FR-3863: a prompt intake whose `key` matches
+    // an existing item returns that item and starts no second planning run.
+    #[test]
+    fn tc_3863_key_idempotent_no_second_plan() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let marker = h.dir.path().join("planner_ran.txt");
+        let fake = write_fake_runner(
+            h.dir.path(),
+            "fake-planner-marker.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\ntouch \"{m}\"\nexit 1\n",
+                m = marker.display()
+            ),
+        );
+        let existing = h
+            .store
+            .add(intake_request(&h, "keyed item", Some("issue-375")))
+            .unwrap();
+        let events_before = fs::read_to_string(h.board.join("events.jsonl")).unwrap();
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake) };
+        let again = intake_add(
+            &h.store,
+            intake_request(&h, "keyed item", Some("issue-375")),
+            "plan it again",
+            IntakeMode::Blocking,
+        );
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        let again = again.unwrap();
+        assert_eq!(again.id, existing.id);
+        assert!(again.planning.is_none());
+        assert!(!marker.exists(), "a second planning run was started");
+        assert!(!intake_lock_path(&h.board, &existing.id).exists());
+        assert_eq!(
+            fs::read_to_string(h.board.join("events.jsonl")).unwrap(),
+            events_before
+        );
+    }
+
+    // TC-3864 / SPEC-board-intake FR-3864: the planner child is exactly
+    // `-C <ws> run --graph --plan-only --json -` (no --approve-plan, no trust
+    // flags), its env has no DMUXAI_WEB_TOKEN / launch token and carries
+    // DMUXAI_RUN_ID; a second planning run on the same item is a conflict.
+    #[test]
+    fn tc_3864_intake_child_policy() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let fake = fake_planner_child(h.dir.path(), &h.hash, "planner");
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake);
+            std::env::set_var("DMUXAI_WEB_TOKEN", "web-token-should-not-leak");
+            std::env::set_var(LAUNCH_TOKEN_ENV, "launch-token-should-not-leak");
+        }
+        let item = intake_add(
+            &h.store,
+            intake_request(&h, "policy intake", None),
+            "plan the policy",
+            IntakeMode::Blocking,
+        );
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var("DMUXAI_WEB_TOKEN");
+            std::env::remove_var(LAUNCH_TOKEN_ENV);
+        }
+        let item = item.unwrap();
+        assert_eq!(
+            item.planning.as_ref().unwrap().state,
+            PlanningState::Planned
+        );
+        let argv = fs::read_to_string(h.dir.path().join("planner_argv.txt")).unwrap();
+        let expected = intake_run_args(&h.ws);
+        assert_eq!(argv.lines().collect::<Vec<_>>(), expected);
+        for forbidden in [
+            "--approve-plan",
+            "--approve-plan-id",
+            "--allow-sensitive",
+            "--trust-workspace-config",
+        ] {
+            assert!(!argv.lines().any(|a| a == forbidden), "{forbidden}");
+        }
+        let env = fs::read_to_string(h.dir.path().join("planner_env.txt")).unwrap();
+        assert!(env.contains("web=\n"), "{env}");
+        assert!(env.contains("launch=\n"), "{env}");
+        let run_id = env
+            .lines()
+            .find_map(|l| l.strip_prefix("run="))
+            .unwrap_or_default();
+        assert!(!run_id.is_empty(), "{env}");
+        assert!(!intake_lock_path(&h.board, &item.id).exists());
+
+        let held = intake_prepare(&h.store, &item.id).unwrap();
+        let lock_path = h.board.join("runs").join(format!("{}.plan.lock", item.id));
+        assert!(lock_path.exists());
+        let Err(conflict) = intake_prepare(&h.store, &item.id) else {
+            panic!("second planning run was not refused");
+        };
+        assert_eq!(conflict.exit_code(), crate::agent_api::exit::CONFLICT);
+        assert!(conflict.to_string().contains("planning run"), "{conflict}");
+        drop(held);
+        assert!(!lock_path.exists());
+        drop(intake_prepare(&h.store, &item.id).unwrap());
     }
 }

@@ -246,6 +246,35 @@ pub struct ThreadMessage {
     pub at_ms: u64,
 }
 
+/// Warning shown for an item whose intake plan came from the heuristic
+/// fallback (SPEC-board-intake FR-3862, OQ-3860).
+pub const FALLBACK_PLAN_WARNING: &str = "planner unavailable — fallback plan";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningState {
+    Planning,
+    Planned,
+    Failed,
+}
+
+/// `item.planning` of a `board add --prompt` intake (SPEC-board-intake FR-3861).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Planning {
+    pub state: PlanningState,
+    pub started_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+    /// `planner` or `fallback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// [`FALLBACK_PLAN_WARNING`] when the attached plan is a fallback plan (FR-3862).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardItem {
     pub id: String,
@@ -274,9 +303,21 @@ pub struct BoardItem {
     pub run_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning: Option<Planning>,
     pub created_ms: u64,
     pub updated_ms: u64,
     pub version: u32,
+}
+
+impl BoardItem {
+    /// FR-3862: the fallback-plan warning while the intake plan is attached.
+    pub fn planning_warning(&self) -> Option<&str> {
+        self.planning
+            .as_ref()
+            .filter(|_| self.plan.is_some())
+            .and_then(|p| p.warning.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -492,6 +533,9 @@ pub fn mask_item_fields(item: &mut BoardItem) {
         && let Some(text) = checked.text.as_mut()
     {
         *text = crate::run_journal::mask_sensitive_tokens(text);
+    }
+    if let Some(error) = item.planning.as_mut().and_then(|p| p.error.as_mut()) {
+        *error = crate::run_journal::mask_sensitive_tokens(error);
     }
 }
 
@@ -713,6 +757,14 @@ mod tests {
             }],
             run_ids: vec![],
             key: None,
+            planning: Some(Planning {
+                state: PlanningState::Failed,
+                started_ms: 0,
+                ended_ms: Some(1),
+                plan_source: None,
+                error: Some(format!("error {secret}")),
+                warning: None,
+            }),
             created_ms: 0,
             updated_ms: 0,
             version: 1,

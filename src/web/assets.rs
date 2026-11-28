@@ -2724,6 +2724,86 @@ mod tests {
         assert!(BOARD_JS.contains("boardAskPlanner(item.id, true)"));
     }
 
+    // TC-3865 / SPEC-board-intake FR-3865, FR-3862: "New task" button + form
+    // (title, kind, workspace = current, prompt) posting to `/api/board`, hidden
+    // unless launching is allowed (`serve`), and a `Planning…` card / fallback
+    // warning from `item.planning`.
+    #[test]
+    fn tc_3865_board_new_task_form() {
+        for id in [
+            "board-new-task",
+            "board-new-task-form",
+            "board-new-title",
+            "board-new-kind",
+            "board-new-workspace",
+            "board-new-prompt",
+            "board-new-submit",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "missing #{id}"
+            );
+        }
+        let toolbar = INDEX_HTML
+            .split("id=\"board-new-task\"")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("new task button markup");
+        assert!(toolbar.contains("hidden"), "New task must start hidden");
+
+        let sync = js_between(
+            BOARD_JS,
+            "function boardSyncNewTask",
+            "function boardToggleNewTask",
+        );
+        assert!(sync.contains("btn.hidden = !boardLaunchAllowed"));
+        let toggle = js_between(
+            BOARD_JS,
+            "function boardToggleNewTask",
+            "function boardSubmitNewTask",
+        );
+        assert!(toggle.contains("dmuxaiCurrentWorkspace"));
+        let submit = js_between(
+            BOARD_JS,
+            "function boardSubmitNewTask",
+            "function boardRenderKanban",
+        );
+        assert!(submit.contains("boardFetchJson('POST', '/api/board', body, true)"));
+        for field in ["title:", "kind:", "workspace:", "prompt:"] {
+            assert!(submit.contains(field), "submit body missing {field}");
+        }
+        assert!(APP_JS.contains("window.dmuxaiCurrentWorkspace"));
+
+        let label = js_between(
+            BOARD_JS,
+            "function boardPlanningLabel",
+            "function boardAppendPlanningStatus",
+        );
+        assert!(label.contains("planning.state === 'planning'"));
+        assert!(label.contains("Planning\\u2026"));
+        assert!(label.contains("planning.warning"));
+        let kanban = js_between(
+            BOARD_JS,
+            "function boardRenderKanban",
+            "function boardRenderList",
+        );
+        assert!(kanban.contains("boardAppendPlanningStatus(card, item"));
+        let decisions = js_between(
+            BOARD_JS,
+            "function boardRenderMyDecisions",
+            "function boardPlanningLabel",
+        );
+        assert!(decisions.contains("boardAppendPlanningStatus(card, item"));
+        let drawer = js_between(
+            BOARD_JS,
+            "function boardRenderDrawer",
+            "function boardAskPlanner",
+        );
+        assert!(drawer.contains("boardAppendPlanningStatus(drawer, item"));
+        assert!(BOARD_CSS.contains(".board-new-task-form[hidden]"));
+        assert!(BOARD_CSS.contains(".board-planning-warning"));
+    }
+
     // TC-3421 (FR-3421)
     #[test]
     fn tc_3421_readme_documents_board_chat_send() {

@@ -177,6 +177,14 @@ fn board_add(workspace_root: &std::path::Path, args: &Value) -> Result<Value, Ap
     if let Some(hash) = plan_hash {
         validate_plan_hash_arg(hash)?;
     }
+    let prompt = match args.get("prompt") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if !p.trim().is_empty() => Some(p.as_str()),
+        Some(_) => return Err(usage("prompt must be a non-empty string")),
+    };
+    if prompt.is_some() && plan_hash.is_some() {
+        return Err(usage("prompt cannot be used with plan_hash"));
+    }
     let workspace = str_arg(args, "workspace")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root.to_path_buf());
@@ -184,25 +192,34 @@ fn board_add(workspace_root: &std::path::Path, args: &Value) -> Result<Value, Ap
         .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
     let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let store = open_board_store()?;
-    let item = store
-        .add(AddItemRequest {
-            title: title.to_owned(),
-            summary: summary.to_owned(),
-            kind,
-            grade,
-            lane,
-            source_bot: str_arg(args, "bot").map(str::to_owned),
-            source_channel: str_arg(args, "channel").map(str::to_owned),
-            source_ref: ref_url.map(str::to_owned),
-            workspace: Some(workspace),
-            recommendation: recommendation.map(str::to_owned),
-            options,
-            plan_hash: plan_hash.map(str::to_owned),
-            key: str_arg(args, "key").map(str::to_owned),
-            by,
-            state_root,
-        })
-        .map_err(ApiError::from)?;
+    let req = AddItemRequest {
+        title: title.to_owned(),
+        summary: summary.to_owned(),
+        kind,
+        grade,
+        lane,
+        source_bot: str_arg(args, "bot").map(str::to_owned),
+        source_channel: str_arg(args, "channel").map(str::to_owned),
+        source_ref: ref_url.map(str::to_owned),
+        workspace: Some(workspace),
+        recommendation: recommendation.map(str::to_owned),
+        options,
+        plan_hash: plan_hash.map(str::to_owned),
+        key: str_arg(args, "key").map(str::to_owned),
+        by,
+        state_root,
+    };
+    // SPEC-board-intake FR-3861: the planner runs detached for MCP.
+    let item = match prompt {
+        Some(prompt) => crate::board::runner::intake_add(
+            &store,
+            req,
+            prompt,
+            crate::board::runner::IntakeMode::Detached,
+        ),
+        None => store.add(req),
+    }
+    .map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }
 

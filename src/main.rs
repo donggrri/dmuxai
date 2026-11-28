@@ -107,7 +107,7 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote] [--new]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--write] [--keep-worktrees] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--no-spec-first] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
+  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--write] [--keep-worktrees] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--no-spec-first] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--plan-only] [--progress] [--json] [--trust-workspace-config]
   dmuxai todo run <id> [--agent ID | --graph] [--model M] [--approve-plan] [--no-spec-first] [--progress] [--json] [--trust-workspace-config]
   dmuxai trust [--status] [--json] [--revoke] [--yes]
   dmuxai todo add <title> [--body TEXT] [--json]

@@ -133,6 +133,9 @@ pub struct PendingItem {
     pub grade: Option<super::Grade>,
     pub age_ms: u64,
     pub updated_ms: u64,
+    /// SPEC-board-intake FR-3862: fallback-plan warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -390,6 +393,15 @@ impl BoardStore {
     }
 
     pub fn add(&self, req: AddItemRequest) -> Result<BoardItem, BoardError> {
+        self.add_reporting_created(req).map(|(item, _)| item)
+    }
+
+    /// [`Self::add`] that also says whether the item was created (`false` when
+    /// `key` matched an existing item; SPEC-board-intake FR-3863).
+    pub fn add_reporting_created(
+        &self,
+        req: AddItemRequest,
+    ) -> Result<(BoardItem, bool), BoardError> {
         validate_new_text(&req.title, &req.summary, req.recommendation.as_deref())?;
         validate_options(&req.options)?;
         validate_ref_url(req.source_ref.as_deref())?;
@@ -400,11 +412,11 @@ impl BoardStore {
                 "plan hash must be 16 lowercase hex characters".to_owned(),
             ));
         }
-        let (item, notify_needs_decision) = self.with_lock(|store| {
+        let (item, notify_needs_decision, created) = self.with_lock(|store| {
             if let Some(key) = &req.key
                 && let Some(existing) = store.find_item_by_key(key, req.source_bot.as_deref())?
             {
-                return Ok((existing, false));
+                return Ok((existing, false, false));
             }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
@@ -444,6 +456,7 @@ impl BoardStore {
                 thread: Vec::new(),
                 run_ids: Vec::new(),
                 key: req.key.clone(),
+                planning: None,
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
                 version: 1,
@@ -462,12 +475,51 @@ impl BoardStore {
             store.save_item_inner(&item)?;
             store.append_event(&item.id, EventKind::Created, item.version, &req.by)?;
             let notify = item.lane == Lane::NeedsDecision;
-            Ok((item, notify))
+            Ok((item, notify, true))
         })?;
         if notify_needs_decision {
             super::notify::dispatch_board_event(&self.base, &item, "needs_decision", &req.by);
         }
-        Ok(item)
+        Ok((item, created))
+    }
+
+    /// Store the intake planning status and optionally a `planner` thread
+    /// message (SPEC-board-intake FR-3861, FR-3862).
+    pub fn set_planning(
+        &self,
+        id: &str,
+        planning: super::Planning,
+        message: Option<&str>,
+    ) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        let message = message.map(|text| {
+            let masked = crate::run_journal::mask_sensitive_tokens(text);
+            masked.chars().take(super::TEXT_MAX).collect::<String>()
+        });
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            item.planning = Some(planning);
+            let kind = if let Some(text) = message {
+                if item.thread.len() >= THREAD_MAX {
+                    item.thread.remove(0);
+                }
+                item.thread.push(ThreadMessage {
+                    from: "planner".to_owned(),
+                    text,
+                    at_ms: now_ms(),
+                });
+                EventKind::Message
+            } else {
+                EventKind::Updated
+            };
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            store.append_event(id, kind, item.version, "planner")?;
+            Ok(item)
+        })
     }
 
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<BoardItem>, BoardError> {
@@ -541,7 +593,9 @@ impl BoardStore {
                 Lane::Done if item.checked.is_none() && item.updated_ms >= cutoff => "check",
                 _ => continue,
             };
+            let warning = item.planning_warning().map(str::to_owned);
             entries.push(PendingItem {
+                warning,
                 id: item.id,
                 reason: reason.to_owned(),
                 lane: item.lane,
@@ -2196,6 +2250,118 @@ mod tests {
             "list took {} ms",
             elapsed.as_millis()
         );
+    }
+
+    // TC-3862 / SPEC-board-intake FR-3862: a fallback plan from intake is kept
+    // (owner can still approve it) but `planning.warning` shows in board show
+    // (`planning_warning`) and board pending; a planner plan has no warning.
+    #[cfg(unix)]
+    #[test]
+    fn tc_3862_fallback_warning() {
+        use crate::board::runner::{IntakeMode, intake_add};
+        use crate::board::{FALLBACK_PLAN_WARNING, PlanningState};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::state_path::test_env_lock();
+        let (dir, store, state) = test_store();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let (_, hash) = crate::board::plan::edit_plan_from_json(
+            &ws,
+            &state,
+            "fallback intake",
+            r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#,
+            None,
+        )
+        .unwrap();
+        let child = |name: &str, source: &str| {
+            let path = dir.path().join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncat > /dev/null\nprintf '{{\"ok\":false,\"exit_code\":7,\"plan_hash\":\"{hash}\",\"plan_source\":\"{source}\",\"planner_error\":\"planner exited 3\"}}\\n'\nexit 7\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let request = |title: &str| AddItemRequest {
+            title: title.to_owned(),
+            summary: String::new(),
+            kind: Kind::Feature,
+            grade: None,
+            lane: None,
+            source_bot: Some("coord".to_owned()),
+            source_channel: None,
+            source_ref: None,
+            workspace: Some(ws.clone()),
+            recommendation: None,
+            options: vec![],
+            plan_hash: None,
+            key: None,
+            by: "bot:coord".to_owned(),
+            state_root: state.clone(),
+        };
+
+        let fallback_bin = child("fake-fallback.sh", "fallback");
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fallback_bin) };
+        let fallback = intake_add(
+            &store,
+            request("fallback item"),
+            "plan it",
+            IntakeMode::Blocking,
+        );
+        let planner_bin = child("fake-planner.sh", "planner");
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &planner_bin) };
+        let planned = intake_add(
+            &store,
+            request("planner item"),
+            "plan it",
+            IntakeMode::Blocking,
+        );
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        let fallback = fallback.unwrap();
+        let planned = planned.unwrap();
+
+        let planning = fallback.planning.as_ref().unwrap();
+        assert_eq!(planning.state, PlanningState::Planned);
+        assert_eq!(planning.plan_source.as_deref(), Some("fallback"));
+        assert_eq!(fallback.planning_warning(), Some(FALLBACK_PLAN_WARNING));
+        assert_eq!(fallback.plan.as_ref().unwrap().hash, hash);
+        let note = &fallback.thread.last().unwrap().text;
+        assert!(note.contains(FALLBACK_PLAN_WARNING), "{note}");
+        assert!(note.contains("planner exited 3"), "{note}");
+        let shown = serde_json::to_value(store.get(&fallback.id).unwrap()).unwrap();
+        assert_eq!(shown["planning"]["warning"], FALLBACK_PLAN_WARNING);
+        assert_eq!(planned.planning_warning(), None);
+
+        let pending = store.pending(None).unwrap();
+        let warning_of = |id: &str| {
+            pending
+                .items
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.warning.clone())
+        };
+        assert_eq!(
+            warning_of(&fallback.id),
+            Some(Some(FALLBACK_PLAN_WARNING.to_owned()))
+        );
+        assert_eq!(warning_of(&planned.id), Some(None));
+
+        let approved = store
+            .decide_without_notify(
+                &fallback.id,
+                crate::board::DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(approved.lane, Lane::Approved);
     }
 
     // TC-3137 / FR-3137: board pending lists decide, failed, check (oldest first, excluding >30d

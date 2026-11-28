@@ -9,6 +9,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - Dashboard: Markdown file paths in agent and board messages open in a read-only viewer (workspace files, and `.md` files under your home folder).
 - Board: approving an item wakes the posting bot (decision event and notify payload with `bot`/`verdict`) and starts the approved plan right away (`[board] auto_run_on_approve`, default on).
+- **Board intake (SPEC-board-intake).** `dmuxai board add --prompt P|- [--detach]`, MCP `board_add` with `prompt`, and the new `POST /api/board` create an item and let the board plan it (`dmuxai run --graph --plan-only`, one planning run per item, 900 s limit); the item carries `planning` (`planning` → `planned`/`failed`) and a fallback plan shows `planner unavailable — fallback plan` in `board show`, `board pending` and the dashboard. The dashboard Board view has a **New task** form (`--web` only). `run --graph --plan-only` (MCP `run` `plan_only`) always plans and stops at the approval gate with exit 7.
 
 - **Runner status and enable switch (SPEC-runner-status).** `dmuxai runners status [--json] [--agent ID]` shows, for cursor-agent and agy, whether the CLI is installed, its version and whether it is signed in (account masked, login hint), using only `--version`, `status --format json`, `models` style probes that never start a model turn. `dmuxai runners enable|disable <id>` writes `[runners.<id>] enabled` to the user config; a disabled runner is refused by `run` and graph routing. The same status is available at `GET /api/runners/status`, the MCP tool `runners_status`, and a new Runners panel in the dashboard More menu (status badge, Refresh, enable switch). Nothing is probed at startup or during runs.
 
@@ -26,6 +27,7 @@ All notable changes to dmuxai are listed here. Versions follow
 
 ### Fixed
 
+- Headless `run --graph`: a fallback plan (judge or planner failed) at the approval gate is now saved to `graph-pending/<hash>.json` like a planner plan, and the exit-7 JSON carries `plan_hash`, `plan_source` and a masked `planner_error`, so `--approve-plan-id` and `board add --plan-hash` work for it (#375).
 - Board: a finished run no longer overwrites a newer lane or plan (it adds a `run` note instead); plan attach/edit, `POST /plan` and `ask --revise` are refused (exit 4 / 409) while a run is in progress; detached board run children are reaped and the run lock records the child pid (#361).
 - `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
 - Board item chat: Send now asks the planner and posts its answer ("Note only" keeps the old store-only message).
