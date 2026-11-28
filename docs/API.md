@@ -37,6 +37,9 @@ The following flags can be used before or after subcommands, or with the interac
 | `dmuxai runners` | `[--json]` | Registered runners, admission, installation and model policy |
 | `dmuxai models` | `[--agent ID]`, `[--json]` | Available models and runner policy |
 | `dmuxai events` | `--since N`, `--limit N`, `--follow`/`-f`, `--json` | Events (see §4); `--json` prints one object per line |
+| `dmuxai runs` | `--limit N` (default 20), `--failed`, `--json` | Recorded run manifests, newest first (TSV lines or a JSON array) |
+| `dmuxai runs list` | `--status S` (repeatable), `--limit N` (default 50, max 200), `--json` | Runs with the `GET /api/runs` fields (status, runner/model, `elapsed_ms`, exit code, `error_kind`, `graph_id`, `stale`, `stalled`): one line per run, or `{runs}` with `--json` |
+| `dmuxai runs show <run_id>` | `--progress N` (default 50, max 200), `--json` | Manifest, graph view, `approval {plan_hash, hint}` when awaiting approval, last N progress lines; `--json` prints the `GET /api/runs/{id}` object with the manifest fields also at top level |
 | `dmuxai board` | see [Decision board](#decision-board) | Coordinator items (user-level store) |
 | `dmuxai mcp` | — | stdio MCP server (see §3) |
 
@@ -435,6 +438,8 @@ Tools (`tools/list`):
 | `board_prompt` | `id`, optional `hash` | `{prompt}` unmasked text from `graph-pending/` |
 | `board_ask` | `id`, `text` (required); `revise`, `agent`, `model`, `by` | Item with planner answer or revised plan (blocks up to 900 s) |
 | `board_run` | `id` (required); `by` | `in_progress` item (detached; records run id and moves to `done`/`unknown` on exit) |
+| `runs_list` | `status` (string or array of run statuses), `limit` (1–200, default 50) | `{runs}` like `dmuxai runs list --json`; invalid status or limit → `exit_code: 2` |
+| `runs_show` | `run_id` (required), `progress` (0–200, default 50) | `{run, manifest, graph, approval, progress}` like `GET /api/runs/{id}`; unknown run → `exit_code: 3`, invalid id → `exit_code: 2` |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
 the forwarded flags, and blocks until it finishes, so the result is final. Tool
@@ -493,8 +498,38 @@ auto_run_on_approve = true
 notify_command = ["notify-send", "dmuxai-board"]
 notify_webhook_url = "https://hooks.example.test/board"
 notify_webhook_secret_env = "DMUXAI_BOARD_SECRET"
-notify_events = ["needs_decision", "decision", "message", "run_finished"]
+notify_events = ["needs_decision", "decision", "message", "run_finished", "run_started", "awaiting_approval", "spec_review_requested"]
 ```
+
+Board event kinds (`board events`, `board wait --any`, MCP `board_wait`, SSE
+`/api/board/events`, and notify payload `event`; leave `notify_events` unset to
+deliver all of them):
+
+| Event | When | Extra fields |
+| --- | --- | --- |
+| `run_started` | `board run` moved the item to `in_progress` and starts the child | `plan_hash` |
+| `awaiting_approval` | An item with a plan enters `needs_decision`, or gets a new plan revision there (once per revision; items without a plan only emit `needs_decision`) | `plan_hash`, `plan_revision` |
+| `spec_review_requested` | A run paused for a human spec review (`awaiting_spec_review`): the gate calls `board::notify_spec_review_requested` once each time a review becomes pending (each round), for the `in_progress` item named by the review's board item id / `DMUXAI_BOARD_ITEM_ID` (agent children do not inherit it) or for a run listed in the item's `run_ids`; a `spec_review` thread message is added next to the `planner` "Spec review requested" message. It is the only notification for a pending review; the older name `spec_review` in `notify_events` selects it | `review_id`, `spec_paths` (≤20, workspace-relative) |
+
+`wait_for any` wakes on these kinds (even when written by another bot); the
+`decision` and `message` filters ignore them, and a waiter never wakes on its own
+writes.
+
+### Manager bot loop
+
+A manager bot can follow every workspace without polling each item:
+
+1. Read what needs a human now: MCP `board_pending` (or `dmuxai board pending --json`).
+2. Block for the next change: MCP `board_wait` with `since_seq` and `wait_for: "any"`
+   (or `dmuxai board wait --any --since-seq S --json`); remember the returned `seq`.
+3. On `run_started` / `run_finished`, inspect the run with MCP `runs_show`
+   (`run_id` from the item's `run_ids`, or `dmuxai -C <repo> runs show <id> --json`);
+   `runs_list` with `status: ["awaiting_approval", "failed"]` finds runs that need
+   attention.
+4. On `awaiting_approval` or `spec_review_requested`, tell the owner (the
+   `approval.hint` from `runs_show` is the approve command); approval itself stays
+   human-only.
+5. Repeat from step 2 with the new `since_seq`.
 
 Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 

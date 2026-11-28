@@ -22,9 +22,9 @@ use crate::run_journal::{mask_sensitive_tokens, valid_run_id};
 use crate::settings::BoardSettings;
 use crate::state_path::valid_pending_plan_hash;
 
+pub use super::BOARD_ITEM_ID_ENV;
+
 pub const BOARD_CHILD_TIMEOUT_SECS: u64 = 900;
-/// Board item id a board run passes to its child (SPEC-spec-review-gate FR-3711).
-pub const BOARD_ITEM_ID_ENV: &str = "DMUXAI_BOARD_ITEM_ID";
 const STALE_LOCK_SECS: u64 = 960;
 const THREAD_CONTEXT_LIMIT: usize = 20;
 
@@ -514,28 +514,16 @@ pub fn spawn_child_dmuxai_for_item(
 }
 
 /// Records a spec review change of a board item's run on the item
-/// (SPEC-spec-review-gate FR-3711): a request stores the review, adds a
-/// `planner` thread message and notifies `spec_review`; a decision updates the
-/// status and adds an `owner` message with the verdict. Never changes the lane
-/// or the decision.
+/// (SPEC-spec-review-gate FR-3711): a request stores the review and adds a
+/// `planner` thread message; a decision updates the status and adds an `owner`
+/// message with the verdict. Never changes the lane or the decision. The
+/// notification for a request is the single `spec_review_requested` event the
+/// gate raises through [`super::notify_spec_review_requested_in`]
+/// (SPEC-coordinator-observability FR-3852), so nothing is dispatched here.
 pub fn sync_spec_review(
     board_base: &Path,
     item_id: &str,
     record: &SpecReviewRecord,
-) -> Result<BoardItem, BoardError> {
-    sync_spec_review_with_settings(
-        board_base,
-        item_id,
-        record,
-        &BoardSettings::load_user_only(),
-    )
-}
-
-pub fn sync_spec_review_with_settings(
-    board_base: &Path,
-    item_id: &str,
-    record: &SpecReviewRecord,
-    settings: &BoardSettings,
 ) -> Result<BoardItem, BoardError> {
     validate_item_id_early(item_id)?;
     if !board_base.join("items").is_dir() {
@@ -582,21 +570,11 @@ pub fn sync_spec_review_with_settings(
         )),
         ReviewStatus::Expired | ReviewStatus::Cancelled => None,
     };
-    let item = store.set_spec_review(
+    store.set_spec_review(
         item_id,
         review,
         message.as_ref().map(|(from, text)| (*from, text.as_str())),
-    )?;
-    if record.status == ReviewStatus::Pending {
-        super::notify::dispatch_board_event_with_settings(
-            board_base,
-            &item,
-            "spec_review",
-            "planner",
-            settings,
-        );
-    }
-    Ok(item)
+    )
 }
 
 fn require_item_workspace(item: &BoardItem) -> Result<PathBuf, BoardError> {
@@ -1008,6 +986,8 @@ pub fn run_item_execute(
         "--json".to_owned(),
         "-".to_owned(),
     ];
+    // FR-3850: a failed event write must not stop the run.
+    let _ = store.record_run_started(&item.id, &by);
     let outcome = match spawn_child_dmuxai_for_item(
         &workspace,
         &args,
@@ -1898,8 +1878,9 @@ exit 0
     }
 
     // TC-3711 / FR-3711: the board run passes DMUXAI_BOARD_ITEM_ID; a review
-    // request stores `spec_review`, adds a `planner` message and notifies
-    // `spec_review`; decisions update the status with an `owner` message; the
+    // request stores `spec_review` and adds a `planner` message without a
+    // separate notification (the single `spec_review_requested` comes from the
+    // gate, FR-3852); decisions update the status with an `owner` message; the
     // lane and decision never change; a bad item id is refused.
     #[test]
     fn tc_3711_board_item_mirrors_spec_review() {
@@ -1975,25 +1956,11 @@ exit 0
         assert_eq!(fs::read_to_string(&env_out).unwrap(), run_item.id);
 
         // Review request and decisions on an in-progress item.
-        let notify_out = dir.path().join("notify.jsonl");
-        let hook = write_fake_runner(
-            dir.path(),
-            "notify-hook.sh",
-            &format!(
-                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
-                notify_out.display()
-            ),
-        );
-        let settings = BoardSettings {
-            notify_command: Some(vec![hook.display().to_string()]),
-            ..BoardSettings::default()
-        };
         let item = add_in_progress_item(&store, &state, &workspace);
-        let requested = sync_spec_review_with_settings(
+        let requested = sync_spec_review(
             &board_base,
             &item.id,
             &spec_review_record(ReviewStatus::Pending, 1, None),
-            &settings,
         )
         .unwrap();
         let review = requested.spec_review.clone().unwrap();
@@ -2010,22 +1977,22 @@ exit 0
             last.text,
             "Spec review requested (round 1): docs/specs/SPEC-x.md"
         );
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let body = fs::read_to_string(&notify_out).unwrap_or_default();
-            if body.contains("\"event\":\"spec_review\"") {
-                assert!(body.contains(&item.id));
-                break;
-            }
-            assert!(Instant::now() < deadline, "no spec_review notification");
-            thread::sleep(Duration::from_millis(20));
-        }
+        let kinds: Vec<String> = store
+            .list_events(0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.item_id == item.id)
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            !kinds.iter().any(|k| k == "spec_review_requested"),
+            "{kinds:?}"
+        );
 
-        let changes = sync_spec_review_with_settings(
+        let changes = sync_spec_review(
             &board_base,
             &item.id,
             &spec_review_record(ReviewStatus::ChangesRequested, 1, Some("add errors")),
-            &settings,
         )
         .unwrap();
         assert_eq!(
@@ -2036,18 +2003,16 @@ exit 0
         assert_eq!(last.from, "owner");
         assert_eq!(last.text, "Spec changes requested (round 1): add errors");
 
-        sync_spec_review_with_settings(
+        sync_spec_review(
             &board_base,
             &item.id,
             &spec_review_record(ReviewStatus::Pending, 2, None),
-            &settings,
         )
         .unwrap();
-        let approved = sync_spec_review_with_settings(
+        let approved = sync_spec_review(
             &board_base,
             &item.id,
             &spec_review_record(ReviewStatus::Approved, 2, None),
-            &settings,
         )
         .unwrap();
         let review = approved.spec_review.as_ref().unwrap();
@@ -2065,22 +2030,15 @@ exit 0
         // Invalid and unknown ids are refused without touching the board.
         let record = spec_review_record(ReviewStatus::Pending, 1, None);
         assert!(matches!(
-            sync_spec_review_with_settings(&board_base, "../x", &record, &settings),
+            sync_spec_review(&board_base, "../x", &record),
             Err(BoardError::Usage(_))
         ));
         assert!(matches!(
-            sync_spec_review_with_settings(
-                &board_base,
-                &crate::board::generate_item_id(),
-                &record,
-                &settings
-            ),
+            sync_spec_review(&board_base, &crate::board::generate_item_id(), &record),
             Err(BoardError::NotFound(_))
         ));
         let missing_board = dir.path().join("no-board");
-        assert!(
-            sync_spec_review_with_settings(&missing_board, &item.id, &record, &settings).is_err()
-        );
+        assert!(sync_spec_review(&missing_board, &item.id, &record).is_err());
         assert!(!missing_board.exists());
     }
 
@@ -2159,6 +2117,152 @@ exit 0
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
 
+    // TC-3850 / FR-3850, NFR-3850: `board run` logs exactly one `run_started`
+    // event between the in_progress move and the result, delivers it as a
+    // notify event when configured, and starts no thread without a target.
+    #[test]
+    fn tc_3850_run_started_event() {
+        use crate::board::notify::{BOARD_NOTIFY_THREAD_SPAWNS, wait_for_pending};
+        use std::sync::atomic::Ordering;
+
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        ensure_dir(&board_base).unwrap();
+        let empty_xdg = dir.path().join("empty_xdg");
+        fs::create_dir_all(&empty_xdg).unwrap();
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        fs::create_dir_all(xdg_cfg.join("dmuxai")).unwrap();
+        let notify_out = dir.path().join("notify.jsonl");
+        let notify_script = write_fake_runner(
+            dir.path(),
+            "notify.sh",
+            &format!(
+                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
+                notify_out.display()
+            ),
+        );
+        fs::write(
+            xdg_cfg.join("dmuxai").join("dmuxai.toml"),
+            format!(
+                "[board]\nnotify_command = [\"{}\"]\n",
+                notify_script.display()
+            ),
+        )
+        .unwrap();
+        let fake_bin = write_fake_runner(
+            dir.path(),
+            "fake-run.sh",
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}\\n'\nexit 0\n",
+        );
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin);
+            std::env::set_var("XDG_CONFIG_HOME", &empty_xdg);
+        }
+
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let (_, hash) =
+            edit_plan_from_json(&workspace, &state, "ship it", &sample_plan_json(), None).unwrap();
+        let run_once = |title: &str| {
+            let item = store
+                .add(AddItemRequest {
+                    title: title.to_owned(),
+                    summary: String::new(),
+                    kind: Kind::Debug,
+                    grade: None,
+                    lane: None,
+                    source_bot: Some("bot".to_owned()),
+                    source_channel: None,
+                    source_ref: None,
+                    workspace: Some(workspace.clone()),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: Some(hash.clone()),
+                    key: None,
+                    by: "bot:test".to_owned(),
+                    state_root: state.clone(),
+                })
+                .unwrap();
+            assert_eq!(item.lane, Lane::Auto);
+            let prepared = run_item_prepare(
+                &store,
+                RunParams {
+                    id: item.id.clone(),
+                    expected_plan_hash: Some(hash.clone()),
+                    by: "bot:coordinator".to_owned(),
+                    state_root: state.clone(),
+                },
+            )
+            .unwrap();
+            let started_version = prepared.item.version;
+            let done = run_item_execute(&store, prepared).unwrap();
+            assert_eq!(done.lane, Lane::Done);
+            (item.id, started_version)
+        };
+
+        // No notify target: the event is logged, no notifier thread starts.
+        let before = BOARD_NOTIFY_THREAD_SPAWNS.load(Ordering::Relaxed);
+        let (quiet_id, started_version) = run_once("quiet run");
+        assert_eq!(
+            BOARD_NOTIFY_THREAD_SPAWNS.load(Ordering::Relaxed),
+            before,
+            "no notifier thread without a target"
+        );
+        let item_events: Vec<_> = store
+            .list_events(0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.item_id == quiet_id)
+            .collect();
+        let started: Vec<_> = item_events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == "run_started")
+            .collect();
+        assert_eq!(started.len(), 1, "one run_started line: {item_events:?}");
+        let (pos, event) = started[0];
+        assert_eq!(event.version, started_version);
+        assert_eq!(event.by, "bot:coordinator");
+        assert_eq!(event.detail.plan_hash.as_deref(), Some(hash.as_str()));
+        assert!(
+            pos > 0 && item_events[pos - 1].kind == "lane",
+            "{item_events:?}"
+        );
+        assert!(
+            item_events[pos + 1..]
+                .iter()
+                .any(|e| e.version > started_version),
+            "run result recorded after run_started: {item_events:?}"
+        );
+
+        // With a notify command the event is delivered with its plan hash.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg) };
+        let (notified_id, _) = run_once("notified run");
+        wait_for_pending(Duration::from_secs(5));
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+        }
+        let raw = fs::read_to_string(&notify_out).expect("notify output");
+        let payloads: Vec<Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+            .filter(|v| v["event"] == "run_started")
+            .collect();
+        assert_eq!(payloads.len(), 1, "{raw}");
+        assert_eq!(payloads[0]["item_id"], notified_id);
+        assert_eq!(payloads[0]["lane"], "in_progress");
+        assert_eq!(payloads[0]["by"], "bot:coordinator");
+        assert_eq!(payloads[0]["plan_hash"], hash);
+    }
+
     #[test]
     fn tc_3138_spawn_child_exports_run_id_and_run_respects_ask_lock() {
         let _env_guard = crate::state_path::test_env_lock();
@@ -2227,6 +2331,91 @@ exit 0
             Err(err) => err,
         };
         assert_eq!(err.exit_code(), crate::agent_api::exit::CONFLICT);
+    }
+
+    // TC-3852 / FR-3852: the board `run` child gets `DMUXAI_BOARD_ITEM_ID` for
+    // its item; ask children and a stale parent value do not leak through.
+    #[test]
+    fn tc_3852_board_run_child_gets_board_item_id_env() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        ensure_dir(&board_base).unwrap();
+        let empty_xdg = dir.path().join("empty_xdg");
+        fs::create_dir_all(&empty_xdg).unwrap();
+        let env_out = dir.path().join("child-item-id.txt");
+        let fake_bin = write_fake_runner(
+            dir.path(),
+            "capture-item-id.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s' \"${{DMUXAI_BOARD_ITEM_ID-unset}}\" > \"{}\"\nprintf '{{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}}\\n'\nexit 0\n",
+                env_out.display()
+            ),
+        );
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_item = std::env::var_os(crate::board::BOARD_ITEM_ID_ENV);
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin);
+            std::env::set_var("XDG_CONFIG_HOME", &empty_xdg);
+            std::env::set_var(crate::board::BOARD_ITEM_ID_ENV, "stale0000000");
+        }
+
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let (_, hash) =
+            edit_plan_from_json(&workspace, &state, "ship it", &sample_plan_json(), None).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "env run".to_owned(),
+                summary: String::new(),
+                kind: Kind::Debug,
+                grade: None,
+                lane: None,
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let prepared = run_item_prepare(
+            &store,
+            RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(hash),
+                by: "bot:coordinator".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        let done = run_item_execute(&store, prepared).unwrap();
+        let run_child_env = fs::read_to_string(&env_out).unwrap();
+
+        let ask_outcome = spawn_child_dmuxai(&workspace, &[], "hi", Duration::from_secs(5), &state);
+        let ask_child_env = fs::read_to_string(&env_out).unwrap();
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_item {
+                Some(v) => std::env::set_var(crate::board::BOARD_ITEM_ID_ENV, v),
+                None => std::env::remove_var(crate::board::BOARD_ITEM_ID_ENV),
+            }
+        }
+
+        assert_eq!(done.lane, Lane::Done);
+        assert_eq!(run_child_env, item.id);
+        assert_eq!(ask_outcome.unwrap().exit_code, 0);
+        assert_eq!(ask_child_env, "unset");
     }
 
     // TC-3233 / FR-3233: auto-run is only triggered from owner approve paths, never by

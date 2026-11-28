@@ -622,6 +622,24 @@ impl Default for SpecReviewConfig {
 /// `spec_review_decided`); the caller writes it to the run journal (FR-3710).
 pub type JournalSink = Box<dyn FnMut(&str) + Send>;
 
+/// Board notification for a review that became pending
+/// (SPEC-coordinator-observability FR-3852). Arguments: board base, workspace,
+/// board item id, record. Must not fail or block the run.
+pub type RequestNotifier = Box<dyn FnMut(&Path, &Path, Option<&str>, &SpecReviewRecord) + Send>;
+
+fn board_request_notifier() -> RequestNotifier {
+    Box::new(|board_base, workspace, item_id, record| {
+        crate::board::notify_spec_review_requested_in(
+            board_base,
+            workspace,
+            item_id,
+            &record.run_id,
+            &record.review_id,
+            &record.spec_paths,
+        );
+    })
+}
+
 /// Why a gated run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -681,6 +699,7 @@ pub struct SpecReviewGate {
     round: u32,
     phase: GatePhase,
     journal: Option<JournalSink>,
+    request_notifier: RequestNotifier,
     polls: u64,
     summary: Option<SpecReviewSummary>,
     last_record: Option<SpecReviewRecord>,
@@ -710,6 +729,7 @@ impl SpecReviewGate {
             round: 0,
             phase: GatePhase::Idle,
             journal: None,
+            request_notifier: board_request_notifier(),
             polls: 0,
             summary: None,
             last_record: None,
@@ -739,6 +759,29 @@ impl SpecReviewGate {
         if let Err(error) = crate::board::runner::sync_spec_review(&board_base, item_id, record) {
             eprintln!("warning: board item {item_id}: spec review not recorded: {error}");
         }
+    }
+
+    /// Raises the board's `spec_review_requested` for a review that just became
+    /// pending (FR-3852). Without a board item id a run id is needed to find
+    /// the item through `run_ids`, so nothing is attempted without one.
+    fn notify_requested(&mut self, record: &SpecReviewRecord) {
+        if self.board_item_id.is_none() && !crate::run_journal::valid_run_id(&record.run_id) {
+            return;
+        }
+        let Some(board_base) = self.store.dir().parent().map(|state| state.join("board")) else {
+            return;
+        };
+        (self.request_notifier)(
+            &board_base,
+            &self.workspace,
+            self.board_item_id.as_deref(),
+            record,
+        );
+    }
+
+    /// Replaces the board notifier (tests).
+    pub fn set_request_notifier(&mut self, notifier: RequestNotifier) {
+        self.request_notifier = notifier;
     }
 
     /// Board sync for a status change without a readable record.
@@ -889,6 +932,7 @@ impl SpecReviewGate {
         session.begin_spec_review_wait(hint.clone());
         self.set_summary(session, ReviewStatus::Pending);
         self.sync_board(&record);
+        self.notify_requested(&record);
         self.emit(serde_json::json!({
             "type": "spec_review_requested",
             "review_id": record.review_id,
@@ -1178,6 +1222,10 @@ mod tests {
 
     impl Harness {
         fn new(cfg: SpecReviewConfig) -> Self {
+            Self::with_run_id(cfg, "runid1")
+        }
+
+        fn with_run_id(cfg: SpecReviewConfig, run_id: &str) -> Self {
             let ws = tempfile::tempdir().unwrap();
             let state = tempfile::tempdir().unwrap();
             let workspace = ws.path().to_path_buf();
@@ -1197,7 +1245,7 @@ mod tests {
                 workspace.clone(),
                 "docs/specs".to_owned(),
                 "run-abc".to_owned(),
-                "runid1".to_owned(),
+                run_id.to_owned(),
                 "add a thing token=abcdef123456789",
             );
             let journal = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1865,5 +1913,194 @@ mod tests {
         assert!(views[1].missing && views[2].missing);
         assert!(views[3].truncated);
         assert_eq!(views[3].content.len(), SPEC_FILE_SHOW_MAX_BYTES);
+    }
+
+    type NotifyCall = (PathBuf, Option<String>, String, String, Vec<String>, u32);
+
+    fn record_notifications(h: &mut Harness) -> Arc<Mutex<Vec<NotifyCall>>> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&calls);
+        h.gate
+            .set_request_notifier(Box::new(move |board_base, _workspace, item_id, record| {
+                sink.lock().unwrap().push((
+                    board_base.to_path_buf(),
+                    item_id.map(str::to_owned),
+                    record.run_id.clone(),
+                    record.review_id.clone(),
+                    record.spec_paths.clone(),
+                    record.round,
+                ));
+            }));
+        calls
+    }
+
+    // TC-3852 / FR-3852: the wait point calls the board hook once each time the
+    // run enters awaiting_spec_review, with the review id, spec paths and board
+    // item id; polls, heartbeats and decisions never call it again.
+    #[test]
+    fn tc_3852_spec_review_wait_point_calls_hook_once_per_pending_round() {
+        let mut cfg = fast_cfg();
+        cfg.heartbeat_interval = Duration::from_millis(100);
+        let mut h = Harness::new(cfg);
+        h.gate.set_board_item_id(Some("babcdef012345".to_owned()));
+        let calls = record_notifications(&mut h);
+
+        h.finish("spec-1").expect("review requested");
+        assert_eq!(h.session.run().phase, GraphRunPhase::AwaitingSpecReview);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            let (board_base, item_id, run_id, review_id, paths, round) = &calls[0];
+            assert_eq!(board_base, &h.store.dir().parent().unwrap().join("board"));
+            assert_eq!(item_id.as_deref(), Some("babcdef012345"));
+            assert_eq!(run_id, "runid1");
+            assert_eq!(review_id, "run-abc");
+            assert_eq!(paths, &vec![SPEC_PATH.to_owned()]);
+            assert_eq!(*round, 1);
+        }
+        let _ = h.finish("research-1");
+        for millis in [50, 150, 300, 450] {
+            let _ = h.poll_at(millis);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 1, "no repeat on poll/resume");
+
+        h.decide(Verdict::RequestChanges, Some("tighten it"))
+            .unwrap();
+        match h.poll_at(600) {
+            GateOutcome::ChangesRequested { actions, .. } => h.absorb(actions),
+            other => panic!("expected changes, got {other:?}"),
+        }
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        h.finish("spec-1").expect("second review requested");
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        assert_eq!(calls.lock().unwrap()[1].5, 2);
+
+        h.decide(Verdict::Approve, None).unwrap();
+        assert!(matches!(h.poll_at(700), GateOutcome::Approved { .. }));
+        let _ = h.poll_at(800);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        // Without a board item id and a run id the board cannot be matched.
+        let mut quiet = Harness::new(fast_cfg());
+        let quiet_calls = record_notifications(&mut quiet);
+        quiet.finish("spec-1").expect("review requested");
+        assert!(quiet_calls.lock().unwrap().is_empty());
+    }
+
+    // TC-3852 / FR-3852: through the real board hook, the wait point leaves one
+    // `spec_review_requested` event and one notification (no separate
+    // `spec_review` one) on the board item; an unknown item never fails the run.
+    #[cfg(unix)]
+    #[test]
+    fn tc_3852_spec_review_wait_point_raises_single_board_event() {
+        use crate::board::{AddItemRequest, BoardStore, Kind, Lane};
+
+        let _env = crate::state_path::test_env_lock();
+        let run_id = "0123456789abcdef";
+        let mut h = Harness::with_run_id(fast_cfg(), run_id);
+        let board_base = h.store.dir().parent().unwrap().join("board");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let notify_out = cfg_dir.path().join("notify.jsonl");
+        let script = cfg_dir.path().join("notify.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
+                notify_out.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::create_dir_all(cfg_dir.path().join("dmuxai")).unwrap();
+        fs::write(
+            cfg_dir.path().join("dmuxai/dmuxai.toml"),
+            format!("[board]\nnotify_command = [\"{}\"]\n", script.display()),
+        )
+        .unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_item = std::env::var_os(crate::board::BOARD_ITEM_ID_ENV);
+        // SAFETY: test-only env mutation under `test_env_lock`.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
+            std::env::remove_var(crate::board::BOARD_ITEM_ID_ENV);
+        }
+
+        let board = BoardStore::open(board_base.clone()).unwrap();
+        let item = board
+            .add(AddItemRequest {
+                title: "paused for spec review".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::InProgress),
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(h.workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: h.store.dir().parent().unwrap().to_path_buf(),
+            })
+            .unwrap();
+        h.gate.set_board_item_id(Some(item.id.clone()));
+        h.finish("spec-1").expect("review requested");
+        for millis in [50, 100, 150] {
+            let _ = h.poll_at(millis);
+        }
+        crate::board::notify::wait_for_pending(Duration::from_secs(5));
+
+        let mut missing = Harness::with_run_id(fast_cfg(), run_id);
+        BoardStore::open(missing.store.dir().parent().unwrap().join("board")).unwrap();
+        missing
+            .gate
+            .set_board_item_id(Some("bfedcba987654".to_owned()));
+        let hint = missing.finish("spec-1");
+
+        // SAFETY: test-only env mutation under `test_env_lock`.
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            if let Some(v) = prev_item {
+                std::env::set_var(crate::board::BOARD_ITEM_ID_ENV, v);
+            }
+        }
+
+        let events: Vec<_> = board
+            .list_events(0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.item_id == item.id && e.kind == "spec_review_requested")
+            .collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].detail.review_id.as_deref(), Some("run-abc"));
+        assert_eq!(events[0].detail.spec_paths, vec![SPEC_PATH.to_owned()]);
+        let after = board.get(&item.id).unwrap();
+        assert_eq!(after.lane, Lane::InProgress);
+        assert_eq!(
+            after.spec_review.as_ref().map(|r| r.status),
+            Some(ReviewStatus::Pending)
+        );
+        let raw = fs::read_to_string(&notify_out).unwrap_or_default();
+        let kinds: Vec<String> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["item_id"] == item.id.as_str())
+            .map(|v| v["event"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(kinds, vec!["spec_review_requested".to_owned()], "{raw}");
+
+        assert!(hint.is_some(), "an unknown board item never fails the run");
+        assert_eq!(
+            missing.session.run().phase,
+            GraphRunPhase::AwaitingSpecReview
+        );
     }
 }

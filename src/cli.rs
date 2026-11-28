@@ -60,11 +60,22 @@ pub enum AgentCommand {
         revoke: bool,
         yes: bool,
     },
-    /// `runs [--limit N] [--failed] [--json]` or `runs show <id> [--json]`.
+    /// `runs [--limit N] [--failed] [--json]` (FR-2562).
     Runs {
-        show_id: Option<String>,
         limit: usize,
         failed: bool,
+        json: bool,
+    },
+    /// `runs list [--status S]... [--limit N] [--json]` (FR-3855).
+    RunsList {
+        statuses: Vec<String>,
+        limit: usize,
+        json: bool,
+    },
+    /// `runs show <id> [--progress N] [--json]` (FR-2562, FR-3856).
+    RunsShow {
+        id: String,
+        progress: usize,
         json: bool,
     },
     /// `runners [--json]` (FR-2831).
@@ -531,16 +542,24 @@ Options:
 ";
 
 pub const RUNS_USAGE: &str = "\
-Usage: dmuxai runs [options]
+Usage: dmuxai runs [--limit N] [--failed] [--json]
+       dmuxai runs list [--status S]... [--limit N] [--json]
+       dmuxai runs show <id> [--progress N] [--json]
 
 List or inspect recorded execution runs.
 
 Subcommands:
-  show <id> [--json]       Show details for a recorded run
+  list                     List runs newest first with the dashboard fields
+                           (status, runner/model, elapsed, exit code, stale)
+  show <id>                Show a run: manifest, graph view, approval hint
+                           and the last progress lines
 
 Options:
-  --limit N                Maximum number of runs to list (default 20)
+  --limit N                Maximum number of runs to list (default 20;
+                           `list`: default 50, max 200)
   --failed                 Only list failed runs
+  --status S               `list`: only runs with status S (repeatable)
+  --progress N             `show`: progress lines to print (default 50, max 200)
   --json                   Print machine-readable JSON on stdout
   -h, --help               Print help information
 ";
@@ -1505,11 +1524,36 @@ pub const RUNS_FLAGS: &[FlagSpec] = &[
     },
 ];
 
-pub const RUNS_SHOW_FLAGS: &[FlagSpec] = &[FlagSpec {
-    names: &["--json"],
-    takes_value: false,
-    hidden: false,
-}];
+pub const RUNS_LIST_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--status"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--limit"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
+
+pub const RUNS_SHOW_FLAGS: &[FlagSpec] = &[
+    FlagSpec {
+        names: &["--progress"],
+        takes_value: true,
+        hidden: false,
+    },
+    FlagSpec {
+        names: &["--json"],
+        takes_value: false,
+        hidden: false,
+    },
+];
 
 pub const RUNNERS_FLAGS: &[FlagSpec] = &[FlagSpec {
     names: &["--json"],
@@ -1789,10 +1833,40 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
                 if !dmuxai::run_journal::valid_run_id(&id) {
                     return Err(format!("invalid run id '{id}'"));
                 }
-                return Ok(AgentCommand::Runs {
-                    show_id: Some(id),
-                    limit: 20,
-                    failed: false,
+                let progress = dmuxai::runs_view::parse_progress_limit(
+                    parsed.flags.get("--progress").cloned().flatten().as_deref(),
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "--progress must be a number from 0 to {}",
+                        dmuxai::runs_view::PROGRESS_MAX
+                    )
+                })?;
+                return Ok(AgentCommand::RunsShow {
+                    id,
+                    progress,
+                    json: parsed.flags.contains_key("--json"),
+                });
+            }
+            if rest.first().map(String::as_str) == Some("list") {
+                let args = &rest[1..];
+                let parsed = parse_flags(args, RUNS_LIST_FLAGS, false)?;
+                let limit = dmuxai::runs_view::parse_runs_limit(
+                    parsed.flags.get("--limit").cloned().flatten().as_deref(),
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "--limit must be a number from 1 to {}",
+                        dmuxai::runs_view::RUNS_LIMIT_MAX
+                    )
+                })?;
+                let statuses = collect_repeat_flag(args, "--status")
+                    .iter()
+                    .map(|raw| dmuxai::runs_view::parse_status_filter(raw))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(AgentCommand::RunsList {
+                    statuses,
+                    limit,
                     json: parsed.flags.contains_key("--json"),
                 });
             }
@@ -1811,7 +1885,6 @@ pub fn parse(args: &[String]) -> Result<AgentCommand, String> {
             let json = parsed.flags.contains_key("--json");
 
             Ok(AgentCommand::Runs {
-                show_id: None,
                 limit,
                 failed,
                 json,
@@ -4451,11 +4524,18 @@ pub async fn execute(command: AgentCommand) -> i32 {
             yes,
         } => trust_workspace(&workspace_root, status, json, revoke, yes),
         AgentCommand::Runs {
-            show_id,
             limit,
             failed,
             json,
-        } => execute_runs(&workspace_root, show_id, limit, failed, json),
+        } => execute_runs(&workspace_root, limit, failed, json),
+        AgentCommand::RunsList {
+            statuses,
+            limit,
+            json,
+        } => execute_runs_list(&workspace_root, &statuses, limit, json),
+        AgentCommand::RunsShow { id, progress, json } => {
+            execute_runs_show(&workspace_root, &id, progress, json)
+        }
         AgentCommand::Runners { json } => {
             let settings = DmuxSettings::load(&workspace_root);
             let val = agent_api::runners_json(&settings);
@@ -5012,14 +5092,8 @@ pub fn term_usage_error(message: impl Into<String>, json: bool) -> i32 {
     term_fail(TermError::usage(message), json)
 }
 
-/// Executes `dmuxai runs` or `dmuxai runs show <id>` (SPEC-run-journal FR-2562).
-fn execute_runs(
-    workspace_root: &Path,
-    show_id: Option<String>,
-    limit: usize,
-    failed: bool,
-    json: bool,
-) -> i32 {
+/// Executes legacy `dmuxai runs` (SPEC-run-journal FR-2562).
+fn execute_runs(workspace_root: &Path, limit: usize, failed: bool, json: bool) -> i32 {
     dmuxai::state_path::warn_write_workspace_metadata(workspace_root);
     let runs_dir = match dmuxai::run_journal::repo_runs_dir(workspace_root) {
         Ok(dir) => dir,
@@ -5031,132 +5105,258 @@ fn execute_runs(
 
     let store = dmuxai::run_journal::JournalStore::new(runs_dir.clone());
 
-    if let Some(id) = show_id {
-        if !dmuxai::run_journal::valid_run_id(&id) {
-            eprintln!("error: invalid run id '{id}'");
-            return exit::USAGE;
-        }
-        let run_dir = runs_dir.join(&id);
-        if let Ok(true) = dmuxai::run_journal::is_symlink(&run_dir) {
-            eprintln!("error: symlink rejected at {}", run_dir.display());
-            return exit::INTERNAL;
-        }
-        if !run_dir.exists() {
-            eprintln!("error: run '{id}' not found");
-            return exit::NOT_FOUND;
-        }
-        match store.load(&id) {
-            Ok(manifest) => {
-                if json {
-                    match serde_json::to_value(&manifest) {
-                        Ok(val) => print_json(&val),
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            return exit::INTERNAL;
-                        }
-                    }
-                } else {
-                    println!("Run ID:    {}", manifest.run_id);
-                    println!("Status:    {}", manifest.status);
-                    println!("Created:   {}", manifest.created_at_ms);
-                    if let Some(runner) = &manifest.requested_runner {
-                        println!("Runner:    {runner}");
-                    }
-                    if let Some(err) = &manifest.error_summary {
-                        println!("Error:     {err}");
-                    }
-                }
-                exit::OK
-            }
-            Err(dmuxai::run_journal::JournalError::Io(e)) => {
-                eprintln!("error: {e}");
-                exit::INTERNAL
-            }
-            Err(dmuxai::run_journal::JournalError::SymlinkDetected(p)) => {
-                eprintln!("error: symlink rejected at {}", p.display());
-                exit::INTERNAL
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                exit::INTERNAL
-            }
-        }
-    } else {
-        // List runs
-        if !runs_dir.exists() {
-            if json {
-                print_json(&serde_json::Value::Array(Vec::new()));
-            }
-            return exit::OK;
-        }
-
-        if let Ok(true) = dmuxai::run_journal::is_symlink(&runs_dir) {
-            eprintln!("error: symlink rejected at {}", runs_dir.display());
-            return exit::INTERNAL;
-        }
-
-        let entries = match std::fs::read_dir(&runs_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return exit::INTERNAL;
-            }
-        };
-
-        let mut manifests = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(true) = dmuxai::run_journal::is_symlink(&path) {
-                continue;
-            }
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !dmuxai::run_journal::valid_run_id(name) {
-                continue;
-            }
-
-            match store.load(name) {
-                Ok(m) => {
-                    if failed && m.status != "failed" {
-                        continue;
-                    }
-                    manifests.push(m);
-                }
-                Err(dmuxai::run_journal::JournalError::UnknownSchemaVersion(v)) => {
-                    eprintln!("warning: unknown schema version {v} in run '{name}', skipping");
-                }
-                Err(dmuxai::run_journal::JournalError::CorruptManifest(msg)) => {
-                    eprintln!("warning: corrupt manifest in run '{name}': {msg}, skipping");
-                }
-                Err(e) => {
-                    eprintln!("warning: could not load run '{name}': {e}, skipping");
-                }
-            }
-        }
-
-        // Sort newest first by created_at_ms
-        manifests.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
-
-        if manifests.len() > limit {
-            manifests.truncate(limit);
-        }
-
+    // List runs
+    if !runs_dir.exists() {
         if json {
-            let val =
-                serde_json::to_value(&manifests).unwrap_or(serde_json::Value::Array(Vec::new()));
-            print_json(&val);
-        } else {
-            for m in manifests {
-                println!("{}\t{}\t{}", m.run_id, m.status, m.created_at_ms);
-            }
+            print_json(&serde_json::Value::Array(Vec::new()));
+        }
+        return exit::OK;
+    }
+
+    if let Ok(true) = dmuxai::run_journal::is_symlink(&runs_dir) {
+        eprintln!("error: symlink rejected at {}", runs_dir.display());
+        return exit::INTERNAL;
+    }
+
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return exit::INTERNAL;
+        }
+    };
+
+    let mut manifests = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(true) = dmuxai::run_journal::is_symlink(&path) {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !dmuxai::run_journal::valid_run_id(name) {
+            continue;
         }
 
-        exit::OK
+        match store.load(name) {
+            Ok(m) => {
+                if failed && m.status != "failed" {
+                    continue;
+                }
+                manifests.push(m);
+            }
+            Err(dmuxai::run_journal::JournalError::UnknownSchemaVersion(v)) => {
+                eprintln!("warning: unknown schema version {v} in run '{name}', skipping");
+            }
+            Err(dmuxai::run_journal::JournalError::CorruptManifest(msg)) => {
+                eprintln!("warning: corrupt manifest in run '{name}': {msg}, skipping");
+            }
+            Err(e) => {
+                eprintln!("warning: could not load run '{name}': {e}, skipping");
+            }
+        }
     }
+
+    // Sort newest first by created_at_ms
+    manifests.sort_by_key(|m| std::cmp::Reverse(m.created_at_ms));
+
+    if manifests.len() > limit {
+        manifests.truncate(limit);
+    }
+
+    if json {
+        let val = serde_json::to_value(&manifests).unwrap_or(serde_json::Value::Array(Vec::new()));
+        print_json(&val);
+    } else {
+        for m in manifests {
+            println!("{}\t{}\t{}", m.run_id, m.status, m.created_at_ms);
+        }
+    }
+
+    exit::OK
+}
+
+fn runs_store(workspace_root: &Path) -> Result<dmuxai::run_journal::JournalStore, i32> {
+    dmuxai::state_path::warn_write_workspace_metadata(workspace_root);
+    dmuxai::run_journal::repo_runs_dir(workspace_root)
+        .map(dmuxai::run_journal::JournalStore::new)
+        .map_err(|e| {
+            eprintln!("error: {e}");
+            exit::INTERNAL
+        })
+}
+
+/// Executes `dmuxai runs list` (FR-3855).
+fn execute_runs_list(workspace_root: &Path, statuses: &[String], limit: usize, json: bool) -> i32 {
+    match runs_store(workspace_root) {
+        Ok(store) => {
+            print!("{}", runs_list_output(&store, statuses, limit, json));
+            exit::OK
+        }
+        Err(code) => code,
+    }
+}
+
+/// Executes `dmuxai runs show <id>` (FR-2562, FR-3856).
+fn execute_runs_show(workspace_root: &Path, id: &str, progress: usize, json: bool) -> i32 {
+    let store = match runs_store(workspace_root) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    match runs_show_output(&store, Some(workspace_root), id, progress, json) {
+        Ok(out) => {
+            print!("{out}");
+            exit::OK
+        }
+        Err(error) => fail(error, json),
+    }
+}
+
+/// `runs list` stdout: `{"runs": [...]}` as `GET /api/runs`, or one line
+/// per run.
+fn runs_list_output(
+    store: &dmuxai::run_journal::JournalStore,
+    statuses: &[String],
+    limit: usize,
+    json: bool,
+) -> String {
+    let runs = dmuxai::runs_view::list_runs(store, statuses, limit);
+    if json {
+        let value = serde_json::json!({ "runs": runs });
+        return format!(
+            "{}\n",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
+    }
+    let mut out = String::new();
+    for run in runs {
+        let runner = run
+            .resolved_runner
+            .as_deref()
+            .or(run.requested_runner.as_deref())
+            .unwrap_or("-");
+        let model = run
+            .resolved_model
+            .as_deref()
+            .or(run.requested_model.as_deref())
+            .unwrap_or("-");
+        let exit_code = run
+            .dmuxai_exit_code
+            .map_or_else(|| "-".to_owned(), |code| code.to_string());
+        let mut flags = Vec::new();
+        if run.stale {
+            flags.push("stale");
+        }
+        if run.stalled {
+            flags.push("stalled");
+        }
+        out.push_str(&format!(
+            "{}\t{}\t{}/{}\t{}\t{}ms\texit={}\t{}\t{}\n",
+            run.run_id,
+            run.status,
+            runner,
+            model,
+            run.origin,
+            run.elapsed_ms,
+            exit_code,
+            run.error_kind.as_deref().unwrap_or("-"),
+            if flags.is_empty() {
+                "-".to_owned()
+            } else {
+                flags.join(",")
+            },
+        ));
+    }
+    out
+}
+
+/// `runs show` stdout. JSON is the `GET /api/runs/{id}` object with the
+/// manifest fields also at top level (FR-2562 compatibility).
+fn runs_show_output(
+    store: &dmuxai::run_journal::JournalStore,
+    workspace_root: Option<&Path>,
+    id: &str,
+    progress: usize,
+    json: bool,
+) -> Result<String, ApiError> {
+    let mut detail = dmuxai::runs_view::run_detail(store, workspace_root, id, progress)
+        .map_err(|e| e.to_api_error(id))?;
+    if json {
+        if let Some(manifest) = detail.get("manifest").and_then(Value::as_object).cloned()
+            && let Some(object) = detail.as_object_mut()
+        {
+            for (key, value) in manifest {
+                object.entry(key).or_insert(value);
+            }
+        }
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&detail).unwrap_or_default()
+        ));
+    }
+    let run = &detail["run"];
+    let field = |value: &Value| -> Option<String> {
+        match value {
+            Value::Null => None,
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        }
+    };
+    let mut out = String::new();
+    for (label, key) in [
+        ("Run ID", "run_id"),
+        ("Status", "status"),
+        ("Origin", "origin"),
+        ("Created", "created_at_ms"),
+        ("Elapsed", "elapsed_ms"),
+        ("Runner", "resolved_runner"),
+        ("Model", "resolved_model"),
+        ("Exit code", "dmuxai_exit_code"),
+        ("Error kind", "error_kind"),
+        ("Error", "error_summary"),
+        ("Graph", "graph_id"),
+    ] {
+        let value = field(&run[key]).or_else(|| match key {
+            "resolved_runner" => field(&run["requested_runner"]),
+            "resolved_model" => field(&run["requested_model"]),
+            _ => None,
+        });
+        if let Some(value) = value {
+            out.push_str(&format!("{:<11}{value}\n", format!("{label}:")));
+        }
+    }
+    if run["stale"] == Value::Bool(true) {
+        out.push_str("Stale:     true\n");
+    }
+    if run["stalled"] == Value::Bool(true) {
+        out.push_str("Stalled:   true\n");
+    }
+    if let Some(graph) = detail["graph"].as_object() {
+        let nodes = graph
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let phase = graph.get("phase").and_then(field).unwrap_or_default();
+        let counts = graph
+            .get("counts")
+            .map(Value::to_string)
+            .unwrap_or_default();
+        out.push_str(&format!("Graph view: {phase}, {nodes} nodes {counts}\n"));
+    }
+    if let Some(hint) = detail["approval"]["hint"].as_str() {
+        out.push_str(&format!("Approve:   {hint}\n"));
+    }
+    if let Some(lines) = detail["progress"].as_array().filter(|l| !l.is_empty()) {
+        out.push_str("Progress:\n");
+        for line in lines {
+            out.push_str(&format!("  {line}\n"));
+        }
+    }
+    Ok(out)
 }
 
 /// `dmuxai init` (FR-814): writes the starter config and reports the runners
@@ -6039,6 +6239,14 @@ impl McpBackend for CliMcpBackend {
 
     fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
         Ok(dmuxai::board::mcp_invoke(&self.workspace_root, name, args))
+    }
+
+    fn runs_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
+        Ok(dmuxai::runs_view::mcp_invoke(
+            &self.workspace_root,
+            name,
+            args,
+        ))
     }
 
     fn models(&self, agent: Option<&str>) -> Result<Value, String> {
@@ -7733,7 +7941,7 @@ mod tests {
                 }
             }
         }
-        for spec in RUNS_SHOW_FLAGS {
+        for spec in RUNS_SHOW_FLAGS.iter().chain(RUNS_LIST_FLAGS) {
             if !spec.hidden {
                 for name in spec.names {
                     assert!(RUNS_USAGE.contains(name), "RUNS_USAGE missing {name}");
@@ -8393,5 +8601,236 @@ mod tests {
         let msg = dmuxai::runner_id::format_unknown_agent_message("nope");
         assert!(msg.contains("cursor-agent"));
         assert!(msg.contains("nope"));
+    }
+
+    fn write_run_manifest(runs_dir: &Path, id: &str, status: &str, created: u64, extra: Value) {
+        let dir = runs_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = json!({
+            "schema_version": 1,
+            "run_id": id,
+            "origin": "cli_headless",
+            "status": status,
+            "created_at_ms": created,
+            "completed_at_ms": created + 50,
+            "duration_ms": 50,
+            "requested_runner": "codex",
+            "resolved_runner": "codex",
+            "dmuxai_exit_code": if status == "failed" { 1 } else { 0 },
+            "links": {},
+            "diagnostics": { "stderr_bytes": 0, "tail_sample": null },
+            "end_summary": null
+        });
+        if let (Some(target), Some(fields)) = (manifest.as_object_mut(), extra.as_object()) {
+            for (key, value) in fields {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    }
+
+    // TC-3855 / FR-3855: `runs list` parses its flags, lists runs newest first
+    // with the GET /api/runs fields, filters by status; empty dir → [].
+    #[test]
+    fn tc_3855_runs_list() {
+        match parse(&args(&[
+            "runs",
+            "list",
+            "--status",
+            "failed",
+            "--status",
+            "completed",
+            "--limit",
+            "5",
+            "--json",
+        ])) {
+            Ok(AgentCommand::RunsList {
+                statuses,
+                limit,
+                json,
+            }) => {
+                assert_eq!(statuses, ["failed", "completed"]);
+                assert_eq!(limit, 5);
+                assert!(json);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        match parse(&args(&["runs", "list"])) {
+            Ok(AgentCommand::RunsList {
+                statuses,
+                limit,
+                json,
+            }) => {
+                assert!(statuses.is_empty());
+                assert_eq!(limit, 50);
+                assert!(!json);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        for bad in [
+            &["runs", "list", "--status", "bogus"][..],
+            &["runs", "list", "--limit", "0"],
+            &["runs", "list", "--limit", "201"],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?} must be a usage error");
+        }
+        assert!(matches!(
+            parse(&args(&["runs", "--failed"])),
+            Ok(AgentCommand::Runs { failed: true, .. })
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        write_run_manifest(&runs, "0000000000000001", "completed", 100, json!({}));
+        write_run_manifest(
+            &runs,
+            "0000000000000002",
+            "failed",
+            300,
+            json!({"error_kind": "provider"}),
+        );
+        write_run_manifest(
+            &runs,
+            "0000000000000003",
+            "awaiting_approval",
+            200,
+            json!({}),
+        );
+        let store = dmuxai::run_journal::JournalStore::new(runs);
+
+        let out: Value = serde_json::from_str(&runs_list_output(&store, &[], 50, true)).unwrap();
+        let rows = out["runs"].as_array().unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["run_id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["0000000000000002", "0000000000000003", "0000000000000001"]
+        );
+        for field in [
+            "origin",
+            "status",
+            "created_at_ms",
+            "elapsed_ms",
+            "stale",
+            "stalled",
+        ] {
+            assert!(rows[0].get(field).is_some(), "missing {field}: {}", rows[0]);
+        }
+        assert_eq!(rows[0]["resolved_runner"], "codex");
+        assert_eq!(rows[0]["dmuxai_exit_code"], 1);
+        assert_eq!(rows[0]["error_kind"], "provider");
+
+        let failed: Value =
+            serde_json::from_str(&runs_list_output(&store, &["failed".to_owned()], 50, true))
+                .unwrap();
+        assert_eq!(failed["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(failed["runs"][0]["run_id"], "0000000000000002");
+        let limited: Value = serde_json::from_str(&runs_list_output(&store, &[], 1, true)).unwrap();
+        assert_eq!(limited["runs"].as_array().unwrap().len(), 1);
+
+        let text = runs_list_output(&store, &[], 50, false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one line per run: {text}");
+        assert!(
+            lines[0].starts_with("0000000000000002\tfailed\tcodex/-\t"),
+            "{text}"
+        );
+        assert!(lines[0].contains("exit=1\tprovider"), "{text}");
+
+        let empty = dmuxai::run_journal::JournalStore::new(dir.path().join("missing"));
+        let out: Value = serde_json::from_str(&runs_list_output(&empty, &[], 50, true)).unwrap();
+        assert_eq!(out["runs"], json!([]));
+        assert_eq!(runs_list_output(&empty, &[], 50, false), "");
+    }
+
+    // TC-3856 / FR-3856: `runs show` prints the approval hint and the
+    // progress tail; unknown id → 3, invalid id → 2; secrets masked.
+    #[test]
+    fn tc_3856_runs_show() {
+        match parse(&args(&[
+            "runs",
+            "show",
+            "00000000000000aa",
+            "--progress",
+            "2",
+            "--json",
+        ])) {
+            Ok(AgentCommand::RunsShow { id, progress, json }) => {
+                assert_eq!(id, "00000000000000aa");
+                assert_eq!(progress, 2);
+                assert!(json);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&args(&["runs", "show", "00000000000000aa"])),
+            Ok(AgentCommand::RunsShow {
+                progress: 50,
+                json: false,
+                ..
+            })
+        ));
+        assert!(parse(&args(&["runs", "show", "../x"])).is_err());
+        assert!(
+            parse(&args(&[
+                "runs",
+                "show",
+                "00000000000000aa",
+                "--progress",
+                "201"
+            ]))
+            .is_err()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let id = "00000000000000aa";
+        write_run_manifest(
+            &runs,
+            id,
+            "awaiting_approval",
+            100,
+            json!({
+                "links": { "graph_id": "g-1" },
+                "end_summary": { "plan_hash": "0123456789abcdef" }
+            }),
+        );
+        std::fs::write(
+            runs.join(id).join("progress.jsonl"),
+            "{\"kind\":\"node\",\"message\":\"one\"}\n{\"kind\":\"node\",\"message\":\"two\"}\n{\"kind\":\"node\",\"message\":\"Bearer sk-secret-token-12345\"}\n",
+        )
+        .unwrap();
+        let store = dmuxai::run_journal::JournalStore::new(runs);
+
+        let out = runs_show_output(&store, Some(dir.path()), id, 2, true).unwrap();
+        assert!(!out.contains("sk-secret-token-12345"), "{out}");
+        let detail: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(detail["run"]["run_id"], id);
+        assert_eq!(
+            detail["run_id"], id,
+            "FR-2562 manifest fields stay top level"
+        );
+        assert_eq!(detail["schema_version"], 1);
+        assert_eq!(detail["links"]["graph_id"], "g-1");
+        assert_eq!(
+            detail["approval"]["hint"],
+            "dmuxai run --graph --approve-plan-id 0123456789abcdef -"
+        );
+        let progress = detail["progress"].as_array().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0]["message"], "two");
+
+        let text = runs_show_output(&store, Some(dir.path()), id, 50, false).unwrap();
+        assert!(text.contains("Status:    awaiting_approval"), "{text}");
+        assert!(
+            text.contains("Approve:   dmuxai run --graph --approve-plan-id 0123456789abcdef -"),
+            "{text}"
+        );
+        assert_eq!(text.matches("\"kind\":\"node\"").count(), 3, "{text}");
+        assert!(!text.contains("sk-secret-token-12345"), "{text}");
+
+        let unknown = runs_show_output(&store, None, "ffffffffffffffff", 50, true).unwrap_err();
+        assert_eq!(unknown.code, exit::NOT_FOUND);
+        let invalid = runs_show_output(&store, None, "../x", 50, true).unwrap_err();
+        assert_eq!(invalid.code, exit::USAGE);
     }
 }

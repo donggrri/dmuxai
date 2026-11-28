@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use super::BoardItem;
+use super::{BoardItem, EventDetail};
 use crate::events::format_ts;
 use crate::notify::{
     DEFAULT_SECRET_HEADER, DEFAULT_TIMEOUT_SECS, append_log, deliver_command_json,
@@ -89,6 +89,12 @@ pub struct BoardNotifyEvent {
     pub verdict: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_run: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_paths: Option<Vec<String>>,
     pub at_ms: u64,
 }
 
@@ -121,8 +127,37 @@ impl BoardNotifyEvent {
             plan_hash: item.plan.as_ref().map(|p| p.hash.clone()),
             verdict,
             auto_run: None,
+            plan_revision: None,
+            review_id: None,
+            spec_paths: None,
             at_ms,
         }
+    }
+
+    /// Payload for coordinator observability events (FR-3850..FR-3852).
+    pub fn from_item_with_detail(
+        item: &BoardItem,
+        event: &str,
+        by: &str,
+        at_ms: u64,
+        detail: &EventDetail,
+    ) -> Self {
+        let mut payload = Self::from_item(item, event, by, at_ms);
+        if let Some(hash) = &detail.plan_hash {
+            payload.plan_hash = Some(hash.clone());
+        }
+        payload.plan_revision = detail.plan_revision;
+        payload.review_id = detail.review_id.as_deref().map(mask_sensitive_tokens);
+        if !detail.spec_paths.is_empty() {
+            payload.spec_paths = Some(
+                detail
+                    .spec_paths
+                    .iter()
+                    .map(|p| mask_sensitive_tokens(p))
+                    .collect(),
+            );
+        }
+        payload
     }
 
     pub fn from_item_with_auto_run(
@@ -168,6 +203,136 @@ pub fn dispatch_board_event_with_settings(
     let at_ms = now_ms();
     let payload = BoardNotifyEvent::from_item(item, event, by, at_ms);
     spawn_notify_delivery(board_base, item, at_ms, &payload, settings);
+}
+
+pub fn dispatch_board_event_detail(
+    board_base: &Path,
+    item: &BoardItem,
+    event: &str,
+    by: &str,
+    detail: &EventDetail,
+) {
+    let settings = BoardSettings::load_user_only();
+    dispatch_board_event_detail_with_settings(board_base, item, event, by, detail, &settings);
+}
+
+pub fn dispatch_board_event_detail_with_settings(
+    board_base: &Path,
+    item: &BoardItem,
+    event: &str,
+    by: &str,
+    detail: &EventDetail,
+    settings: &BoardSettings,
+) {
+    if !settings.has_notify_target() || !settings.allows_event(event) {
+        return;
+    }
+    let at_ms = now_ms();
+    let payload = BoardNotifyEvent::from_item_with_detail(item, event, by, at_ms, detail);
+    spawn_notify_delivery(board_base, item, at_ms, &payload, settings);
+}
+
+/// Hook for the spec review gate (SPEC-coordinator-observability FR-3852):
+/// posts a `spec_review` thread message and raises `spec_review_requested` on
+/// the `in_progress` board item named by [`super::BOARD_ITEM_ID_ENV`] in this
+/// process, else on the item whose `run_ids` holds `run_id`. Absolute `spec_paths` under
+/// `workspace` are made relative, others outside it are dropped, and at most
+/// [`SPEC_PATHS_MAX`] are kept. Never fails the caller: errors go to
+/// `<state base>/board/notify.log`, and a missing board or no matching item
+/// leaves the board untouched.
+pub fn notify_spec_review_requested(
+    workspace: &Path,
+    run_id: &str,
+    review_id: &str,
+    spec_paths: &[String],
+) {
+    let Ok(state) = crate::state_path::state_base() else {
+        return;
+    };
+    notify_spec_review_requested_in(
+        &state.join("board"),
+        workspace,
+        None,
+        run_id,
+        review_id,
+        spec_paths,
+    );
+}
+
+/// [`notify_spec_review_requested`] on the board at `board_base`, preferring
+/// `item_id` (the review record's `board_item_id`) over
+/// [`super::BOARD_ITEM_ID_ENV`] before falling back to `run_ids`.
+pub fn notify_spec_review_requested_in(
+    board_base: &Path,
+    workspace: &Path,
+    item_id: Option<&str>,
+    run_id: &str,
+    review_id: &str,
+    spec_paths: &[String],
+) {
+    if !board_base.join("items").is_dir() {
+        return;
+    }
+    let paths = workspace_relative_spec_paths(workspace, spec_paths);
+    let env_item_id = std::env::var(super::BOARD_ITEM_ID_ENV).ok();
+    let item_id = item_id
+        .or(env_item_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let board_base = board_base.to_path_buf();
+    let result = super::BoardStore::open(board_base.clone())
+        .and_then(|store| store.record_spec_review_request(item_id, run_id, review_id, &paths));
+    if let Err(error) = result {
+        append_log(
+            &board_base.join("notify.log"),
+            &format!("{} spec_review_requested {error}", format_ts(now_ms())),
+        );
+    }
+}
+
+pub const SPEC_PATHS_MAX: usize = 20;
+
+fn workspace_relative_spec_paths(workspace: &Path, spec_paths: &[String]) -> Vec<String> {
+    let root = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let mut out: Vec<String> = Vec::new();
+    for raw in spec_paths {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let path = Path::new(trimmed);
+        let relative = if path.is_absolute() {
+            match path
+                .strip_prefix(&root)
+                .or_else(|_| path.strip_prefix(workspace))
+            {
+                Ok(rel) => rel.to_path_buf(),
+                Err(_) => continue,
+            }
+        } else {
+            path.to_path_buf()
+        };
+        let mut clean = PathBuf::new();
+        let mut escapes = false;
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(part) => clean.push(part),
+                std::path::Component::CurDir => {}
+                _ => escapes = true,
+            }
+        }
+        if escapes || clean.as_os_str().is_empty() {
+            continue;
+        }
+        let text = clean.to_string_lossy().replace('\\', "/");
+        if !out.contains(&text) {
+            out.push(text);
+        }
+        if out.len() >= SPEC_PATHS_MAX {
+            break;
+        }
+    }
+    out
 }
 
 /// Dispatch a `decision` notification, optionally setting `auto_run: true` when
@@ -608,5 +773,300 @@ mod tests {
             .expect("request_changes decision event");
         assert_eq!(changes_ev["verdict"], "request_changes");
         assert!(changes_ev.get("auto_run").is_none());
+    }
+
+    // TC-3852 / FR-3852: the spec review hook posts a `spec_review` thread
+    // message and a `spec_review_requested` board + notify event with up to
+    // 20 workspace-relative paths; an unknown run leaves the board unchanged.
+    #[test]
+    fn tc_3852_spec_review_requested_hook() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let xdg_cfg = dir.path().join("xdg_cfg");
+        std::fs::create_dir_all(xdg_cfg.join("dmuxai")).unwrap();
+        ensure_dir(&board_base).unwrap();
+
+        let out_file = dir.path().join("spec-review-notify.jsonl");
+        let script = dir.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
+                out_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        std::fs::write(
+            xdg_cfg.join("dmuxai").join("dmuxai.toml"),
+            format!("[board]\nnotify_command = [\"{}\"]\n", script.display()),
+        )
+        .unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("DMUXAI_STATE_DIR");
+        let prev_item = std::env::var_os(crate::board::BOARD_ITEM_ID_ENV);
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_cfg);
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+            std::env::remove_var(crate::board::BOARD_ITEM_ID_ENV);
+        }
+
+        let run_id = "0123456789abcdef";
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "spec review".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::InProgress),
+                source_bot: None,
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let item = store
+            .update(
+                &item.id,
+                crate::board::UpdateItemRequest {
+                    title: None,
+                    summary: None,
+                    recommendation: None,
+                    options: None,
+                    grade: None,
+                    kind: None,
+                    run_id: Some(run_id.to_owned()),
+                    if_version: None,
+                    by: "bot:test".to_owned(),
+                },
+            )
+            .unwrap();
+
+        let mut paths = vec![
+            workspace
+                .join("docs/specs/SPEC-a.md")
+                .to_string_lossy()
+                .into_owned(),
+            "docs/specs/SPEC-b.md".to_owned(),
+            "../outside.md".to_owned(),
+            "/etc/passwd".to_owned(),
+            "docs/specs/SPEC-b.md".to_owned(),
+            "docs/x/../y.md".to_owned(),
+        ];
+        paths.extend((0..30).map(|i| format!("docs/specs/SPEC-n{i}.md")));
+        notify_spec_review_requested(&workspace, run_id, "rev-1", &paths);
+
+        let updated = store.get(&item.id).unwrap();
+        assert_eq!(updated.version, item.version + 1);
+        let message = updated.thread.last().expect("thread message");
+        assert_eq!(message.from, "spec_review");
+        assert!(message.text.contains("rev-1"), "{}", message.text);
+        assert!(message.text.contains(run_id), "{}", message.text);
+
+        let events: Vec<_> = store
+            .list_events(0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "spec_review_requested")
+            .collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.item_id, item.id);
+        assert_eq!(event.version, updated.version);
+        assert_eq!(event.by, "spec_review");
+        assert_eq!(event.detail.review_id.as_deref(), Some("rev-1"));
+        let spec_paths = &event.detail.spec_paths;
+        assert_eq!(spec_paths.len(), SPEC_PATHS_MAX);
+        assert_eq!(spec_paths[0], "docs/specs/SPEC-a.md");
+        assert_eq!(spec_paths[1], "docs/specs/SPEC-b.md");
+        assert_eq!(spec_paths[2], "docs/specs/SPEC-n0.md");
+        assert!(
+            spec_paths
+                .iter()
+                .all(|p| !p.contains("..") && !p.starts_with('/')),
+            "{spec_paths:?}"
+        );
+
+        // Unknown or invalid run ids leave the board untouched.
+        let events_before = std::fs::read(board_base.join("events.jsonl")).unwrap();
+        let item_before = std::fs::read(store.item_path(&item.id).unwrap()).unwrap();
+        notify_spec_review_requested(&workspace, "fedcba9876543210", "rev-2", &paths);
+        notify_spec_review_requested(&workspace, "not-a-run", "rev-3", &paths);
+        assert_eq!(
+            std::fs::read(board_base.join("events.jsonl")).unwrap(),
+            events_before
+        );
+        assert_eq!(
+            std::fs::read(store.item_path(&item.id).unwrap()).unwrap(),
+            item_before
+        );
+        let log = std::fs::read_to_string(board_base.join("notify.log")).unwrap_or_default();
+        assert!(
+            log.contains("spec_review_requested"),
+            "invalid run id logged: {log}"
+        );
+
+        wait_for_pending(Duration::from_secs(5));
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_state {
+                Some(v) => std::env::set_var("DMUXAI_STATE_DIR", v),
+                None => std::env::remove_var("DMUXAI_STATE_DIR"),
+            }
+            if let Some(v) = prev_item {
+                std::env::set_var(crate::board::BOARD_ITEM_ID_ENV, v);
+            }
+        }
+
+        let raw = std::fs::read_to_string(&out_file).expect("notify output should exist");
+        let payloads: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim()).ok())
+            .filter(|v| v["event"] == "spec_review_requested")
+            .collect();
+        assert_eq!(payloads.len(), 1, "{raw}");
+        assert_eq!(payloads[0]["item_id"], item.id);
+        assert_eq!(payloads[0]["by"], "spec_review");
+        assert_eq!(payloads[0]["review_id"], "rev-1");
+        assert_eq!(
+            payloads[0]["spec_paths"].as_array().unwrap().len(),
+            SPEC_PATHS_MAX
+        );
+        assert_eq!(payloads[0]["spec_paths"][0], "docs/specs/SPEC-a.md");
+    }
+
+    // TC-3852 / FR-3852: inside a board child run the hook uses the item from
+    // `DMUXAI_BOARD_ITEM_ID` while it is `in_progress`, even before the run id
+    // is on the item; an invalid id or an item in another lane falls back to
+    // `run_ids`.
+    #[test]
+    fn tc_3852_spec_review_hook_uses_board_item_env() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let empty_xdg = dir.path().join("empty_xdg");
+        std::fs::create_dir_all(&empty_xdg).unwrap();
+        ensure_dir(&board_base).unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_state = std::env::var_os("DMUXAI_STATE_DIR");
+        let prev_item = std::env::var_os(crate::board::BOARD_ITEM_ID_ENV);
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &empty_xdg);
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+        }
+
+        let run_id = "0123456789abcdef";
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let add = |title: &str, lane: Lane| {
+            store
+                .add(AddItemRequest {
+                    title: title.to_owned(),
+                    summary: String::new(),
+                    kind: Kind::Feature,
+                    grade: None,
+                    lane: Some(lane),
+                    source_bot: None,
+                    source_channel: None,
+                    source_ref: None,
+                    workspace: Some(workspace.clone()),
+                    recommendation: None,
+                    options: vec![],
+                    plan_hash: None,
+                    key: None,
+                    by: "bot:test".to_owned(),
+                    state_root: state.clone(),
+                })
+                .unwrap()
+        };
+        let paused = add("paused run", Lane::InProgress);
+        let parked = add("not running", Lane::NeedsDecision);
+        let linked = add("linked run", Lane::InProgress);
+        store
+            .update(
+                &linked.id,
+                crate::board::UpdateItemRequest {
+                    title: None,
+                    summary: None,
+                    recommendation: None,
+                    options: None,
+                    grade: None,
+                    kind: None,
+                    run_id: Some(run_id.to_owned()),
+                    if_version: None,
+                    by: "bot:test".to_owned(),
+                },
+            )
+            .unwrap();
+        let paths = vec!["docs/specs/SPEC-a.md".to_owned()];
+        let call = |env_item: &str, review_id: &str| {
+            unsafe { std::env::set_var(crate::board::BOARD_ITEM_ID_ENV, env_item) };
+            notify_spec_review_requested(&workspace, run_id, review_id, &paths);
+        };
+        let reviews_on = |id: &str| -> Vec<String> {
+            store
+                .list_events(0)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "spec_review_requested" && e.item_id == id)
+                .filter_map(|e| e.detail.review_id)
+                .collect()
+        };
+
+        // The env item wins over the item that holds the run id.
+        call(&paused.id, "rev-env");
+        // Not in_progress, invalid or empty → fall back to run_ids.
+        call(&parked.id, "rev-parked");
+        call("../not-an-id", "rev-invalid");
+        call("", "rev-empty");
+
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match prev_state {
+                Some(v) => std::env::set_var("DMUXAI_STATE_DIR", v),
+                None => std::env::remove_var("DMUXAI_STATE_DIR"),
+            }
+            match prev_item {
+                Some(v) => std::env::set_var(crate::board::BOARD_ITEM_ID_ENV, v),
+                None => std::env::remove_var(crate::board::BOARD_ITEM_ID_ENV),
+            }
+        }
+
+        assert_eq!(reviews_on(&paused.id), vec!["rev-env"]);
+        let paused_after = store.get(&paused.id).unwrap();
+        let message = paused_after.thread.last().expect("thread message");
+        assert_eq!(message.from, "spec_review");
+        assert!(message.text.contains("rev-env"), "{}", message.text);
+        assert!(reviews_on(&parked.id).is_empty());
+        assert_eq!(store.get(&parked.id).unwrap().version, parked.version);
+        assert_eq!(
+            reviews_on(&linked.id),
+            vec!["rev-parked", "rev-invalid", "rev-empty"]
+        );
     }
 }

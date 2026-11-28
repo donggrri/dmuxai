@@ -36,6 +36,8 @@ pub trait McpBackend {
     fn models(&self, agent: Option<&str>) -> Result<Value, String>;
     fn runners_status(&self, agent: Option<&str>) -> Result<Value, String>;
     fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
+    /// `runs_list` / `runs_show` over the workspace run journal (FR-3855, FR-3856).
+    fn runs_tool(&self, name: &str, args: &Value) -> Result<Value, String>;
 }
 
 fn tool_definitions() -> Value {
@@ -324,6 +326,33 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["id"]
             }
+        },
+        {
+            "name": "runs_list",
+            "description": "List this workspace's recorded runs newest first (same fields as GET /api/runs: run_id, origin, status, runner/model, created_at_ms, elapsed_ms, exit code, error_kind, graph_id, stale, stalled).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["active", "running", "completed", "failed", "cancelled", "awaiting_approval", "approved"] },
+                        "description": "Only runs with one of these statuses (a single string is also accepted)"
+                    },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Default 50" }
+                }
+            }
+        },
+        {
+            "name": "runs_show",
+            "description": "Show one recorded run: run summary, masked manifest, graph view, approval {plan_hash, hint} when awaiting approval, and the last progress lines (same as GET /api/runs/{id}). Read-only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string", "description": "16 lowercase hex characters" },
+                    "progress": { "type": "integer", "minimum": 0, "maximum": 200, "description": "Progress lines to return (default 50)" }
+                },
+                "required": ["run_id"]
+            }
         }
     ])
 }
@@ -437,6 +466,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
         "models" => backend.models(str_arg(args, "agent")),
         "runners_status" => backend.runners_status(str_arg(args, "agent")),
         name if name.starts_with("board_") => backend.board_tool(name, args),
+        "runs_list" | "runs_show" => backend.runs_tool(name, args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -487,7 +517,7 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": { "name": "dmuxai", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "DmuxAI runs prompts through local AI coding agents. Use status first, todo_add/todo_list for the to-do board, run to execute, events_since to follow progress."
+                    "instructions": "DmuxAI runs prompts through local AI coding agents. Use status first, todo_add/todo_list for the to-do board, run to execute, events_since to follow progress, runs_list/runs_show to inspect recorded runs."
                 }),
             )
         }
@@ -522,6 +552,8 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_events",
                 "board_ask",
                 "board_run",
+                "runs_list",
+                "runs_show",
             ];
             if !known.contains(&name) {
                 return Some(
@@ -565,6 +597,7 @@ mod tests {
         run_result: Mutex<Option<Value>>,
         models_calls: Mutex<Vec<Option<String>>>,
         runners_status_calls: Mutex<Vec<Option<String>>>,
+        runs_dir: Option<std::path::PathBuf>,
     }
 
     impl McpBackend for Stub {
@@ -606,6 +639,18 @@ mod tests {
         fn board_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
             Ok(crate::board::mcp_invoke(
                 std::path::Path::new("/tmp"),
+                name,
+                args,
+            ))
+        }
+        fn runs_tool(&self, name: &str, args: &Value) -> Result<Value, String> {
+            let dir = self
+                .runs_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent-dmuxai-runs"));
+            Ok(crate::runs_view::mcp_invoke_in(
+                &crate::run_journal::JournalStore::new(dir),
+                None,
                 name,
                 args,
             ))
@@ -1283,5 +1328,205 @@ mod tests {
             crate::runner_id::canonical_runner_id(" cursor-agent "),
             crate::runner_id::CURSOR_RUNNER_ID
         );
+    }
+
+    fn write_run(runs_dir: &std::path::Path, id: &str, status: &str, created: u64, extra: Value) {
+        let dir = runs_dir.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = json!({
+            "schema_version": 1,
+            "run_id": id,
+            "origin": "cli_headless",
+            "status": status,
+            "created_at_ms": created,
+            "completed_at_ms": created + 50,
+            "duration_ms": 50,
+            "requested_runner": "codex",
+            "resolved_runner": "codex",
+            "dmuxai_exit_code": if status == "failed" { 1 } else { 0 },
+            "links": {},
+            "diagnostics": { "stderr_bytes": 0, "tail_sample": null },
+            "end_summary": null
+        });
+        if let (Some(target), Some(fields)) = (manifest.as_object_mut(), extra.as_object()) {
+            for (key, value) in fields {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    }
+
+    fn call_tool_json(stub: &Stub, name: &str, arguments: Value) -> Value {
+        call(
+            stub,
+            json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
+        )["result"]
+            .clone()
+    }
+
+    // TC-3855 / FR-3855: MCP runs_list is listed, returns runs newest first
+    // with the GET /api/runs fields, filters by status and rejects bad input.
+    #[test]
+    fn tc_3855_mcp_runs_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        write_run(&runs, "0000000000000001", "completed", 100, json!({}));
+        write_run(
+            &runs,
+            "0000000000000002",
+            "failed",
+            300,
+            json!({"error_kind": "provider"}),
+        );
+        write_run(
+            &runs,
+            "0000000000000003",
+            "awaiting_approval",
+            200,
+            json!({}),
+        );
+        let stub = Stub {
+            runs_dir: Some(runs),
+            ..Stub::default()
+        };
+
+        let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        let tools = list["result"]["tools"].as_array().unwrap();
+        let schema = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))["inputSchema"]
+                .clone()
+        };
+        assert!(schema("runs_list")["properties"]["status"].is_object());
+        assert!(schema("runs_list")["properties"]["limit"].is_object());
+        assert_eq!(schema("runs_show")["required"], json!(["run_id"]));
+
+        let all = call_tool_json(&stub, "runs_list", json!({}));
+        assert_eq!(all["isError"], false, "{all}");
+        let rows = all["structuredContent"]["runs"].as_array().unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["run_id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["0000000000000002", "0000000000000003", "0000000000000001"]
+        );
+        for field in [
+            "origin",
+            "status",
+            "created_at_ms",
+            "elapsed_ms",
+            "stale",
+            "stalled",
+        ] {
+            assert!(rows[0].get(field).is_some(), "missing {field}: {}", rows[0]);
+        }
+        assert_eq!(rows[0]["requested_runner"], "codex");
+        assert_eq!(rows[0]["dmuxai_exit_code"], 1);
+        assert_eq!(rows[0]["error_kind"], "provider");
+
+        let failed = call_tool_json(&stub, "runs_list", json!({"status": ["failed"]}));
+        let rows = failed["structuredContent"]["runs"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["run_id"], "0000000000000002");
+        let one = call_tool_json(
+            &stub,
+            "runs_list",
+            json!({"status": "completed", "limit": 1}),
+        );
+        assert_eq!(
+            one["structuredContent"]["runs"][0]["run_id"],
+            "0000000000000001"
+        );
+        let limited = call_tool_json(&stub, "runs_list", json!({"limit": 1}));
+        assert_eq!(
+            limited["structuredContent"]["runs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for bad in [
+            json!({"status": "bogus"}),
+            json!({"limit": 0}),
+            json!({"limit": 201}),
+        ] {
+            let res = call_tool_json(&stub, "runs_list", bad.clone());
+            assert_eq!(res["isError"], true, "{bad}");
+            assert_eq!(res["structuredContent"]["exit_code"], 2, "{bad}");
+        }
+
+        let empty = Stub {
+            runs_dir: Some(dir.path().join("missing")),
+            ..Stub::default()
+        };
+        let res = call_tool_json(&empty, "runs_list", json!({}));
+        assert_eq!(res["isError"], false);
+        assert_eq!(res["structuredContent"]["runs"], json!([]));
+    }
+
+    // TC-3856 / FR-3856: MCP runs_show returns the approval hint and the
+    // progress tail (masked), unknown id → 3, invalid id → 2.
+    #[test]
+    fn tc_3856_mcp_runs_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let id = "00000000000000aa";
+        write_run(
+            &runs,
+            id,
+            "awaiting_approval",
+            100,
+            json!({
+                "links": { "graph_id": "g-1" },
+                "end_summary": { "plan_hash": "0123456789abcdef" }
+            }),
+        );
+        std::fs::write(
+            runs.join(id).join("progress.jsonl"),
+            "{\"kind\":\"node\",\"message\":\"one\"}\n{\"kind\":\"node\",\"message\":\"two\"}\n{\"kind\":\"node\",\"message\":\"Bearer sk-secret-token-12345\"}\n",
+        )
+        .unwrap();
+        let stub = Stub {
+            runs_dir: Some(runs),
+            ..Stub::default()
+        };
+
+        let res = call_tool_json(&stub, "runs_show", json!({"run_id": id, "progress": 2}));
+        assert_eq!(res["isError"], false, "{res}");
+        let detail = &res["structuredContent"];
+        assert_eq!(detail["run"]["run_id"], id);
+        assert_eq!(detail["manifest"]["run_id"], id);
+        assert_eq!(detail["approval"]["plan_hash"], "0123456789abcdef");
+        assert_eq!(
+            detail["approval"]["hint"],
+            "dmuxai run --graph --approve-plan-id 0123456789abcdef -"
+        );
+        let progress = detail["progress"].as_array().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert_eq!(progress[0]["message"], "two");
+        assert!(!detail.to_string().contains("sk-secret-token-12345"));
+
+        let default_tail = call_tool_json(&stub, "runs_show", json!({"run_id": id}));
+        assert_eq!(
+            default_tail["structuredContent"]["progress"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let unknown = call_tool_json(&stub, "runs_show", json!({"run_id": "ffffffffffffffff"}));
+        assert_eq!(unknown["isError"], true);
+        assert_eq!(unknown["structuredContent"]["exit_code"], 3);
+        for bad in [
+            json!({"run_id": "../x"}),
+            json!({}),
+            json!({"run_id": id, "progress": 201}),
+        ] {
+            let res = call_tool_json(&stub, "runs_show", bad.clone());
+            assert_eq!(res["structuredContent"]["exit_code"], 2, "{bad}");
+        }
     }
 }

@@ -1,76 +1,34 @@
 //! Read-only runs API (`GET /api/runs*`, SPEC-headless-runs-dashboard FR-2806..FR-2809).
 
 use std::convert::Infallible;
-use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use regex::Regex;
-use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::time::interval;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use crate::graph::GraphRun;
-use crate::run_journal::{
-    JournalStore, RunManifest, mask_json_value, mask_sensitive_tokens, valid_run_id,
+use crate::run_journal::{JournalStore, mask_json_value, mask_sensitive_tokens, valid_run_id};
+use crate::runs_view::{RunLookupError, run_item_from_manifest};
+pub(crate) use crate::runs_view::{
+    is_run_active, list_manifests, open_regular_nofollow, parse_runs_limit,
 };
 use crate::web::server::{AppState, Ws, error_json, json_ok};
-use crate::web::snapshot;
-
-static GRAPH_ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]{1,128}$").unwrap());
-
-static RUNNER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9._-]{1,64}$").unwrap());
 
 /// Upper bound on bytes read from the progress log per stream tick.
 const PROGRESS_READ_CAP: u64 = 1024 * 1024;
 
-/// Upper bound on bytes read from a graph snapshot file.
-const GRAPH_READ_CAP: u64 = 4 * 1024 * 1024;
+/// Progress lines returned by `GET /api/runs/{id}` (FR-2807).
+const DETAIL_PROGRESS_LINES: usize = 200;
 
-/// Opens a regular file without following symlinks. Returns `None` when the
-/// path is a symlink, not a regular file, missing, or unreadable.
-pub(crate) fn open_regular_nofollow(path: &Path) -> Option<fs::File> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_file() => return None,
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .ok()?
-    };
-    #[cfg(not(unix))]
-    let file = fs::File::open(path).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    // On non-unix the pre-open symlink check plus post-open metadata is the
-    // strongest available guard; on unix O_NOFOLLOW already closed the race.
-    #[cfg(not(unix))]
-    {
-        if fs::symlink_metadata(path)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(true)
-        {
-            return None;
-        }
-    }
-    Some(file)
+fn manifest_file_meta(path: &Path) -> Option<(u64, SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
 }
 
 fn redact_token_in_text(text: &str, token: &str) -> String {
@@ -125,300 +83,8 @@ fn journal_for(ws: &crate::web::directory::WorkspaceEntry) -> Option<(PathBuf, J
     Some((root, JournalStore::new(dir)))
 }
 
-pub(crate) fn parse_runs_limit(raw: Option<&str>) -> Result<usize, ()> {
-    match raw {
-        None | Some("") => Ok(50),
-        Some(value) => {
-            let parsed = value.parse::<usize>().map_err(|_| ())?;
-            if parsed == 0 || parsed > 200 {
-                Err(())
-            } else {
-                Ok(parsed)
-            }
-        }
-    }
-}
-
-pub(crate) fn is_run_active(status: &str) -> bool {
-    status == "active" || status == "running"
-}
-
-#[cfg(target_os = "linux")]
-fn proc_alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn proc_alive(_pid: u32) -> bool {
-    true
-}
-
-fn run_stale(manifest: &RunManifest) -> bool {
-    if !is_run_active(&manifest.status) {
-        return false;
-    }
-    let Some(pid) = manifest.pid else {
-        return false;
-    };
-    #[cfg(target_os = "linux")]
-    {
-        !proc_alive(pid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-fn progress_mtime_ms(store: &JournalStore, id: &str) -> Option<u64> {
-    let path = store.root().join(id).join("progress.jsonl");
-    let meta = fs::metadata(&path).ok()?;
-    meta.modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64)
-}
-
-fn run_stalled(store: &JournalStore, id: &str, status: &str) -> bool {
-    if !is_run_active(status) {
-        return false;
-    }
-    let Some(mtime_ms) = progress_mtime_ms(store, id) else {
-        return false;
-    };
-    let now = snapshot::now_ms();
-    now.saturating_sub(mtime_ms) > 90_000
-}
-
-fn elapsed_ms(manifest: &RunManifest) -> u64 {
-    let now = snapshot::now_ms();
-    if is_run_active(&manifest.status) {
-        return now.saturating_sub(manifest.created_at_ms);
-    }
-    manifest.duration_ms.unwrap_or_else(|| {
-        manifest
-            .completed_at_ms
-            .unwrap_or(now)
-            .saturating_sub(manifest.created_at_ms)
-    })
-}
-
-#[derive(Serialize)]
-struct RunItem {
-    run_id: String,
-    origin: String,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_runner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolved_runner: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resolved_model: Option<String>,
-    created_at_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    completed_at_ms: Option<u64>,
-    elapsed_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    dmuxai_exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_kind: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    graph_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    approved_by_run_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pid: Option<u32>,
-    stale: bool,
-    stalled: bool,
-}
-
-fn mask_opt_string(value: &Option<String>) -> Option<String> {
-    value.as_ref().map(|s| mask_sensitive_tokens(s))
-}
-
-/// FR-2816: the run id that superseded an `awaiting_approval` run by
-/// executing its approved plan; recorded in `end_summary.approved_by_run_id`.
-fn approved_by_run_id(manifest: &RunManifest) -> Option<String> {
-    manifest
-        .end_summary
-        .as_ref()
-        .and_then(|summary| summary.get("approved_by_run_id"))
-        .and_then(|value| value.as_str())
-        .map(mask_sensitive_tokens)
-}
-
-fn run_item_from_manifest(store: &JournalStore, manifest: &RunManifest) -> RunItem {
-    RunItem {
-        run_id: manifest.run_id.clone(),
-        origin: mask_sensitive_tokens(&manifest.origin),
-        status: manifest.status.clone(),
-        requested_runner: mask_opt_string(&manifest.requested_runner),
-        resolved_runner: mask_opt_string(&manifest.resolved_runner),
-        requested_model: mask_opt_string(&manifest.requested_model),
-        resolved_model: mask_opt_string(&manifest.resolved_model),
-        created_at_ms: manifest.created_at_ms,
-        completed_at_ms: manifest.completed_at_ms,
-        elapsed_ms: elapsed_ms(manifest),
-        dmuxai_exit_code: manifest.dmuxai_exit_code,
-        error_kind: mask_opt_string(&manifest.error_kind),
-        error_summary: mask_opt_string(&manifest.error_summary),
-        graph_id: manifest
-            .links
-            .graph_id
-            .as_ref()
-            .map(|s| mask_sensitive_tokens(s)),
-        approved_by_run_id: approved_by_run_id(manifest),
-        pid: manifest.pid,
-        stale: run_stale(manifest),
-        stalled: run_stalled(store, &manifest.run_id, &manifest.status),
-    }
-}
-
-pub(crate) fn list_manifests(store: &JournalStore) -> Vec<RunManifest> {
-    let root = store.root();
-    if !root.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut manifests = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if crate::run_journal::is_symlink(&path).unwrap_or(true) {
-            continue;
-        }
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !valid_run_id(name) {
-            continue;
-        }
-        if let Ok(manifest) = store.load(name) {
-            manifests.push(manifest);
-        }
-    }
-    manifests.sort_by_key(|a| std::cmp::Reverse(a.created_at_ms));
-    manifests
-}
-
-fn manifest_file_meta(path: &Path) -> Option<(u64, SystemTime)> {
-    let meta = fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
-}
-
-fn load_graph_view(workspace_root: &Path, graph_id: &str) -> Option<serde_json::Value> {
-    if !GRAPH_ID_RE.is_match(graph_id) {
-        return None;
-    }
-    let graphs_dir = workspace_root.join(".dmuxai").join("graphs");
-    match fs::symlink_metadata(&graphs_dir) {
-        Ok(meta) if meta.file_type().is_symlink() || !meta.file_type().is_dir() => return None,
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    let path = graphs_dir.join(format!("{graph_id}.json"));
-    let mut file = open_regular_nofollow(&path)?;
-    let mut bytes = Vec::new();
-    if (&mut file)
-        .take(GRAPH_READ_CAP)
-        .read_to_end(&mut bytes)
-        .is_err()
-    {
-        return None;
-    }
-    let mut run: GraphRun = serde_json::from_slice(&bytes).ok()?;
-    run.normalize_legacy_runners();
-    let mut value = serde_json::to_value(snapshot::snapshot_from_run(&run)).ok()?;
-    mask_json_value(&mut value);
-    Some(value)
-}
-
-#[derive(Serialize)]
-struct ApprovalPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plan_hash: Option<String>,
-    hint: String,
-}
-
-fn approval_for(manifest: &RunManifest) -> Option<ApprovalPayload> {
-    if manifest.status != "awaiting_approval" {
-        return None;
-    }
-    let plan_hash = manifest
-        .end_summary
-        .as_ref()
-        .and_then(|v| v.get("plan_hash"))
-        .and_then(|v| v.as_str())
-        .map(mask_sensitive_tokens);
-    let has_graph = manifest
-        .links
-        .graph_id
-        .as_deref()
-        .is_some_and(|graph_id| !graph_id.is_empty());
-    let valid_graph_hash = has_graph
-        && plan_hash
-            .as_deref()
-            .is_some_and(crate::state_path::valid_pending_plan_hash);
-    let hint = if valid_graph_hash {
-        format!(
-            "dmuxai run --graph --approve-plan-id {} -",
-            plan_hash.as_deref().unwrap_or_default()
-        )
-    } else {
-        let runner = manifest
-            .requested_runner
-            .as_deref()
-            .or(manifest.resolved_runner.as_deref())
-            .unwrap_or("<agent>");
-        let runner = mask_sensitive_tokens(runner);
-        let runner = if RUNNER_RE.is_match(&runner) {
-            runner
-        } else {
-            "<agent>".to_owned()
-        };
-        format!("dmuxai run --agent {runner} --approve-plan -")
-    };
-    Some(ApprovalPayload { plan_hash, hint })
-}
-
-fn manifest_to_json(manifest: &RunManifest) -> serde_json::Value {
-    let mut value = serde_json::to_value(manifest).unwrap_or(serde_json::json!({}));
-    mask_json_value(&mut value);
-    value
-}
-
-fn progress_as_json_values(store: &JournalStore, id: &str) -> Vec<serde_json::Value> {
-    let Ok(lines) = store.load_progress_tail(id, 200) else {
-        return Vec::new();
-    };
-    lines
-        .into_iter()
-        .filter_map(|line| {
-            let masked = mask_sensitive_tokens(&line);
-            let mut value = serde_json::from_str::<serde_json::Value>(&masked).ok()?;
-            mask_json_value(&mut value);
-            Some(value)
-        })
-        .collect()
-}
-
 pub(crate) fn list_response(store: &JournalStore, limit: usize, token: &str) -> Response {
-    let runs: Vec<RunItem> = list_manifests(store)
-        .into_iter()
-        .take(limit)
-        .map(|manifest| run_item_from_manifest(store, &manifest))
-        .collect();
-    let mut payload = serde_json::json!({ "runs": runs });
+    let mut payload = crate::runs_view::list_json(store, &[], limit);
     redact_token_in_value(&mut payload, token);
     json_ok(StatusCode::OK, &payload)
 }
@@ -428,9 +94,8 @@ pub(crate) async fn list(
     Ws(ws): Ws,
     Query(params): Query<RunsListQuery>,
 ) -> Response {
-    let limit = match parse_runs_limit(params.limit.as_deref()) {
-        Ok(limit) => limit,
-        Err(()) => return error_json(StatusCode::BAD_REQUEST, "invalid limit"),
+    let Some(limit) = parse_runs_limit(params.limit.as_deref()) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid limit");
     };
     let Some((_, store)) = journal_for(&ws) else {
         return json_ok(StatusCode::OK, &serde_json::json!({ "runs": [] }));
@@ -444,29 +109,16 @@ pub(crate) fn detail_response(
     id: &str,
     token: &str,
 ) -> Response {
-    let manifest = match store.load(id) {
-        Ok(m) => m,
-        Err(_) => return error_json(StatusCode::NOT_FOUND, "run not found"),
-    };
-    let run = run_item_from_manifest(store, &manifest);
-    let graph = workspace_root.and_then(|root| {
-        manifest
-            .links
-            .graph_id
-            .as_deref()
-            .and_then(|gid| load_graph_view(root, gid))
-    });
-    let approval = approval_for(&manifest);
-    let progress = progress_as_json_values(store, id);
-    let mut payload = serde_json::json!({
-        "run": run,
-        "manifest": manifest_to_json(&manifest),
-        "graph": graph,
-        "approval": approval,
-        "progress": progress,
-    });
-    redact_token_in_value(&mut payload, token);
-    json_ok(StatusCode::OK, &payload)
+    match crate::runs_view::run_detail(store, workspace_root, id, DETAIL_PROGRESS_LINES) {
+        Ok(mut payload) => {
+            redact_token_in_value(&mut payload, token);
+            json_ok(StatusCode::OK, &payload)
+        }
+        Err(RunLookupError::InvalidId) => error_json(StatusCode::BAD_REQUEST, "invalid run id"),
+        Err(RunLookupError::NotFound | RunLookupError::Journal(_)) => {
+            error_json(StatusCode::NOT_FOUND, "run not found")
+        }
+    }
 }
 
 pub(crate) async fn detail(

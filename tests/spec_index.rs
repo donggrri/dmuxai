@@ -26,6 +26,9 @@
 //   -> `tc_2553_tc_link_base_requires_strong_links_for_changed_tcs`.
 // FR-2555 / TC-2554: scripts/gate.sh TC-link step uses --base origin/main when ref exists
 //   -> `tc_2554_gate_tc_links_step_uses_base`.
+// FR-3857 / TC-3857 (SPEC-coordinator-observability): docs/API.md lists `runs`,
+//   `runs_list`/`runs_show`, the new board event kinds and a Manager bot loop
+//   -> `tc_3857_api_docs_runs_and_events`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -1204,4 +1207,51 @@ fn tc_1807_gate_script_browser_command_uses_web_targets() {
         cmd.find("--no-fail-fast") < cmd.find(" -- "),
         "--no-fail-fast must be passed to cargo, before the test-arg separator:\n{cmd}"
     );
+}
+
+/// Returns the body of the `## <heading>` section of `doc` (up to the next `## `).
+fn doc_section<'a>(doc: &'a str, heading: &str) -> &'a str {
+    let marker = format!("\n## {heading}");
+    let start = doc
+        .find(&marker)
+        .unwrap_or_else(|| panic!("docs/API.md has no section '## {heading}'"))
+        + 1;
+    let rest = &doc[start..];
+    let end = rest[3..].find("\n## ").map_or(rest.len(), |i| i + 3);
+    &rest[..end]
+}
+
+// TC-3857 / FR-3857: docs/API.md documents `runs` (§1), `runs_list`/`runs_show`
+// (§3), the new board event kinds and a "Manager bot loop" subsection.
+#[test]
+fn tc_3857_api_docs_runs_and_events() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let doc = fs::read_to_string(root.join("docs/API.md")).unwrap();
+
+    let cli = doc_section(&doc, "1. Headless CLI");
+    for row in [
+        "| `dmuxai runs`",
+        "| `dmuxai runs list`",
+        "| `dmuxai runs show <run_id>`",
+    ] {
+        assert!(cli.contains(row), "§1 must list {row}");
+    }
+    let mcp = doc_section(&doc, "3. MCP server");
+    for row in ["| `runs_list` |", "| `runs_show` |"] {
+        assert!(mcp.contains(row), "§3 must list {row}");
+    }
+    let board = doc_section(&doc, "Decision board");
+    for kind in ["run_started", "awaiting_approval", "spec_review_requested"] {
+        assert!(
+            board.contains(&format!("| `{kind}` |")),
+            "Decision board must list event kind {kind}"
+        );
+    }
+    let loop_start = board
+        .find("### Manager bot loop")
+        .expect("Decision board has a Manager bot loop subsection");
+    let manager = &board[loop_start..];
+    for name in ["board_pending", "board_wait", "runs_show"] {
+        assert!(manager.contains(name), "Manager bot loop mentions {name}");
+    }
 }

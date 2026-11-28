@@ -301,6 +301,8 @@ dmuxai models [--agent ID] [--json]                   # available models and run
 dmuxai run "summarize this repo" --agent agy --json   # one-shot; add --progress for live progress, --graph for the planner
 dmuxai todo add "Write docs" --body "API.md first"
 dmuxai events --follow --json                         # tail .dmuxai/events.jsonl (agent, activity, node, graph, todo)
+dmuxai runs list --status failed --json               # recorded runs (same fields as GET /api/runs)
+dmuxai runs show <run_id> --json                      # manifest, graph view, approval hint, progress tail
 ```
 
 MCP over stdio exposes the same operations as tools; most clients take a
@@ -315,7 +317,8 @@ directory when that is unset. Claude Desktop has no `cwd` field, so pass the
 repo explicitly. These configs are **not yet tested with Claude Desktop
 itself**. `dmuxai mcp` was checked with a raw stdio JSON-RPC session:
 `initialize` and `tools/list` (`todo_add`, `todo_list`, `run`, `status`,
-`events_since`, `models`) both answer.
+`events_since`, `models`) both answer. Run history is exposed as `runs_list` and
+`runs_show` (same data as `dmuxai runs list|show`).
 
 Claude Desktop on Linux (`claude_desktop_config.json`):
 

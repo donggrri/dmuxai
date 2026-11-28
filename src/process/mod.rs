@@ -29,6 +29,10 @@ pub mod supervisor;
 /// - `DMUXAI_BOARD_LAUNCH_TOKEN`: One-time secret handed only to the detached
 ///   `board run --exec-prepared` child (SPEC-board-approval-hardening
 ///   FR-3800). Agent children must never see it.
+/// - `DMUXAI_BOARD_ITEM_ID`: Board item id the decision board sets on its
+///   `run` child (SPEC-spec-review-gate FR-3711, SPEC-coordinator-observability
+///   FR-3852). Only that run process uses it; agent children it spawns must
+///   not inherit it.
 ///
 /// **Preserved (needed by child processes or user preferences):**
 /// - `DMUXAI_STATE_DIR`: Root directory for DmuxAI state. Preserved so that
@@ -54,6 +58,7 @@ pub const INTERNAL_ENV_VARS: &[&str] = &[
     "DMUXAI_CONFIG",
     "DMUXAI_TRUST_WORKSPACE_CONFIG",
     "DMUXAI_BOARD_LAUNCH_TOKEN",
+    "DMUXAI_BOARD_ITEM_ID",
 ];
 
 /// Applies the child process environment policy to a standard process command.
@@ -270,6 +275,30 @@ mod tests {
             Some(&None),
             "expected DMUXAI_CONFIG to be removed (value None)"
         );
+    }
+
+    // TC-3852 / FR-3852: the board item id set on a board `run` child is not
+    // inherited by the agent children that run spawns.
+    #[test]
+    fn tc_3852_board_item_env_not_inherited_by_agent_children() {
+        assert!(INTERNAL_ENV_VARS.contains(&crate::board::BOARD_ITEM_ID_ENV));
+
+        let agent = headless_command(PathBuf::from("test-agent"));
+        let removed = agent
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == crate::board::BOARD_ITEM_ID_ENV && v.is_none());
+        assert!(removed, "headless_command must remove DMUXAI_BOARD_ITEM_ID");
+
+        #[cfg(unix)]
+        {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "printf '%s' \"${DMUXAI_BOARD_ITEM_ID-unset}\""]);
+            cmd.env(crate::board::BOARD_ITEM_ID_ENV, "abcdef012345");
+            apply_child_env_policy(&mut cmd);
+            let output = cmd.output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "unset");
+        }
     }
 
     #[test]
