@@ -150,7 +150,29 @@
         </select>
         <label><input id="board-show-closed" type="checkbox"> Show closed</label>
         <button id="board-rules-toggle" type="button" class="btn btn-small">Rules</button>
+        <button id="board-new-task" type="button" class="btn btn-small btn-primary" aria-expanded="false" aria-controls="board-new-task-form" hidden>New task</button>
       </div>
+      <form id="board-new-task-form" class="board-new-task-form" aria-label="New task" hidden>
+        <label for="board-new-title">Title</label>
+        <input id="board-new-title" type="text" maxlength="200" required>
+        <label for="board-new-kind">Kind</label>
+        <select id="board-new-kind">
+          <option value="feature">feature</option>
+          <option value="debug">debug</option>
+          <option value="question">question</option>
+          <option value="review">review</option>
+          <option value="other">other</option>
+        </select>
+        <label for="board-new-workspace">Workspace</label>
+        <input id="board-new-workspace" type="text" required>
+        <label for="board-new-prompt">Prompt</label>
+        <textarea id="board-new-prompt" rows="4" required></textarea>
+        <p id="board-new-error" class="board-plan-errors" role="alert" hidden></p>
+        <div class="board-new-task-actions">
+          <button id="board-new-submit" type="submit" class="btn btn-small btn-primary">Plan task</button>
+          <button id="board-new-cancel" type="button" class="btn btn-small">Cancel</button>
+        </div>
+      </form>
       <p id="board-notice" class="notice board-notice" role="status" aria-live="polite" hidden></p>
       <section id="board-my-decisions" class="board-my-decisions" aria-label="My decisions">
         <h3>My decisions</h3>

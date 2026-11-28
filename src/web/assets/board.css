@@ -385,6 +385,53 @@ body.board-modal-open {
   border-color: var(--btn-primary-line);
 }
 
+/* SPEC-board-intake FR-3865: "New task" form and planning status. */
+.board-new-task-form {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.4rem 0.6rem;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.5rem;
+  font-size: 0.85rem;
+  background: var(--bg-panel);
+}
+
+.board-new-task-form[hidden] {
+  display: none;
+}
+
+.board-new-task-form label {
+  color: var(--muted);
+}
+
+.board-new-task-form textarea,
+.board-new-task-form .board-plan-errors,
+.board-new-task-actions {
+  grid-column: 1 / -1;
+}
+
+.board-new-task-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.board-planning {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.board-planning-warning {
+  color: var(--warn);
+  font-size: 0.8rem;
+}
+
+.board-planning-failed {
+  color: var(--error-text);
+  font-size: 0.8rem;
+}
+
 .board-rules-panel {
   border: 1px solid var(--line);
   border-radius: 6px;

@@ -133,6 +133,9 @@ pub struct PendingItem {
     pub grade: Option<super::Grade>,
     pub age_ms: u64,
     pub updated_ms: u64,
+    /// SPEC-board-intake FR-3862: fallback-plan warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -390,6 +393,15 @@ impl BoardStore {
     }
 
     pub fn add(&self, req: AddItemRequest) -> Result<BoardItem, BoardError> {
+        self.add_reporting_created(req).map(|(item, _)| item)
+    }
+
+    /// [`Self::add`] that also says whether the item was created (`false` when
+    /// `key` matched an existing item; SPEC-board-intake FR-3863).
+    pub fn add_reporting_created(
+        &self,
+        req: AddItemRequest,
+    ) -> Result<(BoardItem, bool), BoardError> {
         validate_new_text(&req.title, &req.summary, req.recommendation.as_deref())?;
         validate_options(&req.options)?;
         validate_ref_url(req.source_ref.as_deref())?;
@@ -400,11 +412,11 @@ impl BoardStore {
                 "plan hash must be 16 lowercase hex characters".to_owned(),
             ));
         }
-        let (item, notify_needs_decision) = self.with_lock(|store| {
+        let (item, notify_needs_decision, created) = self.with_lock(|store| {
             if let Some(key) = &req.key
                 && let Some(existing) = store.find_item_by_key(key, req.source_bot.as_deref())?
             {
-                return Ok((existing, false));
+                return Ok((existing, false, false));
             }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
@@ -444,6 +456,7 @@ impl BoardStore {
                 thread: Vec::new(),
                 run_ids: Vec::new(),
                 key: req.key.clone(),
+                planning: None,
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
                 version: 1,
@@ -462,12 +475,51 @@ impl BoardStore {
             store.save_item_inner(&item)?;
             store.append_event(&item.id, EventKind::Created, item.version, &req.by)?;
             let notify = item.lane == Lane::NeedsDecision;
-            Ok((item, notify))
+            Ok((item, notify, true))
         })?;
         if notify_needs_decision {
             super::notify::dispatch_board_event(&self.base, &item, "needs_decision", &req.by);
         }
-        Ok(item)
+        Ok((item, created))
+    }
+
+    /// Store the intake planning status and optionally a `planner` thread
+    /// message (SPEC-board-intake FR-3861, FR-3862).
+    pub fn set_planning(
+        &self,
+        id: &str,
+        planning: super::Planning,
+        message: Option<&str>,
+    ) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        let message = message.map(|text| {
+            let masked = crate::run_journal::mask_sensitive_tokens(text);
+            masked.chars().take(super::TEXT_MAX).collect::<String>()
+        });
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            item.planning = Some(planning);
+            let kind = if let Some(text) = message {
+                if item.thread.len() >= THREAD_MAX {
+                    item.thread.remove(0);
+                }
+                item.thread.push(ThreadMessage {
+                    from: "planner".to_owned(),
+                    text,
+                    at_ms: now_ms(),
+                });
+                EventKind::Message
+            } else {
+                EventKind::Updated
+            };
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            store.append_event(id, kind, item.version, "planner")?;
+            Ok(item)
+        })
     }
 
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<BoardItem>, BoardError> {
@@ -541,7 +593,9 @@ impl BoardStore {
                 Lane::Done if item.checked.is_none() && item.updated_ms >= cutoff => "check",
                 _ => continue,
             };
+            let warning = item.planning_warning().map(str::to_owned);
             entries.push(PendingItem {
+                warning,
                 id: item.id,
                 reason: reason.to_owned(),
                 lane: item.lane,
@@ -679,6 +733,7 @@ impl BoardStore {
                     item.version
                 )));
             }
+            enforce_in_progress_move(by, lane, &item)?;
             let prev_lane = item.lane;
             item.lane = lane;
             if prev_lane != lane || matches!(lane, Lane::Done | Lane::Unknown) {
@@ -709,6 +764,7 @@ impl BoardStore {
         }
         let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
+            store.ensure_no_run_in_flight(&item)?;
             let pending = read_pending_plan(state_root, hash)?;
             let computed = pending_hash_for_plan(&pending)?;
             if computed != hash {
@@ -745,6 +801,7 @@ impl BoardStore {
         }
         let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
+            store.ensure_no_run_in_flight(&item)?;
             let pending = read_pending_plan(_state_root, hash)?;
             let computed = pending_hash_for_plan(&pending)?;
             if computed != hash {
@@ -803,6 +860,18 @@ impl BoardStore {
             .ok_or_else(|| BoardError::Internal("board store has no state parent".to_owned()))?;
         let pending = super::plan::read_pending_or_board_copy(state_root, &self.base, &plan_hash)?;
         Ok(pending.prompt)
+    }
+
+    /// FR-3807: no plan attach or edit while a live run holds the item.
+    fn ensure_no_run_in_flight(&self, item: &BoardItem) -> Result<(), BoardError> {
+        if item.lane == Lane::InProgress
+            && super::runner::BoardLockGuard::is_active(&self.base, "runs", &item.id)
+        {
+            return Err(BoardError::Conflict(
+                "cannot change the plan while a run is in progress for this item".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn clear_decision_on_plan_change(&self, item: &mut BoardItem) {
@@ -872,6 +941,14 @@ impl BoardStore {
     }
 
     pub fn with_rules_lock<T>(
+        &self,
+        work: impl FnOnce() -> Result<T, BoardError>,
+    ) -> Result<T, BoardError> {
+        self.with_lock(|_| work())
+    }
+
+    /// Serializes run lock read-modify-write against other board writers.
+    pub(crate) fn with_store_lock<T>(
         &self,
         work: impl FnOnce() -> Result<T, BoardError>,
     ) -> Result<T, BoardError> {
@@ -1102,7 +1179,10 @@ impl BoardStore {
         Ok(item)
     }
 
-    /// Record the outcome of `board run` (FR-3133, FR-3135).
+    /// Record the outcome of `board run` (FR-3133, FR-3135). The lane moves to
+    /// `done`/`unknown` only while the item is still `in_progress` on the plan
+    /// that ran; otherwise only a `run` thread note is added
+    /// (SPEC-board-approval-hardening FR-3806).
     pub fn record_run_result(
         &self,
         id: &str,
@@ -1110,6 +1190,7 @@ impl BoardStore {
         exit_code: i32,
         summary: Option<&str>,
         by: &str,
+        plan_hash: &str,
     ) -> Result<BoardItem, BoardError> {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
@@ -1137,6 +1218,14 @@ impl BoardStore {
                 }
                 m
             };
+            let applied = item.lane == Lane::InProgress
+                && item.plan.as_ref().map(|p| p.hash.as_str()) == Some(plan_hash);
+            if !applied {
+                msg = format!(
+                    "Run {run_label} finished (exit {exit_code}) but its result was not applied: the item changed while it ran (lane '{}').",
+                    item.lane.as_str()
+                );
+            }
             if msg.chars().count() > super::TEXT_MAX {
                 msg = msg.chars().take(super::TEXT_MAX).collect();
             }
@@ -1148,16 +1237,23 @@ impl BoardStore {
                 text: msg,
                 at_ms: now_ms(),
             });
-            item.lane = if exit_code == 0 {
-                Lane::Done
-            } else {
-                Lane::Unknown
-            };
-            item.checked = None;
+            if applied {
+                item.lane = if exit_code == 0 {
+                    Lane::Done
+                } else {
+                    Lane::Unknown
+                };
+                item.checked = None;
+            }
             item.version += 1;
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
-            store.append_event(id, EventKind::Lane, item.version, by)?;
+            let kind = if applied {
+                EventKind::Lane
+            } else {
+                EventKind::Message
+            };
+            store.append_event(id, kind, item.version, by)?;
             Ok(item)
         })?;
         super::notify::dispatch_board_event(&self.base, &item, "run_finished", by);
@@ -1323,6 +1419,26 @@ fn enforce_sensitive_lane_move(by: &str, lane: Lane) -> Result<(), BoardError> {
         ));
     }
     Ok(())
+}
+
+/// FR-3803: a non-owner may move an item into `in_progress` only when it is in
+/// the `auto` lane or already approved by the owner for its current plan, which
+/// is exactly what `board run` checks before it moves the item.
+fn enforce_in_progress_move(by: &str, lane: Lane, item: &BoardItem) -> Result<(), BoardError> {
+    if lane != Lane::InProgress || by == "owner" || item.lane == Lane::Auto {
+        return Ok(());
+    }
+    let approved_for_plan = item.decision.as_ref().is_some_and(|d| {
+        d.verdict == Verdict::Approve
+            && d.by == "owner"
+            && d.plan_hash.as_deref() == item.plan.as_ref().map(|p| p.hash.as_str())
+    });
+    if approved_for_plan {
+        return Ok(());
+    }
+    Err(BoardError::Forbidden(
+        "only an approved or auto lane item can move into in_progress; use `board run`".to_owned(),
+    ))
 }
 
 fn workspace_from_path(path: Option<&Path>) -> Result<WorkspaceRef, BoardError> {
@@ -2136,6 +2252,118 @@ mod tests {
         );
     }
 
+    // TC-3862 / SPEC-board-intake FR-3862: a fallback plan from intake is kept
+    // (owner can still approve it) but `planning.warning` shows in board show
+    // (`planning_warning`) and board pending; a planner plan has no warning.
+    #[cfg(unix)]
+    #[test]
+    fn tc_3862_fallback_warning() {
+        use crate::board::runner::{IntakeMode, intake_add};
+        use crate::board::{FALLBACK_PLAN_WARNING, PlanningState};
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::state_path::test_env_lock();
+        let (dir, store, state) = test_store();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let (_, hash) = crate::board::plan::edit_plan_from_json(
+            &ws,
+            &state,
+            "fallback intake",
+            r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#,
+            None,
+        )
+        .unwrap();
+        let child = |name: &str, source: &str| {
+            let path = dir.path().join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\ncat > /dev/null\nprintf '{{\"ok\":false,\"exit_code\":7,\"plan_hash\":\"{hash}\",\"plan_source\":\"{source}\",\"planner_error\":\"planner exited 3\"}}\\n'\nexit 7\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let request = |title: &str| AddItemRequest {
+            title: title.to_owned(),
+            summary: String::new(),
+            kind: Kind::Feature,
+            grade: None,
+            lane: None,
+            source_bot: Some("coord".to_owned()),
+            source_channel: None,
+            source_ref: None,
+            workspace: Some(ws.clone()),
+            recommendation: None,
+            options: vec![],
+            plan_hash: None,
+            key: None,
+            by: "bot:coord".to_owned(),
+            state_root: state.clone(),
+        };
+
+        let fallback_bin = child("fake-fallback.sh", "fallback");
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fallback_bin) };
+        let fallback = intake_add(
+            &store,
+            request("fallback item"),
+            "plan it",
+            IntakeMode::Blocking,
+        );
+        let planner_bin = child("fake-planner.sh", "planner");
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &planner_bin) };
+        let planned = intake_add(
+            &store,
+            request("planner item"),
+            "plan it",
+            IntakeMode::Blocking,
+        );
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        let fallback = fallback.unwrap();
+        let planned = planned.unwrap();
+
+        let planning = fallback.planning.as_ref().unwrap();
+        assert_eq!(planning.state, PlanningState::Planned);
+        assert_eq!(planning.plan_source.as_deref(), Some("fallback"));
+        assert_eq!(fallback.planning_warning(), Some(FALLBACK_PLAN_WARNING));
+        assert_eq!(fallback.plan.as_ref().unwrap().hash, hash);
+        let note = &fallback.thread.last().unwrap().text;
+        assert!(note.contains(FALLBACK_PLAN_WARNING), "{note}");
+        assert!(note.contains("planner exited 3"), "{note}");
+        let shown = serde_json::to_value(store.get(&fallback.id).unwrap()).unwrap();
+        assert_eq!(shown["planning"]["warning"], FALLBACK_PLAN_WARNING);
+        assert_eq!(planned.planning_warning(), None);
+
+        let pending = store.pending(None).unwrap();
+        let warning_of = |id: &str| {
+            pending
+                .items
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.warning.clone())
+        };
+        assert_eq!(
+            warning_of(&fallback.id),
+            Some(Some(FALLBACK_PLAN_WARNING.to_owned()))
+        );
+        assert_eq!(warning_of(&planned.id), Some(None));
+
+        let approved = store
+            .decide_without_notify(
+                &fallback.id,
+                crate::board::DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(approved.lane, Lane::Approved);
+    }
+
     // TC-3137 / FR-3137: board pending lists decide, failed, check (oldest first, excluding >30d
     // done/unknown), and board check records checked + event and removes from pending.
     #[test]
@@ -2391,5 +2619,300 @@ mod tests {
             }
             None => panic!("expected wait_any to wake on decision"),
         }
+    }
+
+    const HARDENING_PLAN_JSON: &str = r#"{"tasks":[{"id":"task-1","title":"t","done_check":"d","size":"small","depends_on":[]}],"steps":[{"id":"s1","role":"implement","job":"j","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+
+    /// An item with a plan in `lane` (`Approved` records an owner approval).
+    fn item_with_plan(
+        store: &BoardStore,
+        state: &Path,
+        ws: &Path,
+        lane: Lane,
+    ) -> (BoardItem, String) {
+        let (_, hash) =
+            crate::board::edit_plan_from_json(ws, state, "ship", HARDENING_PLAN_JSON, None)
+                .unwrap();
+        let add_lane = if lane == Lane::Auto {
+            None
+        } else {
+            Some(Lane::NeedsDecision)
+        };
+        let item = store
+            .add(AddItemRequest {
+                title: format!("hardening {}", lane.as_str()),
+                summary: String::new(),
+                kind: if lane == Lane::Auto {
+                    Kind::Debug
+                } else {
+                    Kind::Feature
+                },
+                grade: None,
+                lane: add_lane,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.to_path_buf()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.to_path_buf(),
+            })
+            .unwrap();
+        assert_eq!(item.lane, lane_after_add(lane));
+        let item = if lane == Lane::Approved {
+            store
+                .decide_without_notify(
+                    &item.id,
+                    DecideRequest {
+                        verdict: Verdict::Approve,
+                        text: None,
+                        option: None,
+                        plan_hash: Some(hash.clone()),
+                        by: "owner".to_owned(),
+                    },
+                )
+                .unwrap()
+        } else {
+            item
+        };
+        (item, hash)
+    }
+
+    fn lane_after_add(lane: Lane) -> Lane {
+        if lane == Lane::Auto {
+            Lane::Auto
+        } else {
+            Lane::NeedsDecision
+        }
+    }
+
+    fn hardening_store() -> (tempfile::TempDir, BoardStore, PathBuf, PathBuf) {
+        let (dir, store, state) = test_store();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        (dir, store, state, ws)
+    }
+
+    // TC-3803 / FR-3803: a bot cannot move a `needs_decision` item into `in_progress`
+    // (store and MCP refuse with exit 5 and a `board run` hint); approved and auto
+    // items and the owner are unaffected.
+    #[test]
+    fn tc_3803_move_into_in_progress_restricted() {
+        let _env = crate::state_path::test_env_lock();
+        let (_dir, store, state, ws) = hardening_store();
+        let (pending, _) = item_with_plan(&store, &state, &ws, Lane::NeedsDecision);
+
+        let err = store
+            .move_lane(&pending.id, Lane::InProgress, "bot:coord", None)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), crate::agent_api::exit::FORBIDDEN);
+        assert!(err.to_string().contains("board run"), "hint: {err}");
+        assert_eq!(store.get(&pending.id).unwrap(), pending);
+
+        let prev_state = std::env::var_os("DMUXAI_STATE_DIR");
+        unsafe { std::env::set_var("DMUXAI_STATE_DIR", &state) };
+        let mcp = crate::board::mcp_invoke(
+            &ws,
+            "board_move",
+            &serde_json::json!({ "id": pending.id, "lane": "in_progress" }),
+        );
+        unsafe {
+            match prev_state {
+                Some(v) => std::env::set_var("DMUXAI_STATE_DIR", v),
+                None => std::env::remove_var("DMUXAI_STATE_DIR"),
+            }
+        }
+        assert_eq!(mcp["ok"], false, "mcp: {mcp}");
+        assert_eq!(
+            mcp["exit_code"],
+            crate::agent_api::exit::FORBIDDEN,
+            "mcp: {mcp}"
+        );
+        assert_eq!(store.get(&pending.id).unwrap().lane, Lane::NeedsDecision);
+
+        let (approved, _) = item_with_plan(&store, &state, &ws, Lane::Approved);
+        let (auto, _) = item_with_plan(&store, &state, &ws, Lane::Auto);
+        assert_eq!(
+            store
+                .move_lane(&approved.id, Lane::InProgress, "bot:coord", None)
+                .unwrap()
+                .lane,
+            Lane::InProgress
+        );
+        assert_eq!(
+            store
+                .move_lane(&auto.id, Lane::InProgress, "bot:coord", None)
+                .unwrap()
+                .lane,
+            Lane::InProgress
+        );
+        assert_eq!(
+            store
+                .move_lane(&pending.id, Lane::InProgress, "owner", None)
+                .unwrap()
+                .lane,
+            Lane::InProgress
+        );
+    }
+
+    // TC-3806 / FR-3806: a run result moves the lane only while the item is still
+    // `in_progress` on the plan that ran; a rejected or re-planned item keeps its
+    // lane and plan and gets a `run` note with the exit code.
+    #[test]
+    fn tc_3806_run_result_respects_newer_state() {
+        let _env = crate::state_path::test_env_lock();
+        let (_dir, store, state, ws) = hardening_store();
+
+        // Success: still in_progress on the same plan -> done.
+        let (ok_item, ok_hash) = item_with_plan(&store, &state, &ws, Lane::Approved);
+        store
+            .move_lane(&ok_item.id, Lane::InProgress, "bot:coord", None)
+            .unwrap();
+        let done = store
+            .record_run_result(
+                &ok_item.id,
+                Some("0123456789abcdef"),
+                0,
+                None,
+                "bot:coord",
+                &ok_hash,
+            )
+            .unwrap();
+        assert_eq!(done.lane, Lane::Done);
+
+        // Rejected while running -> lane stays rejected.
+        let (rejected, hash) = item_with_plan(&store, &state, &ws, Lane::Approved);
+        store
+            .move_lane(&rejected.id, Lane::InProgress, "bot:coord", None)
+            .unwrap();
+        store
+            .decide_without_notify(
+                &rejected.id,
+                DecideRequest {
+                    verdict: Verdict::Reject,
+                    text: None,
+                    option: None,
+                    plan_hash: None,
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let after = store
+            .record_run_result(
+                &rejected.id,
+                Some("1111111111111111"),
+                0,
+                None,
+                "bot:coord",
+                &hash,
+            )
+            .unwrap();
+        assert_eq!(after.lane, Lane::Rejected);
+        assert_eq!(after.plan.as_ref().unwrap().hash, hash);
+        let note = after.thread.last().unwrap();
+        assert_eq!(note.from, "run");
+        assert!(note.text.contains("exit 0"), "note: {}", note.text);
+        assert!(note.text.contains("not applied"), "note: {}", note.text);
+
+        // Re-planned while running (no live run lock) -> new plan and lane are kept.
+        let (replanned, old_hash) = item_with_plan(&store, &state, &ws, Lane::Approved);
+        store
+            .move_lane(&replanned.id, Lane::InProgress, "bot:coord", None)
+            .unwrap();
+        let (_, new_hash) = crate::board::edit_plan_from_json(
+            &ws,
+            &state,
+            "ship v2",
+            &HARDENING_PLAN_JSON.replace("\"j\"", "\"j2\""),
+            None,
+        )
+        .unwrap();
+        store
+            .attach_plan(&replanned.id, &new_hash, &state, "bot:coord")
+            .unwrap();
+        let after = store
+            .record_run_result(&replanned.id, None, 3, Some("boom"), "bot:coord", &old_hash)
+            .unwrap();
+        assert_eq!(after.lane, Lane::NeedsDecision);
+        assert_eq!(after.plan.as_ref().unwrap().hash, new_hash);
+        let note = &after.thread.last().unwrap().text;
+        assert!(
+            note.contains("exit 3") && note.contains("not applied"),
+            "note: {note}"
+        );
+
+        // Failure on the same plan still moves to unknown.
+        let (failed, failed_hash) = item_with_plan(&store, &state, &ws, Lane::Auto);
+        store
+            .move_lane(&failed.id, Lane::InProgress, "bot:coord", None)
+            .unwrap();
+        let after = store
+            .record_run_result(&failed.id, None, 2, Some("err"), "bot:coord", &failed_hash)
+            .unwrap();
+        assert_eq!(after.lane, Lane::Unknown);
+    }
+
+    // TC-3807 / FR-3807: while a live run holds an `in_progress` item, plan attach,
+    // plan edit and `ask --revise` are refused with conflict; after the run ends they
+    // work again. The HTTP `POST /plan` path is covered in `src/web/board_api.rs`.
+    #[test]
+    fn tc_3807_plan_change_refused_while_running() {
+        let _env = crate::state_path::test_env_lock();
+        let (_dir, store, state, ws) = hardening_store();
+        let (item, hash) = item_with_plan(&store, &state, &ws, Lane::Approved);
+        let prepared = crate::board::runner::run_item_prepare(
+            &store,
+            crate::board::runner::RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(hash.clone()),
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        let (_, new_hash) = crate::board::edit_plan_from_json(
+            &ws,
+            &state,
+            "ship v2",
+            &HARDENING_PLAN_JSON.replace("\"j\"", "\"j2\""),
+            None,
+        )
+        .unwrap();
+
+        let attach = store
+            .attach_plan(&item.id, &new_hash, &state, "bot:coord")
+            .unwrap_err();
+        assert_eq!(attach.exit_code(), crate::agent_api::exit::CONFLICT);
+        let edit = store
+            .edit_plan(&item.id, &new_hash, &ws, &state, "bot:coord")
+            .unwrap_err();
+        assert_eq!(edit.exit_code(), crate::agent_api::exit::CONFLICT);
+        let revise = crate::board::runner::ask_item_prepare(
+            &store,
+            crate::board::runner::AskParams {
+                id: item.id.clone(),
+                text: "change it".to_owned(),
+                revise: true,
+                agent: None,
+                model: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .err()
+        .expect("revise must be refused while running");
+        assert_eq!(revise.exit_code(), crate::agent_api::exit::CONFLICT);
+        let current = store.get(&item.id).unwrap();
+        assert_eq!(current.lane, Lane::InProgress);
+        assert_eq!(current.plan.as_ref().unwrap().hash, hash);
+
+        drop(prepared);
+        let reattached = store
+            .attach_plan(&item.id, &new_hash, &state, "bot:coord")
+            .unwrap();
+        assert_eq!(reattached.plan.as_ref().unwrap().hash, new_hash);
     }
 }

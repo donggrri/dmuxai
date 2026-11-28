@@ -162,6 +162,7 @@ function boardRenderMyDecisions(container, items) {
       boardAgeMs(item.updated_ms)
     ].filter(Boolean).join(' · ');
     card.appendChild(boardEl('div', 'board-decision-meta', meta));
+    boardAppendPlanningStatus(card, item, 'board-decision-planning');
     if (item.recommendation) {
       card.appendChild(boardEl('div', 'board-decision-recommendation', item.recommendation));
     }
@@ -248,6 +249,103 @@ function boardRenderMyDecisions(container, items) {
   }
 }
 
+/* SPEC-board-intake FR-3862, FR-3865: planning status and fallback warning. */
+function boardPlanningLabel(item) {
+  var planning = item && item.planning;
+  if (!planning) { return null; }
+  if (planning.state === 'planning') {
+    return { cls: 'board-planning', text: 'Planning\u2026' };
+  }
+  if (planning.state === 'failed') {
+    return { cls: 'board-planning-failed', text: 'Planning failed' + (planning.error ? ': ' + planning.error : '') };
+  }
+  if (planning.warning && item.plan) {
+    return { cls: 'board-planning-warning', text: planning.warning };
+  }
+  return null;
+}
+
+function boardAppendPlanningStatus(container, item, baseClass) {
+  var label = boardPlanningLabel(item);
+  if (!label) { return; }
+  var node = boardEl('div', baseClass + ' ' + label.cls, label.text);
+  node.setAttribute('role', 'status');
+  container.appendChild(node);
+}
+
+function boardSyncNewTask() {
+  var btn = document.getElementById('board-new-task');
+  var form = document.getElementById('board-new-task-form');
+  if (btn) { btn.hidden = !boardLaunchAllowed; }
+  if (form && !boardLaunchAllowed) {
+    form.hidden = true;
+    if (btn) { btn.setAttribute('aria-expanded', 'false'); }
+  }
+}
+
+function boardToggleNewTask(open) {
+  var btn = document.getElementById('board-new-task');
+  var form = document.getElementById('board-new-task-form');
+  if (!form) { return; }
+  var show = open && boardLaunchAllowed;
+  form.hidden = !show;
+  if (btn) { btn.setAttribute('aria-expanded', show ? 'true' : 'false'); }
+  if (!show) { return; }
+  var ws = document.getElementById('board-new-workspace');
+  if (ws && !ws.value && typeof window.dmuxaiCurrentWorkspace === 'function') {
+    ws.value = window.dmuxaiCurrentWorkspace();
+  }
+  var title = document.getElementById('board-new-title');
+  if (title) { title.focus(); }
+}
+
+function boardSubmitNewTask(ev) {
+  if (ev) { ev.preventDefault(); }
+  if (!boardLaunchAllowed) { return; }
+  var title = document.getElementById('board-new-title');
+  var kind = document.getElementById('board-new-kind');
+  var ws = document.getElementById('board-new-workspace');
+  var prompt = document.getElementById('board-new-prompt');
+  var errEl = document.getElementById('board-new-error');
+  var submit = document.getElementById('board-new-submit');
+  var body = {
+    title: title ? title.value.trim() : '',
+    kind: kind ? kind.value : 'feature',
+    workspace: ws ? ws.value.trim() : '',
+    prompt: prompt ? prompt.value : ''
+  };
+  if (!body.title || !body.workspace || !body.prompt.trim()) {
+    if (errEl) {
+      errEl.textContent = 'Title, workspace and prompt are required';
+      errEl.hidden = false;
+    }
+    return;
+  }
+  if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+  if (submit) { submit.disabled = true; }
+  boardFetchJson('POST', '/api/board', body, true).then(function (item) {
+    if (submit) { submit.disabled = false; }
+    if (title) { title.value = ''; }
+    if (prompt) { prompt.value = ''; }
+    boardToggleNewTask(false);
+    if (item && item.id) {
+      var replaced = false;
+      for (var i = 0; i < boardItems.length; i++) {
+        if (boardItems[i].id === item.id) { boardItems[i] = item; replaced = true; }
+      }
+      if (!replaced) { boardItems.unshift(item); }
+      boardRenderList();
+    }
+    boardRefreshList().catch(function () { /* ignore */ });
+  }).catch(function (err) {
+    if (submit) { submit.disabled = false; }
+    if (errEl) {
+      errEl.textContent = err && err.message ? err.message : 'Could not create the task';
+      errEl.hidden = false;
+    }
+  });
+}
+
 function boardRenderKanban(root, items) {
   var kanban = root.querySelector('#board-kanban');
   if (!kanban) { return; }
@@ -266,6 +364,7 @@ function boardRenderKanban(root, items) {
       card.appendChild(boardEl('div', 'board-card-title', item.title));
       var sub = boardBasename(item.workspace && item.workspace.path) + ' · ' + item.kind;
       card.appendChild(boardEl('div', 'board-card-meta board-decision-meta', sub));
+      boardAppendPlanningStatus(card, item, 'board-card-planning');
       var menu = document.createElement('select');
       menu.className = 'board-card-menu';
       menu.setAttribute('aria-label', 'Move lane');
@@ -317,6 +416,7 @@ function boardRefreshList() {
     if (data && typeof data.launch_allowed === 'boolean') {
       boardLaunchAllowed = data.launch_allowed;
     }
+    boardSyncNewTask();
     boardItems = data && data.items ? data.items : [];
     boardRenderList();
     if (boardSelectedId) {
@@ -586,6 +686,7 @@ function boardRenderDrawer(item) {
   drawer.appendChild(header);
   var summaryEl = boardEl('p', 'board-drawer-summary', item.summary || '');
   drawer.appendChild(summaryEl);
+  boardAppendPlanningStatus(drawer, item, 'board-drawer-planning');
   if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
     window.dmuxaiLinkifyMdPaths(summaryEl);
   }
@@ -1086,6 +1187,18 @@ function boardBindToolbar() {
     saveRules.addEventListener('click', function () {
       boardSaveRules(rulesPanel);
     });
+  }
+  var newTask = document.getElementById('board-new-task');
+  var newForm = document.getElementById('board-new-task-form');
+  if (newTask && newForm) {
+    newTask.addEventListener('click', function () {
+      boardToggleNewTask(newForm.hidden);
+    });
+    newForm.addEventListener('submit', boardSubmitNewTask);
+    var cancel = document.getElementById('board-new-cancel');
+    if (cancel) {
+      cancel.addEventListener('click', function () { boardToggleNewTask(false); });
+    }
   }
 }
 

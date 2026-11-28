@@ -19,7 +19,9 @@ use crate::term::backend::{Backend, now_ms};
 use crate::term::buffer::RingBuffer;
 use crate::term::client::socket_path;
 use crate::term::journal::{TERM_IO_COALESCE_MAX_DELAY_MS, TermJournal};
-use crate::term::policy::{ApprovalGate, Decision, Policy, RUN_ID_ENV, approve_with_run_guard};
+use crate::term::policy::{
+    ApprovalGate, Decision, Policy, RUN_ID_ENV, approve_with_run_guard, ensure_run_input_allowed,
+};
 use crate::term::proto::{PROTOCOL_VERSION, RequestOp, Response, read_request, write_response};
 use crate::term::wait::{
     MARKER_PREFIX, WaitOptions, WaitReason, WaitResult, exec_output_text, marker_command,
@@ -46,7 +48,22 @@ struct Session {
     journal_error: Option<String>,
 }
 
+/// The `DMUXAI_RUN_ID` a session was opened with (FR-3805); kept by reopen
+/// because it is part of the spec.
+fn spec_run_id(spec: &SessionSpec) -> Option<&str> {
+    spec.env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == RUN_ID_ENV)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+}
+
 impl Session {
+    fn ensure_run_input_allowed(&self, caller_run_id: Option<&str>) -> Result<(), TermError> {
+        ensure_run_input_allowed(&self.spec.name, spec_run_id(&self.spec), caller_run_id)
+    }
+
     fn refresh(&mut self) {
         if self.state != SessionState::Open {
             return;
@@ -373,6 +390,7 @@ impl Shared {
                 text,
                 newline,
                 secret,
+                run_id,
             } => {
                 let size = text.len() + usize::from(newline);
                 ensure_input_within_limit(size)?;
@@ -385,6 +403,7 @@ impl Shared {
                     return Err(TermError::conflict(format!("session '{name}' is not open")));
                 }
                 ensure_input_allowed(&name, session.takeover)?;
+                session.ensure_run_input_allowed(run_id.as_deref())?;
                 self.ensure_policy_allows(&name, &text)?;
                 let mut data = text.into_bytes();
                 if newline {
@@ -393,7 +412,7 @@ impl Shared {
                 let seq = session.backend.send(&data, secret)?;
                 Ok(Response::ok(json!({"seq": seq})))
             }
-            RequestOp::SendKeys { name, keys } => {
+            RequestOp::SendKeys { name, keys, run_id } => {
                 let data = parse_key_list(&keys)?;
                 let handle = self.session(&name)?;
                 let mut session = handle
@@ -404,6 +423,7 @@ impl Shared {
                     return Err(TermError::conflict(format!("session '{name}' is not open")));
                 }
                 ensure_input_allowed(&name, session.takeover)?;
+                session.ensure_run_input_allowed(run_id.as_deref())?;
                 let seq = session.backend.send(&data, false)?;
                 Ok(Response::ok(json!({"seq": seq})))
             }
@@ -465,7 +485,8 @@ impl Shared {
                 name,
                 command,
                 timeout_ms,
-            } => self.exec(name, command, timeout_ms),
+                run_id,
+            } => self.exec(name, command, timeout_ms, run_id.as_deref()),
             RequestOp::List => {
                 self.refresh_sessions();
                 let sessions: Vec<Value> = self
@@ -668,6 +689,7 @@ impl Shared {
         name: String,
         command: String,
         timeout_ms: Option<u64>,
+        caller_run_id: Option<&str>,
     ) -> Result<Response, TermError> {
         let started = Instant::now();
         let timeout = timeout_ms
@@ -683,6 +705,7 @@ impl Shared {
                 return Err(TermError::conflict(format!("session '{name}' is not open")));
             }
             ensure_input_allowed(&name, session.takeover)?;
+            session.ensure_run_input_allowed(caller_run_id)?;
             self.ensure_policy_allows(&name, &command)?;
             let since = session.backend.seq();
             match session.spec.kind {

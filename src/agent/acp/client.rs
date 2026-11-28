@@ -18,7 +18,7 @@ use crate::agent::{
     Agent, AgentError, AgentErrorKind, AgentEvent, AgentOutput, OutputContext, TurnPolicy,
     classify_login_failure,
 };
-use dmuxai::process::{apply_child_cwd_tokio, apply_child_env_policy};
+use dmuxai::process::{apply_child_cwd_tokio, apply_child_env_policy, apply_run_id_env};
 
 use super::debug::acp_trace;
 use super::permissions::{PermissionContext, choose_permission_option, permission_option_denies};
@@ -103,6 +103,27 @@ fn is_response_to(value: &Value, id: u64) -> bool {
     value.get("id").and_then(Value::as_u64) == Some(id) && value.get("method").is_none()
 }
 
+fn acp_command(program: &Path, args: &[String], cwd: &Path) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    apply_child_cwd_tokio(&mut command, cwd);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    apply_child_env_policy(command.as_std_mut());
+    apply_run_id_env(command.as_std_mut());
+
+    #[cfg(unix)]
+    {
+        dmuxai::process::supervisor::configure_child(
+            &mut command,
+            &dmuxai::process::supervisor::ChildOptions::default(),
+        );
+    }
+    command
+}
+
 /// Run one ACP turn: spawn `program` with `args`, drive protocol, emit events.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_acp_turn(
@@ -117,23 +138,7 @@ pub async fn run_acp_turn(
     context: &OutputContext,
     config: AcpTurnConfig,
 ) -> io::Result<AcpRunOutcome> {
-    let mut command = Command::new(program);
-    command.args(args);
-    apply_child_cwd_tokio(&mut command, cwd);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    command.kill_on_drop(true);
-    apply_child_env_policy(command.as_std_mut());
-
-    #[cfg(unix)]
-    {
-        dmuxai::process::supervisor::configure_child(
-            &mut command,
-            &dmuxai::process::supervisor::ChildOptions::default(),
-        );
-    }
-
+    let mut command = acp_command(program, args, cwd);
     let mut child = command.spawn()?;
     let child_pid = child.id();
     #[cfg(unix)]
@@ -1044,5 +1049,38 @@ mod tests {
         assert!(super::is_response_to(&response, 3));
         assert!(!super::is_response_to(&request, 3));
         assert!(!super::is_response_to(&response, 4));
+    }
+
+    // TC-3804 / FR-3804: the ACP agent child carries the parent's DMUXAI_RUN_ID,
+    // or a fresh one when the parent has none.
+    #[test]
+    fn tc_3804_run_id_on_acp_child() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let run_id_env = dmuxai::term::policy::RUN_ID_ENV;
+        let child_run_id = |command: &super::Command| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == run_id_env)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let previous = std::env::var_os(run_id_env);
+        let cwd = std::env::temp_dir();
+        unsafe { std::env::set_var(run_id_env, "0123456789abcdef") };
+        let inherited = super::acp_command(std::path::Path::new("agent"), &[], &cwd);
+        unsafe { std::env::remove_var(run_id_env) };
+        let fresh = super::acp_command(std::path::Path::new("agent"), &[], &cwd);
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(run_id_env, value),
+                None => std::env::remove_var(run_id_env),
+            }
+        }
+        assert_eq!(
+            child_run_id(&inherited).as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert!(child_run_id(&fresh).is_some_and(|value| !value.is_empty()));
     }
 }

@@ -2116,6 +2116,10 @@ function syncCenterViewsWithSnapshot(snap) {
 
 // Hooks for the inline chat rows (session.js, FR-1217..FR-1221).
 window.dmuxaiServerNow = function () { return graphServerNow(snapshot, Date.now()); };
+// Board "New task" form default workspace (SPEC-board-intake FR-3865).
+window.dmuxaiCurrentWorkspace = function () {
+  return snapshot && snapshot.workspace ? String(snapshot.workspace) : '';
+};
 
 window.dmuxaiFocusGraphNode = function (id) {
   setCenterView('graph', { focus: false });

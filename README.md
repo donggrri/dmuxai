@@ -148,6 +148,16 @@ workspaces (cards needing your decision, items to check, and kanban lanes).
 Click any card to open its detail popup with the plan steps, decision history,
 and side chat.
 
+To add a task in one call, give the board the prompt and let it plan:
+`dmuxai board add -C <repo> --title "…" --kind feature --prompt - --json`
+(prompt on stdin, `--detach` to return immediately; MCP `board_add` with
+`prompt`). The board runs `dmuxai run --graph --plan-only` in that workspace and
+attaches the plan; the card shows `Planning…` until it arrives. In
+`dmuxai --web` the **New task** button opens the same form (title, kind,
+workspace, prompt); it is hidden in view-only `dmuxai serve`. When the planner
+was unavailable, the attached fallback plan is marked
+`planner unavailable — fallback plan`.
+
 In `dmuxai --web`, pressing **Send** (or Ctrl/Cmd+Enter) in the item chat posts
 your message and asks the planner read-only, posting the answer in the thread
 (or use **Ask & revise plan** to generate a revised plan). Check **Note only

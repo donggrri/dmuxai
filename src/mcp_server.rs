@@ -22,6 +22,7 @@ pub struct RunArgs {
     pub graph: bool,
     pub todo_id: Option<String>,
     pub no_spec_first: bool,
+    pub plan_only: bool,
 }
 
 /// Operations behind the MCP tools. Each returns a JSON value that becomes
@@ -90,6 +91,10 @@ fn tool_definitions() -> Value {
                         "type": "boolean",
                         "description": "Disable spec-first workflow for this run (same as dmuxai run --no-spec-first)"
                     },
+                    "plan_only": {
+                        "type": "boolean",
+                        "description": "Always plan and stop at the approval gate with exit 7 and plan_hash, never execute (same as dmuxai run --graph --plan-only); requires graph"
+                    },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
                 }
             }
@@ -138,7 +143,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "board_add",
-            "description": "Add an item to the user-level coordinator decision board.",
+            "description": "Add an item to the user-level coordinator decision board. With prompt, dmuxai plans it in the item's workspace (detached run --graph --plan-only) and attaches the plan; the item shows planning.state until then.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -154,6 +159,7 @@ fn tool_definitions() -> Value {
                     "recommendation": { "type": "string" },
                     "options": { "type": "array", "items": { "type": "string" } },
                     "plan_hash": { "type": "string" },
+                    "prompt": { "type": "string", "description": "Task prompt to plan; cannot be used with plan_hash" },
                     "key": { "type": "string" },
                     "by": { "type": "string" }
                 },
@@ -391,9 +397,30 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                     .get("no_spec_first")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                plan_only: args
+                    .get("plan_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             };
             if run.todo_id.is_none() && run.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
                 return Err("prompt or todo_id is required".to_owned());
+            }
+            // SPEC-board-intake FR-3866: plan_only never executes or approves.
+            if run.plan_only {
+                if run.approve_plan || run.approve_plan_id.is_some() {
+                    return Err(
+                        "plan_only cannot be used with approve_plan or approve_plan_id".to_owned(),
+                    );
+                }
+                if run.agent.is_some() {
+                    return Err("plan_only cannot be used with agent".to_owned());
+                }
+                if run.todo_id.is_some() {
+                    return Err("plan_only cannot be used with todo_id".to_owned());
+                }
+                if !run.graph {
+                    return Err("plan_only requires graph".to_owned());
+                }
             }
             if run.graph && run.agent.is_some() {
                 return Err("use either agent or graph, not both".to_owned());
@@ -643,6 +670,7 @@ mod tests {
                     "recommendation",
                     "options",
                     "plan_hash",
+                    "prompt",
                     "key",
                     "by",
                 ],
@@ -898,6 +926,7 @@ mod tests {
                     graph: false,
                     todo_id: None,
                     no_spec_first: false,
+                    plan_only: false,
                 }
             );
         }

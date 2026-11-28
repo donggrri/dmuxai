@@ -26,6 +26,9 @@ pub mod supervisor;
 /// - `DMUXAI_TRUST_WORKSPACE_CONFIG`: Process-scoped workspace trust opt-in flag.
 ///   Child processes must not inherit this opt-in to maintain isolation and
 ///   ensure child runs evaluate trust independently per workspace.
+/// - `DMUXAI_BOARD_LAUNCH_TOKEN`: One-time secret handed only to the detached
+///   `board run --exec-prepared` child (SPEC-board-approval-hardening
+///   FR-3800). Agent children must never see it.
 ///
 /// **Preserved (needed by child processes or user preferences):**
 /// - `DMUXAI_STATE_DIR`: Root directory for DmuxAI state. Preserved so that
@@ -50,6 +53,7 @@ pub const INTERNAL_ENV_VARS: &[&str] = &[
     "DMUXAI_MCP_CONFIG",
     "DMUXAI_CONFIG",
     "DMUXAI_TRUST_WORKSPACE_CONFIG",
+    "DMUXAI_BOARD_LAUNCH_TOKEN",
 ];
 
 /// Applies the child process environment policy to a standard process command.
@@ -119,16 +123,25 @@ fn resolve_program_value(
         .unwrap_or_else(|| PathBuf::from(default_name))
 }
 
+/// The parent's `DMUXAI_RUN_ID`, when set and non-empty.
+pub fn current_run_id() -> Option<String> {
+    std::env::var(crate::term::policy::RUN_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Sets `DMUXAI_RUN_ID` on an agent child: the parent's run id when set,
+/// otherwise a fresh one (SPEC-board-approval-hardening FR-3804).
+pub fn apply_run_id_env(cmd: &mut std::process::Command) {
+    let run_id = current_run_id().unwrap_or_else(crate::run_journal::generate_run_id);
+    cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
+}
+
 /// Creates a headless Tokio process command for the current OS.
 pub fn headless_command(program: PathBuf) -> Command {
     let mut command = Command::new(program);
     apply_child_env_policy_tokio(&mut command);
-    if std::env::var_os(crate::term::policy::RUN_ID_ENV).is_none_or(|v| v.is_empty()) {
-        command.env(
-            crate::term::policy::RUN_ID_ENV,
-            crate::run_journal::generate_run_id(),
-        );
-    }
+    apply_run_id_env(command.as_std_mut());
     command
 }
 
