@@ -436,9 +436,8 @@ pub(crate) async fn list_runs(
     let Some(loc) = lookup_repo_key(&repo_key) else {
         return error_json(StatusCode::NOT_FOUND, "project not found");
     };
-    let limit = match parse_runs_limit(params.limit.as_deref()) {
-        Ok(limit) => limit,
-        Err(()) => return error_json(StatusCode::BAD_REQUEST, "invalid limit"),
+    let Some(limit) = parse_runs_limit(params.limit.as_deref()) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid limit");
     };
     let Some(runs_dir) = loc.runs_dir else {
         return json_ok(StatusCode::OK, &serde_json::json!({ "runs": [] }));

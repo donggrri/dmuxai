@@ -8,6 +8,7 @@ pub mod runner;
 mod store;
 
 pub use mcp::invoke as mcp_invoke;
+pub use notify::{notify_spec_review_requested, notify_spec_review_requested_in};
 
 pub use plan::{
     PendingPlanFile, board_plan_copy_path, edit_plan_from_json, edit_plan_from_json_keep_cap,
@@ -16,8 +17,8 @@ pub use plan::{
 };
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{
-    AddItemRequest, BoardStore, DecideRequest, ListFilter, PendingItem, PendingList, SayRequest,
-    UpdateItemRequest, WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
+    AddItemRequest, BoardStore, DecideRequest, EventDetail, ListFilter, PendingItem, PendingList,
+    SayRequest, UpdateItemRequest, WaitEvent, WaitEventAny, WaitFilter, WaitFor, WaitOutcome,
 };
 
 /// Who is invoking a board write (FR-3108 owner identity).
@@ -31,6 +32,10 @@ pub enum BoardCaller {
 
 use crate::agent_api::exit;
 use serde::{Deserialize, Serialize};
+
+/// Board item id the board sets on its `run` child (FR-3852). Internal: agent
+/// children of that run never inherit it (`process::INTERNAL_ENV_VARS`).
+pub const BOARD_ITEM_ID_ENV: &str = "DMUXAI_BOARD_ITEM_ID";
 
 pub const ITEM_ID_LEN: usize = 12;
 pub const TITLE_MAX: usize = 200;
@@ -291,6 +296,9 @@ pub struct BoardItem {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec_review: Option<BoardSpecReview>,
+    /// Plan revision already announced as `awaiting_approval` (FR-3851).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_approval_revision: Option<u32>,
     pub created_ms: u64,
     pub updated_ms: u64,
     pub version: u32,
@@ -732,6 +740,7 @@ mod tests {
             run_ids: vec![],
             key: None,
             spec_review: None,
+            awaiting_approval_revision: None,
             created_ms: 0,
             updated_ms: 0,
             version: 1,

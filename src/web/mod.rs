@@ -23,7 +23,7 @@ mod peer_connect;
 pub mod reuse;
 pub mod runs_api;
 mod server;
-mod snapshot;
+pub(crate) mod snapshot;
 
 pub use access::{WebAccess, build_allowed_hosts, effective_server_uid};
 pub use auth::{

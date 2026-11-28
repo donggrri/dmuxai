@@ -129,8 +129,16 @@ pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] = &[
     "decision",
     "message",
     "run_finished",
-    "spec_review",
+    "run_started",
+    "awaiting_approval",
+    "spec_review_requested",
+    SPEC_REVIEW_NOTIFY_ALIAS,
 ];
+
+/// Former name of the pending spec review notification (SPEC-spec-review-gate
+/// FR-3711); still accepted in `[board] notify_events` and allows
+/// `spec_review_requested` (SPEC-coordinator-observability FR-3852).
+pub const SPEC_REVIEW_NOTIFY_ALIAS: &str = "spec_review";
 
 /// Placeholder for unknown `[board]` TOML keys so `BoardSettings` keeps `Eq`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -330,9 +338,11 @@ impl BoardSettings {
     }
 
     pub fn allows_event(&self, event: &str) -> bool {
-        self.notify_events
-            .as_ref()
-            .is_none_or(|allowed| allowed.iter().any(|e| e == event))
+        self.notify_events.as_ref().is_none_or(|allowed| {
+            allowed.iter().any(|e| {
+                e == event || (event == "spec_review_requested" && e == SPEC_REVIEW_NOTIFY_ALIAS)
+            })
+        })
     }
 
     pub fn load_user_only() -> Self {
@@ -7504,6 +7514,58 @@ notify_webhook_url = "ftp://bad"
         let ws_ignored =
             DmuxSettings::load_with_user_config(&ws, Some(&dir.path().join("missing.toml")));
         assert!(ws_ignored.board.auto_run_on_approve);
+    }
+
+    // TC-3853 / FR-3853: `[board] notify_events` accepts the coordinator
+    // observability names, unset delivers every event, unknown names warn.
+    #[test]
+    fn tc_3853_notify_events_new_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_cfg = dir.path().join("dmuxai.toml");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            &user_cfg,
+            "[board]\nnotify_command = [\"true\"]\nnotify_events = [\"run_started\", \"awaiting_approval\", \"spec_review_requested\"]\n",
+        )
+        .unwrap();
+        let settings = DmuxSettings::load_with_user_config(&ws, Some(&user_cfg));
+        assert!(
+            !settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("notify_events")),
+            "warnings: {:?}",
+            settings.config_warnings
+        );
+        for name in ["run_started", "awaiting_approval", "spec_review_requested"] {
+            assert!(settings.board.allows_event(name), "{name} must be allowed");
+        }
+        assert!(!settings.board.allows_event("needs_decision"));
+
+        let unset = BoardSettings::default();
+        for name in VALID_BOARD_NOTIFY_EVENTS {
+            assert!(unset.allows_event(name), "unset must allow {name}");
+        }
+
+        let unknown = BoardSettings {
+            notify_events: Some(vec!["run_started".to_owned(), "run_paused".to_owned()]),
+            ..BoardSettings::default()
+        };
+        let warnings = unknown.validate();
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("'run_paused'"));
+        assert!(warnings[0].contains("spec_review_requested"));
+
+        // The former pending-review name stays valid and selects the single
+        // `spec_review_requested` notification.
+        let legacy = BoardSettings {
+            notify_events: Some(vec![SPEC_REVIEW_NOTIFY_ALIAS.to_owned()]),
+            ..BoardSettings::default()
+        };
+        assert!(legacy.validate().is_empty());
+        assert!(legacy.allows_event("spec_review_requested"));
+        assert!(!legacy.allows_event("run_started"));
     }
 
     // TC-3202 / FR-3202

@@ -44,6 +44,10 @@ fn load_attached_plan(
     Ok((pending, hash.to_owned()))
 }
 
+/// Thread `from` and event `by` of spec review requests (FR-3852).
+pub const SPEC_REVIEW_ACTOR: &str = "spec_review";
+const SPEC_REVIEW_ID_MAX: usize = 128;
+
 #[derive(Debug, Clone)]
 pub struct AddItemRequest {
     pub title: String,
@@ -120,6 +124,8 @@ pub struct WaitEvent {
     pub kind: String,
     pub by: String,
     pub version: u32,
+    #[serde(flatten)]
+    pub detail: EventDetail,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,6 +135,22 @@ pub struct WaitEventAny {
     pub kind: String,
     pub by: String,
     pub version: u32,
+    #[serde(flatten)]
+    pub detail: EventDetail,
+}
+
+/// Optional fields of coordinator observability events
+/// (SPEC-coordinator-observability FR-3850..FR-3852).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_revision: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +196,40 @@ enum EventKind {
     Decision,
     Message,
     Checked,
+    RunStarted,
+    AwaitingApproval,
+    SpecReviewRequested,
+}
+
+impl EventKind {
+    /// Coordinator observability kinds wake `wait --for any` whoever wrote
+    /// them (FR-3854); the waiter's own writes are still ignored.
+    fn is_observability(&self) -> bool {
+        matches!(
+            self,
+            EventKind::RunStarted | EventKind::AwaitingApproval | EventKind::SpecReviewRequested
+        )
+    }
+
+    fn matches_wait(&self, wait_for: WaitFor) -> bool {
+        match wait_for {
+            WaitFor::Decision => matches!(self, EventKind::Decision),
+            WaitFor::Message => matches!(self, EventKind::Message),
+            WaitFor::Any => {
+                matches!(
+                    self,
+                    EventKind::Decision | EventKind::Message | EventKind::Plan | EventKind::Lane
+                ) || self.is_observability()
+            }
+        }
+    }
+
+    fn as_str(&self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +240,15 @@ struct BoardEvent {
     version: u32,
     at_ms: u64,
     by: String,
+    #[serde(flatten)]
+    detail: EventDetail,
+}
+
+/// Only `seq` of an event line, so lines with kinds or fields this binary
+/// does not know still count when allocating the next `seq`.
+#[derive(Deserialize)]
+struct EventSeq {
+    seq: u64,
 }
 
 pub struct BoardStore {
@@ -345,7 +410,7 @@ impl BoardStore {
                 .map_err(|e| BoardError::Internal(e.to_string()))?;
         }
         for line in scan_text.lines() {
-            if let Ok(event) = serde_json::from_str::<BoardEvent>(line) {
+            if let Ok(event) = serde_json::from_str::<EventSeq>(line) {
                 last = last.max(event.seq);
             }
         }
@@ -359,6 +424,17 @@ impl BoardStore {
         version: u32,
         by: &str,
     ) -> Result<(), BoardError> {
+        self.append_event_detail(item_id, kind, version, by, EventDetail::default())
+    }
+
+    fn append_event_detail(
+        &self,
+        item_id: &str,
+        kind: EventKind,
+        version: u32,
+        by: &str,
+        detail: EventDetail,
+    ) -> Result<(), BoardError> {
         let seq = self.read_last_seq()? + 1;
         let event = BoardEvent {
             seq,
@@ -367,6 +443,7 @@ impl BoardStore {
             version,
             at_ms: now_ms(),
             by: by.to_owned(),
+            detail,
         };
         let line =
             serde_json::to_string(&event).map_err(|e| BoardError::Internal(e.to_string()))?;
@@ -423,11 +500,11 @@ impl BoardStore {
                 "plan hash must be 16 lowercase hex characters".to_owned(),
             ));
         }
-        let (item, notify_needs_decision) = self.with_lock(|store| {
+        let (item, notify_needs_decision, awaiting) = self.with_lock(|store| {
             if let Some(key) = &req.key
                 && let Some(existing) = store.find_item_by_key(key, req.source_bot.as_deref())?
             {
-                return Ok((existing, false));
+                return Ok((existing, false, None));
             }
             let rules = RulesStore::new(&store.base).load();
             let lane = if let Some(lane) = req.lane {
@@ -468,6 +545,7 @@ impl BoardStore {
                 run_ids: Vec::new(),
                 key: req.key.clone(),
                 spec_review: None,
+                awaiting_approval_revision: None,
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
                 version: 1,
@@ -479,16 +557,68 @@ impl BoardStore {
                 item.plan = Some(board_plan_from_pending(pending, hash, None));
                 store.clear_decision_on_plan_change(&mut item);
             }
+            let awaiting = mark_awaiting_approval(&mut item, None, None);
             mask_item_fields(&mut item);
             store.save_item_inner(&item)?;
             store.append_event(&item.id, EventKind::Created, item.version, &req.by)?;
+            store.append_awaiting_approval(&item, &req.by, awaiting.as_ref())?;
             let notify = item.lane == Lane::NeedsDecision;
-            Ok((item, notify))
+            Ok((item, notify, awaiting))
         })?;
-        if notify_needs_decision {
-            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", &req.by);
-        }
+        self.dispatch_lane_events(&item, &req.by, notify_needs_decision, awaiting.as_ref());
         Ok(item)
+    }
+
+    fn append_awaiting_approval(
+        &self,
+        item: &BoardItem,
+        by: &str,
+        awaiting: Option<&EventDetail>,
+    ) -> Result<(), BoardError> {
+        match awaiting {
+            Some(detail) => self.append_event_detail(
+                &item.id,
+                EventKind::AwaitingApproval,
+                item.version,
+                by,
+                detail.clone(),
+            ),
+            None => Ok(()),
+        }
+    }
+
+    /// Dispatch `needs_decision` and `awaiting_approval` notifications after
+    /// the write, reading `[board]` once (FR-3135, FR-3851).
+    fn dispatch_lane_events(
+        &self,
+        item: &BoardItem,
+        by: &str,
+        needs_decision: bool,
+        awaiting: Option<&EventDetail>,
+    ) {
+        if !needs_decision && awaiting.is_none() {
+            return;
+        }
+        let settings = crate::settings::BoardSettings::load_user_only();
+        if needs_decision {
+            super::notify::dispatch_board_event_with_settings(
+                &self.base,
+                item,
+                "needs_decision",
+                by,
+                &settings,
+            );
+        }
+        if let Some(detail) = awaiting {
+            super::notify::dispatch_board_event_detail_with_settings(
+                &self.base,
+                item,
+                "awaiting_approval",
+                by,
+                detail,
+                &settings,
+            );
+        }
     }
 
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<BoardItem>, BoardError> {
@@ -696,7 +826,7 @@ impl BoardStore {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
         }
         enforce_sensitive_lane_move(by, lane)?;
-        let (item, notify_needs_decision) = self.with_lock(|store| {
+        let (item, notify_needs_decision, awaiting) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             if let Some(expected) = if_version
                 && item.version != expected
@@ -708,20 +838,21 @@ impl BoardStore {
             }
             enforce_in_progress_move(by, lane, &item)?;
             let prev_lane = item.lane;
+            let prev_revision = item.plan.as_ref().map(|p| p.revision);
             item.lane = lane;
             if prev_lane != lane || matches!(lane, Lane::Done | Lane::Unknown) {
                 item.checked = None;
             }
             item.version += 1;
             item.updated_ms = now_ms();
+            let awaiting = mark_awaiting_approval(&mut item, Some(prev_lane), prev_revision);
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Lane, item.version, by)?;
+            store.append_awaiting_approval(&item, by, awaiting.as_ref())?;
             let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
-            Ok((item, notify))
+            Ok((item, notify, awaiting))
         })?;
-        if notify_needs_decision {
-            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
-        }
+        self.dispatch_lane_events(&item, by, notify_needs_decision, awaiting.as_ref());
         Ok(item)
     }
 
@@ -735,26 +866,27 @@ impl BoardStore {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
-        let (item, notify_needs_decision) = self.with_lock(|store| {
+        let (item, notify_needs_decision, awaiting) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             store.ensure_no_run_in_flight(&item)?;
             let (pending, hash) =
                 load_attached_plan(state_root, item.workspace.path.as_deref(), hash)?;
             write_board_plan_copy(state_root, &store.base, &hash)?;
             let prev_lane = item.lane;
+            let prev_revision = item.plan.as_ref().map(|p| p.revision);
             let plan = board_plan_from_pending(pending, hash, item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
             item.version += 1;
             item.updated_ms = now_ms();
+            let awaiting = mark_awaiting_approval(&mut item, Some(prev_lane), prev_revision);
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
+            store.append_awaiting_approval(&item, by, awaiting.as_ref())?;
             let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
-            Ok((item, notify))
+            Ok((item, notify, awaiting))
         })?;
-        if notify_needs_decision {
-            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
-        }
+        self.dispatch_lane_events(&item, by, notify_needs_decision, awaiting.as_ref());
         Ok(item)
     }
 
@@ -769,26 +901,27 @@ impl BoardStore {
         if !valid_item_id(id) || !valid_pending_plan_hash(hash) {
             return Err(BoardError::Usage("invalid id or plan hash".to_owned()));
         }
-        let (item, notify_needs_decision) = self.with_lock(|store| {
+        let (item, notify_needs_decision, awaiting) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
             store.ensure_no_run_in_flight(&item)?;
             let (pending, hash) =
                 load_attached_plan(_state_root, item.workspace.path.as_deref(), hash)?;
             write_board_plan_copy(_state_root, &store.base, &hash)?;
             let prev_lane = item.lane;
+            let prev_revision = item.plan.as_ref().map(|p| p.revision);
             let plan = board_plan_from_pending(pending, hash, item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
             item.version += 1;
             item.updated_ms = now_ms();
+            let awaiting = mark_awaiting_approval(&mut item, Some(prev_lane), prev_revision);
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Plan, item.version, by)?;
+            store.append_awaiting_approval(&item, by, awaiting.as_ref())?;
             let notify = prev_lane != Lane::NeedsDecision && item.lane == Lane::NeedsDecision;
-            Ok((item, notify))
+            Ok((item, notify, awaiting))
         })?;
-        if notify_needs_decision {
-            super::notify::dispatch_board_event(&self.base, &item, "needs_decision", by);
-        }
+        self.dispatch_lane_events(&item, by, notify_needs_decision, awaiting.as_ref());
         Ok(item)
     }
 
@@ -892,16 +1025,13 @@ impl BoardStore {
             if event.seq <= since_seq {
                 continue;
             }
-            let kind = serde_json::to_value(&event.kind)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "unknown".to_owned());
             out.push(WaitEventAny {
                 seq: event.seq,
                 item_id: event.item_id,
-                kind,
+                kind: event.kind.as_str(),
                 by: event.by,
                 version: event.version,
+                detail: event.detail,
             });
         }
         Ok(out)
@@ -1273,6 +1403,136 @@ impl BoardStore {
         Ok(item)
     }
 
+    /// Log `run_started` for an `in_progress` item whose child run is about
+    /// to start and dispatch the notification (FR-3850). Appends one event
+    /// line and leaves the item unchanged (NFR-3850).
+    pub fn record_run_started(&self, id: &str, by: &str) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        let (item, detail) = self.with_lock(|store| {
+            let item = store.load_item_inner(id)?;
+            let detail = EventDetail {
+                plan_hash: item.plan.as_ref().map(|p| p.hash.clone()),
+                ..EventDetail::default()
+            };
+            store.append_event_detail(
+                id,
+                EventKind::RunStarted,
+                item.version,
+                by,
+                detail.clone(),
+            )?;
+            Ok((item, detail))
+        })?;
+        super::notify::dispatch_board_event_detail(&self.base, &item, "run_started", by, &detail);
+        Ok(item)
+    }
+
+    /// Post a `spec_review` thread message and log `spec_review_requested` on
+    /// `item_id` when it names an `in_progress` item, else on the item whose
+    /// `run_ids` holds `run_id` (FR-3852). Returns `None` and writes nothing
+    /// when no item matches. `spec_paths` must already be workspace-relative
+    /// and capped.
+    pub fn record_spec_review_request(
+        &self,
+        item_id: Option<&str>,
+        run_id: &str,
+        review_id: &str,
+        spec_paths: &[String],
+    ) -> Result<Option<BoardItem>, BoardError> {
+        if !crate::run_journal::valid_run_id(run_id) {
+            return Err(BoardError::Usage("invalid run id".to_owned()));
+        }
+        let review_id = crate::run_journal::mask_sensitive_tokens(review_id.trim());
+        let review_id: String = review_id.chars().take(SPEC_REVIEW_ID_MAX).collect();
+        if review_id.is_empty() {
+            return Err(BoardError::Usage("review id is required".to_owned()));
+        }
+        let spec_paths: Vec<String> = spec_paths
+            .iter()
+            .map(|p| crate::run_journal::mask_sensitive_tokens(p))
+            .collect();
+        let found = self.with_lock(|store| {
+            let in_progress = item_id
+                .filter(|id| valid_item_id(id))
+                .and_then(|id| store.load_item_inner(id).ok())
+                .filter(|item| item.lane == Lane::InProgress);
+            let target = match in_progress {
+                Some(item) => Some(item),
+                None => store.find_item_by_run_id(run_id)?,
+            };
+            let Some(mut item) = target else {
+                return Ok(None);
+            };
+            let listed = if spec_paths.is_empty() {
+                "no spec paths".to_owned()
+            } else {
+                spec_paths.join(", ")
+            };
+            let text: String =
+                format!("Spec review {review_id} requested for run {run_id}: {listed}")
+                    .chars()
+                    .take(super::TEXT_MAX)
+                    .collect();
+            if item.thread.len() >= THREAD_MAX {
+                item.thread.remove(0);
+            }
+            item.thread.push(ThreadMessage {
+                from: SPEC_REVIEW_ACTOR.to_owned(),
+                text,
+                at_ms: now_ms(),
+            });
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            let detail = EventDetail {
+                review_id: Some(review_id.clone()),
+                spec_paths: spec_paths.clone(),
+                ..EventDetail::default()
+            };
+            store.append_event_detail(
+                &item.id,
+                EventKind::SpecReviewRequested,
+                item.version,
+                SPEC_REVIEW_ACTOR,
+                detail.clone(),
+            )?;
+            Ok(Some((item, detail)))
+        })?;
+        let Some((item, detail)) = found else {
+            return Ok(None);
+        };
+        super::notify::dispatch_board_event_detail(
+            &self.base,
+            &item,
+            "spec_review_requested",
+            SPEC_REVIEW_ACTOR,
+            &detail,
+        );
+        Ok(Some(item))
+    }
+
+    fn find_item_by_run_id(&self, run_id: &str) -> Result<Option<BoardItem>, BoardError> {
+        for entry in
+            fs::read_dir(&self.items_dir).map_err(|e| BoardError::Internal(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| BoardError::Internal(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|e| BoardError::Internal(e.to_string()))?;
+            let Ok(item) = serde_json::from_slice::<BoardItem>(&bytes) else {
+                continue;
+            };
+            if item.run_ids.iter().any(|existing| existing == run_id) {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn wait(&self, id: &str, filter: WaitFilter) -> Result<WaitOutcome, BoardError> {
         if !valid_item_id(id) {
             return Err(BoardError::Usage("invalid board item id".to_owned()));
@@ -1356,68 +1616,61 @@ fn wait_trigger_for_event(event: &BoardEvent, id: &str, filter: &WaitFilter) -> 
     if event.item_id != id || event.version <= filter.since_version {
         return None;
     }
-    if event.by == filter.waiter {
+    if !event_wakes_waiter(event, filter) {
         return None;
     }
-    if !actor_wakes_waiter(&event.by) {
-        return None;
-    }
-    let matches = match filter.wait_for {
-        WaitFor::Decision => matches!(event.kind, EventKind::Decision),
-        WaitFor::Message => matches!(event.kind, EventKind::Message),
-        WaitFor::Any => matches!(
-            event.kind,
-            EventKind::Decision | EventKind::Message | EventKind::Plan | EventKind::Lane
-        ),
-    };
-    if !matches {
-        return None;
-    }
-    if matches!(event.kind, EventKind::Lane) && filter.wait_for != WaitFor::Any {
-        return None;
-    }
-    let kind = serde_json::to_value(&event.kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_owned());
     Some(WaitEvent {
         seq: event.seq,
         item_id: event.item_id.clone(),
-        kind,
+        kind: event.kind.as_str(),
         by: event.by.clone(),
         version: event.version,
+        detail: event.detail.clone(),
     })
 }
 
 fn wait_trigger_for_event_any(event: &BoardEvent, filter: &WaitFilter) -> Option<WaitEventAny> {
-    if event.by == filter.waiter {
+    if !event_wakes_waiter(event, filter) {
         return None;
     }
-    if !actor_wakes_waiter(&event.by) {
-        return None;
-    }
-    let matches = match filter.wait_for {
-        WaitFor::Decision => matches!(event.kind, EventKind::Decision),
-        WaitFor::Message => matches!(event.kind, EventKind::Message),
-        WaitFor::Any => matches!(
-            event.kind,
-            EventKind::Decision | EventKind::Message | EventKind::Plan | EventKind::Lane
-        ),
-    };
-    if !matches {
-        return None;
-    }
-    let kind = serde_json::to_value(&event.kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "unknown".to_owned());
     Some(WaitEventAny {
         seq: event.seq,
         item_id: event.item_id.clone(),
-        kind,
+        kind: event.kind.as_str(),
         by: event.by.clone(),
         version: event.version,
+        detail: event.detail.clone(),
     })
+}
+
+fn event_wakes_waiter(event: &BoardEvent, filter: &WaitFilter) -> bool {
+    event.by != filter.waiter
+        && (actor_wakes_waiter(&event.by) || event.kind.is_observability())
+        && event.kind.matches_wait(filter.wait_for)
+}
+
+/// Record that the item's current plan revision is announced as
+/// `awaiting_approval` when the item enters `needs_decision` with a plan or a
+/// new revision lands there, at most once per revision (FR-3851).
+fn mark_awaiting_approval(
+    item: &mut BoardItem,
+    prev_lane: Option<Lane>,
+    prev_revision: Option<u32>,
+) -> Option<EventDetail> {
+    let plan = item.plan.as_ref()?;
+    if item.lane != Lane::NeedsDecision || item.awaiting_approval_revision == Some(plan.revision) {
+        return None;
+    }
+    if prev_lane == Some(Lane::NeedsDecision) && prev_revision == Some(plan.revision) {
+        return None;
+    }
+    let detail = EventDetail {
+        plan_hash: Some(plan.hash.clone()),
+        plan_revision: Some(plan.revision),
+        ..EventDetail::default()
+    };
+    item.awaiting_approval_revision = Some(plan.revision);
+    Some(detail)
 }
 
 fn enforce_sensitive_lane_move(by: &str, lane: Lane) -> Result<(), BoardError> {
@@ -2229,6 +2482,231 @@ mod tests {
             }
             None => panic!("wait_any should return the owner event on another item"),
         }
+    }
+
+    fn pending_plan(prompt: &str) -> PendingPlanFile {
+        PendingPlanFile {
+            prompt: prompt.to_owned(),
+            tasks: vec![PlanTask {
+                id: "task-1".to_owned(),
+                title: "t".to_owned(),
+                done_check: "d".to_owned(),
+                areas: vec![],
+                size: TaskSize::Small,
+                depends_on: vec![],
+                implicit: false,
+            }],
+            steps: vec![PlanStep {
+                id: "s1".to_owned(),
+                role: "implement".to_owned(),
+                job: "j".to_owned(),
+                runner: "cursor".to_owned(),
+                model: None,
+                depends_on: vec![],
+                sensitive: None,
+                task: Some("task-1".to_owned()),
+                ..Default::default()
+            }],
+            dynamic_cap: None,
+        }
+    }
+
+    fn add_request(
+        title: &str,
+        lane: Option<Lane>,
+        plan_hash: Option<String>,
+        state: &Path,
+    ) -> AddItemRequest {
+        AddItemRequest {
+            title: title.to_owned(),
+            summary: String::new(),
+            kind: Kind::Feature,
+            grade: None,
+            lane,
+            source_bot: None,
+            source_channel: None,
+            source_ref: None,
+            workspace: None,
+            recommendation: None,
+            options: vec![],
+            plan_hash,
+            key: None,
+            by: "bot:test".to_owned(),
+            state_root: state.to_path_buf(),
+        }
+    }
+
+    fn awaiting_events(store: &BoardStore, item_id: &str) -> Vec<WaitEventAny> {
+        store
+            .list_events(0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.item_id == item_id && e.kind == "awaiting_approval")
+            .collect()
+    }
+
+    // TC-3851 / FR-3851: `awaiting_approval` is emitted once per plan
+    // revision while the item is in needs_decision, never without a plan.
+    #[test]
+    fn tc_3851_awaiting_approval_event() {
+        let (_dir, store, state) = test_store();
+
+        // Created in needs_decision with a plan → one event.
+        let hash1 = write_pending_plan(&state, &pending_plan("first")).unwrap();
+        let item = store
+            .add(add_request(
+                "with plan",
+                Some(Lane::NeedsDecision),
+                Some(hash1.clone()),
+                &state,
+            ))
+            .unwrap();
+        let events = awaiting_events(&store, &item.id);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].detail.plan_hash.as_deref(), Some(hash1.as_str()));
+        let rev1 = item.plan.as_ref().unwrap().revision;
+        assert_eq!(events[0].detail.plan_revision, Some(rev1));
+        assert_eq!(events[0].version, item.version);
+        assert_eq!(item.awaiting_approval_revision, Some(rev1));
+
+        // Same revision: re-entering needs_decision does not repeat it.
+        store
+            .move_lane(&item.id, Lane::NeedsDecision, "bot:test", None)
+            .unwrap();
+        store
+            .move_lane(&item.id, Lane::Unknown, "bot:test", None)
+            .unwrap();
+        store
+            .move_lane(&item.id, Lane::NeedsDecision, "bot:test", None)
+            .unwrap();
+        assert_eq!(awaiting_events(&store, &item.id).len(), 1);
+
+        // A new revision while in needs_decision → one more event.
+        let hash2 = write_pending_plan(&state, &pending_plan("second")).unwrap();
+        let item = store
+            .attach_plan(&item.id, &hash2, &state, "bot:test")
+            .unwrap();
+        let events = awaiting_events(&store, &item.id);
+        assert_eq!(events.len(), 2, "{events:?}");
+        let rev2 = item.plan.as_ref().unwrap().revision;
+        assert!(rev2 > rev1);
+        assert_eq!(events[1].detail.plan_hash.as_deref(), Some(hash2.as_str()));
+        assert_eq!(events[1].detail.plan_revision, Some(rev2));
+        assert_eq!(events[1].by, "bot:test");
+
+        // A plan attached to an item outside needs_decision moves it there
+        // and announces it.
+        let later = store
+            .add(add_request(
+                "later plan",
+                Some(Lane::InProgress),
+                None,
+                &state,
+            ))
+            .unwrap();
+        assert!(awaiting_events(&store, &later.id).is_empty());
+        let hash3 = write_pending_plan(&state, &pending_plan("third")).unwrap();
+        let later = store
+            .attach_plan(&later.id, &hash3, &state, "bot:test")
+            .unwrap();
+        assert_eq!(later.lane, Lane::NeedsDecision);
+        assert_eq!(awaiting_events(&store, &later.id).len(), 1);
+
+        // Without a plan only the existing events are written.
+        let plain = store
+            .add(add_request(
+                "no plan",
+                Some(Lane::NeedsDecision),
+                None,
+                &state,
+            ))
+            .unwrap();
+        store
+            .move_lane(&plain.id, Lane::Unknown, "bot:test", None)
+            .unwrap();
+        store
+            .move_lane(&plain.id, Lane::NeedsDecision, "bot:test", None)
+            .unwrap();
+        assert!(awaiting_events(&store, &plain.id).is_empty());
+        assert_eq!(
+            store.get(&plain.id).unwrap().awaiting_approval_revision,
+            None
+        );
+    }
+
+    // TC-3854 / FR-3854: `board wait --any` wakes on the new kinds; the
+    // decision filter does not; `board events` lists them with detail.
+    #[test]
+    fn tc_3854_wait_any_sees_new_kinds() {
+        let (_dir, store, state) = test_store();
+        let hash = write_pending_plan(&state, &pending_plan("run me")).unwrap();
+        let item = store
+            .add(add_request(
+                "run",
+                Some(Lane::NeedsDecision),
+                Some(hash.clone()),
+                &state,
+            ))
+            .unwrap();
+        let since_seq = store.list_events(0).unwrap().last().map_or(0, |e| e.seq);
+
+        let spawn_waiter = |wait_for: WaitFor, timeout_secs: u64| {
+            let waiter_store = BoardStore::open(store.base().to_path_buf()).unwrap();
+            thread::spawn(move || {
+                waiter_store
+                    .wait_any(
+                        since_seq,
+                        WaitFilter {
+                            since_version: 0,
+                            timeout_secs,
+                            wait_for,
+                            waiter: "bot:coordinator".to_owned(),
+                        },
+                    )
+                    .unwrap()
+            })
+        };
+        let any = spawn_waiter(WaitFor::Any, 3);
+        let decision = spawn_waiter(WaitFor::Decision, 1);
+        thread::sleep(Duration::from_millis(300));
+        store.record_run_started(&item.id, "bot:runner").unwrap();
+
+        match any.join().unwrap() {
+            Some((event, got)) => {
+                assert_eq!(event.kind, "run_started");
+                assert_eq!(event.item_id, item.id);
+                assert_eq!(event.by, "bot:runner");
+                assert_eq!(event.detail.plan_hash.as_deref(), Some(hash.as_str()));
+                assert_eq!(got.id, item.id);
+            }
+            None => panic!("wait --any must wake on run_started"),
+        }
+        assert!(
+            decision.join().unwrap().is_none(),
+            "a decision waiter must not wake on run_started"
+        );
+
+        // The waiter's own observability writes are still filtered out.
+        let own = BoardStore::open(store.base().to_path_buf())
+            .unwrap()
+            .wait_any(
+                since_seq,
+                WaitFilter {
+                    since_version: 0,
+                    timeout_secs: 1,
+                    wait_for: WaitFor::Any,
+                    waiter: "bot:runner".to_owned(),
+                },
+            )
+            .unwrap();
+        assert!(own.is_none(), "self events must not wake the waiter");
+
+        let listed = store.list_events(since_seq).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, "run_started");
+        assert_eq!(listed[0].detail.plan_hash.as_deref(), Some(hash.as_str()));
+        let unchanged = store.get(&item.id).unwrap();
+        assert_eq!(unchanged.version, item.version);
     }
 
     #[test]
