@@ -150,7 +150,14 @@ fn tc_3764_new_browser_tests_use_shared_env_and_deadline() {
     // web_board_e2e keeps its own helper with the same limits.
     let board = read("tests/web_board_e2e.rs");
     assert!(board.contains("fn setup_env() -> Env"));
-    assert!(board.contains("recv_timeout(Duration::from_secs(55))"));
+    // After #372, run_probe delegates to run_probe_for(..., Duration::from_secs(55)).
+    assert!(
+        board.contains("recv_timeout(Duration::from_secs(55))")
+            || (board.contains("run_probe_for(")
+                && board.contains("Duration::from_secs(55)")
+                && board.contains("recv_timeout(timeout)")),
+        "web_board_e2e probe deadline is 55 s"
+    );
     assert!(board.contains("\"--port\""));
 }
 
