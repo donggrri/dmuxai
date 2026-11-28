@@ -1,6 +1,6 @@
 # SPEC: Board item work-session links
 
-Status: approved (Dongjin 2026-11-28)
+Status: implemented
 Owner: Dongjin
 Created: 2026-11-28
 Baseline: `068b920` + SPEC-board-approval-hardening

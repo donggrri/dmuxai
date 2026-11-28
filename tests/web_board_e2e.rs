@@ -1464,3 +1464,200 @@ with sync_playwright() as p:
         "view-only serve must not invoke planner/run child: {log}"
     );
 }
+
+/// Seeds an item with a completed `run` session link (ids + `docs/notes.md`)
+/// followed by a failed `ask` link without ids, plus the run's manifest under
+/// `<root>/data` (SPEC-board-work-session FR-3825).
+fn seed_work_session(env: &Env) -> (String, PathBuf) {
+    let item = board_add(env, "Work session item", "Has sessions", "needs_decision");
+    let id = item["id"].as_str().expect("id").to_owned();
+    let ws_path = item["workspace"]["path"]
+        .as_str()
+        .expect("workspace path")
+        .to_owned();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let run_id = "0123456789abcdef";
+    let item_path = env.state.join("board/items").join(format!("{id}.json"));
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(&item_path).expect("item json")).expect("item");
+    raw["sessions"] = serde_json::json!([
+        {
+            "kind": "run",
+            "run_id": run_id,
+            "conversation_id": "conv-e2e",
+            "graph_id": "graph-e2e",
+            "workspace_path": ws_path,
+            "agent": "cursor-agent",
+            "model": "gpt-5",
+            "status": "completed",
+            "exit_code": 0,
+            "started_ms": now - 120_000,
+            "ended_ms": now - 60_000,
+            "md_paths": ["docs/notes.md"]
+        },
+        {
+            "kind": "ask",
+            "workspace_path": ws_path,
+            "status": "failed",
+            "exit_code": 1,
+            "started_ms": now - 30_000,
+            "ended_ms": now - 20_000,
+            "md_paths": []
+        }
+    ]);
+    fs::write(&item_path, serde_json::to_vec_pretty(&raw).unwrap()).expect("write item");
+
+    let data = env.state.parent().expect("root").join("data");
+    let run_dir = data
+        .join("repos")
+        .join(dmuxai::state_path::repo_key_for_canonical(&ws_path))
+        .join("runs")
+        .join(run_id);
+    fs::create_dir_all(&run_dir).expect("run dir");
+    fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "run_id": run_id,
+            "origin": "cli",
+            "status": "completed",
+            "created_at_ms": now - 120_000,
+            "completed_at_ms": now - 60_000,
+            "requested_runner": "cursor-agent",
+            "resolved_model": "gpt-5",
+            "dmuxai_exit_code": 0,
+            "links": { "conversation_id": "conv-e2e", "graph_id": "graph-e2e" },
+            "diagnostics": { "stderr_bytes": 0 },
+            "workspace_root": ws_path,
+        }))
+        .unwrap(),
+    )
+    .expect("manifest");
+    (id, data)
+}
+
+const WORK_SESSION_PROBE: &str = r#"
+def work_session_info(page):
+    page.wait_for_selector('#board-work-session', timeout=20000)
+    return page.evaluate("""() => {
+      const sec = document.getElementById('board-work-session');
+      const rows = [...sec.querySelectorAll('.board-session')];
+      const tok = sessionStorage.getItem('dmuxai.token') || '';
+      const run = rows.find(r => r.getAttribute('data-kind') === 'run');
+      return {
+        title: sec.querySelector('.board-work-session-title').textContent,
+        kinds: rows.map(r => r.getAttribute('data-kind')),
+        run_labels: [...run.querySelectorAll('.board-session-link')].map(b => b.textContent),
+        ask_links: rows[0].querySelectorAll('.board-session-link').length,
+        run_status: run.querySelector('.board-session-status').textContent,
+        run_agent: run.querySelector('.board-session-agent').textContent,
+        run_age: (run.querySelector('.board-session-age') || {}).textContent || '',
+        hrefs: sec.querySelectorAll('[href]').length,
+        token_leak: tok.length > 0 && sec.outerHTML.includes(tok),
+      };
+    }""")
+"#;
+
+// TC-3825 / FR-3825: the modal's Work session section lists links newest
+// first with status, agent/model and age; Run/Graph/Open in Chat/MD links
+// appear only when their id is present, carry no href or token, the MD link
+// opens the Markdown viewer and Run opens the Runs view detail.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3825_work_session_section_links_open_viewer_and_runs() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let (id, data) = seed_work_session(&env);
+    let data_dir = data.to_string_lossy().into_owned();
+    let (_guard, url) = start_web(&env, &[("DMUXAI_DATA_DIR", data_dir.as_str())]);
+
+    let script = format!(
+        r##"{OPEN_BOARD}
+{WORK_SESSION_PROBE}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    open_board(page)
+    open_item(page)
+    info = work_session_info(page)
+    page.locator('#board-work-session .board-session-md').first.click()
+    page.wait_for_selector("#md-viewer-backdrop:not([hidden])", timeout=20000)
+    page.wait_for_function(
+        "() => document.querySelector('#md-viewer-body').innerText.includes('link-free')",
+        timeout=20000)
+    page.keyboard.press("Escape")
+    page.wait_for_function(
+        "() => document.getElementById('md-viewer-backdrop').hidden", timeout=5000)
+    page.locator('#board-work-session .board-session-run').first.click()
+    page.wait_for_selector('#runs:not([hidden])', timeout=20000)
+    page.wait_for_selector('#runs-detail:not([hidden])', timeout=20000)
+    info["board_closed"] = page.evaluate("() => document.getElementById('board').hidden")
+    browser.close()
+    print(json.dumps({{"ok": True, **info}}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, &id]);
+    assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["title"], "Work session", "{result}");
+    assert_eq!(
+        result["kinds"],
+        serde_json::json!(["ask", "run"]),
+        "{result}"
+    );
+    assert_eq!(
+        result["run_labels"],
+        serde_json::json!(["Run", "Graph", "Open in Chat", "docs/notes.md"]),
+        "{result}"
+    );
+    assert_eq!(result["ask_links"].as_u64(), Some(0), "{result}");
+    assert_eq!(result["run_status"], "Completed", "{result}");
+    assert_eq!(result["run_agent"], "cursor-agent / gpt-5", "{result}");
+    assert_eq!(result["run_age"], "1m", "{result}");
+    assert_eq!(result["hrefs"].as_u64(), Some(0), "{result}");
+    assert_eq!(result["token_leak"].as_bool(), Some(false), "{result}");
+    assert_eq!(result["board_closed"].as_bool(), Some(true), "{result}");
+}
+
+// TC-3825 / FR-3825: view-only `serve` shows the Work session section but
+// never offers "Open in Chat".
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3825_serve_hides_open_in_chat() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let (id, data) = seed_work_session(&env);
+    let data_dir = data.to_string_lossy().into_owned();
+    let (_guard, url) = start_serve(&env, &[("DMUXAI_DATA_DIR", data_dir.as_str())]);
+
+    let script = format!(
+        r##"{OPEN_BOARD}
+{WORK_SESSION_PROBE}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    open_board(page)
+    open_item(page)
+    info = work_session_info(page)
+    browser.close()
+    print(json.dumps({{"ok": True, **info}}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, &id]);
+    assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+    assert_eq!(
+        result["run_labels"],
+        serde_json::json!(["Run", "Graph", "docs/notes.md"]),
+        "{result}"
+    );
+}

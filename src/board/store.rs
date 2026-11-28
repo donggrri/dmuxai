@@ -16,9 +16,10 @@ use super::plan::{
 };
 use super::rules::RulesStore;
 use super::{
-    BoardError, BoardItem, CLOSED_HIDE_DAYS, Decision, Kind, Lane, Source, THREAD_MAX,
-    ThreadMessage, Verdict, WorkspaceRef, generate_item_id, mask_item_fields, valid_item_id,
-    validate_message, validate_new_text, validate_options, validate_ref_url,
+    BoardError, BoardItem, CLOSED_HIDE_DAYS, Decision, Kind, Lane, SESSIONS_MAX, SessionLink,
+    SessionStatus, Source, THREAD_MAX, ThreadMessage, Verdict, WorkspaceRef, generate_item_id,
+    mask_item_fields, valid_item_id, validate_message, validate_new_text, validate_options,
+    validate_ref_url,
 };
 use crate::state_path::{repo_key, valid_pending_plan_hash};
 use crate::workspace::normalize_workspace_path;
@@ -151,6 +152,7 @@ enum EventKind {
     Decision,
     Message,
     Checked,
+    Session,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,6 +445,7 @@ impl BoardStore {
                 checked: None,
                 thread: Vec::new(),
                 run_ids: Vec::new(),
+                sessions: Vec::new(),
                 key: req.key.clone(),
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
@@ -1091,6 +1094,70 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Message, item.version, "run")?;
+            Ok(item)
+        })
+    }
+
+    /// Append a session link and log a `session` event; the oldest links are
+    /// dropped past [`SESSIONS_MAX`] (SPEC-board-work-session FR-3820, FR-3822).
+    pub fn append_session(
+        &self,
+        id: &str,
+        link: SessionLink,
+        by: &str,
+    ) -> Result<BoardItem, BoardError> {
+        self.update_sessions(id, by, |sessions| {
+            sessions.push(link);
+            true
+        })
+    }
+
+    /// Replace the `running` link of `link.kind` started at `started_ms` with
+    /// its finished form, or append it when it was already dropped (FR-3821).
+    pub fn finish_session(
+        &self,
+        id: &str,
+        started_ms: u64,
+        link: SessionLink,
+        by: &str,
+    ) -> Result<BoardItem, BoardError> {
+        self.update_sessions(id, by, |sessions| {
+            match sessions.iter_mut().rev().find(|existing| {
+                existing.kind == link.kind
+                    && existing.started_ms == started_ms
+                    && existing.status == SessionStatus::Running
+            }) {
+                Some(existing) => *existing = link,
+                None => sessions.push(link),
+            }
+            true
+        })
+    }
+
+    /// Edit `sessions` under the store lock. `edit` returns `false` to leave the
+    /// item untouched (no version bump, no event).
+    pub(crate) fn update_sessions(
+        &self,
+        id: &str,
+        by: &str,
+        edit: impl FnOnce(&mut Vec<SessionLink>) -> bool,
+    ) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if !edit(&mut item.sessions) {
+                return Ok(item);
+            }
+            let excess = item.sessions.len().saturating_sub(SESSIONS_MAX);
+            if excess > 0 {
+                item.sessions.drain(..excess);
+            }
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            store.append_event(id, EventKind::Session, item.version, by)?;
             Ok(item)
         })
     }
@@ -2748,5 +2815,107 @@ mod tests {
             .attach_plan(&item.id, &new_hash, &state, "bot:coord")
             .unwrap();
         assert_eq!(reattached.plan.as_ref().unwrap().hash, new_hash);
+    }
+
+    // TC-3823 / FR-3823, NFR-3820: `board session` reports the latest run link
+    // with a conversation and its binding agents/statuses, read-only and
+    // without provider session ids, under 200 ms on a 10k-turn database; a
+    // missing database yields `bindings: []` and a warning and is not created.
+    #[test]
+    fn tc_3823_board_session_reports_bindings() {
+        use crate::board::session::{self, BindingView, test_support};
+        use crate::board::{SessionKind, SessionStatus};
+        use crate::conversation::BindingStatus;
+        let (dir, store, state) = test_store();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "work session".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let ws_path = item.workspace.path.clone().unwrap();
+
+        let empty = session::session_view(&store, &item.id, &state).unwrap();
+        assert!(empty.work_session.is_none());
+        assert!(empty.bindings.is_empty() && empty.warning.is_none());
+
+        let mut run = session::running_link(SessionKind::Run, Path::new(&ws_path), 1);
+        run.status = SessionStatus::Completed;
+        run.run_id = Some("0123456789abcdef".to_owned());
+        run.conversation_id = Some("conv-work".to_owned());
+        store.append_session(&item.id, run, "bot:coord").unwrap();
+        let mut ask = session::running_link(SessionKind::Ask, Path::new(&ws_path), 2);
+        ask.status = SessionStatus::Completed;
+        ask.conversation_id = Some("conv-ask".to_owned());
+        store.append_session(&item.id, ask, "planner").unwrap();
+
+        let db = state
+            .join("repos")
+            .join(crate::state_path::repo_key_for_canonical(&ws_path))
+            .join("conversations.sqlite3");
+        let missing = session::session_view(&store, &item.id, &state).unwrap();
+        assert_eq!(
+            missing
+                .work_session
+                .as_ref()
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            Some("conv-work")
+        );
+        assert!(missing.bindings.is_empty());
+        assert!(missing.warning.is_some());
+        assert!(!db.exists(), "board session must not create the database");
+
+        test_support::seed_conversation_db(&state, &ws_path, "conv-work", 10_000);
+        let bytes = fs::read(&db).unwrap();
+        let started = Instant::now();
+        let view = session::session_view(&store, &item.id, &state).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "board session took {elapsed:?}"
+        );
+        assert_eq!(
+            view.bindings,
+            vec![
+                BindingView {
+                    agent: "agy".to_owned(),
+                    status: BindingStatus::Stale,
+                },
+                BindingView {
+                    agent: "cursor".to_owned(),
+                    status: BindingStatus::Active,
+                },
+            ]
+        );
+        assert!(view.warning.is_none());
+        assert_eq!(view.sessions.len(), 2);
+        let json = serde_json::to_value(&view).unwrap();
+        for key in ["item_id", "work_session", "sessions", "bindings"] {
+            assert!(json.get(key).is_some(), "missing {key}");
+        }
+        assert!(!json.to_string().contains("SECRET"));
+        assert_eq!(fs::read(&db).unwrap(), bytes, "database left untouched");
+
+        let unknown = session::session_view(&store, "b000000000000", &state).unwrap_err();
+        assert_eq!(unknown.exit_code(), crate::agent_api::exit::NOT_FOUND);
+        let invalid = session::session_view(&store, "nope", &state).unwrap_err();
+        assert_eq!(invalid.exit_code(), crate::agent_api::exit::USAGE);
     }
 }

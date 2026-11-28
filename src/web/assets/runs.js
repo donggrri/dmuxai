@@ -930,6 +930,16 @@ window.dmuxaiOpenRunForGraph = function (graphId, opts) {
   });
 };
 
+// SPEC-board-work-session FR-3825: the board "Run" link opens this run's
+// detail in the Runs view.
+window.dmuxaiOpenRun = function (runId, opts) {
+  if (!runId) { return; }
+  if (typeof window.dmuxaiSetCenterView === 'function') {
+    window.dmuxaiSetCenterView('runs', opts);
+  }
+  runsSelectRun(String(runId));
+};
+
 function runsInit() {
   runsBindStreamScroll();
   var fullBtn = document.getElementById('runs-full-graph');

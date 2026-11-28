@@ -319,6 +319,28 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["id"]
             }
+        },
+        {
+            "name": "board_session",
+            "description": "Read-only work session of a decision board item: session links, the latest run's conversation and its provider binding agents and statuses.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_link",
+            "description": "Link an existing run (from the item's workspace run journal) to a decision board item as a run session link.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id", "run_id"]
+            }
         }
     ])
 }
@@ -513,6 +535,8 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_events",
                 "board_ask",
                 "board_run",
+                "board_session",
+                "board_link",
             ];
             if !known.contains(&name) {
                 return Some(
@@ -685,6 +709,8 @@ mod tests {
             ),
             ("board_prompt", &["id", "hash"]),
             ("board_events", &["since"]),
+            ("board_session", &["id"]),
+            ("board_link", &["id", "run_id", "by"]),
         ];
         let ok_call = call(
             &stub,
