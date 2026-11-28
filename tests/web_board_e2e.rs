@@ -458,7 +458,7 @@ fn run_probe(
     script_body: &str,
     args: &[&str],
 ) -> serde_json::Value {
-    run_probe_for(python, chrome, script_body, args, Duration::from_secs(90))
+    run_probe_for(python, chrome, script_body, args, Duration::from_secs(55))
 }
 
 fn run_probe_for(
