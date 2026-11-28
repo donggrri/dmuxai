@@ -2211,14 +2211,18 @@ with sync_playwright() as p:
     out['add_ms'] = wait_for(
         "(id) => !!document.querySelector('[data-item-id=\"' + id + '\"]')", new_id)
 
-    # 2. a lane move appears in the target lane.
-    cli('board', 'move', new_id, 'in_progress')
+    # 2. a lane move appears in the target lane. A bot may not move an
+    # unapproved item into in_progress (FR-3803) or auto (FR-3138), and done is
+    # hidden unless closed items are shown, so use the visible unknown lane.
+    cli('board', 'move', new_id, 'unknown')
     out['move_ms'] = wait_for(
-        "(id) => !!document.querySelector('#board-lane-in_progress [data-item-id=\"' + id + '\"]')", new_id)
+        "(id) => !!document.querySelector('#board-lane-unknown [data-item-id=\"' + id + '\"]')"
+        " && !document.querySelector('#board-lane-needs_decision [data-item-id=\"' + id + '\"]')",
+        new_id)
 
     # 3. a new thread message appears in the open item.
     page.evaluate("""(id) => {
-      const card = document.querySelector('#board-lane-in_progress .board-card[data-item-id="' + id + '"] .board-card-title');
+      const card = document.querySelector('#board-lane-unknown .board-card[data-item-id="' + id + '"] .board-card-title');
       if (card) { card.click(); }
     }""", new_id)
     page.wait_for_selector('#board-drawer-wrap.open:not([hidden])', timeout=10000)
