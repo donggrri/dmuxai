@@ -25,13 +25,96 @@ pub const BOARD_CHILD_TIMEOUT_SECS: u64 = 900;
 const STALE_LOCK_SECS: u64 = 960;
 const THREAD_CONTEXT_LIMIT: usize = 20;
 
+/// Environment variable carrying the one-time launch token to the detached
+/// `board run --exec-prepared` child (SPEC-board-approval-hardening FR-3800).
+pub const LAUNCH_TOKEN_ENV: &str = "DMUXAI_BOARD_LAUNCH_TOKEN";
+
+/// Contents of `<board base>/runs/<id>.lock` written by [`run_item_prepare`]
+/// (FR-3800). Only the SHA-256 of the launch token is stored; it is cleared
+/// once the token is used (FR-3801).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunLock {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_sha256: Option<String>,
+    #[serde(default)]
+    pub plan_hash: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub created_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_lane: Option<Lane>,
+}
+
+fn run_lock_path(board_base: &Path, id: &str) -> PathBuf {
+    board_base.join("runs").join(format!("{id}.lock"))
+}
+
+/// Reads the run lock of item `id`; `None` when missing or not a JSON record.
+pub fn read_run_lock(board_base: &Path, id: &str) -> Option<RunLock> {
+    let text = fs::read_to_string(run_lock_path(board_base, id)).ok()?;
+    serde_json::from_str(text.trim()).ok()
+}
+
+fn write_run_lock(board_base: &Path, id: &str, lock: &RunLock) -> Result<(), BoardError> {
+    crate::board::store::ensure_dir(&board_base.join("runs"))?;
+    let bytes = serde_json::to_vec(lock).map_err(|e| BoardError::Internal(e.to_string()))?;
+    crate::board::store::atomic_write(&run_lock_path(board_base, id), &bytes)
+}
+
+/// 64 lowercase hex characters. UUID v4 draws from the OS CSPRNG (`getrandom`),
+/// so two of them carry 244 random bits.
+fn generate_launch_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn launch_token_sha256(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(token.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Reads the launch token from [`LAUNCH_TOKEN_ENV`] and removes it from this
+/// process's environment so no later child can inherit it (FR-3800).
+pub fn take_launch_token_from_env() -> Option<String> {
+    let token = std::env::var(LAUNCH_TOKEN_ENV).ok();
+    if token.is_some() {
+        // SAFETY: called once on the CLI thread before any agent child is spawned.
+        unsafe { std::env::remove_var(LAUNCH_TOKEN_ENV) };
+    }
+    token.filter(|t| !t.trim().is_empty())
+}
+
+fn lock_pid(contents: &str) -> Option<u32> {
+    let trimmed = contents.trim();
+    if let Some(pid) = trimmed.strip_prefix("pid=") {
+        return pid.parse::<u32>().ok();
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()?
+        .get("pid")?
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
 fn lock_is_stale(path: &Path) -> bool {
     #[cfg(unix)]
     if let Ok(contents) = fs::read_to_string(path)
-        && let Some(pid) = contents
-            .trim()
-            .strip_prefix("pid=")
-            .and_then(|s| s.parse::<u32>().ok())
+        && let Some(pid) = lock_pid(&contents)
         && pid > 0
     {
         // SAFETY: kill(pid, 0) checks process existence without sending a signal.
@@ -64,7 +147,14 @@ impl BoardLockGuard {
         crate::board::store::ensure_dir(&dir)?;
         let path = dir.join(format!("{id}.lock"));
         for attempt in 0..2 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
                 Ok(mut file) => {
                     let _ = writeln!(file, "pid={}", std::process::id());
                     return Ok(Self { path });
@@ -94,15 +184,45 @@ impl BoardLockGuard {
         true
     }
 
-    pub fn take_over(board_base: &Path, subdir: &str, id: &str) -> Result<Self, BoardError> {
-        let dir = board_base.join(subdir);
-        crate::board::store::ensure_dir(&dir)?;
-        let path = dir.join(format!("{id}.lock"));
-        crate::board::store::atomic_write(
-            &path,
-            format!("pid={}\n", std::process::id()).as_bytes(),
-        )?;
-        Ok(Self { path })
+    /// Takes over the run lock of a prepared run inside the detached
+    /// `--exec-prepared` child: the presented launch token must hash to the
+    /// stored value for this plan hash. The token is consumed and the lock
+    /// now names this process (FR-3801, FR-3808).
+    pub fn take_over(
+        store: &BoardStore,
+        id: &str,
+        plan_hash: &str,
+        launch_token: Option<&str>,
+    ) -> Result<(Self, RunLock), BoardError> {
+        let refused = || {
+            BoardError::Forbidden(
+                "board run --exec-prepared needs the launch token of a prepared run; start runs with `board run`"
+                    .to_owned(),
+            )
+        };
+        let token = launch_token
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(refused)?;
+        let presented = launch_token_sha256(token);
+        store.with_store_lock(|| {
+            let mut lock = read_run_lock(store.base(), id).ok_or_else(refused)?;
+            let expected = lock.token_sha256.as_deref().ok_or_else(refused)?;
+            if lock.plan_hash != plan_hash
+                || !constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            {
+                return Err(refused());
+            }
+            lock.token_sha256 = None;
+            lock.pid = std::process::id();
+            write_run_lock(store.base(), id, &lock)?;
+            Ok((
+                Self {
+                    path: run_lock_path(store.base(), id),
+                },
+                lock,
+            ))
+        })
     }
 
     pub fn disarm(self) {
@@ -613,6 +733,15 @@ pub struct PreparedRun {
     pub guard: BoardLockGuard,
     pub by: String,
     pub state_root: PathBuf,
+    launch_token: String,
+}
+
+impl PreparedRun {
+    /// The raw one-time launch token whose SHA-256 is in the run lock. It is
+    /// only ever handed to the detached child through [`LAUNCH_TOKEN_ENV`].
+    pub fn launch_token(&self) -> &str {
+        &self.launch_token
+    }
 }
 
 pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<PreparedRun, BoardError> {
@@ -681,6 +810,23 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
     let workspace = require_item_workspace(&item)?;
     let pending = ensure_pending_plan_from_copy(&params.state_root, store.base(), &plan.hash)?;
     let plan_hash = plan.hash.clone();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let launch_token = generate_launch_token();
+    write_run_lock(
+        store.base(),
+        &params.id,
+        &RunLock {
+            pid: std::process::id(),
+            token_sha256: Some(launch_token_sha256(&launch_token)),
+            plan_hash: plan_hash.clone(),
+            actor: params.by.clone(),
+            created_ms: now,
+            prepared_lane: Some(item.lane),
+        },
+    )?;
     let in_progress_item =
         store.move_lane(&params.id, Lane::InProgress, &params.by, Some(item.version))?;
 
@@ -688,10 +834,6 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
         include_all: true,
         ..Default::default()
     }) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         prune_old_plan_copies(store.base(), &all_items, now);
     }
 
@@ -703,6 +845,7 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
         guard,
         by: params.by,
         state_root: params.state_root,
+        launch_token,
     })
 }
 
@@ -718,6 +861,7 @@ pub fn run_item_execute(
         guard,
         by,
         state_root,
+        launch_token: _,
     } = prepared;
     let _guard = guard;
     let normalized_prompt = normalize_plan_prompt(&prompt);
@@ -727,7 +871,7 @@ pub fn run_item_execute(
         "run".to_owned(),
         "--graph".to_owned(),
         "--approve-plan-id".to_owned(),
-        plan_hash,
+        plan_hash.clone(),
         "--json".to_owned(),
         "-".to_owned(),
     ];
@@ -740,7 +884,8 @@ pub fn run_item_execute(
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
-            let _ = store.record_run_result(&item.id, None, 1, Some(&err.to_string()), &by);
+            let _ =
+                store.record_run_result(&item.id, None, 1, Some(&err.to_string()), &by, &plan_hash);
             return Err(err);
         }
     };
@@ -750,12 +895,39 @@ pub fn run_item_execute(
         outcome.exit_code,
         outcome.summary.as_deref(),
         &by,
+        &plan_hash,
     )
+}
+
+/// Point the run lock at the detached child while its token is still unused,
+/// so a stale-lock check sees a dead child as stale (FR-3808).
+fn record_launched_pid(store: &BoardStore, id: &str, pid: u32) {
+    let _ = store.with_store_lock(|| {
+        if let Some(mut lock) = read_run_lock(store.base(), id)
+            && lock.token_sha256.is_some()
+        {
+            lock.pid = pid;
+            write_run_lock(store.base(), id, &lock)?;
+        }
+        Ok(())
+    });
+}
+
+/// Wait for the detached child on a background thread so a long-lived parent
+/// (MCP server, dashboard) never keeps a zombie (FR-3808).
+fn reap_detached_child(mut child: std::process::Child) {
+    let _ = thread::Builder::new()
+        .name("board-run-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Spawn a detached OS subprocess (`setsid` + null stdio) running the hidden
 /// `board run <id> --exec-prepared --plan-hash H --by ACTOR` command, and
-/// return immediately with the `in_progress` item (FR-3133).
+/// return immediately with the `in_progress` item (FR-3133). The launch token
+/// travels only in [`LAUNCH_TOKEN_ENV`]; `--by` is informational (FR-3800,
+/// FR-3801).
 pub fn launch_detached_board_run(
     store: &BoardStore,
     prepared: PreparedRun,
@@ -769,6 +941,7 @@ pub fn launch_detached_board_run(
                 1,
                 Some(&err.to_string()),
                 &prepared.by,
+                &prepared.plan_hash,
             );
             return Err(err);
         }
@@ -791,6 +964,7 @@ pub fn launch_detached_board_run(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::run_journal::generate_run_id);
     cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
+    cmd.env(LAUNCH_TOKEN_ENV, &prepared.launch_token);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -805,13 +979,22 @@ pub fn launch_detached_board_run(
         }
     }
     match cmd.spawn() {
-        Ok(_child) => {
+        Ok(child) => {
+            record_launched_pid(store, &prepared.item.id, child.id());
+            reap_detached_child(child);
             prepared.guard.disarm();
             Ok(prepared.item)
         }
         Err(e) => {
             let msg = format!("failed to spawn detached board run: {e}");
-            let _ = store.record_run_result(&prepared.item.id, None, 1, Some(&msg), &prepared.by);
+            let _ = store.record_run_result(
+                &prepared.item.id,
+                None,
+                1,
+                Some(&msg),
+                &prepared.by,
+                &prepared.plan_hash,
+            );
             Err(BoardError::Internal(msg))
         }
     }
@@ -903,13 +1086,41 @@ pub fn auto_run_after_owner_approve(
     }
 }
 
+/// FR-3802: a prepared run executes only for an owner approval of exactly this
+/// plan, or for an item that was in the `auto` lane when it was prepared.
+fn ensure_prepared_run_allowed(
+    item: &BoardItem,
+    lock: &RunLock,
+    plan_hash: &str,
+) -> Result<(), BoardError> {
+    if lock.prepared_lane == Some(Lane::Auto) {
+        return Ok(());
+    }
+    let approved_by_owner = item
+        .decision
+        .as_ref()
+        .is_some_and(|d| d.verdict == Verdict::Approve && d.by == "owner");
+    if !approved_by_owner {
+        return Err(BoardError::Forbidden(
+            "prepared runs need an owner approval or an auto lane item".to_owned(),
+        ));
+    }
+    if item.decision.as_ref().and_then(|d| d.plan_hash.as_deref()) != Some(plan_hash) {
+        return Err(BoardError::Conflict(
+            "decision plan hash does not match the prepared plan".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Execute a previously prepared `in_progress` board run inside the detached
-/// `--exec-prepared` subprocess and record its result (FR-3133).
+/// `--exec-prepared` subprocess and record its result (FR-3133). The caller
+/// presents the launch token; the actor comes from the run lock (FR-3801).
 pub fn run_item_execute_prepared(
     store: &BoardStore,
     id: &str,
     plan_hash: &str,
-    by: &str,
+    launch_token: Option<&str>,
     state_root: &Path,
 ) -> Result<BoardItem, BoardError> {
     validate_item_id_early(id)?;
@@ -918,10 +1129,13 @@ pub fn run_item_execute_prepared(
             "plan hash must be 16 lowercase hex characters".to_owned(),
         ));
     }
-    if by == "planner" {
-        return Err(BoardError::Forbidden("planner cannot run items".to_owned()));
+    let (guard, lock) = BoardLockGuard::take_over(store, id, plan_hash, launch_token)?;
+    let by = lock.actor.as_str();
+    if by == "planner" || (by != "owner" && !by.starts_with("bot:")) {
+        return Err(BoardError::Forbidden(
+            "prepared run has no valid actor".to_owned(),
+        ));
     }
-    let guard = BoardLockGuard::take_over(store.base(), "runs", id)?;
     let item = store.get(id)?;
     if item.lane != Lane::InProgress {
         return Err(BoardError::Conflict(format!(
@@ -932,20 +1146,21 @@ pub fn run_item_execute_prepared(
     let current_hash = item.plan.as_ref().map(|p| p.hash.as_str());
     if current_hash != Some(plan_hash) {
         let msg = "plan hash does not match the current plan";
-        let _ = store.record_run_result(id, None, 1, Some(msg), by);
+        let _ = store.record_run_result(id, None, 1, Some(msg), by, plan_hash);
         return Err(BoardError::Conflict(msg.to_owned()));
     }
+    ensure_prepared_run_allowed(&item, &lock, plan_hash)?;
     let workspace = match require_item_workspace(&item) {
         Ok(ws) => ws,
         Err(err) => {
-            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by);
+            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by, plan_hash);
             return Err(err);
         }
     };
     let pending = match ensure_pending_plan_from_copy(state_root, store.base(), plan_hash) {
         Ok(p) => p,
         Err(err) => {
-            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by);
+            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by, plan_hash);
             return Err(err);
         }
     };
@@ -959,6 +1174,7 @@ pub fn run_item_execute_prepared(
             guard,
             by: by.to_owned(),
             state_root: state_root.to_path_buf(),
+            launch_token: String::new(),
         },
     )
 }
@@ -1440,6 +1656,7 @@ exit 0
             },
         )
         .unwrap();
+        let auto_token = auto_prep.launch_token().to_owned();
         let detached_item = launch_detached_board_run(&store, auto_prep).unwrap();
         assert_eq!(detached_item.lane, Lane::InProgress);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1451,7 +1668,7 @@ exit 0
         assert!(self_args.contains(&hash));
 
         let exec_done =
-            run_item_execute_prepared(&store, &auto_item.id, &hash, "bot:coordinator", &state)
+            run_item_execute_prepared(&store, &auto_item.id, &hash, Some(&auto_token), &state)
                 .unwrap();
         assert_eq!(exec_done.lane, Lane::Done);
 
@@ -1968,5 +2185,373 @@ exit 0
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    struct Hardening {
+        dir: tempfile::TempDir,
+        state: PathBuf,
+        board: PathBuf,
+        ws: PathBuf,
+        store: BoardStore,
+        hash: String,
+    }
+
+    fn hardening() -> Hardening {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        ensure_dir(&state).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let (_, hash) =
+            edit_plan_from_json(&ws, &state, "ship", &sample_plan_json(), None).unwrap();
+        Hardening {
+            dir,
+            state,
+            board,
+            ws,
+            store,
+            hash,
+        }
+    }
+
+    /// An item with the shared plan, brought into `lane` the way users do it.
+    fn hardening_item(h: &Hardening, lane: Lane) -> BoardItem {
+        let item = h
+            .store
+            .add(AddItemRequest {
+                title: format!("hardening {}", lane.as_str()),
+                summary: String::new(),
+                kind: if lane == Lane::Auto {
+                    Kind::Debug
+                } else {
+                    Kind::Feature
+                },
+                grade: None,
+                lane: (lane != Lane::Auto).then_some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(h.ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(h.hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: h.state.clone(),
+            })
+            .unwrap();
+        let verdict = match lane {
+            Lane::Approved => Verdict::Approve,
+            Lane::Rejected => Verdict::Reject,
+            _ => return item,
+        };
+        h.store
+            .decide_without_notify(
+                &item.id,
+                DecideRequest {
+                    verdict,
+                    text: None,
+                    option: None,
+                    plan_hash: (verdict == Verdict::Approve).then(|| h.hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap()
+    }
+
+    fn fake_ok_child(dir: &Path) -> PathBuf {
+        write_fake_runner(
+            dir,
+            "fake-ok-run.sh",
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}\\n'\nexit 0\n",
+        )
+    }
+
+    fn prepare(h: &Hardening, item: &BoardItem) -> PreparedRun {
+        run_item_prepare(
+            &h.store,
+            RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(h.hash.clone()),
+                by: "bot:coordinator".to_owned(),
+                state_root: h.state.clone(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn wait_for(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + deadline;
+        while Instant::now() < until {
+            if ready() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        ready()
+    }
+
+    fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut hits = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if fs::read(&path)
+                    .map(|b| String::from_utf8_lossy(&b).contains(needle))
+                    .unwrap_or(false)
+                {
+                    hits.push(path);
+                }
+            }
+        }
+        hits
+    }
+
+    // TC-3800 / FR-3800: prepare writes a 0600 run lock with the SHA-256 of a
+    // 128-bit+ token; the raw token reaches the detached child only through
+    // `DMUXAI_BOARD_LAUNCH_TOKEN`, never argv, the board files or the item.
+    #[cfg(unix)]
+    #[test]
+    fn tc_3800_prepare_writes_token_hash_not_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Approved);
+        let prepared = prepare(&h, &item);
+        let token = prepared.launch_token().to_owned();
+        assert!(token.len() >= 32, "token too short: {}", token.len());
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(token, prepare_token_of_another_item(&h));
+
+        let lock_path = h.board.join("runs").join(format!("{}.lock", item.id));
+        let lock_mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(lock_mode, 0o600);
+        let dir_mode = fs::metadata(h.board.join("runs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let lock = read_run_lock(&h.board, &item.id).unwrap();
+        assert_eq!(
+            lock.token_sha256.as_deref(),
+            Some(launch_token_sha256(&token).as_str())
+        );
+        assert_eq!(lock.plan_hash, h.hash);
+        assert_eq!(lock.actor, "bot:coordinator");
+        assert_eq!(lock.pid, std::process::id());
+        assert!(lock.created_ms > 0);
+        assert_eq!(lock.prepared_lane, Some(Lane::Approved));
+
+        let argv_file = h.dir.path().join("self_argv.txt");
+        let env_file = h.dir.path().join("self_env.txt");
+        let fake_self = write_fake_runner(
+            h.dir.path(),
+            "fake-self-token.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$DMUXAI_BOARD_LAUNCH_TOKEN\" > \"{env}.tmp\"\nprintf '%s\\n' \"$@\" > \"{argv}\"\nmv \"{env}.tmp\" \"{env}\"\nexit 0\n",
+                env = env_file.display(),
+                argv = argv_file.display(),
+            ),
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self) };
+        let launched = launch_detached_board_run(&h.store, prepared);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_SELF_BIN") };
+        let launched = launched.unwrap();
+        assert_eq!(launched.lane, Lane::InProgress);
+        assert!(wait_for(Duration::from_secs(3), || env_file.exists()));
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), token);
+        let argv = fs::read_to_string(&argv_file).unwrap();
+        assert!(argv.contains("--exec-prepared"));
+        assert!(!argv.contains(&token), "token leaked into argv: {argv}");
+        assert!(!serde_json::to_string(&launched).unwrap().contains(&token));
+        assert!(
+            files_containing(&h.state, &token).is_empty(),
+            "token persisted under state"
+        );
+    }
+
+    fn prepare_token_of_another_item(h: &Hardening) -> String {
+        let other = hardening_item(h, Lane::Auto);
+        let prepared = prepare(h, &other);
+        prepared.launch_token().to_owned()
+    }
+
+    // TC-3801 / FR-3801: exec-prepared needs the lock's token for that item and
+    // plan hash; missing, wrong and reused tokens are refused (exit 5) without
+    // touching the item, and the actor comes from the lock.
+    #[test]
+    fn tc_3801_exec_prepared_requires_launch_token() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Approved);
+        let prepared = prepare(&h, &item);
+        let token = prepared.launch_token().to_owned();
+        prepared.guard.disarm();
+        let before = h.store.get(&item.id).unwrap();
+        assert_eq!(before.lane, Lane::InProgress);
+
+        let fake_bin = fake_ok_child(h.dir.path());
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+        let wrong_hash = "0000000000000000";
+        let attempts: [(Option<&str>, &str); 4] = [
+            (None, h.hash.as_str()),
+            (Some(""), h.hash.as_str()),
+            (Some("00ff00ff00ff00ff00ff00ff00ff00ff"), h.hash.as_str()),
+            (Some(token.as_str()), wrong_hash),
+        ];
+        for (presented, hash) in attempts {
+            let err = run_item_execute_prepared(&h.store, &item.id, hash, presented, &h.state)
+                .unwrap_err();
+            assert_eq!(
+                err.exit_code(),
+                crate::agent_api::exit::FORBIDDEN,
+                "{presented:?}"
+            );
+            assert_eq!(h.store.get(&item.id).unwrap(), before);
+        }
+
+        let done =
+            run_item_execute_prepared(&h.store, &item.id, &h.hash, Some(&token), &h.state).unwrap();
+        assert_eq!(done.lane, Lane::Done);
+        let events = fs::read_to_string(h.board.join("events.jsonl")).unwrap();
+        let last: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(last["by"], "bot:coordinator");
+
+        let after = h.store.get(&item.id).unwrap();
+        let reuse = run_item_execute_prepared(&h.store, &item.id, &h.hash, Some(&token), &h.state)
+            .unwrap_err();
+        assert_eq!(reuse.exit_code(), crate::agent_api::exit::FORBIDDEN);
+        assert_eq!(h.store.get(&item.id).unwrap(), after);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    /// Force `item` into `in_progress` with a run lock holding a known token, as
+    /// if it had been prepared from `prepared_lane`.
+    fn force_prepared(h: &Hardening, item: &BoardItem, prepared_lane: Lane) -> String {
+        h.store
+            .move_lane(&item.id, Lane::InProgress, "owner", None)
+            .unwrap();
+        let token = generate_launch_token();
+        write_run_lock(
+            &h.board,
+            &item.id,
+            &RunLock {
+                pid: std::process::id(),
+                token_sha256: Some(launch_token_sha256(&token)),
+                plan_hash: h.hash.clone(),
+                actor: "bot:coordinator".to_owned(),
+                created_ms: 1,
+                prepared_lane: Some(prepared_lane),
+            },
+        )
+        .unwrap();
+        token
+    }
+
+    // TC-3802 / FR-3802: even with a valid token, exec-prepared runs only an item
+    // approved by the owner for that plan hash, or one prepared from `auto`.
+    #[test]
+    fn tc_3802_exec_prepared_checks_decision() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let fake_bin = fake_ok_child(h.dir.path());
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+
+        let pending = hardening_item(&h, Lane::NeedsDecision);
+        let rejected = hardening_item(&h, Lane::Rejected);
+        let stale = hardening_item(&h, Lane::Approved);
+        let approved = hardening_item(&h, Lane::Approved);
+        let auto = hardening_item(&h, Lane::Auto);
+
+        let item_file = h.board.join("items").join(format!("{}.json", stale.id));
+        let mut raw: Value = serde_json::from_slice(&fs::read(&item_file).unwrap()).unwrap();
+        raw["decision"]["plan_hash"] = Value::String("0000000000000000".to_owned());
+        fs::write(&item_file, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let cases = [
+            (
+                &pending,
+                Lane::NeedsDecision,
+                Some(crate::agent_api::exit::FORBIDDEN),
+            ),
+            (
+                &rejected,
+                Lane::Rejected,
+                Some(crate::agent_api::exit::FORBIDDEN),
+            ),
+            (
+                &stale,
+                Lane::Approved,
+                Some(crate::agent_api::exit::CONFLICT),
+            ),
+            (&approved, Lane::Approved, None),
+            (&auto, Lane::Auto, None),
+        ];
+        for (item, prepared_lane, refused) in cases {
+            let token = force_prepared(&h, item, prepared_lane);
+            let result =
+                run_item_execute_prepared(&h.store, &item.id, &h.hash, Some(&token), &h.state);
+            let current = h.store.get(&item.id).unwrap();
+            match refused {
+                Some(code) => {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.exit_code(), code, "{}: {err}", item.title);
+                    assert_eq!(current.lane, Lane::InProgress, "{}", item.title);
+                    assert!(current.run_ids.is_empty(), "{}", item.title);
+                }
+                None => {
+                    assert_eq!(result.unwrap().lane, Lane::Done, "{}", item.title);
+                }
+            }
+        }
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    // TC-3808 / FR-3808: the parent reaps the detached child (no zombie), and the
+    // run lock names the child so a dead child leaves a stale, inactive lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tc_3808_detached_child_reaped() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Auto);
+        let prepared = prepare(&h, &item);
+        let pid_file = h.dir.path().join("child.pid");
+        let fake_self = write_fake_runner(
+            h.dir.path(),
+            "fake-self-pid.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{p}.tmp\"\nmv \"{p}.tmp\" \"{p}\"\nexit 0\n",
+                p = pid_file.display()
+            ),
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self) };
+        let launched = launch_detached_board_run(&h.store, prepared);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_SELF_BIN") };
+        launched.unwrap();
+
+        assert!(wait_for(Duration::from_secs(3), || pid_file.exists()));
+        let child_pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(read_run_lock(&h.board, &item.id).unwrap().pid, child_pid);
+
+        // A zombie keeps its /proc entry until reaped; a reaped child has none.
+        let reaped = || !Path::new(&format!("/proc/{child_pid}")).exists();
+        assert!(
+            wait_for(Duration::from_secs(3), reaped),
+            "detached child {child_pid} left as a zombie"
+        );
+        assert!(wait_for(Duration::from_secs(3), || {
+            !BoardLockGuard::is_active(&h.board, "runs", &item.id)
+        }));
     }
 }
