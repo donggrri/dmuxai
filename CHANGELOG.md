@@ -30,8 +30,13 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - Board item detail opens as a centered popup instead of a side drawer.
 
+### Security
+
+- Board runs (SPEC-board-approval-hardening, #354, #361, #362): the detached `board run --exec-prepared` step now needs a one-time launch token (only its SHA-256 is stored in the 0600 run lock; the token travels in the environment, never argv) and checks the owner approval or `auto` lane again; the recorded actor comes from the run lock, not `--by`. A non-owner `board move` into `in_progress` is refused unless the item is approved for its current plan or in `auto`. Custom, ACP, fan-out leg and notify hook children now carry `DMUXAI_RUN_ID`, and `term send`/`exec` from a run into a session opened outside a run exits 5 (`forbidden`).
+
 ### Fixed
 
+- Board: a finished run no longer overwrites a newer lane or plan (it adds a `run` note instead); plan attach/edit, `POST /plan` and `ask --revise` are refused (exit 4 / 409) while a run is in progress; detached board run children are reaped and the run lock records the child pid (#361).
 - `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
 - Board item chat: Send now asks the planner and posts its answer ("Note only" keeps the old store-only message).
 - Board: live updates and planner answers now work on tokenless dashboards; Ask no longer sticks on "Asking planner…" (#357).

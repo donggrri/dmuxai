@@ -316,6 +316,27 @@ pub fn generate_approval_id() -> String {
     )
 }
 
+/// SPEC-board-approval-hardening FR-3805: input from a run-originated caller
+/// (`DMUXAI_RUN_ID` set) is refused (exit 5, `forbidden`) for a session that
+/// was opened outside a run, so an agent cannot type into a human's terminal.
+pub fn ensure_run_input_allowed(
+    name: &str,
+    session_run_id: Option<&str>,
+    caller_run_id: Option<&str>,
+) -> Result<(), TermError> {
+    let caller_in_run = caller_run_id.is_some_and(|value| !value.trim().is_empty());
+    let session_in_run = session_run_id.is_some_and(|value| !value.trim().is_empty());
+    if caller_in_run && !session_in_run {
+        return Err(TermError::new(
+            exit::FORBIDDEN,
+            format!(
+                "session '{name}' was opened outside a dmuxai run; input from a run (DMUXAI_RUN_ID is set) is refused; ask a human to type it"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// FR-2630: `term approve` is refused (exit 5, `forbidden`) whenever
 /// `DMUXAI_RUN_ID` is set, so an agent cannot approve its own blocked input.
 pub fn approve_with_run_guard(
