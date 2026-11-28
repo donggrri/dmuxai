@@ -3,6 +3,7 @@
 mod mcp;
 pub mod notify;
 mod plan;
+pub mod resume;
 mod rules;
 pub mod runner;
 pub mod session;

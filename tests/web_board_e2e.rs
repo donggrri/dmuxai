@@ -1661,3 +1661,94 @@ with sync_playwright() as p:
         "{result}"
     );
 }
+
+// TC-3836 / FR-3836: in `--web` the chat selector (Work session (auto) /
+// Fresh with summary / Item only) is shown only for an item with a work
+// session; the ask request carries `resume`, the child continues the work
+// conversation and the answer shows the mode used.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3836_chat_resume_selector_sends_resume_and_shows_mode() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let _ = fs::remove_file(&env.argv_log);
+    let (id, data) = seed_work_session(&env);
+    let bare = board_add(&env, "No session item", "Plain", "needs_decision");
+    let bare_id = bare["id"].as_str().expect("id").to_owned();
+    let data_dir = data.to_string_lossy().into_owned();
+    let (_guard, url) = start_web(&env, &[("DMUXAI_DATA_DIR", data_dir.as_str())]);
+
+    let script = format!(
+        r##"{OPEN_BOARD}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    bodies = []
+    page.on("request", lambda r: bodies.append(r.post_data or "")
+            if r.method == "POST" and r.url.endswith("/ask") else None)
+    work_id = item_id
+    item_id = sys.argv[4]
+    open_board(page)
+    open_item(page)
+    bare_hidden = page.evaluate(
+        "() => document.getElementById('board-chat-resume').hidden")
+    page.keyboard.press("Escape")
+    page.wait_for_function(
+        "() => !document.getElementById('board-drawer-wrap').classList.contains('open')",
+        timeout=5000)
+    item_id = work_id
+    open_item(page)
+    sel = page.evaluate("""() => {{
+      const s = document.getElementById('board-chat-resume');
+      return {{ hidden: s.hidden, value: s.value,
+               options: [...s.options].map(o => [o.value, o.textContent]) }};
+    }}""")
+    page.select_option('#board-chat-resume', 'fresh')
+    page.fill("#board-chat-input", "what changed?")
+    page.locator('#board-chat-send').click(force=True)
+    page.wait_for_function(
+        """() => [...document.querySelectorAll('#board-chat-thread .board-chat-mode')].length > 0""",
+        timeout=20000)
+    mode = page.evaluate("""() => {{
+      const m = [...document.querySelectorAll('#board-chat-thread .board-chat-mode')].pop();
+      return {{ text: m.textContent, mode: m.getAttribute('data-mode'),
+               bubble: m.parentElement.querySelector('.board-chat-bubble').textContent }};
+    }}""")
+    browser.close()
+    print(json.dumps({{"ok": True, "bare_hidden": bare_hidden, "sel": sel,
+                      "mode": mode, "bodies": bodies}}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, &id, &bare_id]);
+    assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["bare_hidden"].as_bool(), Some(true), "{result}");
+    assert_eq!(result["sel"]["hidden"].as_bool(), Some(false), "{result}");
+    assert_eq!(result["sel"]["value"], "auto", "{result}");
+    assert_eq!(
+        result["sel"]["options"],
+        serde_json::json!([
+            ["auto", "Work session (auto)"],
+            ["fresh", "Fresh with summary"],
+            ["off", "Item only"]
+        ]),
+        "{result}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(result["bodies"][0].as_str().unwrap_or("{}")).unwrap_or_default();
+    assert_eq!(body["resume"], "fresh", "{result}");
+    assert_eq!(result["mode"]["mode"], "summary", "{result}");
+    assert_eq!(
+        result["mode"]["text"], "Summary resume \u{b7} cursor-agent",
+        "{result}"
+    );
+    assert_eq!(result["mode"]["bubble"], "Planner answer: ok", "{result}");
+    let log = argv_log_text(&env);
+    assert!(log.contains("--conversation conv-e2e"), "{log}");
+    assert!(log.contains("--fresh-session"), "{log}");
+    assert!(log.contains("--read-only"), "{log}");
+    assert!(!log.contains("--allow-sensitive"), "{log}");
+}

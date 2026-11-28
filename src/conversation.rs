@@ -1034,6 +1034,20 @@ pub struct ConversationEngine {
     session_closed: bool,
     workspace_root: String,
     active_conversation: Option<ConversationId>,
+    /// Seeded headless continuations bring their own bounded context, so an
+    /// oversized projection is cut to the recent tail instead of starting a
+    /// summary turn (SPEC-board-ask-resume NFR-3830).
+    skip_summary_jobs: bool,
+}
+
+/// Stored material of one conversation for the work-session summary
+/// (SPEC-board-ask-resume §3). Never carries provider session ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkSessionDigest {
+    /// Latest stored summary document of any agent, rendered.
+    pub summary: Option<String>,
+    /// Completed turns in order.
+    pub turns: Vec<ProjectedTurn>,
 }
 
 /// Opens the conversation database, waiting for a concurrent DmuxAI process to
@@ -1188,12 +1202,46 @@ fn open_once(
         session_closed: false,
         workspace_root: workspace_root.to_owned(),
         active_conversation: None,
+        skip_summary_jobs: false,
     })
 }
 
 impl ConversationEngine {
     pub fn open(db_path: &Path, workspace_root: &Path) -> Result<Self, ConversationError> {
         open_with_retry(db_path, workspace_root, OPEN_RETRY_BUDGET)
+    }
+
+    /// See [`ConversationEngine::skip_summary_jobs`].
+    pub fn set_skip_summary_jobs(&mut self, skip: bool) {
+        self.skip_summary_jobs = skip;
+    }
+
+    /// The stored summary document and completed turns of conversation `id` in
+    /// this workspace; `Ok(None)` when it does not exist (SPEC-board-ask-resume
+    /// FR-3830, FR-3831). Read-only.
+    pub fn work_session_digest(
+        &self,
+        id: &ConversationId,
+    ) -> Result<Option<WorkSessionDigest>, ConversationError> {
+        if !self.conversation_exists(id)? {
+            return Ok(None);
+        }
+        let turns = load_projected_turns(&self.connection, id)?;
+        let summary = self
+            .connection
+            .query_row(
+                "SELECT summary_json FROM context_checkpoints
+                  WHERE conversation_id = ?1
+                  ORDER BY covers_through_seq DESC, created_at_ms DESC
+                  LIMIT 1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|json| serde_json::from_str::<SummaryDocument>(&json).ok())
+            .map(|document| document.render())
+            .filter(|text| !text.trim().is_empty());
+        Ok(Some(WorkSessionDigest { summary, turns }))
     }
 
     /// Returns whether another non-expired DmuxAI process is using this
@@ -2091,6 +2139,14 @@ impl ConversationEngine {
             }
             tail_chars += chars;
             tail_start = index;
+        }
+        if self.skip_summary_jobs {
+            return Ok(ProjectionBuild::Ready(ContextProjection {
+                summary,
+                recent: turns[tail_start..].to_vec(),
+                through_seq,
+                source_hash: hash_turns(turns.iter()),
+            }));
         }
         let covers_index = if tail_start == 0 {
             turns.len()

@@ -532,11 +532,16 @@ fn board_ask(args: &Value) -> Result<Value, ApiError> {
     let revise = args.get("revise").and_then(Value::as_bool).unwrap_or(false);
     let agent = str_arg(args, "agent").map(str::to_owned);
     let model = str_arg(args, "model").map(str::to_owned);
+    let resume = match str_arg(args, "resume") {
+        None => super::resume::ResumeMode::default(),
+        Some(raw) => super::resume::ResumeMode::parse(raw)
+            .ok_or_else(|| usage("resume must be auto, native, fresh or off"))?,
+    };
     let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let state_root = crate::state_path::state_base()
         .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
     let store = open_board_store()?;
-    let item = super::runner::ask_item(
+    let answer = super::runner::ask_item_report(
         &store,
         super::runner::AskParams {
             id: id.to_owned(),
@@ -546,10 +551,14 @@ fn board_ask(args: &Value) -> Result<Value, ApiError> {
             model,
             by,
             state_root,
+            resume,
         },
     )
     .map_err(ApiError::from)?;
-    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+    Ok(super::resume::ask_answer_json(
+        &answer.item,
+        answer.resume.as_ref(),
+    ))
 }
 
 fn board_run(args: &Value) -> Result<Value, ApiError> {

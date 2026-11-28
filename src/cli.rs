@@ -18,7 +18,7 @@ use dmuxai::term::proto::{RequestOp, Response};
 use dmuxai::term::{self, SessionKind, TermError};
 use dmuxai::web::DashboardHub;
 
-use crate::app::{App, HeadlessOutcome, HeadlessRequest};
+use crate::app::{App, HeadlessContinuation, HeadlessOutcome, HeadlessRequest};
 
 /// A parsed agent-facing subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +190,8 @@ pub enum BoardOp {
         agent: Option<String>,
         model: Option<String>,
         by: Option<String>,
+        /// SPEC-board-ask-resume FR-3832.
+        resume: dmuxai::board::resume::ResumeMode,
     },
     Run {
         id: String,
@@ -310,6 +312,16 @@ pub struct RunOptions {
     pub write: bool,
     pub keep_worktrees: bool,
     pub no_spec_first: bool,
+    /// SPEC-board-ask-resume FR-3830: continue this stored conversation.
+    pub conversation: Option<String>,
+    /// Hidden (board ask): board item whose thread and Markdown links feed the
+    /// work-session summary.
+    pub board_item: Option<String>,
+    /// Hidden (`board ask --resume fresh`): never resume the provider session.
+    pub fresh_session: bool,
+    /// Hidden (ask during a live board run, FR-3834): run in a new
+    /// conversation seeded with the work-session summary.
+    pub fork_summary: bool,
 }
 
 /// First arguments that select an agent-facing subcommand.
@@ -400,7 +412,7 @@ Usage: dmuxai board rules [--set FILE|-] [--json]
 ";
 
 pub const BOARD_ASK_USAGE: &str = "\
-Usage: dmuxai board ask <id> --text T|- [--revise] [--agent A] [--model M] [--by ACTOR] [--json]
+Usage: dmuxai board ask <id> --text T|- [--revise] [--resume auto|native|fresh|off] [--agent A] [--model M] [--by ACTOR] [--json]
 ";
 
 pub const BOARD_RUN_USAGE: &str = "\
@@ -433,6 +445,7 @@ Arguments:
 
 Options:
   --agent ID               Runner id (cursor-agent, agy, codex, or a custom agent; `cursor` is an alias)
+  --conversation ID        Continue stored conversation ID with one agent turn (needs --agent)
   --agents RUNNERS         Comma-separated runners for fan-out (a,b[:model],...)
   --write                  Write fan-out: each leg runs in its own git worktree (needs --agents)
   --keep-worktrees         Keep leg worktrees after a write fan-out (needs --write)
@@ -948,6 +961,27 @@ pub const RUN_FLAGS: &[FlagSpec] = &[
         hidden: false,
     },
     FlagSpec {
+        names: &["--conversation"],
+        takes_value: true,
+        hidden: false,
+    },
+    // Internal to `board ask` (SPEC-board-ask-resume FR-3832..FR-3834).
+    FlagSpec {
+        names: &["--board-item"],
+        takes_value: true,
+        hidden: true,
+    },
+    FlagSpec {
+        names: &["--fresh-session"],
+        takes_value: false,
+        hidden: true,
+    },
+    FlagSpec {
+        names: &["--fork-summary"],
+        takes_value: false,
+        hidden: true,
+    },
+    FlagSpec {
         names: &["--agents"],
         takes_value: true,
         hidden: false,
@@ -1303,7 +1337,12 @@ fn parse_run_options_with_flags(
         write: parsed.flags.contains_key("--write"),
         keep_worktrees: parsed.flags.contains_key("--keep-worktrees"),
         no_spec_first: parsed.flags.contains_key("--no-spec-first"),
+        conversation: parsed.flags.get("--conversation").cloned().flatten(),
+        board_item: parsed.flags.get("--board-item").cloned().flatten(),
+        fresh_session: parsed.flags.contains_key("--fresh-session"),
+        fork_summary: parsed.flags.contains_key("--fork-summary"),
     };
+    validate_conversation_options(&options)?;
     if options.write && options.agents.is_none() {
         return Err("--write requires --agents".to_owned());
     }
@@ -1358,6 +1397,43 @@ fn parse_run_options_with_flags(
         return Err("--model needs --agent".to_owned());
     }
     Ok(options)
+}
+
+/// FR-3830: `--conversation` usage rules. Ids are checked before any store
+/// access.
+fn validate_conversation_options(options: &RunOptions) -> Result<(), String> {
+    let Some(id) = options.conversation.as_deref() else {
+        if options.board_item.is_some() || options.fresh_session || options.fork_summary {
+            return Err(
+                "--board-item, --fresh-session and --fork-summary need --conversation".to_owned(),
+            );
+        }
+        return Ok(());
+    };
+    if !dmuxai::board::session::valid_link_id(id) {
+        return Err("--conversation must be 1-128 characters of A-Z, a-z, 0-9, _ or -".to_owned());
+    }
+    if options.graph {
+        return Err("--conversation cannot be used with --graph".to_owned());
+    }
+    if options.agents.is_some() {
+        return Err("--conversation cannot be used with --agents".to_owned());
+    }
+    if options.agent.is_none() {
+        return Err("--conversation needs --agent".to_owned());
+    }
+    if options.approve_plan_id.is_some() {
+        return Err("--conversation cannot be used with --approve-plan-id".to_owned());
+    }
+    if options.fresh_session && options.fork_summary {
+        return Err("--fresh-session cannot be used with --fork-summary".to_owned());
+    }
+    if let Some(item) = options.board_item.as_deref()
+        && !dmuxai::board::valid_item_id(item)
+    {
+        return Err("--board-item is not a valid board item id".to_owned());
+    }
+    Ok(())
 }
 
 /// Parses `args` (without the program name) whose first element is one of
@@ -2231,6 +2307,11 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     hidden: false,
                 },
                 FlagSpec {
+                    names: &["--resume"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
                     names: &["--revise"],
                     takes_value: false,
                     hidden: false,
@@ -2267,6 +2348,11 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 .get("--text")
                 .and_then(|v| v.clone())
                 .ok_or_else(|| "--text is required".to_owned())?;
+            let resume = match parsed.flags.get("--resume").cloned().flatten() {
+                None => dmuxai::board::resume::ResumeMode::default(),
+                Some(raw) => dmuxai::board::resume::ResumeMode::parse(&raw)
+                    .ok_or_else(|| "--resume must be auto, native, fresh or off".to_owned())?,
+            };
             Ok(BoardCommand {
                 json: parsed.flags.contains_key("--json"),
                 op: BoardOp::Ask {
@@ -2276,6 +2362,7 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                     agent: parsed.flags.get("--agent").cloned().flatten(),
                     model: parsed.flags.get("--model").cloned().flatten(),
                     by: parsed.flags.get("--by").cloned().flatten(),
+                    resume,
                 },
             })
         }
@@ -3953,10 +4040,11 @@ fn execute_board_with_caller(
                 agent,
                 model,
                 by,
+                resume,
             } => {
                 let text = read_prompt(&text)?;
                 let by = resolve_actor(by.as_deref(), caller).map_err(ApiError::from)?;
-                let item = dmuxai::board::runner::ask_item(
+                let answer = dmuxai::board::runner::ask_item_report(
                     &store,
                     dmuxai::board::runner::AskParams {
                         id,
@@ -3966,11 +4054,16 @@ fn execute_board_with_caller(
                         model,
                         by,
                         state_root,
+                        resume,
                     },
                 )
                 .map_err(ApiError::from)?;
+                let item = &answer.item;
                 if json_out {
-                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                    print_json(&dmuxai::board::resume::ask_answer_json(
+                        item,
+                        answer.resume.as_ref(),
+                    ));
                 } else if let Some(last) = item.thread.last() {
                     println!("{}", last.text);
                 }
@@ -5091,6 +5184,10 @@ fn outcome_json(outcome: &HeadlessOutcome, first_seq: u64, last_seq: u64) -> Val
     if !outcome.fallbacks.is_empty() {
         value["fallbacks"] = json!(outcome.fallbacks);
     }
+    // SPEC-board-ask-resume FR-3830: only for `run --conversation`.
+    if let Some(resume) = &outcome.resume {
+        value["resume"] = json!(resume);
+    }
     value
 }
 
@@ -5397,6 +5494,46 @@ async fn run_fanout_headless(
     Ok((outcome, first_seq, last_seq))
 }
 
+/// `run --conversation`: checks the conversation exists in this workspace's
+/// store (else exit 3) and builds the work-session summary used when the turn
+/// cannot resume natively (SPEC-board-ask-resume FR-3830, FR-3831).
+fn conversation_continuation(
+    engine: &ConversationEngine,
+    workspace_root: &Path,
+    options: &RunOptions,
+    id: &str,
+) -> Result<HeadlessContinuation, ApiError> {
+    use dmuxai::board::resume::{
+        SummaryInput, board_summary_context, build_work_session_summary, summary_steps,
+    };
+    let digest = engine
+        .work_session_digest(&dmuxai::conversation::ConversationId::new(id))
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?
+        .ok_or_else(|| ApiError::new(exit::NOT_FOUND, format!("conversation {id} not found")))?;
+    let (md_paths, thread) = options
+        .board_item
+        .as_deref()
+        .and_then(|item_id| {
+            let item = agent_api::open_board_store().ok()?.get(item_id).ok()?;
+            Some(board_summary_context(&item, id))
+        })
+        .unwrap_or_default();
+    let summary = build_work_session_summary(&SummaryInput {
+        conversation_id: id.to_owned(),
+        stored_summary: digest.summary,
+        steps: summary_steps(workspace_root, id, &digest.turns),
+        last_reply: digest.turns.last().map(|turn| turn.assistant.clone()),
+        md_paths,
+        thread,
+    });
+    Ok(HeadlessContinuation {
+        conversation_id: id.to_owned(),
+        summary,
+        force_fresh: options.fresh_session,
+        fork: options.fork_summary,
+    })
+}
+
 async fn run_headless(
     workspace_root: &Path,
     options: &RunOptions,
@@ -5429,6 +5566,19 @@ async fn run_headless(
     }
     let engine = ConversationEngine::open(&db_path, workspace_root)
         .map_err(|error| conversation_open_error(&error))?;
+    let continuation = match options.conversation.as_deref() {
+        Some(id) => match conversation_continuation(&engine, workspace_root, options, id) {
+            Ok(continuation) => Some(continuation),
+            Err(error) if error.code == exit::NOT_FOUND => {
+                let outcome =
+                    HeadlessOutcome::failure(error.code, id, options.agent.clone(), error.message)
+                        .with_error_kind("not_found");
+                return Ok((outcome, 1, 0));
+            }
+            Err(error) => return Err(error),
+        },
+        None => None,
+    };
     for warning in dmuxai::custom_agent::install_registry(settings.custom_agents.clone()) {
         eprintln!("warning: {warning}");
     }
@@ -5444,6 +5594,9 @@ async fn run_headless(
     let mut app = App::new(engine, workspace_root.to_path_buf(), settings)
         .map_err(|error| conversation_open_error(&error))?;
     app.attach_dashboard(hub);
+    if let Some(continuation) = continuation {
+        app.set_headless_continuation(continuation);
+    }
     if todo_id.is_some() {
         let store = agent_api::open_todo_store(workspace_root)?;
         app.attach_todo_store(Arc::new(store));
@@ -5665,6 +5818,9 @@ fn mcp_run_argv(args: &RunArgs) -> Vec<String> {
     };
     if let Some(agent) = &args.agent {
         argv.extend(["--agent".into(), agent.clone()]);
+    }
+    if let Some(conversation) = &args.conversation_id {
+        argv.extend(["--conversation".into(), conversation.clone()]);
     }
     if let Some(model) = &args.model {
         argv.extend(["--model".into(), model.clone()]);
@@ -6307,6 +6463,7 @@ mod tests {
                     },
                 ],
             }),
+            resume: None,
         };
         let json = outcome_json(&outcome, 0, 0);
         assert_eq!(json["error_kind"], "policy");
@@ -6402,6 +6559,7 @@ mod tests {
                     },
                 ],
             }),
+            resume: None,
         };
         let json = outcome_json(&outcome, 0, 0);
         assert_eq!(json["aggregate"]["recommendation"], "go");
@@ -6518,6 +6676,7 @@ mod tests {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            resume: None,
         };
         let json = outcome_json(&outcome, 1, 2);
         assert_eq!(json["error"], "boom");
@@ -6546,6 +6705,7 @@ mod tests {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            resume: None,
         };
         let json = outcome_json(&outcome, 0, 0);
         assert!(json["error"].is_null());
@@ -6710,6 +6870,7 @@ mod tests {
             graph: false,
             todo_id: None,
             no_spec_first: false,
+            conversation_id: None,
         };
         assert_eq!(
             mcp_run_argv(&args),
@@ -6737,6 +6898,7 @@ mod tests {
             graph: false,
             todo_id: Some("t1".into()),
             no_spec_first: false,
+            conversation_id: None,
         };
         assert_eq!(
             mcp_run_argv(&todo),
@@ -6813,6 +6975,100 @@ mod tests {
                 "plan it"
             ]
         );
+    }
+
+    // TC-3830 / FR-3830: `--conversation` parses with `--agent`, is a usage
+    // error with --graph/--agents/without --agent or with a malformed id, the
+    // board-only hidden flags need it, and MCP `conversation_id` forwards it.
+    // TC-3832 / FR-3832: `board ask --resume` parses; other values are usage.
+    #[test]
+    fn tc_3830_run_conversation_flags_and_mcp_forwarding() {
+        match parse(&args(&[
+            "run",
+            "--conversation",
+            "conv-1",
+            "--agent",
+            "cursor",
+            "--fresh-session",
+            "--board-item",
+            "b0123456789ab",
+            "-",
+        ])) {
+            Ok(AgentCommand::Run(run)) => {
+                assert_eq!(run.conversation.as_deref(), Some("conv-1"));
+                assert!(run.fresh_session && !run.fork_summary);
+                assert_eq!(run.board_item.as_deref(), Some("b0123456789ab"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        for bad in [
+            &["run", "--conversation", "c", "--graph", "x"][..],
+            &["run", "--conversation", "c", "--agents", "cursor,agy", "x"],
+            &["run", "--conversation", "c", "x"],
+            &["run", "--conversation", "../c", "--agent", "agy", "x"],
+            &["run", "--fork-summary", "--agent", "agy", "x"],
+            &[
+                "run",
+                "--conversation",
+                "c",
+                "--agent",
+                "agy",
+                "--board-item",
+                "abc",
+                "x",
+            ],
+            &[
+                "run",
+                "--conversation",
+                "c",
+                "--agent",
+                "agy",
+                "--fresh-session",
+                "--fork-summary",
+                "x",
+            ],
+        ] {
+            assert!(parse(&args(bad)).is_err(), "{bad:?}");
+        }
+        assert!(!RUN_USAGE.contains("--fork-summary") && !RUN_USAGE.contains("--board-item"));
+        assert!(RUN_USAGE.contains("--conversation ID"));
+
+        let forwarded = RunArgs {
+            prompt: Some("go on".into()),
+            agent: Some("cursor".into()),
+            conversation_id: Some("conv-1".into()),
+            ..RunArgs::default()
+        };
+        assert_eq!(
+            mcp_run_argv(&forwarded),
+            vec![
+                "run",
+                "--agent",
+                "cursor",
+                "--conversation",
+                "conv-1",
+                "--json",
+                "--",
+                "go on"
+            ]
+        );
+
+        match parse(&args(&[
+            "board", "ask", "abc", "--text", "q", "--resume", "fresh",
+        ])) {
+            Ok(AgentCommand::Board(BoardCommand {
+                op: BoardOp::Ask { resume, .. },
+                ..
+            })) => assert_eq!(resume, dmuxai::board::resume::ResumeMode::Fresh),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            parse(&args(&[
+                "board", "ask", "abc", "--text", "q", "--resume", "x"
+            ]))
+            .is_err()
+        );
+        assert!(BOARD_ASK_USAGE.contains("--resume auto|native|fresh|off"));
     }
 
     // TC-2550 / FR-2550: --approve-plan-id must be exactly 16 lowercase hex

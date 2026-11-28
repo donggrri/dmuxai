@@ -1,6 +1,6 @@
 # SPEC: Ask in the work session (hybrid resume)
 
-Status: approved (Dongjin 2026-11-28)
+Status: implemented
 Owner: Dongjin
 Created: 2026-11-28
 Baseline: `068b920` + SPEC-board-work-session

@@ -510,6 +510,9 @@ struct AskBody {
     agent: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// `auto` (default), `native`, `fresh` or `off` (SPEC-board-ask-resume FR-3832).
+    #[serde(default)]
+    resume: Option<String>,
 }
 
 async fn board_ask(
@@ -530,6 +533,18 @@ async fn board_ask(
         Ok(actor) => actor,
         Err(error) => return board_error_response(error),
     };
+    let resume = match body.resume.as_deref() {
+        None => crate::board::resume::ResumeMode::default(),
+        Some(raw) => match crate::board::resume::ResumeMode::parse(raw) {
+            Some(mode) => mode,
+            None => {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "resume must be auto, native, fresh or off",
+                );
+            }
+        },
+    };
     let board_base = state.board_base.clone();
     let state_root = state.state_root.clone();
     let params = crate::board::runner::AskParams {
@@ -540,6 +555,7 @@ async fn board_ask(
         model: body.model,
         by,
         state_root,
+        resume,
     };
     match with_store(board_base.clone(), move |store| {
         crate::board::runner::ask_item_prepare(store, params)
@@ -548,12 +564,28 @@ async fn board_ask(
     {
         Ok(prepared) => {
             let item = prepared.item.clone();
+            let planned = prepared.planned_resume();
             std::thread::spawn(move || {
                 if let Ok(bg_store) = open_store(&board_base) {
                     let _ = crate::board::runner::ask_item_execute(&bg_store, prepared);
                 }
             });
-            json_ok(StatusCode::ACCEPTED, &item_response(item))
+            let mut body = item_response(item);
+            if let Some(resume) = planned {
+                body["resume"] = serde_json::json!(resume);
+            }
+            json_ok(StatusCode::ACCEPTED, &body)
+        }
+        Err(BoardError::Conflict(message))
+            if message.starts_with(crate::board::runner::NO_ACTIVE_BINDING) =>
+        {
+            json_ok(
+                StatusCode::CONFLICT,
+                &serde_json::json!({
+                    "error": message,
+                    "reason": crate::board::runner::NO_ACTIVE_BINDING,
+                }),
+            )
         }
         Err(error) => board_error_response(error),
     }
@@ -1311,6 +1343,46 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+
+        // TC-3832 / FR-3832: HTTP `resume`. Without a work session native is
+        // usage (400); a bad value is 400; with a work session but no active
+        // binding native is 409 with `reason: no_active_binding`.
+        let ask = |body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/board/{}/ask", item.id))
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        for body in [
+            r#"{"text":"why?","resume":"native"}"#,
+            r#"{"text":"why?","resume":"bogus"}"#,
+        ] {
+            let resp = web_router.clone().oneshot(ask(body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        let mut link = crate::board::session::running_link(
+            crate::board::SessionKind::Run,
+            &ws,
+            crate::board::session::now_ms(),
+        );
+        link.conversation_id = Some("conv-http".to_owned());
+        link.agent = Some("cursor-agent".to_owned());
+        store.append_session(&item.id, link, "planner").unwrap();
+        let resp = web_router
+            .clone()
+            .oneshot(ask(r#"{"text":"why?","resume":"native"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["reason"], crate::board::runner::NO_ACTIVE_BINDING);
 
         let resp = web_router
             .clone()

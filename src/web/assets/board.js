@@ -598,6 +598,20 @@ function boardOpenSessionChat(link, errEl) {
   });
 }
 
+// SPEC-board-ask-resume FR-3836: the chat can continue the work session only
+// when the item has a run link with a conversation.
+var BOARD_CHAT_RESUME_OPTIONS = [
+  ['auto', 'Work session (auto)'],
+  ['fresh', 'Fresh with summary'],
+  ['off', 'Item only']
+];
+var BOARD_CHAT_MODE_RE = /^\[(native|summary) resume \u00b7 ([^\]]+)\] /;
+
+function boardHasWorkSession(item) {
+  var sessions = item && Array.isArray(item.sessions) ? item.sessions : [];
+  return sessions.some(function (link) { return link && link.kind === 'run' && !!link.conversation_id; });
+}
+
 function boardRenderWorkSession(drawer, item) {
   var sessions = Array.isArray(item.sessions) ? item.sessions.slice().reverse() : [];
   if (!sessions.length) { return; }
@@ -673,6 +687,8 @@ function boardRenderDrawer(item) {
   var draftText = preserveDraft ? existingInput.value : '';
   var existingNote = document.getElementById('board-chat-note-only');
   var draftNoteOnly = preserveDraft && existingNote ? !!existingNote.checked : false;
+  var existingResume = document.getElementById('board-chat-resume');
+  var draftResume = preserveDraft && existingResume ? existingResume.value : 'auto';
   var focusWasInput = preserveDraft && document.activeElement === existingInput;
 
   var pendingAsk = boardAskPending[item.id];
@@ -840,7 +856,16 @@ function boardRenderDrawer(item) {
       }
       line.appendChild(boardEl('div', 'board-chat-sender', msg.from || 'unknown'));
       line.appendChild(boardEl('div', 'board-chat-time', boardFormatChatTime(msg.at_ms)));
-      var bubble = boardEl('div', 'board-chat-bubble', msg.text || '');
+      var msgText = msg.text || '';
+      var modeMatch = msg.from === 'planner' ? BOARD_CHAT_MODE_RE.exec(msgText) : null;
+      if (modeMatch) {
+        var modeLabel = (modeMatch[1] === 'native' ? 'Native resume' : 'Summary resume') + ' \u00b7 ' + modeMatch[2];
+        var modeEl = boardEl('div', 'board-chat-mode', modeLabel);
+        modeEl.setAttribute('data-mode', modeMatch[1]);
+        line.appendChild(modeEl);
+        msgText = msgText.slice(modeMatch[0].length);
+      }
+      var bubble = boardEl('div', 'board-chat-bubble', msgText);
       line.appendChild(bubble);
       if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
         window.dmuxaiLinkifyMdPaths(bubble);
@@ -862,6 +887,20 @@ function boardRenderDrawer(item) {
   send.type = 'button';
   send.id = 'board-chat-send';
   chatActions.appendChild(send);
+
+  var resumeSel = document.createElement('select');
+  resumeSel.id = 'board-chat-resume';
+  resumeSel.className = 'board-chat-resume';
+  resumeSel.setAttribute('aria-label', 'Ask mode');
+  BOARD_CHAT_RESUME_OPTIONS.forEach(function (opt) {
+    var option = document.createElement('option');
+    option.value = opt[0];
+    option.textContent = opt[1];
+    resumeSel.appendChild(option);
+  });
+  resumeSel.value = draftResume;
+  resumeSel.hidden = !(boardLaunchAllowed && boardHasWorkSession(item));
+  chatActions.appendChild(resumeSel);
 
   var reviseBtn = boardEl('button', 'btn btn-small', 'Ask & revise plan');
   reviseBtn.type = 'button';
@@ -950,10 +989,10 @@ function boardAskPlanner(id, revise) {
     busy.textContent = 'Asking planner\u2026';
   }
   boardStartAskPoll(id);
-  boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', {
-    text: text,
-    revise: !!revise
-  }).then(function () {
+  var askBody = { text: text, revise: !!revise };
+  var resumeSel = document.getElementById('board-chat-resume');
+  if (!revise && resumeSel && !resumeSel.hidden) { askBody.resume = resumeSel.value; }
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', askBody).then(function () {
     var curTa = document.getElementById('board-chat-input');
     if (curTa) { curTa.value = ''; }
     if (boardSelectedId === id) {

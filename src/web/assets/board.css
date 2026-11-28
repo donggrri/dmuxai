@@ -463,6 +463,7 @@ body.board-modal-open {
 
 .board-run-actions[hidden],
 .board-chat-note-only[hidden],
+.board-chat-resume[hidden],
 #board-ask-revise[hidden],
 .board-ask-busy[hidden],
 #board-run[hidden] {
@@ -561,6 +562,21 @@ body.board-modal-open {
   font-size: 0.8rem;
   color: var(--muted);
   cursor: pointer;
+}
+
+.board-chat-resume {
+  font-size: 0.8rem;
+  max-width: 12rem;
+}
+
+.board-chat-mode {
+  display: inline-block;
+  margin-bottom: 0.2rem;
+  padding: 0 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.7rem;
+  color: var(--muted);
 }
 
 .board-ask-busy {

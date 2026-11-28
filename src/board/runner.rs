@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use super::resume::{ResumeMode, ResumeReport, default_ask_agent};
 use super::{
     BoardError, BoardItem, BoardStore, Lane, ListFilter, SayRequest, SessionKind, TEXT_MAX,
     Verdict, ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies, session,
@@ -244,6 +245,8 @@ pub struct ChildOutcome {
     pub text: Option<String>,
     pub summary: Option<String>,
     pub links: super::session::ChildLinks,
+    /// `resume.mode` of a `run --conversation` child (FR-3833).
+    pub resume_mode: Option<String>,
 }
 
 fn resolve_child_bin() -> Result<PathBuf, BoardError> {
@@ -487,7 +490,14 @@ pub fn spawn_child_dmuxai(
         text,
         summary,
         links: parse_child_links(&stdout),
+        resume_mode: parse_child_resume_mode(&stdout),
     })
+}
+
+fn parse_child_resume_mode(stdout: &str) -> Option<String> {
+    let val = child_json_object(stdout.trim())?;
+    let mode = val.get("resume")?.get("mode")?.as_str()?;
+    matches!(mode, "native" | "summary").then(|| mode.to_owned())
 }
 
 fn require_item_workspace(item: &BoardItem) -> Result<PathBuf, BoardError> {
@@ -561,6 +571,22 @@ pub struct AskParams {
     pub model: Option<String>,
     pub by: String,
     pub state_root: PathBuf,
+    /// Ignored with `revise` (SPEC-board-ask-resume FR-3832).
+    pub resume: ResumeMode,
+}
+
+/// How an ask continues the item's work session (SPEC-board-ask-resume
+/// FR-3832..FR-3834).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskResumePlan {
+    pub conversation_id: String,
+    pub agent: String,
+    /// New conversation seeded with the summary (live board run, FR-3834).
+    pub fork: bool,
+    /// Never resume the provider session (`--resume fresh`).
+    pub force_fresh: bool,
+    /// `native` or `summary`, from the binding state at prepare time.
+    pub expected_mode: &'static str,
 }
 
 pub struct PreparedAsk {
@@ -568,7 +594,129 @@ pub struct PreparedAsk {
     pub workspace: PathBuf,
     pub guard: BoardLockGuard,
     pub params: AskParams,
+    pub resume: Option<AskResumePlan>,
 }
+
+impl PreparedAsk {
+    /// Resume mode the ask is expected to use; `None` for a plan revision.
+    pub fn planned_resume(&self) -> Option<ResumeReport> {
+        if self.params.revise {
+            return None;
+        }
+        Some(match &self.resume {
+            Some(plan) => ResumeReport {
+                mode: plan.expected_mode.to_owned(),
+                agent: Some(plan.agent.clone()),
+            },
+            None => ResumeReport {
+                mode: "off".to_owned(),
+                agent: self.params.agent.clone(),
+            },
+        })
+    }
+}
+
+/// Result of an ask: the updated item and the resume mode used (FR-3833).
+#[derive(Debug, Clone)]
+pub struct AskAnswer {
+    pub item: BoardItem,
+    pub resume: Option<ResumeReport>,
+}
+
+fn binding_is_active(
+    state_root: &Path,
+    workspace_path: &str,
+    conversation_id: &str,
+    agent: &str,
+) -> bool {
+    let db_path = state_root
+        .join("repos")
+        .join(crate::state_path::repo_key_for_canonical(workspace_path))
+        .join("conversations.sqlite3");
+    let wanted = crate::runner_id::canonical_runner_id(agent);
+    matches!(
+        crate::conversation::read_binding_statuses(&db_path, conversation_id),
+        Ok(Some(rows)) if rows.iter().any(|(key, status)| {
+            *status == crate::conversation::BindingStatus::Active
+                && crate::runner_id::canonical_runner_id(key) == wanted
+        })
+    )
+}
+
+/// FR-3832..FR-3834: decides whether and how an ask continues the work
+/// session. `None` keeps the FR-3132 item-only ask.
+fn plan_ask_resume(
+    store: &BoardStore,
+    item: &BoardItem,
+    params: &AskParams,
+) -> Result<Option<AskResumePlan>, BoardError> {
+    if params.revise || params.resume == ResumeMode::Off {
+        return Ok(None);
+    }
+    let Some((link, conversation_id)) = session::work_session(item)
+        .and_then(|link| Some((link, link.conversation_id.clone()?)))
+        .filter(|(_, id)| session::valid_link_id(id))
+    else {
+        return match params.resume {
+            ResumeMode::Auto => Ok(None),
+            mode => Err(BoardError::Usage(format!(
+                "--resume {} needs a work session; this item has none",
+                mode.as_str()
+            ))),
+        };
+    };
+    let agent = params
+        .agent
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| default_ask_agent(link))
+        .ok_or_else(|| {
+            BoardError::Usage("cannot tell which agent did the work; pass --agent".to_owned())
+        })?;
+    let live =
+        item.lane == Lane::InProgress && BoardLockGuard::is_active(store.base(), "runs", &item.id);
+    if live {
+        if params.resume == ResumeMode::Native {
+            return Err(BoardError::Conflict(
+                "cannot resume the work session natively while a board run is in progress for this item"
+                    .to_owned(),
+            ));
+        }
+        return Ok(Some(AskResumePlan {
+            conversation_id,
+            agent,
+            fork: true,
+            force_fresh: false,
+            expected_mode: "summary",
+        }));
+    }
+    let active = binding_is_active(
+        &params.state_root,
+        &link.workspace_path,
+        &conversation_id,
+        &agent,
+    );
+    if params.resume == ResumeMode::Native && !active {
+        return Err(BoardError::Conflict(format!(
+            "{NO_ACTIVE_BINDING}: the work session has no active {agent} session"
+        )));
+    }
+    let force_fresh = params.resume == ResumeMode::Fresh;
+    Ok(Some(AskResumePlan {
+        conversation_id,
+        agent,
+        fork: false,
+        force_fresh,
+        expected_mode: if active && !force_fresh {
+            "native"
+        } else {
+            "summary"
+        },
+    }))
+}
+
+/// Conflict reason of `--resume native` without an active binding (FR-3832).
+pub const NO_ACTIVE_BINDING: &str = "no_active_binding";
 
 pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<PreparedAsk, BoardError> {
     validate_item_id_early(&params.id)?;
@@ -588,6 +736,7 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
             "cannot --revise while a run is in progress for this item".to_owned(),
         ));
     }
+    let resume = plan_ask_resume(store, &existing, &params)?;
     let guard = BoardLockGuard::acquire(
         store.base(),
         "asks",
@@ -606,7 +755,49 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
         workspace,
         guard,
         params,
+        resume,
     })
+}
+
+/// Child argv of an ask that continues the work session (FR-3832, FR-3835):
+/// always `--read-only`, never `--allow-sensitive`/`--trust-workspace-config`.
+pub fn ask_resume_run_args(
+    workspace: &Path,
+    plan: &AskResumePlan,
+    model: Option<&str>,
+    item_id: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--conversation".to_owned(),
+        plan.conversation_id.clone(),
+        "--agent".to_owned(),
+        plan.agent.clone(),
+        "--read-only".to_owned(),
+        "--json".to_owned(),
+    ];
+    if let Some(m) = model {
+        args.push("--model".to_owned());
+        args.push(m.to_owned());
+    }
+    if plan.fork {
+        args.push("--fork-summary".to_owned());
+    } else if plan.force_fresh {
+        args.push("--fresh-session".to_owned());
+    }
+    args.push("--board-item".to_owned());
+    args.push(item_id.to_owned());
+    args.push("-".to_owned());
+    args
+}
+
+fn build_follow_up_prompt(item: &BoardItem, question: &str) -> String {
+    format!(
+        "Follow-up question from the decision board about \"{}\". Answer it from the work session; this turn is read-only, so do not edit files.\n\nQuestion:\n{question}\n",
+        item.title
+    )
 }
 
 pub fn ask_run_args(workspace: &Path, agent: Option<&str>, model: Option<&str>) -> Vec<String> {
@@ -633,15 +824,68 @@ pub fn ask_item_execute(
     store: &BoardStore,
     prepared: PreparedAsk,
 ) -> Result<BoardItem, BoardError> {
+    ask_item_execute_report(store, prepared).map(|answer| answer.item)
+}
+
+pub fn ask_item_execute_report(
+    store: &BoardStore,
+    prepared: PreparedAsk,
+) -> Result<AskAnswer, BoardError> {
     let PreparedAsk {
         item,
         workspace,
         guard,
         params,
+        resume,
     } = prepared;
     let ws_str = workspace.to_string_lossy().into_owned();
     let timeout = child_timeout();
     let started_ms = session::now_ms();
+
+    if let Some(plan) = resume {
+        let args = ask_resume_run_args(&workspace, &plan, params.model.as_deref(), &params.id);
+        let prompt = build_follow_up_prompt(&item, &params.text);
+        let mut outcome =
+            spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
+        if !plan.fork && outcome.links.conversation_id.is_none() {
+            outcome.links.conversation_id = Some(plan.conversation_id.clone());
+        }
+        append_ask_link(
+            store,
+            &params.id,
+            &workspace,
+            started_ms,
+            &outcome,
+            Some(&plan.agent),
+            params.model.as_deref(),
+        );
+        let mode = outcome
+            .resume_mode
+            .clone()
+            .unwrap_or_else(|| plan.expected_mode.to_owned());
+        let mut answer = format!("[{mode} resume · {}] ", plan.agent);
+        if plan.fork {
+            answer.push_str("(new conversation; a board run is in progress) ");
+        }
+        answer.push_str(&ask_answer_text(outcome));
+        let masked = mask_sensitive_tokens(&answer);
+        let text: String = masked.chars().take(TEXT_MAX).collect();
+        drop(guard);
+        let item = store.say(
+            &params.id,
+            SayRequest {
+                text,
+                from: "planner".to_owned(),
+            },
+        )?;
+        return Ok(AskAnswer {
+            item,
+            resume: Some(ResumeReport {
+                mode,
+                agent: Some(plan.agent),
+            }),
+        });
+    }
 
     if !params.revise {
         let board_cfg = BoardSettings::load_user_only();
@@ -661,36 +905,25 @@ pub fn ask_item_execute(
             agent.as_deref(),
             model.as_deref(),
         );
-        let raw_answer = if outcome.exit_code == 0 {
-            outcome
-                .text
-                .or(outcome.summary)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "planner ask returned empty response".to_owned())
-        } else {
-            let mut msg = format!("planner ask failed (exit {})", outcome.exit_code);
-            if let Some(detail) = outcome
-                .summary
-                .or(outcome.text)
-                .filter(|s| !s.trim().is_empty())
-            {
-                let clipped: String = detail.chars().take(2000).collect();
-                msg.push_str(": ");
-                msg.push_str(&clipped);
-            }
-            msg
-        };
+        let raw_answer = ask_answer_text(outcome);
         let masked = mask_sensitive_tokens(&raw_answer);
         let answer: String = masked.chars().take(TEXT_MAX).collect();
         // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
         drop(guard);
-        return store.say(
+        let item = store.say(
             &params.id,
             SayRequest {
                 text: answer,
                 from: "planner".to_owned(),
             },
-        );
+        )?;
+        return Ok(AskAnswer {
+            item,
+            resume: Some(ResumeReport {
+                mode: "off".to_owned(),
+                agent,
+            }),
+        });
     }
 
     let plan = item
@@ -726,13 +959,15 @@ pub fn ask_item_execute(
         let msg = format!("Revised plan to revision {rev} ({new_hash}, {steps} steps).");
         // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
         drop(guard);
-        return store.say(
-            &params.id,
-            SayRequest {
-                text: msg,
-                from: "planner".to_owned(),
-            },
-        );
+        return store
+            .say(
+                &params.id,
+                SayRequest {
+                    text: msg,
+                    from: "planner".to_owned(),
+                },
+            )
+            .map(|item| AskAnswer { item, resume: None });
     }
 
     let mut msg = format!(
@@ -747,13 +982,36 @@ pub fn ask_item_execute(
     }
     // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
     drop(guard);
-    store.say(
-        &params.id,
-        SayRequest {
-            text: msg,
-            from: "planner".to_owned(),
-        },
-    )
+    store
+        .say(
+            &params.id,
+            SayRequest {
+                text: msg,
+                from: "planner".to_owned(),
+            },
+        )
+        .map(|item| AskAnswer { item, resume: None })
+}
+
+fn ask_answer_text(outcome: ChildOutcome) -> String {
+    if outcome.exit_code == 0 {
+        return outcome
+            .text
+            .or(outcome.summary)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "planner ask returned empty response".to_owned());
+    }
+    let mut msg = format!("planner ask failed (exit {})", outcome.exit_code);
+    if let Some(detail) = outcome
+        .summary
+        .or(outcome.text)
+        .filter(|s| !s.trim().is_empty())
+    {
+        let clipped: String = detail.chars().take(2000).collect();
+        msg.push_str(": ");
+        msg.push_str(&clipped);
+    }
+    msg
 }
 
 /// Record a finished `board ask` as an `ask` session link (SPEC-board-work-session
@@ -781,8 +1039,12 @@ fn append_ask_link(
 }
 
 pub fn ask_item(store: &BoardStore, params: AskParams) -> Result<BoardItem, BoardError> {
+    ask_item_report(store, params).map(|answer| answer.item)
+}
+
+pub fn ask_item_report(store: &BoardStore, params: AskParams) -> Result<AskAnswer, BoardError> {
     let prepared = ask_item_prepare(store, params)?;
-    ask_item_execute(store, prepared)
+    ask_item_execute_report(store, prepared)
 }
 
 pub struct RunParams {
@@ -1386,6 +1648,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1427,6 +1690,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1461,6 +1725,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1490,6 +1755,7 @@ exit 1
                     model: None,
                     by: "owner".to_owned(),
                     state_root: state.clone(),
+                    resume: ResumeMode::Auto,
                 },
             )
             .err()
@@ -1511,6 +1777,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -2046,6 +2313,7 @@ exit 0
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -2831,6 +3099,7 @@ exit 0
             model: None,
             by: "bot:coord".to_owned(),
             state_root: h.state.clone(),
+            resume: ResumeMode::Auto,
         };
         let answered = with_board_env(&child, &data, || ask_item(&h.store, ask(false))).unwrap();
         let link = answered.sessions.last().unwrap();
@@ -2860,5 +3129,309 @@ exit 0
         let link = failed.sessions.last().unwrap();
         assert_eq!(link.status, SessionStatus::Failed);
         assert_eq!(link.exit_code, Some(1));
+    }
+
+    /// Gives `item` a work session (a `run` link in `conv-x` by cursor-agent)
+    /// and seeds that conversation's database: active cursor binding, stale agy.
+    fn with_work_session(h: &Hardening, item: &BoardItem) {
+        let mut link = session::running_link(SessionKind::Run, &h.ws, 1_000);
+        link.conversation_id = Some("conv-x".to_owned());
+        link.agent = Some("cursor-agent".to_owned());
+        session::test_support::seed_conversation_db(&h.state, &link.workspace_path, "conv-x", 2);
+        h.store.append_session(&item.id, link, "planner").unwrap();
+    }
+
+    /// Fake child that logs argv and env and answers like `run --json`; with
+    /// `--conversation` it reports `resume.mode` (`summary` for
+    /// `--fresh-session`/`--fork-summary`, else `native`).
+    fn resume_child(h: &Hardening) -> (PathBuf, PathBuf) {
+        let log = h.dir.path().join("ask-argv.log");
+        let child = write_fake_runner(
+            h.dir.path(),
+            "fake-resume.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s | env:%s\\n' \"$*\" \"$(env | grep -c -e DMUXAI_ALLOW_SENSITIVE -e DMUXAI_TRUST_WORKSPACE_CONFIG)\" >> \"{log}\"\n\
+                 conv=conv-x\nmode=native\ncase \"$*\" in\n  *--fork-summary*) conv=conv-fork; mode=summary ;;\n  *--fresh-session*) mode=summary ;;\nesac\n\
+                 case \"$*\" in\n  *--conversation*)\n    printf '{{\"ok\":true,\"exit_code\":0,\"text\":\"answer\",\"run_id\":\"1111111111111111\",\"conversation_id\":\"%s\",\"agent\":\"cursor-agent\",\"resume\":{{\"mode\":\"%s\",\"agent\":\"cursor-agent\"}}}}\\n' \"$conv\" \"$mode\"\n    exit 0 ;;\nesac\n\
+                 printf '{{\"ok\":true,\"exit_code\":0,\"text\":\"item answer\"}}\\n'\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        (child, log)
+    }
+
+    fn resume_ask(h: &Hardening, item: &BoardItem, resume: ResumeMode) -> AskParams {
+        AskParams {
+            id: item.id.clone(),
+            text: "what changed?".to_owned(),
+            revise: false,
+            agent: None,
+            model: None,
+            by: "owner".to_owned(),
+            state_root: h.state.clone(),
+            resume,
+        }
+    }
+
+    fn last_argv(log: &Path) -> String {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    // TC-3832 / FR-3832: with a work session, auto/native/fresh run the child
+    // with `--conversation conv-x --agent cursor-agent`, fresh adds
+    // `--fresh-session`, off keeps the item-only ask; native without an active
+    // binding is a conflict (exit 4, `no_active_binding`); native/fresh without
+    // a work session are usage errors and auto falls back to off.
+    #[test]
+    fn tc_3832_ask_resume_modes() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+
+        for mode in [ResumeMode::Auto, ResumeMode::Native, ResumeMode::Fresh] {
+            with_board_env(&child, &data, || {
+                ask_item_report(&h.store, resume_ask(&h, &item, mode))
+            })
+            .unwrap();
+            let argv = last_argv(&log);
+            assert!(
+                argv.contains("run --conversation conv-x --agent cursor-agent --read-only --json"),
+                "{mode:?}: {argv}"
+            );
+            assert!(
+                argv.contains(&format!("--board-item {}", item.id)),
+                "{argv}"
+            );
+            assert_eq!(argv.contains("--fresh-session"), mode == ResumeMode::Fresh);
+            assert!(!argv.contains("--fork-summary"));
+        }
+
+        let off = with_board_env(&child, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &item, ResumeMode::Off))
+        })
+        .unwrap();
+        assert!(!last_argv(&log).contains("--conversation"));
+        assert_eq!(off.resume.as_ref().unwrap().mode, "off");
+
+        // Failure: --agent agy has only a stale binding.
+        let lines_before = fs::read_to_string(&log).unwrap().lines().count();
+        let native_agy = with_board_env(&child, &data, || {
+            ask_item_report(
+                &h.store,
+                AskParams {
+                    agent: Some("agy".to_owned()),
+                    ..resume_ask(&h, &item, ResumeMode::Native)
+                },
+            )
+        })
+        .unwrap_err();
+        assert_eq!(native_agy.exit_code(), crate::agent_api::exit::CONFLICT);
+        assert!(native_agy.to_string().contains(NO_ACTIVE_BINDING));
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            lines_before,
+            "a refused ask spawns no child"
+        );
+
+        // Boundary: an item without a work session.
+        let bare = hardening_item(&h, Lane::NeedsDecision);
+        for mode in [ResumeMode::Native, ResumeMode::Fresh] {
+            let err = with_board_env(&child, &data, || {
+                ask_item_report(&h.store, resume_ask(&h, &bare, mode))
+            })
+            .unwrap_err();
+            assert_eq!(err.exit_code(), crate::agent_api::exit::USAGE, "{mode:?}");
+        }
+        let auto = with_board_env(&child, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &bare, ResumeMode::Auto))
+        })
+        .unwrap();
+        assert_eq!(auto.resume.as_ref().unwrap().mode, "off");
+        assert!(!last_argv(&log).contains("--conversation"));
+
+        // --revise ignores --resume (FR-3132 plan revision).
+        let revise = AskParams {
+            revise: true,
+            ..resume_ask(&h, &item, ResumeMode::Native)
+        };
+        let prepared = ask_item_prepare(&h.store, revise).unwrap();
+        assert!(prepared.resume.is_none() && prepared.planned_resume().is_none());
+    }
+
+    // TC-3833 / FR-3833: the planner message is prefixed with the mode and
+    // agent, the result reports `resume.mode`, and the ask link records the
+    // work conversation id.
+    #[test]
+    fn tc_3833_ask_reports_resume_mode() {
+        use crate::board::resume::ask_answer_json;
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, _log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+
+        let prepared = ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Auto)).unwrap();
+        let planned = prepared.planned_resume().unwrap();
+        assert_eq!(planned.mode, "native");
+        assert_eq!(planned.agent.as_deref(), Some("cursor-agent"));
+        let answer = with_board_env(&child, &data, || {
+            ask_item_execute_report(&h.store, prepared)
+        })
+        .unwrap();
+        let last = answer.item.thread.last().unwrap();
+        assert_eq!(last.from, "planner");
+        assert_eq!(last.text, "[native resume · cursor-agent] answer");
+        let json = ask_answer_json(&answer.item, answer.resume.as_ref());
+        assert_eq!(json["resume"]["mode"], "native");
+        assert_eq!(json["resume"]["agent"], "cursor-agent");
+        let link = answer.item.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-x"));
+        assert_eq!(link.agent.as_deref(), Some("cursor-agent"));
+
+        let fresh = with_board_env(&child, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &item, ResumeMode::Fresh))
+        })
+        .unwrap();
+        assert_eq!(fresh.resume.as_ref().unwrap().mode, "summary");
+        assert!(
+            fresh
+                .item
+                .thread
+                .last()
+                .unwrap()
+                .text
+                .starts_with("[summary resume · cursor-agent] ")
+        );
+
+        // Failure: a crashing child still reports the planned mode.
+        let crash = write_fake_runner(
+            h.dir.path(),
+            "fake-resume-crash.sh",
+            "#!/bin/sh\ncat > /dev/null\nexit 1\n",
+        );
+        let failed = with_board_env(&crash, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &item, ResumeMode::Auto))
+        })
+        .unwrap();
+        let text = &failed.item.thread.last().unwrap().text;
+        assert!(
+            text.starts_with("[native resume · cursor-agent] planner ask failed (exit 1)"),
+            "{text}"
+        );
+        assert_eq!(
+            failed
+                .item
+                .sessions
+                .last()
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            Some("conv-x")
+        );
+    }
+
+    // TC-3834 / FR-3834: during a live board run, auto asks in a new
+    // conversation seeded with the summary (`--fork-summary`, mode summary,
+    // never native) and says so; native is a conflict.
+    #[test]
+    fn tc_3834_ask_during_run_uses_summary() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::Approved);
+        with_work_session(&h, &item);
+        let running = prepare(&h, &item);
+        assert_eq!(running.item.lane, Lane::InProgress);
+
+        let prepared = ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Auto)).unwrap();
+        assert_eq!(prepared.planned_resume().unwrap().mode, "summary");
+        let answer = with_board_env(&child, &data, || {
+            ask_item_execute_report(&h.store, prepared)
+        })
+        .unwrap();
+        let argv = last_argv(&log);
+        assert!(argv.contains("--conversation conv-x"), "{argv}");
+        assert!(argv.contains("--fork-summary"), "{argv}");
+        assert_eq!(answer.resume.as_ref().unwrap().mode, "summary");
+        let text = &answer.item.thread.last().unwrap().text;
+        assert!(
+            text.starts_with(
+                "[summary resume · cursor-agent] (new conversation; a board run is in progress) "
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            answer
+                .item
+                .sessions
+                .last()
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            Some("conv-fork"),
+            "the running conversation is never appended to"
+        );
+
+        let native = ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Native))
+            .err()
+            .expect("native must be refused during a run");
+        assert_eq!(native.exit_code(), crate::agent_api::exit::CONFLICT);
+
+        // Boundary: in progress without a live lock is not a live run.
+        drop(running);
+        if !BoardLockGuard::is_active(&h.board, "runs", &item.id) {
+            let prepared =
+                ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Auto)).unwrap();
+            assert_eq!(prepared.planned_resume().unwrap().mode, "native");
+        }
+    }
+
+    // TC-3835 / FR-3835: every resume mode runs the child with `--read-only`,
+    // never with --allow-sensitive/--trust-workspace-config (argv or env), and
+    // writes no decision or check.
+    #[test]
+    fn tc_3835_ask_resume_stays_read_only() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+        let before = h.store.get(&item.id).unwrap();
+
+        for mode in [
+            ResumeMode::Auto,
+            ResumeMode::Native,
+            ResumeMode::Fresh,
+            ResumeMode::Off,
+        ] {
+            with_board_env(&child, &data, || {
+                ask_item_report(&h.store, resume_ask(&h, &item, mode))
+            })
+            .unwrap();
+        }
+        let lines = fs::read_to_string(&log).unwrap();
+        assert_eq!(lines.lines().count(), 4);
+        for line in lines.lines() {
+            assert!(line.contains("--read-only"), "{line}");
+            assert!(!line.contains("--allow-sensitive"), "{line}");
+            assert!(!line.contains("--trust-workspace-config"), "{line}");
+            assert!(line.ends_with("env:0"), "{line}");
+        }
+        let after = h.store.get(&item.id).unwrap();
+        assert_eq!(after.lane, before.lane);
+        assert_eq!(after.decision, before.decision);
+        assert_eq!(after.checked, before.checked);
     }
 }

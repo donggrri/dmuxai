@@ -2801,6 +2801,7 @@ mod tests {
                 model: None,
                 by: "bot:coord".to_owned(),
                 state_root: state.clone(),
+                resume: Default::default(),
             },
         )
         .err()
