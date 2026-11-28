@@ -62,6 +62,8 @@
 //! - TC-2693 (NFR-2693): a read from a second client is served while the host
 //!   is still blocked in another client's wait
 //! - TC-2695 (INT-2695): `--json` errors are exactly one JSON object
+//! - TC-3805 (SPEC-board-approval-hardening FR-3805): a run caller cannot
+//!   type into a session opened without a run id; reopen keeps the run id
 
 #![cfg(unix)]
 
@@ -1002,6 +1004,65 @@ fn tc_2630_dangerous_send_needs_one_shot_approval() {
         "approve inside a run must be forbidden: {out:?}"
     );
     assert_eq!(json["error_kind"], "forbidden", "run guard: {json:?}");
+}
+
+/// TC-3805 / SPEC-board-approval-hardening FR-3805: a caller with
+/// `DMUXAI_RUN_ID` set cannot `send`, `send --keys` or `exec` into a session a
+/// human opened without a run id (exit 5, `forbidden`); a session opened inside
+/// the run keeps working, and `reopen` keeps each session's run id.
+#[test]
+fn tc_3805_run_caller_cannot_type_into_human_session() {
+    let sandbox = Sandbox::new();
+    let _guard = sandbox.close_guard();
+    let in_run = |args: &[&str]| {
+        let output = sandbox
+            .command(args)
+            .env("DMUXAI_RUN_ID", "run-1")
+            .stdin(Stdio::null())
+            .output()
+            .expect("execute dmuxai");
+        let out = Out::new(output);
+        let json = out.json("stdout");
+        (out, json)
+    };
+    let assert_forbidden = |args: &[&str]| {
+        let (out, json) = in_run(args);
+        assert_eq!(out.code, 5, "{args:?} from a run: {out:?}");
+        assert_eq!(json["error_kind"], "forbidden", "{args:?}: {json:?}");
+        assert!(
+            json.to_string().contains("ask a human"),
+            "{args:?} names a human: {json:?}"
+        );
+    };
+
+    sandbox.open_shell("h");
+    assert_forbidden(&["term", "send", "h", "echo hi", "--json"]);
+    assert_forbidden(&["term", "send", "h", "--keys", "Enter", "--json"]);
+    assert_forbidden(&["term", "exec", "h", "echo hi", "--json"]);
+
+    let (out, _) = in_run(&["term", "open", "r", "--json"]);
+    assert_eq!(out.code, 0, "open inside a run: {out:?}");
+    let (out, result) = in_run(&["term", "exec", "r", "echo RID=$DMUXAI_RUN_ID", "--json"]);
+    assert_eq!(out.code, 0, "exec into run session: {out:?}");
+    assert_eq!(result["text"], json!("RID=run-1"), "exec: {result:?}");
+
+    let (out, _) = in_run(&["term", "reopen", "r", "--json"]);
+    assert_eq!(out.code, 0, "reopen run session: {out:?}");
+    let (out, result) = in_run(&["term", "exec", "r", "echo RID=$DMUXAI_RUN_ID", "--json"]);
+    assert_eq!(out.code, 0, "exec after reopen: {out:?}");
+    assert_eq!(
+        result["text"],
+        json!("RID=run-1"),
+        "reopen kept run id: {result:?}"
+    );
+
+    let (out, _) = sandbox.term_json(&["term", "reopen", "h", "--json"]);
+    assert_eq!(out.code, 0, "reopen human session: {out:?}");
+    assert_forbidden(&["term", "exec", "h", "echo hi", "--json"]);
+
+    let (out, result) = sandbox.term_json(&["term", "exec", "h", "echo human", "--json"]);
+    assert_eq!(out.code, 0, "human exec: {out:?}");
+    assert_eq!(result["text"], json!("human"), "human exec: {result:?}");
 }
 
 /// TC-2630 / FR-2630: a trusted workspace `[terminal.policy] allow` regex

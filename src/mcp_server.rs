@@ -22,6 +22,8 @@ pub struct RunArgs {
     pub graph: bool,
     pub todo_id: Option<String>,
     pub no_spec_first: bool,
+    /// SPEC-board-ask-resume FR-3830: `run --conversation`.
+    pub conversation_id: Option<String>,
 }
 
 /// Operations behind the MCP tools. Each returns a JSON value that becomes
@@ -90,7 +92,11 @@ fn tool_definitions() -> Value {
                         "type": "boolean",
                         "description": "Disable spec-first workflow for this run (same as dmuxai run --no-spec-first)"
                     },
-                    "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
+                    "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "Continue this stored conversation with one agent turn (same as dmuxai run --conversation); requires agent, cannot be used with graph or todo_id"
+                    }
                 }
             }
         },
@@ -294,7 +300,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "board_ask",
-            "description": "Ask the planner a question on a decision board item or request a plan revision (blocks up to 900s).",
+            "description": "Ask the planner a question on a decision board item or request a plan revision (blocks up to 900s). With a work session the ask continues it read-only; the result has resume.mode (native, summary, off).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -303,7 +309,12 @@ fn tool_definitions() -> Value {
                     "revise": { "type": "boolean" },
                     "agent": { "type": "string" },
                     "model": { "type": "string" },
-                    "by": { "type": "string" }
+                    "by": { "type": "string" },
+                    "resume": {
+                        "type": "string",
+                        "enum": ["auto", "native", "fresh", "off"],
+                        "description": "Continue the item's work session: auto (default), native (requires an active provider session), fresh (summary-seeded session) or off (item context only); ignored with revise"
+                    }
                 },
                 "required": ["id", "text"]
             }
@@ -318,6 +329,28 @@ fn tool_definitions() -> Value {
                     "by": { "type": "string" }
                 },
                 "required": ["id"]
+            }
+        },
+        {
+            "name": "board_session",
+            "description": "Read-only work session of a decision board item: session links, the latest run's conversation and its provider binding agents and statuses.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "board_link",
+            "description": "Link an existing run (from the item's workspace run journal) to a decision board item as a run session link.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "run_id": { "type": "string" },
+                    "by": { "type": "string" }
+                },
+                "required": ["id", "run_id"]
             }
         }
     ])
@@ -391,6 +424,7 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                     .get("no_spec_first")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                conversation_id: str_arg(args, "conversation_id").map(str::to_owned),
             };
             if run.todo_id.is_none() && run.prompt.as_deref().is_none_or(|p| p.trim().is_empty()) {
                 return Err("prompt or todo_id is required".to_owned());
@@ -413,6 +447,24 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
             }
             if run.model.is_some() && run.agent.is_none() {
                 return Err("model needs agent".to_owned());
+            }
+            // FR-3830: validate the id before the backend touches the store.
+            if let Some(id) = &run.conversation_id {
+                if !crate::board::session::valid_link_id(id) {
+                    return Err(
+                        "conversation_id must be 1-128 characters of A-Z, a-z, 0-9, _ or -"
+                            .to_owned(),
+                    );
+                }
+                if run.graph || run.todo_id.is_some() || run.approve_plan_id.is_some() {
+                    return Err(
+                        "conversation_id cannot be used with graph, todo_id or approve_plan_id"
+                            .to_owned(),
+                    );
+                }
+                if run.agent.is_none() {
+                    return Err("conversation_id needs agent".to_owned());
+                }
             }
             backend.run(run)
         }
@@ -513,6 +565,8 @@ pub fn handle_line(backend: &dyn McpBackend, line: &str) -> Option<String> {
                 "board_events",
                 "board_ask",
                 "board_run",
+                "board_session",
+                "board_link",
             ];
             if !known.contains(&name) {
                 return Some(
@@ -685,6 +739,8 @@ mod tests {
             ),
             ("board_prompt", &["id", "hash"]),
             ("board_events", &["since"]),
+            ("board_session", &["id"]),
+            ("board_link", &["id", "run_id", "by"]),
         ];
         let ok_call = call(
             &stub,
@@ -898,6 +954,7 @@ mod tests {
                     graph: false,
                     todo_id: None,
                     no_spec_first: false,
+                    conversation_id: None,
                 }
             );
         }

@@ -67,6 +67,7 @@ where
             get(board_rules_get).put(board_rules_put),
         )
         .route("/api/board/{id}", get(board_get))
+        .route("/api/board/{id}/session", get(board_session))
         .route("/api/board/{id}/decision", post(board_decision))
         .route("/api/board/{id}/check", post(board_check))
         .route("/api/board/{id}/messages", post(board_messages))
@@ -227,6 +228,26 @@ async fn board_get(State(state): State<BoardApiState>, AxumPath(id): AxumPath<St
     }
     match with_store(state.board_base.clone(), move |store| store.get(&id)).await {
         Ok(item) => json_ok(StatusCode::OK, &item_response(item)),
+        Err(error) => board_error_response(error),
+    }
+}
+
+/// Read-only work session (SPEC-board-work-session FR-3823); served by both
+/// `serve` and `--web`.
+async fn board_session(
+    State(state): State<BoardApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if !valid_item_id(&id) {
+        return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
+    }
+    let state_root = state.state_root.clone();
+    match with_store(state.board_base.clone(), move |store| {
+        crate::board::session::session_view(store, &id, &state_root)
+    })
+    .await
+    {
+        Ok(view) => json_ok(StatusCode::OK, &view),
         Err(error) => board_error_response(error),
     }
 }
@@ -489,6 +510,9 @@ struct AskBody {
     agent: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// `auto` (default), `native`, `fresh` or `off` (SPEC-board-ask-resume FR-3832).
+    #[serde(default)]
+    resume: Option<String>,
 }
 
 async fn board_ask(
@@ -509,6 +533,18 @@ async fn board_ask(
         Ok(actor) => actor,
         Err(error) => return board_error_response(error),
     };
+    let resume = match body.resume.as_deref() {
+        None => crate::board::resume::ResumeMode::default(),
+        Some(raw) => match crate::board::resume::ResumeMode::parse(raw) {
+            Some(mode) => mode,
+            None => {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "resume must be auto, native, fresh or off",
+                );
+            }
+        },
+    };
     let board_base = state.board_base.clone();
     let state_root = state.state_root.clone();
     let params = crate::board::runner::AskParams {
@@ -519,6 +555,7 @@ async fn board_ask(
         model: body.model,
         by,
         state_root,
+        resume,
     };
     match with_store(board_base.clone(), move |store| {
         crate::board::runner::ask_item_prepare(store, params)
@@ -527,12 +564,28 @@ async fn board_ask(
     {
         Ok(prepared) => {
             let item = prepared.item.clone();
+            let planned = prepared.planned_resume();
             std::thread::spawn(move || {
                 if let Ok(bg_store) = open_store(&board_base) {
                     let _ = crate::board::runner::ask_item_execute(&bg_store, prepared);
                 }
             });
-            json_ok(StatusCode::ACCEPTED, &item_response(item))
+            let mut body = item_response(item);
+            if let Some(resume) = planned {
+                body["resume"] = serde_json::json!(resume);
+            }
+            json_ok(StatusCode::ACCEPTED, &body)
+        }
+        Err(BoardError::Conflict(message))
+            if message.starts_with(crate::board::runner::NO_ACTIVE_BINDING) =>
+        {
+            json_ok(
+                StatusCode::CONFLICT,
+                &serde_json::json!({
+                    "error": message,
+                    "reason": crate::board::runner::NO_ACTIVE_BINDING,
+                }),
+            )
         }
         Err(error) => board_error_response(error),
     }
@@ -923,6 +976,89 @@ mod tests {
         assert!(body.contains(&id));
     }
 
+    // TC-3807 / SPEC-board-approval-hardening FR-3807: `POST /plan` answers 409
+    // while a live run holds the `in_progress` item, and works after the run ends.
+    #[tokio::test]
+    async fn tc_3807_http_plan_refused_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let plan_json = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&ws, &state, "ship it", plan_json, None).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "running".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        store
+            .decide_without_notify(
+                &item.id,
+                crate::board::DecideRequest {
+                    verdict: crate::board::Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let prepared = crate::board::runner::run_item_prepare(
+            &store,
+            crate::board::runner::RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(hash.clone()),
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+
+        let token = "boardtesttoken";
+        let router = test_router(board.clone(), state.clone(), token);
+        let post_plan = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/board/{}/plan", item.id))
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("X-Dmuxai-Human", "1")
+                .body(axum::body::Body::from(
+                    r#"{"steps":[{"id":"step-1","role":"implement","job":"edit more","runner":"cursor","depends_on":[],"task":"task-1"}]}"#,
+                ))
+                .unwrap()
+        };
+        let resp = router.clone().oneshot(post_plan()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let current = store.get(&item.id).unwrap();
+        assert_eq!(current.lane, Lane::InProgress);
+        assert_eq!(current.plan.as_ref().unwrap().hash, hash);
+
+        drop(prepared);
+        let resp = router.clone().oneshot(post_plan()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        assert_ne!(store.get(&item.id).unwrap().plan.unwrap().hash, hash);
+    }
+
     // TC-3121 / FR-3121: SSE replay and tail.
     #[tokio::test]
     async fn tc_3121_board_sse_replays_since_and_streams_new_events() {
@@ -1207,6 +1343,46 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+
+        // TC-3832 / FR-3832: HTTP `resume`. Without a work session native is
+        // usage (400); a bad value is 400; with a work session but no active
+        // binding native is 409 with `reason: no_active_binding`.
+        let ask = |body: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/board/{}/ask", item.id))
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        };
+        for body in [
+            r#"{"text":"why?","resume":"native"}"#,
+            r#"{"text":"why?","resume":"bogus"}"#,
+        ] {
+            let resp = web_router.clone().oneshot(ask(body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        let mut link = crate::board::session::running_link(
+            crate::board::SessionKind::Run,
+            &ws,
+            crate::board::session::now_ms(),
+        );
+        link.conversation_id = Some("conv-http".to_owned());
+        link.agent = Some("cursor-agent".to_owned());
+        store.append_session(&item.id, link, "planner").unwrap();
+        let resp = web_router
+            .clone()
+            .oneshot(ask(r#"{"text":"why?","resume":"native"}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["reason"], crate::board::runner::NO_ACTIVE_BINDING);
 
         let resp = web_router
             .clone()
@@ -1858,5 +2034,106 @@ mod tests {
                 None => std::env::remove_var("DMUXAI_BOARD_SELF_BIN"),
             }
         }
+    }
+
+    // TC-3823 / FR-3823, FR-3824: `GET /api/board/{id}/session` is read-only on
+    // a view-only router, reports binding agents and statuses without provider
+    // session ids, 404s unknown items and warns when the database is missing;
+    // `GET /api/board/{id}` includes `sessions`.
+    #[tokio::test]
+    async fn tc_3823_board_session_reports_bindings() {
+        use crate::board::{SessionKind, SessionStatus, session};
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "session".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let ws_path = item.workspace.path.clone().unwrap();
+        let mut link = session::running_link(SessionKind::Run, Path::new(&ws_path), 1);
+        link.status = SessionStatus::Completed;
+        link.conversation_id = Some("conv-http".to_owned());
+        store.append_session(&item.id, link, "bot:coord").unwrap();
+        let token = "boardtesttoken";
+        let router = test_router(board.clone(), state.clone(), token);
+        let get = |uri: String| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{}/session", item.id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let missing: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(missing["bindings"], serde_json::json!([]));
+        assert!(missing["warning"].is_string());
+        assert_eq!(missing["work_session"]["conversation_id"], "conv-http");
+
+        session::test_support::seed_conversation_db(&state, &ws_path, "conv-http", 10);
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{}/session", item.id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(!body.contains("SECRET"), "{body}");
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["item_id"], item.id.as_str());
+        assert_eq!(
+            view["bindings"],
+            serde_json::json!([
+                {"agent": "agy", "status": "stale"},
+                {"agent": "cursor", "status": "active"}
+            ])
+        );
+        assert!(view.get("warning").is_none());
+
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{}", item.id)))
+            .await
+            .unwrap();
+        let shown: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(shown["sessions"][0]["conversation_id"], "conv-http");
+
+        let resp = router
+            .clone()
+            .oneshot(get("/api/board/b000000000001/session".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = router
+            .clone()
+            .oneshot(get("/api/board/nope/session".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -1034,6 +1034,20 @@ pub struct ConversationEngine {
     session_closed: bool,
     workspace_root: String,
     active_conversation: Option<ConversationId>,
+    /// Seeded headless continuations bring their own bounded context, so an
+    /// oversized projection is cut to the recent tail instead of starting a
+    /// summary turn (SPEC-board-ask-resume NFR-3830).
+    skip_summary_jobs: bool,
+}
+
+/// Stored material of one conversation for the work-session summary
+/// (SPEC-board-ask-resume §3). Never carries provider session ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkSessionDigest {
+    /// Latest stored summary document of any agent, rendered.
+    pub summary: Option<String>,
+    /// Completed turns in order.
+    pub turns: Vec<ProjectedTurn>,
 }
 
 /// Opens the conversation database, waiting for a concurrent DmuxAI process to
@@ -1188,12 +1202,46 @@ fn open_once(
         session_closed: false,
         workspace_root: workspace_root.to_owned(),
         active_conversation: None,
+        skip_summary_jobs: false,
     })
 }
 
 impl ConversationEngine {
     pub fn open(db_path: &Path, workspace_root: &Path) -> Result<Self, ConversationError> {
         open_with_retry(db_path, workspace_root, OPEN_RETRY_BUDGET)
+    }
+
+    /// See [`ConversationEngine::skip_summary_jobs`].
+    pub fn set_skip_summary_jobs(&mut self, skip: bool) {
+        self.skip_summary_jobs = skip;
+    }
+
+    /// The stored summary document and completed turns of conversation `id` in
+    /// this workspace; `Ok(None)` when it does not exist (SPEC-board-ask-resume
+    /// FR-3830, FR-3831). Read-only.
+    pub fn work_session_digest(
+        &self,
+        id: &ConversationId,
+    ) -> Result<Option<WorkSessionDigest>, ConversationError> {
+        if !self.conversation_exists(id)? {
+            return Ok(None);
+        }
+        let turns = load_projected_turns(&self.connection, id)?;
+        let summary = self
+            .connection
+            .query_row(
+                "SELECT summary_json FROM context_checkpoints
+                  WHERE conversation_id = ?1
+                  ORDER BY covers_through_seq DESC, created_at_ms DESC
+                  LIMIT 1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|json| serde_json::from_str::<SummaryDocument>(&json).ok())
+            .map(|document| document.render())
+            .filter(|text| !text.trim().is_empty());
+        Ok(Some(WorkSessionDigest { summary, turns }))
     }
 
     /// Returns whether another non-expired DmuxAI process is using this
@@ -2092,6 +2140,14 @@ impl ConversationEngine {
             tail_chars += chars;
             tail_start = index;
         }
+        if self.skip_summary_jobs {
+            return Ok(ProjectionBuild::Ready(ContextProjection {
+                summary,
+                recent: turns[tail_start..].to_vec(),
+                through_seq,
+                source_hash: hash_turns(turns.iter()),
+            }));
+        }
         let covers_index = if tail_start == 0 {
             turns.len()
         } else {
@@ -2940,6 +2996,41 @@ pub fn list_repo_db_conversations(
     rows.into_iter()
         .filter(|(workspace, _)| crate::state_path::repo_key_for_canonical(workspace) == repo_key)
         .collect()
+}
+
+/// Read-only provider binding agents and statuses of one conversation
+/// (SPEC-board-work-session FR-3823). Never selects `provider_session_id`,
+/// never creates or migrates the database; `Ok(None)` when the file is missing
+/// or its schema is unknown.
+pub fn read_binding_statuses(
+    db_path: &Path,
+    conversation_id: &str,
+) -> Result<Option<Vec<(String, BindingStatus)>>, ConversationError> {
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_millis(250))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(1..=SCHEMA_VERSION).contains(&version) {
+        return Ok(None);
+    }
+    let mut stmt = connection.prepare(
+        "SELECT agent, status FROM provider_bindings WHERE conversation_id = ?1 ORDER BY agent",
+    )?;
+    let rows = stmt.query_map([conversation_id], |row| {
+        let agent: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        Ok((agent, BindingStatus::from_db(&status)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(Some(out))
 }
 
 /// Read-only transcript loader for a single conversation in a repo database (FR-2982).

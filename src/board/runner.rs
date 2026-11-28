@@ -11,9 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use super::resume::{ResumeMode, ResumeReport, default_ask_agent};
 use super::{
-    BoardError, BoardItem, BoardStore, Lane, ListFilter, SayRequest, TEXT_MAX, Verdict,
-    ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies,
+    BoardError, BoardItem, BoardStore, Lane, ListFilter, SayRequest, SessionKind, TEXT_MAX,
+    Verdict, ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies, session,
     validate_item_id_early, validate_message,
 };
 use crate::process::{apply_child_cwd, apply_child_env_policy};
@@ -25,13 +26,96 @@ pub const BOARD_CHILD_TIMEOUT_SECS: u64 = 900;
 const STALE_LOCK_SECS: u64 = 960;
 const THREAD_CONTEXT_LIMIT: usize = 20;
 
+/// Environment variable carrying the one-time launch token to the detached
+/// `board run --exec-prepared` child (SPEC-board-approval-hardening FR-3800).
+pub const LAUNCH_TOKEN_ENV: &str = "DMUXAI_BOARD_LAUNCH_TOKEN";
+
+/// Contents of `<board base>/runs/<id>.lock` written by [`run_item_prepare`]
+/// (FR-3800). Only the SHA-256 of the launch token is stored; it is cleared
+/// once the token is used (FR-3801).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunLock {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_sha256: Option<String>,
+    #[serde(default)]
+    pub plan_hash: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub created_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_lane: Option<Lane>,
+}
+
+fn run_lock_path(board_base: &Path, id: &str) -> PathBuf {
+    board_base.join("runs").join(format!("{id}.lock"))
+}
+
+/// Reads the run lock of item `id`; `None` when missing or not a JSON record.
+pub fn read_run_lock(board_base: &Path, id: &str) -> Option<RunLock> {
+    let text = fs::read_to_string(run_lock_path(board_base, id)).ok()?;
+    serde_json::from_str(text.trim()).ok()
+}
+
+fn write_run_lock(board_base: &Path, id: &str, lock: &RunLock) -> Result<(), BoardError> {
+    crate::board::store::ensure_dir(&board_base.join("runs"))?;
+    let bytes = serde_json::to_vec(lock).map_err(|e| BoardError::Internal(e.to_string()))?;
+    crate::board::store::atomic_write(&run_lock_path(board_base, id), &bytes)
+}
+
+/// 64 lowercase hex characters. UUID v4 draws from the OS CSPRNG (`getrandom`),
+/// so two of them carry 244 random bits.
+fn generate_launch_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn launch_token_sha256(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(token.as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest.iter() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Reads the launch token from [`LAUNCH_TOKEN_ENV`] and removes it from this
+/// process's environment so no later child can inherit it (FR-3800).
+pub fn take_launch_token_from_env() -> Option<String> {
+    let token = std::env::var(LAUNCH_TOKEN_ENV).ok();
+    if token.is_some() {
+        // SAFETY: called once on the CLI thread before any agent child is spawned.
+        unsafe { std::env::remove_var(LAUNCH_TOKEN_ENV) };
+    }
+    token.filter(|t| !t.trim().is_empty())
+}
+
+fn lock_pid(contents: &str) -> Option<u32> {
+    let trimmed = contents.trim();
+    if let Some(pid) = trimmed.strip_prefix("pid=") {
+        return pid.parse::<u32>().ok();
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()?
+        .get("pid")?
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
 fn lock_is_stale(path: &Path) -> bool {
     #[cfg(unix)]
     if let Ok(contents) = fs::read_to_string(path)
-        && let Some(pid) = contents
-            .trim()
-            .strip_prefix("pid=")
-            .and_then(|s| s.parse::<u32>().ok())
+        && let Some(pid) = lock_pid(&contents)
         && pid > 0
     {
         // SAFETY: kill(pid, 0) checks process existence without sending a signal.
@@ -64,7 +148,14 @@ impl BoardLockGuard {
         crate::board::store::ensure_dir(&dir)?;
         let path = dir.join(format!("{id}.lock"));
         for attempt in 0..2 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
                 Ok(mut file) => {
                     let _ = writeln!(file, "pid={}", std::process::id());
                     return Ok(Self { path });
@@ -94,15 +185,45 @@ impl BoardLockGuard {
         true
     }
 
-    pub fn take_over(board_base: &Path, subdir: &str, id: &str) -> Result<Self, BoardError> {
-        let dir = board_base.join(subdir);
-        crate::board::store::ensure_dir(&dir)?;
-        let path = dir.join(format!("{id}.lock"));
-        crate::board::store::atomic_write(
-            &path,
-            format!("pid={}\n", std::process::id()).as_bytes(),
-        )?;
-        Ok(Self { path })
+    /// Takes over the run lock of a prepared run inside the detached
+    /// `--exec-prepared` child: the presented launch token must hash to the
+    /// stored value for this plan hash. The token is consumed and the lock
+    /// now names this process (FR-3801, FR-3808).
+    pub fn take_over(
+        store: &BoardStore,
+        id: &str,
+        plan_hash: &str,
+        launch_token: Option<&str>,
+    ) -> Result<(Self, RunLock), BoardError> {
+        let refused = || {
+            BoardError::Forbidden(
+                "board run --exec-prepared needs the launch token of a prepared run; start runs with `board run`"
+                    .to_owned(),
+            )
+        };
+        let token = launch_token
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(refused)?;
+        let presented = launch_token_sha256(token);
+        store.with_store_lock(|| {
+            let mut lock = read_run_lock(store.base(), id).ok_or_else(refused)?;
+            let expected = lock.token_sha256.as_deref().ok_or_else(refused)?;
+            if lock.plan_hash != plan_hash
+                || !constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            {
+                return Err(refused());
+            }
+            lock.token_sha256 = None;
+            lock.pid = std::process::id();
+            write_run_lock(store.base(), id, &lock)?;
+            Ok((
+                Self {
+                    path: run_lock_path(store.base(), id),
+                },
+                lock,
+            ))
+        })
     }
 
     pub fn disarm(self) {
@@ -123,6 +244,9 @@ pub struct ChildOutcome {
     pub plan_hash: Option<String>,
     pub text: Option<String>,
     pub summary: Option<String>,
+    pub links: super::session::ChildLinks,
+    /// `resume.mode` of a `run --conversation` child (FR-3833).
+    pub resume_mode: Option<String>,
 }
 
 fn resolve_child_bin() -> Result<PathBuf, BoardError> {
@@ -172,13 +296,7 @@ fn parse_child_json(
     if trimmed.is_empty() {
         return (None, None, None, None);
     }
-    let parsed = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
-        trimmed
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-    });
-    let Some(val) = parsed.filter(Value::is_object) else {
+    let Some(val) = child_json_object(trimmed) else {
         return (
             None,
             None,
@@ -223,6 +341,34 @@ fn parse_child_json(
         })
         .map(str::to_owned);
     (run_id, plan_hash, text, summary)
+}
+
+fn child_json_object(trimmed: &str) -> Option<Value> {
+    let parsed = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
+        trimmed
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+    });
+    parsed.filter(Value::is_object)
+}
+
+fn parse_child_links(stdout: &str) -> super::session::ChildLinks {
+    let field = |val: &Value, key: &str| {
+        val.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    match child_json_object(stdout.trim()) {
+        Some(val) => super::session::ChildLinks {
+            conversation_id: field(&val, "conversation_id"),
+            graph_id: field(&val, "graph_id"),
+            agent: field(&val, "agent"),
+        },
+        None => super::session::ChildLinks::default(),
+    }
 }
 
 fn kill_child_process_group(child: &mut std::process::Child) {
@@ -343,7 +489,15 @@ pub fn spawn_child_dmuxai(
         plan_hash,
         text,
         summary,
+        links: parse_child_links(&stdout),
+        resume_mode: parse_child_resume_mode(&stdout),
     })
+}
+
+fn parse_child_resume_mode(stdout: &str) -> Option<String> {
+    let val = child_json_object(stdout.trim())?;
+    let mode = val.get("resume")?.get("mode")?.as_str()?;
+    matches!(mode, "native" | "summary").then(|| mode.to_owned())
 }
 
 fn require_item_workspace(item: &BoardItem) -> Result<PathBuf, BoardError> {
@@ -417,6 +571,22 @@ pub struct AskParams {
     pub model: Option<String>,
     pub by: String,
     pub state_root: PathBuf,
+    /// Ignored with `revise` (SPEC-board-ask-resume FR-3832).
+    pub resume: ResumeMode,
+}
+
+/// How an ask continues the item's work session (SPEC-board-ask-resume
+/// FR-3832..FR-3834).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskResumePlan {
+    pub conversation_id: String,
+    pub agent: String,
+    /// New conversation seeded with the summary (live board run, FR-3834).
+    pub fork: bool,
+    /// Never resume the provider session (`--resume fresh`).
+    pub force_fresh: bool,
+    /// `native` or `summary`, from the binding state at prepare time.
+    pub expected_mode: &'static str,
 }
 
 pub struct PreparedAsk {
@@ -424,7 +594,129 @@ pub struct PreparedAsk {
     pub workspace: PathBuf,
     pub guard: BoardLockGuard,
     pub params: AskParams,
+    pub resume: Option<AskResumePlan>,
 }
+
+impl PreparedAsk {
+    /// Resume mode the ask is expected to use; `None` for a plan revision.
+    pub fn planned_resume(&self) -> Option<ResumeReport> {
+        if self.params.revise {
+            return None;
+        }
+        Some(match &self.resume {
+            Some(plan) => ResumeReport {
+                mode: plan.expected_mode.to_owned(),
+                agent: Some(plan.agent.clone()),
+            },
+            None => ResumeReport {
+                mode: "off".to_owned(),
+                agent: self.params.agent.clone(),
+            },
+        })
+    }
+}
+
+/// Result of an ask: the updated item and the resume mode used (FR-3833).
+#[derive(Debug, Clone)]
+pub struct AskAnswer {
+    pub item: BoardItem,
+    pub resume: Option<ResumeReport>,
+}
+
+fn binding_is_active(
+    state_root: &Path,
+    workspace_path: &str,
+    conversation_id: &str,
+    agent: &str,
+) -> bool {
+    let db_path = state_root
+        .join("repos")
+        .join(crate::state_path::repo_key_for_canonical(workspace_path))
+        .join("conversations.sqlite3");
+    let wanted = crate::runner_id::canonical_runner_id(agent);
+    matches!(
+        crate::conversation::read_binding_statuses(&db_path, conversation_id),
+        Ok(Some(rows)) if rows.iter().any(|(key, status)| {
+            *status == crate::conversation::BindingStatus::Active
+                && crate::runner_id::canonical_runner_id(key) == wanted
+        })
+    )
+}
+
+/// FR-3832..FR-3834: decides whether and how an ask continues the work
+/// session. `None` keeps the FR-3132 item-only ask.
+fn plan_ask_resume(
+    store: &BoardStore,
+    item: &BoardItem,
+    params: &AskParams,
+) -> Result<Option<AskResumePlan>, BoardError> {
+    if params.revise || params.resume == ResumeMode::Off {
+        return Ok(None);
+    }
+    let Some((link, conversation_id)) = session::work_session(item)
+        .and_then(|link| Some((link, link.conversation_id.clone()?)))
+        .filter(|(_, id)| session::valid_link_id(id))
+    else {
+        return match params.resume {
+            ResumeMode::Auto => Ok(None),
+            mode => Err(BoardError::Usage(format!(
+                "--resume {} needs a work session; this item has none",
+                mode.as_str()
+            ))),
+        };
+    };
+    let agent = params
+        .agent
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| default_ask_agent(link))
+        .ok_or_else(|| {
+            BoardError::Usage("cannot tell which agent did the work; pass --agent".to_owned())
+        })?;
+    let live =
+        item.lane == Lane::InProgress && BoardLockGuard::is_active(store.base(), "runs", &item.id);
+    if live {
+        if params.resume == ResumeMode::Native {
+            return Err(BoardError::Conflict(
+                "cannot resume the work session natively while a board run is in progress for this item"
+                    .to_owned(),
+            ));
+        }
+        return Ok(Some(AskResumePlan {
+            conversation_id,
+            agent,
+            fork: true,
+            force_fresh: false,
+            expected_mode: "summary",
+        }));
+    }
+    let active = binding_is_active(
+        &params.state_root,
+        &link.workspace_path,
+        &conversation_id,
+        &agent,
+    );
+    if params.resume == ResumeMode::Native && !active {
+        return Err(BoardError::Conflict(format!(
+            "{NO_ACTIVE_BINDING}: the work session has no active {agent} session"
+        )));
+    }
+    let force_fresh = params.resume == ResumeMode::Fresh;
+    Ok(Some(AskResumePlan {
+        conversation_id,
+        agent,
+        fork: false,
+        force_fresh,
+        expected_mode: if active && !force_fresh {
+            "native"
+        } else {
+            "summary"
+        },
+    }))
+}
+
+/// Conflict reason of `--resume native` without an active binding (FR-3832).
+pub const NO_ACTIVE_BINDING: &str = "no_active_binding";
 
 pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<PreparedAsk, BoardError> {
     validate_item_id_early(&params.id)?;
@@ -444,6 +736,7 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
             "cannot --revise while a run is in progress for this item".to_owned(),
         ));
     }
+    let resume = plan_ask_resume(store, &existing, &params)?;
     let guard = BoardLockGuard::acquire(
         store.base(),
         "asks",
@@ -462,7 +755,49 @@ pub fn ask_item_prepare(store: &BoardStore, params: AskParams) -> Result<Prepare
         workspace,
         guard,
         params,
+        resume,
     })
+}
+
+/// Child argv of an ask that continues the work session (FR-3832, FR-3835):
+/// always `--read-only`, never `--allow-sensitive`/`--trust-workspace-config`.
+pub fn ask_resume_run_args(
+    workspace: &Path,
+    plan: &AskResumePlan,
+    model: Option<&str>,
+    item_id: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-C".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+        "run".to_owned(),
+        "--conversation".to_owned(),
+        plan.conversation_id.clone(),
+        "--agent".to_owned(),
+        plan.agent.clone(),
+        "--read-only".to_owned(),
+        "--json".to_owned(),
+    ];
+    if let Some(m) = model {
+        args.push("--model".to_owned());
+        args.push(m.to_owned());
+    }
+    if plan.fork {
+        args.push("--fork-summary".to_owned());
+    } else if plan.force_fresh {
+        args.push("--fresh-session".to_owned());
+    }
+    args.push("--board-item".to_owned());
+    args.push(item_id.to_owned());
+    args.push("-".to_owned());
+    args
+}
+
+fn build_follow_up_prompt(item: &BoardItem, question: &str) -> String {
+    format!(
+        "Follow-up question from the decision board about \"{}\". Answer it from the work session; this turn is read-only, so do not edit files.\n\nQuestion:\n{question}\n",
+        item.title
+    )
 }
 
 pub fn ask_run_args(workspace: &Path, agent: Option<&str>, model: Option<&str>) -> Vec<String> {
@@ -489,14 +824,68 @@ pub fn ask_item_execute(
     store: &BoardStore,
     prepared: PreparedAsk,
 ) -> Result<BoardItem, BoardError> {
+    ask_item_execute_report(store, prepared).map(|answer| answer.item)
+}
+
+pub fn ask_item_execute_report(
+    store: &BoardStore,
+    prepared: PreparedAsk,
+) -> Result<AskAnswer, BoardError> {
     let PreparedAsk {
         item,
         workspace,
         guard,
         params,
+        resume,
     } = prepared;
     let ws_str = workspace.to_string_lossy().into_owned();
     let timeout = child_timeout();
+    let started_ms = session::now_ms();
+
+    if let Some(plan) = resume {
+        let args = ask_resume_run_args(&workspace, &plan, params.model.as_deref(), &params.id);
+        let prompt = build_follow_up_prompt(&item, &params.text);
+        let mut outcome =
+            spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
+        if !plan.fork && outcome.links.conversation_id.is_none() {
+            outcome.links.conversation_id = Some(plan.conversation_id.clone());
+        }
+        append_ask_link(
+            store,
+            &params.id,
+            &workspace,
+            started_ms,
+            &outcome,
+            Some(&plan.agent),
+            params.model.as_deref(),
+        );
+        let mode = outcome
+            .resume_mode
+            .clone()
+            .unwrap_or_else(|| plan.expected_mode.to_owned());
+        let mut answer = format!("[{mode} resume · {}] ", plan.agent);
+        if plan.fork {
+            answer.push_str("(new conversation; a board run is in progress) ");
+        }
+        answer.push_str(&ask_answer_text(outcome));
+        let masked = mask_sensitive_tokens(&answer);
+        let text: String = masked.chars().take(TEXT_MAX).collect();
+        drop(guard);
+        let item = store.say(
+            &params.id,
+            SayRequest {
+                text,
+                from: "planner".to_owned(),
+            },
+        )?;
+        return Ok(AskAnswer {
+            item,
+            resume: Some(ResumeReport {
+                mode,
+                agent: Some(plan.agent),
+            }),
+        });
+    }
 
     if !params.revise {
         let board_cfg = BoardSettings::load_user_only();
@@ -507,36 +896,34 @@ pub fn ask_item_execute(
 
         let prompt = build_ask_prompt(&item, &params.text);
         let outcome = spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
-        let raw_answer = if outcome.exit_code == 0 {
-            outcome
-                .text
-                .or(outcome.summary)
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "planner ask returned empty response".to_owned())
-        } else {
-            let mut msg = format!("planner ask failed (exit {})", outcome.exit_code);
-            if let Some(detail) = outcome
-                .summary
-                .or(outcome.text)
-                .filter(|s| !s.trim().is_empty())
-            {
-                let clipped: String = detail.chars().take(2000).collect();
-                msg.push_str(": ");
-                msg.push_str(&clipped);
-            }
-            msg
-        };
+        append_ask_link(
+            store,
+            &params.id,
+            &workspace,
+            started_ms,
+            &outcome,
+            agent.as_deref(),
+            model.as_deref(),
+        );
+        let raw_answer = ask_answer_text(outcome);
         let masked = mask_sensitive_tokens(&raw_answer);
         let answer: String = masked.chars().take(TEXT_MAX).collect();
         // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
         drop(guard);
-        return store.say(
+        let item = store.say(
             &params.id,
             SayRequest {
                 text: answer,
                 from: "planner".to_owned(),
             },
-        );
+        )?;
+        return Ok(AskAnswer {
+            item,
+            resume: Some(ResumeReport {
+                mode: "off".to_owned(),
+                agent,
+            }),
+        });
     }
 
     let plan = item
@@ -554,6 +941,15 @@ pub fn ask_item_execute(
         "-".to_owned(),
     ];
     let outcome = spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
+    append_ask_link(
+        store,
+        &params.id,
+        &workspace,
+        started_ms,
+        &outcome,
+        params.agent.as_deref(),
+        params.model.as_deref(),
+    );
     if outcome.exit_code == 7
         && let Some(new_hash) = outcome.plan_hash
     {
@@ -563,13 +959,15 @@ pub fn ask_item_execute(
         let msg = format!("Revised plan to revision {rev} ({new_hash}, {steps} steps).");
         // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
         drop(guard);
-        return store.say(
-            &params.id,
-            SayRequest {
-                text: msg,
-                from: "planner".to_owned(),
-            },
-        );
+        return store
+            .say(
+                &params.id,
+                SayRequest {
+                    text: msg,
+                    from: "planner".to_owned(),
+                },
+            )
+            .map(|item| AskAnswer { item, resume: None });
     }
 
     let mut msg = format!(
@@ -584,18 +982,69 @@ pub fn ask_item_execute(
     }
     // FR-3132: release the ask lock before posting the answer so an immediate run is not refused
     drop(guard);
-    store.say(
-        &params.id,
-        SayRequest {
-            text: msg,
-            from: "planner".to_owned(),
-        },
-    )
+    store
+        .say(
+            &params.id,
+            SayRequest {
+                text: msg,
+                from: "planner".to_owned(),
+            },
+        )
+        .map(|item| AskAnswer { item, resume: None })
+}
+
+fn ask_answer_text(outcome: ChildOutcome) -> String {
+    if outcome.exit_code == 0 {
+        return outcome
+            .text
+            .or(outcome.summary)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "planner ask returned empty response".to_owned());
+    }
+    let mut msg = format!("planner ask failed (exit {})", outcome.exit_code);
+    if let Some(detail) = outcome
+        .summary
+        .or(outcome.text)
+        .filter(|s| !s.trim().is_empty())
+    {
+        let clipped: String = detail.chars().take(2000).collect();
+        msg.push_str(": ");
+        msg.push_str(&clipped);
+    }
+    msg
+}
+
+/// Record a finished `board ask` as an `ask` session link (SPEC-board-work-session
+/// FR-3822). Best-effort: a store error never hides the planner answer.
+fn append_ask_link(
+    store: &BoardStore,
+    id: &str,
+    workspace: &Path,
+    started_ms: u64,
+    outcome: &ChildOutcome,
+    agent: Option<&str>,
+    model: Option<&str>,
+) {
+    let mut link = session::running_link(SessionKind::Ask, workspace, started_ms);
+    link.agent = agent.map(str::to_owned);
+    link.model = model.map(str::to_owned);
+    let link = session::finished_link(
+        link,
+        outcome.run_id.as_deref(),
+        outcome.exit_code,
+        &outcome.links,
+        Vec::new(),
+    );
+    let _ = store.append_session(id, link, "planner");
 }
 
 pub fn ask_item(store: &BoardStore, params: AskParams) -> Result<BoardItem, BoardError> {
+    ask_item_report(store, params).map(|answer| answer.item)
+}
+
+pub fn ask_item_report(store: &BoardStore, params: AskParams) -> Result<AskAnswer, BoardError> {
     let prepared = ask_item_prepare(store, params)?;
-    ask_item_execute(store, prepared)
+    ask_item_execute_report(store, prepared)
 }
 
 pub struct RunParams {
@@ -613,6 +1062,15 @@ pub struct PreparedRun {
     pub guard: BoardLockGuard,
     pub by: String,
     pub state_root: PathBuf,
+    launch_token: String,
+}
+
+impl PreparedRun {
+    /// The raw one-time launch token whose SHA-256 is in the run lock. It is
+    /// only ever handed to the detached child through [`LAUNCH_TOKEN_ENV`].
+    pub fn launch_token(&self) -> &str {
+        &self.launch_token
+    }
 }
 
 pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<PreparedRun, BoardError> {
@@ -681,6 +1139,23 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
     let workspace = require_item_workspace(&item)?;
     let pending = ensure_pending_plan_from_copy(&params.state_root, store.base(), &plan.hash)?;
     let plan_hash = plan.hash.clone();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let launch_token = generate_launch_token();
+    write_run_lock(
+        store.base(),
+        &params.id,
+        &RunLock {
+            pid: std::process::id(),
+            token_sha256: Some(launch_token_sha256(&launch_token)),
+            plan_hash: plan_hash.clone(),
+            actor: params.by.clone(),
+            created_ms: now,
+            prepared_lane: Some(item.lane),
+        },
+    )?;
     let in_progress_item =
         store.move_lane(&params.id, Lane::InProgress, &params.by, Some(item.version))?;
 
@@ -688,10 +1163,6 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
         include_all: true,
         ..Default::default()
     }) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         prune_old_plan_copies(store.base(), &all_items, now);
     }
 
@@ -703,6 +1174,7 @@ pub fn run_item_prepare(store: &BoardStore, params: RunParams) -> Result<Prepare
         guard,
         by: params.by,
         state_root: params.state_root,
+        launch_token,
     })
 }
 
@@ -718,6 +1190,7 @@ pub fn run_item_execute(
         guard,
         by,
         state_root,
+        launch_token: _,
     } = prepared;
     let _guard = guard;
     let normalized_prompt = normalize_plan_prompt(&prompt);
@@ -727,10 +1200,16 @@ pub fn run_item_execute(
         "run".to_owned(),
         "--graph".to_owned(),
         "--approve-plan-id".to_owned(),
-        plan_hash,
+        plan_hash.clone(),
         "--json".to_owned(),
         "-".to_owned(),
     ];
+    // SPEC-board-work-session FR-3820, FR-3821: session writes are best-effort
+    // and never block recording the run result.
+    let started_ms = session::now_ms();
+    let running = session::running_link(SessionKind::Run, &workspace, started_ms);
+    let _ = store.append_session(&item.id, running.clone(), &by);
+    let before = session::md_snapshot(&workspace);
     let outcome = match spawn_child_dmuxai(
         &workspace,
         &args,
@@ -740,22 +1219,62 @@ pub fn run_item_execute(
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
-            let _ = store.record_run_result(&item.id, None, 1, Some(&err.to_string()), &by);
+            let failed = session::finished_link(running, None, 1, &Default::default(), Vec::new());
+            let _ = store.finish_session(&item.id, started_ms, failed, &by);
+            let _ =
+                store.record_run_result(&item.id, None, 1, Some(&err.to_string()), &by, &plan_hash);
             return Err(err);
         }
     };
+    let md_paths =
+        session::changed_md_paths(before.as_ref(), session::md_snapshot(&workspace).as_ref());
+    let finished = session::finished_link(
+        running,
+        outcome.run_id.as_deref(),
+        outcome.exit_code,
+        &outcome.links,
+        md_paths,
+    );
+    let _ = store.finish_session(&item.id, started_ms, finished, &by);
     store.record_run_result(
         &item.id,
         outcome.run_id.as_deref(),
         outcome.exit_code,
         outcome.summary.as_deref(),
         &by,
+        &plan_hash,
     )
+}
+
+/// Point the run lock at the detached child while its token is still unused,
+/// so a stale-lock check sees a dead child as stale (FR-3808).
+fn record_launched_pid(store: &BoardStore, id: &str, pid: u32) {
+    let _ = store.with_store_lock(|| {
+        if let Some(mut lock) = read_run_lock(store.base(), id)
+            && lock.token_sha256.is_some()
+        {
+            lock.pid = pid;
+            write_run_lock(store.base(), id, &lock)?;
+        }
+        Ok(())
+    });
+}
+
+/// Wait for the detached child on a background thread so a long-lived parent
+/// (MCP server, dashboard) never keeps a zombie (FR-3808).
+fn reap_detached_child(mut child: std::process::Child) {
+    let _ = thread::Builder::new()
+        .name("board-run-reaper".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Spawn a detached OS subprocess (`setsid` + null stdio) running the hidden
 /// `board run <id> --exec-prepared --plan-hash H --by ACTOR` command, and
-/// return immediately with the `in_progress` item (FR-3133).
+/// return immediately with the `in_progress` item (FR-3133). The launch token
+/// travels only in [`LAUNCH_TOKEN_ENV`]; `--by` is informational (FR-3800,
+/// FR-3801).
 pub fn launch_detached_board_run(
     store: &BoardStore,
     prepared: PreparedRun,
@@ -769,6 +1288,7 @@ pub fn launch_detached_board_run(
                 1,
                 Some(&err.to_string()),
                 &prepared.by,
+                &prepared.plan_hash,
             );
             return Err(err);
         }
@@ -791,6 +1311,7 @@ pub fn launch_detached_board_run(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::run_journal::generate_run_id);
     cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
+    cmd.env(LAUNCH_TOKEN_ENV, &prepared.launch_token);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -805,13 +1326,22 @@ pub fn launch_detached_board_run(
         }
     }
     match cmd.spawn() {
-        Ok(_child) => {
+        Ok(child) => {
+            record_launched_pid(store, &prepared.item.id, child.id());
+            reap_detached_child(child);
             prepared.guard.disarm();
             Ok(prepared.item)
         }
         Err(e) => {
             let msg = format!("failed to spawn detached board run: {e}");
-            let _ = store.record_run_result(&prepared.item.id, None, 1, Some(&msg), &prepared.by);
+            let _ = store.record_run_result(
+                &prepared.item.id,
+                None,
+                1,
+                Some(&msg),
+                &prepared.by,
+                &prepared.plan_hash,
+            );
             Err(BoardError::Internal(msg))
         }
     }
@@ -903,13 +1433,41 @@ pub fn auto_run_after_owner_approve(
     }
 }
 
+/// FR-3802: a prepared run executes only for an owner approval of exactly this
+/// plan, or for an item that was in the `auto` lane when it was prepared.
+fn ensure_prepared_run_allowed(
+    item: &BoardItem,
+    lock: &RunLock,
+    plan_hash: &str,
+) -> Result<(), BoardError> {
+    if lock.prepared_lane == Some(Lane::Auto) {
+        return Ok(());
+    }
+    let approved_by_owner = item
+        .decision
+        .as_ref()
+        .is_some_and(|d| d.verdict == Verdict::Approve && d.by == "owner");
+    if !approved_by_owner {
+        return Err(BoardError::Forbidden(
+            "prepared runs need an owner approval or an auto lane item".to_owned(),
+        ));
+    }
+    if item.decision.as_ref().and_then(|d| d.plan_hash.as_deref()) != Some(plan_hash) {
+        return Err(BoardError::Conflict(
+            "decision plan hash does not match the prepared plan".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Execute a previously prepared `in_progress` board run inside the detached
-/// `--exec-prepared` subprocess and record its result (FR-3133).
+/// `--exec-prepared` subprocess and record its result (FR-3133). The caller
+/// presents the launch token; the actor comes from the run lock (FR-3801).
 pub fn run_item_execute_prepared(
     store: &BoardStore,
     id: &str,
     plan_hash: &str,
-    by: &str,
+    launch_token: Option<&str>,
     state_root: &Path,
 ) -> Result<BoardItem, BoardError> {
     validate_item_id_early(id)?;
@@ -918,10 +1476,13 @@ pub fn run_item_execute_prepared(
             "plan hash must be 16 lowercase hex characters".to_owned(),
         ));
     }
-    if by == "planner" {
-        return Err(BoardError::Forbidden("planner cannot run items".to_owned()));
+    let (guard, lock) = BoardLockGuard::take_over(store, id, plan_hash, launch_token)?;
+    let by = lock.actor.as_str();
+    if by == "planner" || (by != "owner" && !by.starts_with("bot:")) {
+        return Err(BoardError::Forbidden(
+            "prepared run has no valid actor".to_owned(),
+        ));
     }
-    let guard = BoardLockGuard::take_over(store.base(), "runs", id)?;
     let item = store.get(id)?;
     if item.lane != Lane::InProgress {
         return Err(BoardError::Conflict(format!(
@@ -932,20 +1493,21 @@ pub fn run_item_execute_prepared(
     let current_hash = item.plan.as_ref().map(|p| p.hash.as_str());
     if current_hash != Some(plan_hash) {
         let msg = "plan hash does not match the current plan";
-        let _ = store.record_run_result(id, None, 1, Some(msg), by);
+        let _ = store.record_run_result(id, None, 1, Some(msg), by, plan_hash);
         return Err(BoardError::Conflict(msg.to_owned()));
     }
+    ensure_prepared_run_allowed(&item, &lock, plan_hash)?;
     let workspace = match require_item_workspace(&item) {
         Ok(ws) => ws,
         Err(err) => {
-            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by);
+            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by, plan_hash);
             return Err(err);
         }
     };
     let pending = match ensure_pending_plan_from_copy(state_root, store.base(), plan_hash) {
         Ok(p) => p,
         Err(err) => {
-            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by);
+            let _ = store.record_run_result(id, None, 1, Some(&err.to_string()), by, plan_hash);
             return Err(err);
         }
     };
@@ -959,6 +1521,7 @@ pub fn run_item_execute_prepared(
             guard,
             by: by.to_owned(),
             state_root: state_root.to_path_buf(),
+            launch_token: String::new(),
         },
     )
 }
@@ -1085,6 +1648,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1126,6 +1690,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1160,6 +1725,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1189,6 +1755,7 @@ exit 1
                     model: None,
                     by: "owner".to_owned(),
                     state_root: state.clone(),
+                    resume: ResumeMode::Auto,
                 },
             )
             .err()
@@ -1210,6 +1777,7 @@ exit 1
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1440,6 +2008,7 @@ exit 0
             },
         )
         .unwrap();
+        let auto_token = auto_prep.launch_token().to_owned();
         let detached_item = launch_detached_board_run(&store, auto_prep).unwrap();
         assert_eq!(detached_item.lane, Lane::InProgress);
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -1451,7 +2020,7 @@ exit 0
         assert!(self_args.contains(&hash));
 
         let exec_done =
-            run_item_execute_prepared(&store, &auto_item.id, &hash, "bot:coordinator", &state)
+            run_item_execute_prepared(&store, &auto_item.id, &hash, Some(&auto_token), &state)
                 .unwrap();
         assert_eq!(exec_done.lane, Lane::Done);
 
@@ -1744,6 +2313,7 @@ exit 0
                 model: None,
                 by: "owner".to_owned(),
                 state_root: state.clone(),
+                resume: ResumeMode::Auto,
             },
         )
         .unwrap();
@@ -1968,5 +2538,900 @@ exit 0
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    struct Hardening {
+        dir: tempfile::TempDir,
+        state: PathBuf,
+        board: PathBuf,
+        ws: PathBuf,
+        store: BoardStore,
+        hash: String,
+    }
+
+    fn hardening() -> Hardening {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        ensure_dir(&state).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let (_, hash) =
+            edit_plan_from_json(&ws, &state, "ship", &sample_plan_json(), None).unwrap();
+        Hardening {
+            dir,
+            state,
+            board,
+            ws,
+            store,
+            hash,
+        }
+    }
+
+    /// An item with the shared plan, brought into `lane` the way users do it.
+    fn hardening_item(h: &Hardening, lane: Lane) -> BoardItem {
+        let item = h
+            .store
+            .add(AddItemRequest {
+                title: format!("hardening {}", lane.as_str()),
+                summary: String::new(),
+                kind: if lane == Lane::Auto {
+                    Kind::Debug
+                } else {
+                    Kind::Feature
+                },
+                grade: None,
+                lane: (lane != Lane::Auto).then_some(Lane::NeedsDecision),
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(h.ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(h.hash.clone()),
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: h.state.clone(),
+            })
+            .unwrap();
+        let verdict = match lane {
+            Lane::Approved => Verdict::Approve,
+            Lane::Rejected => Verdict::Reject,
+            _ => return item,
+        };
+        h.store
+            .decide_without_notify(
+                &item.id,
+                DecideRequest {
+                    verdict,
+                    text: None,
+                    option: None,
+                    plan_hash: (verdict == Verdict::Approve).then(|| h.hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap()
+    }
+
+    fn fake_ok_child(dir: &Path) -> PathBuf {
+        write_fake_runner(
+            dir,
+            "fake-ok-run.sh",
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"text\":\"done\"}\\n'\nexit 0\n",
+        )
+    }
+
+    fn prepare(h: &Hardening, item: &BoardItem) -> PreparedRun {
+        run_item_prepare(
+            &h.store,
+            RunParams {
+                id: item.id.clone(),
+                expected_plan_hash: Some(h.hash.clone()),
+                by: "bot:coordinator".to_owned(),
+                state_root: h.state.clone(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn wait_for(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
+        let until = Instant::now() + deadline;
+        while Instant::now() < until {
+            if ready() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        ready()
+    }
+
+    fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut hits = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if fs::read(&path)
+                    .map(|b| String::from_utf8_lossy(&b).contains(needle))
+                    .unwrap_or(false)
+                {
+                    hits.push(path);
+                }
+            }
+        }
+        hits
+    }
+
+    // TC-3800 / FR-3800: prepare writes a 0600 run lock with the SHA-256 of a
+    // 128-bit+ token; the raw token reaches the detached child only through
+    // `DMUXAI_BOARD_LAUNCH_TOKEN`, never argv, the board files or the item.
+    #[cfg(unix)]
+    #[test]
+    fn tc_3800_prepare_writes_token_hash_not_argv() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Approved);
+        let prepared = prepare(&h, &item);
+        let token = prepared.launch_token().to_owned();
+        assert!(token.len() >= 32, "token too short: {}", token.len());
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(token, prepare_token_of_another_item(&h));
+
+        let lock_path = h.board.join("runs").join(format!("{}.lock", item.id));
+        let lock_mode = fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(lock_mode, 0o600);
+        let dir_mode = fs::metadata(h.board.join("runs"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let lock = read_run_lock(&h.board, &item.id).unwrap();
+        assert_eq!(
+            lock.token_sha256.as_deref(),
+            Some(launch_token_sha256(&token).as_str())
+        );
+        assert_eq!(lock.plan_hash, h.hash);
+        assert_eq!(lock.actor, "bot:coordinator");
+        assert_eq!(lock.pid, std::process::id());
+        assert!(lock.created_ms > 0);
+        assert_eq!(lock.prepared_lane, Some(Lane::Approved));
+
+        let argv_file = h.dir.path().join("self_argv.txt");
+        let env_file = h.dir.path().join("self_env.txt");
+        let fake_self = write_fake_runner(
+            h.dir.path(),
+            "fake-self-token.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$DMUXAI_BOARD_LAUNCH_TOKEN\" > \"{env}.tmp\"\nprintf '%s\\n' \"$@\" > \"{argv}\"\nmv \"{env}.tmp\" \"{env}\"\nexit 0\n",
+                env = env_file.display(),
+                argv = argv_file.display(),
+            ),
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self) };
+        let launched = launch_detached_board_run(&h.store, prepared);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_SELF_BIN") };
+        let launched = launched.unwrap();
+        assert_eq!(launched.lane, Lane::InProgress);
+        assert!(wait_for(Duration::from_secs(3), || env_file.exists()));
+        assert_eq!(fs::read_to_string(&env_file).unwrap(), token);
+        let argv = fs::read_to_string(&argv_file).unwrap();
+        assert!(argv.contains("--exec-prepared"));
+        assert!(!argv.contains(&token), "token leaked into argv: {argv}");
+        assert!(!serde_json::to_string(&launched).unwrap().contains(&token));
+        assert!(
+            files_containing(&h.state, &token).is_empty(),
+            "token persisted under state"
+        );
+    }
+
+    fn prepare_token_of_another_item(h: &Hardening) -> String {
+        let other = hardening_item(h, Lane::Auto);
+        let prepared = prepare(h, &other);
+        prepared.launch_token().to_owned()
+    }
+
+    // TC-3801 / FR-3801: exec-prepared needs the lock's token for that item and
+    // plan hash; missing, wrong and reused tokens are refused (exit 5) without
+    // touching the item, and the actor comes from the lock.
+    #[test]
+    fn tc_3801_exec_prepared_requires_launch_token() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Approved);
+        let prepared = prepare(&h, &item);
+        let token = prepared.launch_token().to_owned();
+        prepared.guard.disarm();
+        let before = h.store.get(&item.id).unwrap();
+        assert_eq!(before.lane, Lane::InProgress);
+
+        let fake_bin = fake_ok_child(h.dir.path());
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+        let wrong_hash = "0000000000000000";
+        let attempts: [(Option<&str>, &str); 4] = [
+            (None, h.hash.as_str()),
+            (Some(""), h.hash.as_str()),
+            (Some("00ff00ff00ff00ff00ff00ff00ff00ff"), h.hash.as_str()),
+            (Some(token.as_str()), wrong_hash),
+        ];
+        for (presented, hash) in attempts {
+            let err = run_item_execute_prepared(&h.store, &item.id, hash, presented, &h.state)
+                .unwrap_err();
+            assert_eq!(
+                err.exit_code(),
+                crate::agent_api::exit::FORBIDDEN,
+                "{presented:?}"
+            );
+            assert_eq!(h.store.get(&item.id).unwrap(), before);
+        }
+
+        let done =
+            run_item_execute_prepared(&h.store, &item.id, &h.hash, Some(&token), &h.state).unwrap();
+        assert_eq!(done.lane, Lane::Done);
+        let events = fs::read_to_string(h.board.join("events.jsonl")).unwrap();
+        let last: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+        assert_eq!(last["by"], "bot:coordinator");
+
+        let after = h.store.get(&item.id).unwrap();
+        let reuse = run_item_execute_prepared(&h.store, &item.id, &h.hash, Some(&token), &h.state)
+            .unwrap_err();
+        assert_eq!(reuse.exit_code(), crate::agent_api::exit::FORBIDDEN);
+        assert_eq!(h.store.get(&item.id).unwrap(), after);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    /// Force `item` into `in_progress` with a run lock holding a known token, as
+    /// if it had been prepared from `prepared_lane`.
+    fn force_prepared(h: &Hardening, item: &BoardItem, prepared_lane: Lane) -> String {
+        h.store
+            .move_lane(&item.id, Lane::InProgress, "owner", None)
+            .unwrap();
+        let token = generate_launch_token();
+        write_run_lock(
+            &h.board,
+            &item.id,
+            &RunLock {
+                pid: std::process::id(),
+                token_sha256: Some(launch_token_sha256(&token)),
+                plan_hash: h.hash.clone(),
+                actor: "bot:coordinator".to_owned(),
+                created_ms: 1,
+                prepared_lane: Some(prepared_lane),
+            },
+        )
+        .unwrap();
+        token
+    }
+
+    // TC-3802 / FR-3802: even with a valid token, exec-prepared runs only an item
+    // approved by the owner for that plan hash, or one prepared from `auto`.
+    #[test]
+    fn tc_3802_exec_prepared_checks_decision() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let fake_bin = fake_ok_child(h.dir.path());
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+
+        let pending = hardening_item(&h, Lane::NeedsDecision);
+        let rejected = hardening_item(&h, Lane::Rejected);
+        let stale = hardening_item(&h, Lane::Approved);
+        let approved = hardening_item(&h, Lane::Approved);
+        let auto = hardening_item(&h, Lane::Auto);
+
+        let item_file = h.board.join("items").join(format!("{}.json", stale.id));
+        let mut raw: Value = serde_json::from_slice(&fs::read(&item_file).unwrap()).unwrap();
+        raw["decision"]["plan_hash"] = Value::String("0000000000000000".to_owned());
+        fs::write(&item_file, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let cases = [
+            (
+                &pending,
+                Lane::NeedsDecision,
+                Some(crate::agent_api::exit::FORBIDDEN),
+            ),
+            (
+                &rejected,
+                Lane::Rejected,
+                Some(crate::agent_api::exit::FORBIDDEN),
+            ),
+            (
+                &stale,
+                Lane::Approved,
+                Some(crate::agent_api::exit::CONFLICT),
+            ),
+            (&approved, Lane::Approved, None),
+            (&auto, Lane::Auto, None),
+        ];
+        for (item, prepared_lane, refused) in cases {
+            let token = force_prepared(&h, item, prepared_lane);
+            let result =
+                run_item_execute_prepared(&h.store, &item.id, &h.hash, Some(&token), &h.state);
+            let current = h.store.get(&item.id).unwrap();
+            match refused {
+                Some(code) => {
+                    let err = result.unwrap_err();
+                    assert_eq!(err.exit_code(), code, "{}: {err}", item.title);
+                    assert_eq!(current.lane, Lane::InProgress, "{}", item.title);
+                    assert!(current.run_ids.is_empty(), "{}", item.title);
+                }
+                None => {
+                    assert_eq!(result.unwrap().lane, Lane::Done, "{}", item.title);
+                }
+            }
+        }
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+    }
+
+    // TC-3808 / FR-3808: the parent reaps the detached child (no zombie), and the
+    // run lock names the child so a dead child leaves a stale, inactive lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tc_3808_detached_child_reaped() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Auto);
+        let prepared = prepare(&h, &item);
+        let pid_file = h.dir.path().join("child.pid");
+        let fake_self = write_fake_runner(
+            h.dir.path(),
+            "fake-self-pid.sh",
+            &format!(
+                "#!/bin/sh\necho $$ > \"{p}.tmp\"\nmv \"{p}.tmp\" \"{p}\"\nexit 0\n",
+                p = pid_file.display()
+            ),
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_SELF_BIN", &fake_self) };
+        let launched = launch_detached_board_run(&h.store, prepared);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_SELF_BIN") };
+        launched.unwrap();
+
+        assert!(wait_for(Duration::from_secs(3), || pid_file.exists()));
+        let child_pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(read_run_lock(&h.board, &item.id).unwrap().pid, child_pid);
+
+        // A zombie keeps its /proc entry until reaped; a reaped child has none.
+        let reaped = || !Path::new(&format!("/proc/{child_pid}")).exists();
+        assert!(
+            wait_for(Duration::from_secs(3), reaped),
+            "detached child {child_pid} left as a zombie"
+        );
+        assert!(wait_for(Duration::from_secs(3), || {
+            !BoardLockGuard::is_active(&h.board, "runs", &item.id)
+        }));
+    }
+
+    fn with_board_env<T>(child: &Path, data: &Path, work: impl FnOnce() -> T) -> T {
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", child);
+            std::env::set_var("DMUXAI_DATA_DIR", data);
+        }
+        let out = work();
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var("DMUXAI_DATA_DIR");
+        }
+        out
+    }
+
+    fn item_workspace(item: &BoardItem) -> String {
+        item.workspace.path.clone().unwrap()
+    }
+
+    // TC-3820 / FR-3820: a board run appends a `running` link (and logs a
+    // `session` event) before the child finishes; links are capped at 50 with
+    // the oldest dropped; legacy items without `sessions` still load.
+    #[test]
+    fn tc_3820_run_appends_running_session_link() {
+        use crate::board::{SESSIONS_MAX, SessionKind, SessionStatus};
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Auto);
+        let item_file = h.board.join("items").join(format!("{}.json", item.id));
+        let during = h.dir.path().join("during.json");
+        let child = write_fake_runner(
+            h.dir.path(),
+            "fake-snapshot.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\ncp \"{}\" \"{}\"\nprintf '{{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\"}}\\n'\nexit 0\n",
+                item_file.display(),
+                during.display()
+            ),
+        );
+        let data = h.dir.path().join("data");
+        let done = with_board_env(&child, &data, || {
+            run_item_execute(&h.store, prepare(&h, &item))
+        })
+        .unwrap();
+
+        let seen: BoardItem = serde_json::from_slice(&fs::read(&during).unwrap()).unwrap();
+        assert_eq!(seen.sessions.len(), 1);
+        let running = &seen.sessions[0];
+        assert_eq!(running.kind, SessionKind::Run);
+        assert_eq!(running.status, SessionStatus::Running);
+        assert_eq!(running.workspace_path, item_workspace(&item));
+        assert!(running.ended_ms.is_none() && running.exit_code.is_none());
+        let events = h.store.list_events(0).unwrap();
+        let session_event = events
+            .iter()
+            .find(|e| e.item_id == item.id && e.kind == "session")
+            .expect("session event");
+        assert_eq!(session_event.by, "bot:coordinator");
+        assert_eq!(done.lane, Lane::Done);
+        assert_eq!(
+            done.sessions.len(),
+            1,
+            "the running link is filled in place"
+        );
+        assert_eq!(done.sessions[0].status, SessionStatus::Completed);
+        assert_eq!(done.sessions[0].started_ms, running.started_ms);
+
+        // Boundary: at most SESSIONS_MAX links, the oldest dropped first.
+        for n in 0..(SESSIONS_MAX as u64 + 5) {
+            let link = crate::board::session::running_link(SessionKind::Ask, &h.ws, 10_000 + n);
+            h.store.append_session(&item.id, link, "planner").unwrap();
+        }
+        let capped = h.store.get(&item.id).unwrap();
+        assert_eq!(capped.sessions.len(), SESSIONS_MAX);
+        assert_eq!(capped.sessions[0].started_ms, 10_005);
+
+        // Legacy item JSON without `sessions` loads with an empty list.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&item_file).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("sessions");
+        fs::write(&item_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert!(h.store.get(&item.id).unwrap().sessions.is_empty());
+    }
+
+    // TC-3821 / FR-3821: the finished run fills the link from the child's
+    // `--json` output and run manifest, with the `.md` files it changed in a git
+    // workspace; a crashed child leaves a `failed` link with its exit code; a
+    // non-git workspace has no md_paths; no provider session id is stored.
+    #[test]
+    fn tc_3821_run_result_fills_session_link() {
+        use crate::board::SessionStatus;
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let git = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&h.ws)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        fs::write(h.ws.join("README.md"), "# untouched\n").unwrap();
+        let data = h.dir.path().join("data");
+        let item = hardening_item(&h, Lane::Auto);
+        let ws = item_workspace(&item);
+        crate::board::session::test_support::write_manifest(
+            &data,
+            &ws,
+            "0123456789abcdef",
+            "completed",
+            Some("conv-1"),
+            Some("graph-1"),
+        );
+        let writer = write_fake_runner(
+            h.dir.path(),
+            "fake-writer.sh",
+            "#!/bin/sh\ncat > /dev/null\nmkdir -p docs/specs .dmuxai src\n\
+             printf '# x\\n' > docs/specs/SPEC-x.md\nprintf 'x' > src/a.rs\nprintf 'x' > .dmuxai/n.md\n\
+             printf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"conversation_id\":\"conv-1\",\"graph_id\":\"graph-1\",\"agent\":\"cursor\",\"provider_session_id\":\"psid-SECRET\"}\\n'\nexit 0\n",
+        );
+        let done = with_board_env(&writer, &data, || {
+            run_item_execute(&h.store, prepare(&h, &item))
+        })
+        .unwrap();
+        let link = done.sessions.last().unwrap();
+        assert_eq!(link.status, SessionStatus::Completed);
+        assert_eq!(link.exit_code, Some(0));
+        assert_eq!(link.run_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(link.graph_id.as_deref(), Some("graph-1"));
+        assert_eq!(link.agent.as_deref(), Some("cursor-agent"));
+        assert_eq!(link.model.as_deref(), Some("gpt-5"));
+        assert!(link.ended_ms.is_some());
+        assert_eq!(link.md_paths, vec!["docs/specs/SPEC-x.md".to_owned()]);
+        assert!(files_containing(&h.board, "psid-SECRET").is_empty());
+
+        // Failure: a crashing child (no JSON, exit 3) leaves a failed link.
+        let crashed = hardening_item(&h, Lane::Auto);
+        let crash = write_fake_runner(
+            h.dir.path(),
+            "fake-crash.sh",
+            "#!/bin/sh\ncat > /dev/null\nexit 3\n",
+        );
+        let after = with_board_env(&crash, &data, || {
+            run_item_execute(&h.store, prepare(&h, &crashed))
+        })
+        .unwrap();
+        assert_eq!(after.lane, Lane::Unknown);
+        let failed = after.sessions.last().unwrap();
+        assert_eq!(failed.status, SessionStatus::Failed);
+        assert_eq!(failed.exit_code, Some(3));
+        assert!(failed.run_id.is_none() && failed.md_paths.is_empty());
+
+        // Boundary: outside git, md_paths stay empty.
+        let plain = hardening();
+        let plain_item = hardening_item(&plain, Lane::Auto);
+        let done = with_board_env(&writer, &data, || {
+            run_item_execute(&plain.store, prepare(&plain, &plain_item))
+        })
+        .unwrap();
+        assert!(done.sessions.last().unwrap().md_paths.is_empty());
+    }
+
+    // TC-3822 / FR-3822: `board ask` (with and without --revise) appends an
+    // `ask` link with run id, conversation id and status.
+    #[test]
+    fn tc_3822_ask_appends_session_link() {
+        use crate::board::{SessionKind, SessionStatus};
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        let (_, hash2) = edit_plan_from_json(
+            &h.ws,
+            &h.state,
+            "ship",
+            &sample_plan_json().replace("\"edit\"", "\"edit-v2\""),
+            None,
+        )
+        .unwrap();
+        let child = write_fake_runner(
+            h.dir.path(),
+            "fake-ask.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\ncase \"$*\" in\n  *--read-only*)\n    printf '{{\"ok\":true,\"exit_code\":0,\"text\":\"answer\",\"run_id\":\"1111111111111111\",\"conversation_id\":\"conv-ask\",\"agent\":\"agy\"}}\\n'\n    exit 0 ;;\n  *--graph*)\n    printf '{{\"ok\":false,\"exit_code\":7,\"plan_hash\":\"{hash2}\",\"run_id\":\"2222222222222222\",\"conversation_id\":\"conv-rev\",\"graph_id\":\"g-rev\"}}\\n'\n    exit 7 ;;\nesac\nexit 1\n"
+            ),
+        );
+        let ask = |revise: bool| AskParams {
+            id: item.id.clone(),
+            text: "why?".to_owned(),
+            revise,
+            agent: None,
+            model: None,
+            by: "bot:coord".to_owned(),
+            state_root: h.state.clone(),
+            resume: ResumeMode::Auto,
+        };
+        let answered = with_board_env(&child, &data, || ask_item(&h.store, ask(false))).unwrap();
+        let link = answered.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.status, SessionStatus::Completed);
+        assert_eq!(link.run_id.as_deref(), Some("1111111111111111"));
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-ask"));
+        assert_eq!(link.agent.as_deref(), Some("agy"));
+
+        let revised = with_board_env(&child, &data, || ask_item(&h.store, ask(true))).unwrap();
+        assert_eq!(revised.plan.as_ref().unwrap().hash, hash2);
+        let link = revised.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.status, SessionStatus::AwaitingApproval);
+        assert_eq!(link.run_id.as_deref(), Some("2222222222222222"));
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-rev"));
+        assert_eq!(link.graph_id.as_deref(), Some("g-rev"));
+        assert_eq!(revised.sessions.len(), 2);
+
+        // Failure: a failing planner child leaves a failed ask link.
+        let failing = write_fake_runner(
+            h.dir.path(),
+            "fake-ask-fail.sh",
+            "#!/bin/sh\ncat > /dev/null\nexit 1\n",
+        );
+        let failed = with_board_env(&failing, &data, || ask_item(&h.store, ask(false))).unwrap();
+        let link = failed.sessions.last().unwrap();
+        assert_eq!(link.status, SessionStatus::Failed);
+        assert_eq!(link.exit_code, Some(1));
+    }
+
+    /// Gives `item` a work session (a `run` link in `conv-x` by cursor-agent)
+    /// and seeds that conversation's database: active cursor binding, stale agy.
+    fn with_work_session(h: &Hardening, item: &BoardItem) {
+        let mut link = session::running_link(SessionKind::Run, &h.ws, 1_000);
+        link.conversation_id = Some("conv-x".to_owned());
+        link.agent = Some("cursor-agent".to_owned());
+        session::test_support::seed_conversation_db(&h.state, &link.workspace_path, "conv-x", 2);
+        h.store.append_session(&item.id, link, "planner").unwrap();
+    }
+
+    /// Fake child that logs argv and env and answers like `run --json`; with
+    /// `--conversation` it reports `resume.mode` (`summary` for
+    /// `--fresh-session`/`--fork-summary`, else `native`).
+    fn resume_child(h: &Hardening) -> (PathBuf, PathBuf) {
+        let log = h.dir.path().join("ask-argv.log");
+        let child = write_fake_runner(
+            h.dir.path(),
+            "fake-resume.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s | env:%s\\n' \"$*\" \"$(env | grep -c -e DMUXAI_ALLOW_SENSITIVE -e DMUXAI_TRUST_WORKSPACE_CONFIG)\" >> \"{log}\"\n\
+                 conv=conv-x\nmode=native\ncase \"$*\" in\n  *--fork-summary*) conv=conv-fork; mode=summary ;;\n  *--fresh-session*) mode=summary ;;\nesac\n\
+                 case \"$*\" in\n  *--conversation*)\n    printf '{{\"ok\":true,\"exit_code\":0,\"text\":\"answer\",\"run_id\":\"1111111111111111\",\"conversation_id\":\"%s\",\"agent\":\"cursor-agent\",\"resume\":{{\"mode\":\"%s\",\"agent\":\"cursor-agent\"}}}}\\n' \"$conv\" \"$mode\"\n    exit 0 ;;\nesac\n\
+                 printf '{{\"ok\":true,\"exit_code\":0,\"text\":\"item answer\"}}\\n'\nexit 0\n",
+                log = log.display()
+            ),
+        );
+        (child, log)
+    }
+
+    fn resume_ask(h: &Hardening, item: &BoardItem, resume: ResumeMode) -> AskParams {
+        AskParams {
+            id: item.id.clone(),
+            text: "what changed?".to_owned(),
+            revise: false,
+            agent: None,
+            model: None,
+            by: "owner".to_owned(),
+            state_root: h.state.clone(),
+            resume,
+        }
+    }
+
+    fn last_argv(log: &Path) -> String {
+        fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    // TC-3832 / FR-3832: with a work session, auto/native/fresh run the child
+    // with `--conversation conv-x --agent cursor-agent`, fresh adds
+    // `--fresh-session`, off keeps the item-only ask; native without an active
+    // binding is a conflict (exit 4, `no_active_binding`); native/fresh without
+    // a work session are usage errors and auto falls back to off.
+    #[test]
+    fn tc_3832_ask_resume_modes() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+
+        for mode in [ResumeMode::Auto, ResumeMode::Native, ResumeMode::Fresh] {
+            with_board_env(&child, &data, || {
+                ask_item_report(&h.store, resume_ask(&h, &item, mode))
+            })
+            .unwrap();
+            let argv = last_argv(&log);
+            assert!(
+                argv.contains("run --conversation conv-x --agent cursor-agent --read-only --json"),
+                "{mode:?}: {argv}"
+            );
+            assert!(
+                argv.contains(&format!("--board-item {}", item.id)),
+                "{argv}"
+            );
+            assert_eq!(argv.contains("--fresh-session"), mode == ResumeMode::Fresh);
+            assert!(!argv.contains("--fork-summary"));
+        }
+
+        let off = with_board_env(&child, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &item, ResumeMode::Off))
+        })
+        .unwrap();
+        assert!(!last_argv(&log).contains("--conversation"));
+        assert_eq!(off.resume.as_ref().unwrap().mode, "off");
+
+        // Failure: --agent agy has only a stale binding.
+        let lines_before = fs::read_to_string(&log).unwrap().lines().count();
+        let native_agy = with_board_env(&child, &data, || {
+            ask_item_report(
+                &h.store,
+                AskParams {
+                    agent: Some("agy".to_owned()),
+                    ..resume_ask(&h, &item, ResumeMode::Native)
+                },
+            )
+        })
+        .unwrap_err();
+        assert_eq!(native_agy.exit_code(), crate::agent_api::exit::CONFLICT);
+        assert!(native_agy.to_string().contains(NO_ACTIVE_BINDING));
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().lines().count(),
+            lines_before,
+            "a refused ask spawns no child"
+        );
+
+        // Boundary: an item without a work session.
+        let bare = hardening_item(&h, Lane::NeedsDecision);
+        for mode in [ResumeMode::Native, ResumeMode::Fresh] {
+            let err = with_board_env(&child, &data, || {
+                ask_item_report(&h.store, resume_ask(&h, &bare, mode))
+            })
+            .unwrap_err();
+            assert_eq!(err.exit_code(), crate::agent_api::exit::USAGE, "{mode:?}");
+        }
+        let auto = with_board_env(&child, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &bare, ResumeMode::Auto))
+        })
+        .unwrap();
+        assert_eq!(auto.resume.as_ref().unwrap().mode, "off");
+        assert!(!last_argv(&log).contains("--conversation"));
+
+        // --revise ignores --resume (FR-3132 plan revision).
+        let revise = AskParams {
+            revise: true,
+            ..resume_ask(&h, &item, ResumeMode::Native)
+        };
+        let prepared = ask_item_prepare(&h.store, revise).unwrap();
+        assert!(prepared.resume.is_none() && prepared.planned_resume().is_none());
+    }
+
+    // TC-3833 / FR-3833: the planner message is prefixed with the mode and
+    // agent, the result reports `resume.mode`, and the ask link records the
+    // work conversation id.
+    #[test]
+    fn tc_3833_ask_reports_resume_mode() {
+        use crate::board::resume::ask_answer_json;
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, _log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+
+        let prepared = ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Auto)).unwrap();
+        let planned = prepared.planned_resume().unwrap();
+        assert_eq!(planned.mode, "native");
+        assert_eq!(planned.agent.as_deref(), Some("cursor-agent"));
+        let answer = with_board_env(&child, &data, || {
+            ask_item_execute_report(&h.store, prepared)
+        })
+        .unwrap();
+        let last = answer.item.thread.last().unwrap();
+        assert_eq!(last.from, "planner");
+        assert_eq!(last.text, "[native resume · cursor-agent] answer");
+        let json = ask_answer_json(&answer.item, answer.resume.as_ref());
+        assert_eq!(json["resume"]["mode"], "native");
+        assert_eq!(json["resume"]["agent"], "cursor-agent");
+        let link = answer.item.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-x"));
+        assert_eq!(link.agent.as_deref(), Some("cursor-agent"));
+
+        let fresh = with_board_env(&child, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &item, ResumeMode::Fresh))
+        })
+        .unwrap();
+        assert_eq!(fresh.resume.as_ref().unwrap().mode, "summary");
+        assert!(
+            fresh
+                .item
+                .thread
+                .last()
+                .unwrap()
+                .text
+                .starts_with("[summary resume · cursor-agent] ")
+        );
+
+        // Failure: a crashing child still reports the planned mode.
+        let crash = write_fake_runner(
+            h.dir.path(),
+            "fake-resume-crash.sh",
+            "#!/bin/sh\ncat > /dev/null\nexit 1\n",
+        );
+        let failed = with_board_env(&crash, &data, || {
+            ask_item_report(&h.store, resume_ask(&h, &item, ResumeMode::Auto))
+        })
+        .unwrap();
+        let text = &failed.item.thread.last().unwrap().text;
+        assert!(
+            text.starts_with("[native resume · cursor-agent] planner ask failed (exit 1)"),
+            "{text}"
+        );
+        assert_eq!(
+            failed
+                .item
+                .sessions
+                .last()
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            Some("conv-x")
+        );
+    }
+
+    // TC-3834 / FR-3834: during a live board run, auto asks in a new
+    // conversation seeded with the summary (`--fork-summary`, mode summary,
+    // never native) and says so; native is a conflict.
+    #[test]
+    fn tc_3834_ask_during_run_uses_summary() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::Approved);
+        with_work_session(&h, &item);
+        let running = prepare(&h, &item);
+        assert_eq!(running.item.lane, Lane::InProgress);
+
+        let prepared = ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Auto)).unwrap();
+        assert_eq!(prepared.planned_resume().unwrap().mode, "summary");
+        let answer = with_board_env(&child, &data, || {
+            ask_item_execute_report(&h.store, prepared)
+        })
+        .unwrap();
+        let argv = last_argv(&log);
+        assert!(argv.contains("--conversation conv-x"), "{argv}");
+        assert!(argv.contains("--fork-summary"), "{argv}");
+        assert_eq!(answer.resume.as_ref().unwrap().mode, "summary");
+        let text = &answer.item.thread.last().unwrap().text;
+        assert!(
+            text.starts_with(
+                "[summary resume · cursor-agent] (new conversation; a board run is in progress) "
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            answer
+                .item
+                .sessions
+                .last()
+                .unwrap()
+                .conversation_id
+                .as_deref(),
+            Some("conv-fork"),
+            "the running conversation is never appended to"
+        );
+
+        let native = ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Native))
+            .err()
+            .expect("native must be refused during a run");
+        assert_eq!(native.exit_code(), crate::agent_api::exit::CONFLICT);
+
+        // Boundary: in progress without a live lock is not a live run.
+        drop(running);
+        if !BoardLockGuard::is_active(&h.board, "runs", &item.id) {
+            let prepared =
+                ask_item_prepare(&h.store, resume_ask(&h, &item, ResumeMode::Auto)).unwrap();
+            assert_eq!(prepared.planned_resume().unwrap().mode, "native");
+        }
+    }
+
+    // TC-3835 / FR-3835: every resume mode runs the child with `--read-only`,
+    // never with --allow-sensitive/--trust-workspace-config (argv or env), and
+    // writes no decision or check.
+    #[test]
+    fn tc_3835_ask_resume_stays_read_only() {
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let (child, log) = resume_child(&h);
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        with_work_session(&h, &item);
+        let before = h.store.get(&item.id).unwrap();
+
+        for mode in [
+            ResumeMode::Auto,
+            ResumeMode::Native,
+            ResumeMode::Fresh,
+            ResumeMode::Off,
+        ] {
+            with_board_env(&child, &data, || {
+                ask_item_report(&h.store, resume_ask(&h, &item, mode))
+            })
+            .unwrap();
+        }
+        let lines = fs::read_to_string(&log).unwrap();
+        assert_eq!(lines.lines().count(), 4);
+        for line in lines.lines() {
+            assert!(line.contains("--read-only"), "{line}");
+            assert!(!line.contains("--allow-sensitive"), "{line}");
+            assert!(!line.contains("--trust-workspace-config"), "{line}");
+            assert!(line.ends_with("env:0"), "{line}");
+        }
+        let after = h.store.get(&item.id).unwrap();
+        assert_eq!(after.lane, before.lane);
+        assert_eq!(after.decision, before.decision);
+        assert_eq!(after.checked, before.checked);
     }
 }

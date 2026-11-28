@@ -9,6 +9,8 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - Dashboard: Markdown file paths in agent and board messages open in a read-only viewer (workspace files, and `.md` files under your home folder).
 - Board: approving an item wakes the posting bot (decision event and notify payload with `bot`/`verdict`) and starts the approved plan right away (`[board] auto_run_on_approve`, default on).
+- Board work sessions (SPEC-board-work-session): every board run and ask records where it worked (`sessions` on the item: run, conversation and graph ids, agent/model, status and the `.md` files the run changed). `dmuxai board session <id>`, MCP `board_session` and `GET /api/board/{id}/session` show the work session and its provider bindings (agent and status only, read-only); `dmuxai board link <id> --run-id R` (MCP `board_link`) links an existing run. The item popup has a "Work session" section with Run, Graph, Open in Chat and Markdown links.
+- Ask in the work session (SPEC-board-ask-resume): `dmuxai run --conversation <id> --agent A` continues a stored conversation with one agent turn. It resumes the provider session when its binding is active; otherwise it starts a fresh session whose prompt begins with a bounded, masked "Work session summary". JSON `resume {mode, agent}`; MCP `run` `conversation_id`. `board ask --resume auto|native|fresh|off` (MCP `board_ask` `resume`, HTTP ask `resume`) continues the item's work session read-only by default. During a live board run it uses a new summary-seeded conversation. The answer is tagged `[native resume · A]` / `[summary resume · A]`. The board chat has a "Work session (auto) / Fresh with summary / Item only" selector when the item has a work session.
 
 - **Runner status and enable switch (SPEC-runner-status).** `dmuxai runners status [--json] [--agent ID]` shows, for cursor-agent and agy, whether the CLI is installed, its version and whether it is signed in (account masked, login hint), using only `--version`, `status --format json`, `models` style probes that never start a model turn. `dmuxai runners enable|disable <id>` writes `[runners.<id>] enabled` to the user config; a disabled runner is refused by `run` and graph routing. The same status is available at `GET /api/runners/status`, the MCP tool `runners_status`, and a new Runners panel in the dashboard More menu (status badge, Refresh, enable switch). Nothing is probed at startup or during runs.
 
@@ -20,8 +22,13 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - Board item detail opens as a centered popup instead of a side drawer.
 
+### Security
+
+- Board runs (SPEC-board-approval-hardening, #354, #361, #362): the detached `board run --exec-prepared` step now needs a one-time launch token (only its SHA-256 is stored in the 0600 run lock; the token travels in the environment, never argv) and checks the owner approval or `auto` lane again; the recorded actor comes from the run lock, not `--by`. A non-owner `board move` into `in_progress` is refused unless the item is approved for its current plan or in `auto`. Custom, ACP, fan-out leg and notify hook children now carry `DMUXAI_RUN_ID`, and `term send`/`exec` from a run into a session opened outside a run exits 5 (`forbidden`).
+
 ### Fixed
 
+- Board: a finished run no longer overwrites a newer lane or plan (it adds a `run` note instead); plan attach/edit, `POST /plan` and `ask --revise` are refused (exit 4 / 409) while a run is in progress; detached board run children are reaped and the run lock records the child pid (#361).
 - `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
 - Board item chat: Send now asks the planner and posts its answer ("Note only" keeps the old store-only message).
 - Board: live updates and planner answers now work on tokenless dashboards; Ask no longer sticks on "Asking planner…" (#357).

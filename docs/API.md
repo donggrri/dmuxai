@@ -28,7 +28,7 @@ The following flags can be used before or after subcommands, or with the interac
 
 | Command | Flags | stdout |
 | --- | --- | --- |
-| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
+| `dmuxai run <prompt\|->` | `--agent ID` (Cursor keyword: `cursor-agent`; `cursor` alias), `--conversation ID`, `--model M`, `--approve-plan`, `--allow-sensitive`, `--graph` (no-op), `--progress`, `--json`, `--trust-workspace-config` | Final agent text, or one JSON object with `--json` |
 | `dmuxai todo add <title>` | `--body TEXT`, `--json` | The created to-do (TSV or JSON) |
 | `dmuxai todo list` | `--status open\|running\|done`, `--json` | To-dos (TSV lines or a JSON array) |
 | `dmuxai todo run <id>` | `--agent ID \| --graph`, `--model M`, `--progress`, `--json`, `--trust-workspace-config` | Same as `run`; the to-do is marked running then done/open |
@@ -49,6 +49,27 @@ Notes:
   error to stderr and exits `2` (see [SPEC-acp-runners](specs/SPEC-acp-runners.md)
   FR-1318); the MCP `run` tool rejects a `mode` argument the same way. `--` ends
   flag parsing (`dmuxai run -- --literal prompt`).
+- `run --conversation <id> --agent A` continues stored conversation `<id>` of
+  this workspace with **one** agent turn (no judge, planner or spec-first graph;
+  [SPEC-board-ask-resume](specs/SPEC-board-ask-resume.md) FR-3830). If the
+  conversation has an active provider binding for `A` and the unseen delta is
+  small, the provider session is resumed natively (`resume.mode = "native"`).
+  Otherwise a fresh provider session starts and its prompt begins with a
+  `Work session summary` section: at most 12 000 characters, with secrets masked.
+  The summary holds the latest stored summary, the plan steps with status and
+  each step's last reply (at most 1 500 characters each), the changed Markdown
+  paths and the board thread's last 10 messages. Then come the shared projection
+  and the request (`resume.mode = "summary"`). A provider that rejects the
+  resume retires the binding and retries once in `summary` mode. `--conversation`
+  needs `--agent` and cannot be combined with `--graph`, `--agents` or
+  `--approve-plan-id`. A malformed id (anything other than 1–128 of
+  `A-Z a-z 0-9 _ -`) exits `2` before any store access. An unknown id exits `3`
+  (`error_kind: "not_found"`). `board ask` uses three hidden flags with it:
+  - `--board-item ID` adds that item's thread and Markdown links to the summary;
+  - `--fresh-session` never resumes natively;
+  - `--fork-summary` runs in a new conversation seeded with the summary.
+
+  `run` without `--conversation` is unchanged.
 - Without `--agent`, headless `run` uses the same judge → plan path as the TUI.
   Exit `7` means plan approval (`--approve-plan`), a sensitive gate, or an agent
   that stopped at its own plan review without editing files. The plan-review case
@@ -115,6 +136,7 @@ Notes:
 | `plan` | object\|null | `{steps, tasks}` when a plan was produced (including exit 7 awaiting approval) |
 | `events` | object | `first_seq`/`last_seq` written for this run; both `null` when the run wrote no events |
 | `fallbacks` | array | Optional list of handovers: `{from_runner, from_model, reason, detail, to_runner, to_model}` (`to_*` null when the chain is exhausted); omitted when empty |
+| `resume` | object | Only for `run --conversation`: `{mode: "native"\|"summary", agent}` |
 
 Failures with `--json` print `{ "ok": false, "exit_code": <n>, "error": "<message>", "error_kind": "<kind>|null" }`, where `error_kind` is `sensitive_gate` for a headless sensitive gate, `conflict` for exit 4 and `internal` for exit 6.
 
@@ -418,7 +440,7 @@ Tools (`tools/list`):
 | --- | --- | --- |
 | `todo_add` | `title` (required), `body` | Created to-do |
 | `todo_list` | `status` (`open`\|`running`\|`done`) | Array of to-dos |
-| `run` | `prompt`, `agent`, `model`, `approve_plan`, `allow_sensitive`, `graph`, `todo_id` | Run outcome JSON (same keys as `run --json`), plus `approval_required: true` when the child exits `7`. The fields forward to the same child flags as the CLI: `model` → `--model` (requires `agent`, conflicts with `graph`), `approve_plan` → `--approve-plan`, `allow_sensitive` → `--allow-sensitive`. `agent` and `graph` are mutually exclusive. The deprecated `mode` argument is rejected with a removed-mode tool error; the MCP server never passes `--mode` or `--read-only`. |
+| `run` | `prompt`, `agent`, `model`, `approve_plan`, `allow_sensitive`, `graph`, `todo_id`, `conversation_id` | Run outcome JSON (same keys as `run --json`), plus `approval_required: true` when the child exits `7`. The fields forward to the same child flags as the CLI: `model` → `--model` (requires `agent`, conflicts with `graph`), `conversation_id` → `--conversation` (requires `agent`; conflicts with `graph`, `todo_id` and `approve_plan_id`; the id is validated before the child starts), `approve_plan` → `--approve-plan`, `allow_sensitive` → `--allow-sensitive`. `agent` and `graph` are mutually exclusive. The deprecated `mode` argument is rejected with a removed-mode tool error; the MCP server never passes `--mode` or `--read-only`. |
 | `status` | — | Status JSON (see §1) |
 | `events_since` | `since` (≥0), `limit` (1–1000, default 200) | `{events, last_seq}` |
 | `models` | `agent` (optional) | Available models and runner policy JSON (same as `dmuxai models --json`) |
@@ -432,8 +454,10 @@ Tools (`tools/list`):
 | `board_say` | `id`, `text`, `from` | Item with thread |
 | `board_wait` | `id` or global wait, `since_version`, `since_seq`, `timeout_secs` (≤300), `wait_for` | Item or `{timed_out:true,version}` |
 | `board_prompt` | `id`, optional `hash` | `{prompt}` unmasked text from `graph-pending/` |
-| `board_ask` | `id`, `text` (required); `revise`, `agent`, `model`, `by` | Item with planner answer or revised plan (blocks up to 900 s) |
+| `board_ask` | `id`, `text` (required); `revise`, `agent`, `model`, `by`, `resume` (`auto`\|`native`\|`fresh`\|`off`) | Item with planner answer or revised plan (blocks up to 900 s), plus `resume: {mode, agent}` for a plain ask |
 | `board_run` | `id` (required); `by` | `in_progress` item (detached; records run id and moves to `done`/`unknown` on exit) |
+| `board_session` | `id` | Read-only `{item_id, work_session, sessions, bindings, warning?}`; `bindings` are `{agent, status}` only |
+| `board_link` | `id`, `run_id` (required); `by` | Item with a `run` session link read from that run's manifest (unknown run → exit 3) |
 
 `run` spawns a child `dmuxai run --json` (or `dmuxai todo run <id> --json`), adding
 the forwarded flags, and blocks until it finishes, so the result is final. Tool
@@ -472,7 +496,49 @@ Typical loop (see [SPEC-decision-board](specs/SPEC-decision-board.md) §7):
 Subcommands: `add` (`--key` for idempotency), `list`, `show`, `update`, `move`
 (`--if-version`), `plan`, `prompt`, `decide`, `check` (`--text`), `pending`
 (`--workspace`), `say`, `wait`, `events`, `rules`, `ask` (`--text`, `--revise`,
-`--agent`, `--model`, `--by`), `run` (`--detach`, `--by`).
+`--resume`, `--agent`, `--model`, `--by`), `run` (`--detach`, `--by`), `session`,
+`link` (`--run-id`).
+
+Ask in the work session ([SPEC-board-ask-resume](specs/SPEC-board-ask-resume.md)):
+`board ask <id> --text T [--resume auto|native|fresh|off]` (MCP `board_ask`
+`resume`, HTTP ask body `resume`). The default is `auto`.
+
+- With a work session, the ask runs
+  `run --conversation <work conversation> --agent A --read-only --json -` in the
+  item workspace. `A` is `--agent`, else the runner of the work session's last
+  implement step, else the run's agent.
+- `auto` resumes natively when the binding for `A` is active, otherwise it uses
+  `summary`.
+- `native` requires an active binding; otherwise it is a conflict (exit `4`;
+  HTTP `409` with `reason: "no_active_binding"`).
+- `fresh` always uses `summary`.
+- `off` keeps the item-only ask.
+- Without a work session, `auto` behaves as `off`, and `native`/`fresh` are
+  usage errors.
+- While the item has a live board run (lane `in_progress` with a run lock),
+  `auto`/`fresh` run in a new conversation seeded with the summary, and
+  `native` is a conflict.
+- `--revise` ignores `--resume`.
+- The planner thread message starts with `[native resume · A]` or
+  `[summary resume · A]`. The ask session link records the conversation used.
+- `--json`/MCP results add `resume: {mode: "native"|"summary"|"off", agent}`.
+- Asks always pass `--read-only` and never pass `--allow-sensitive` or
+  `--trust-workspace-config`.
+
+Work sessions ([SPEC-board-work-session](specs/SPEC-board-work-session.md)):
+every item has `sessions`, a list (at most 50, oldest dropped) of links to
+where its board runs and asks did their work: `{kind: "run"|"ask", run_id?,
+conversation_id?, graph_id?, workspace_path, agent?, model?, status, exit_code?,
+started_ms, ended_ms?, md_paths[]}`. `status` is `running` while the child runs,
+then `completed`, `failed`, `cancelled` or `awaiting_approval`. `md_paths` lists
+up to 50 workspace-relative `.md` files whose `git status` changed during a run
+(empty outside git). `dmuxai board session <id> [--json]` prints the work session
+(the latest `run` link with a conversation) and, read from the workspace
+conversation database without creating or migrating it, each provider binding's
+`agent` and `status` (`active`/`stale`) — never the provider session id. A
+missing workspace or database gives `bindings: []` and a `warning`.
+`dmuxai board link <id> --run-id R` adds a `run` link from run `R`'s manifest in
+the item's workspace (unknown run → exit `3`, invalid id → exit `2`).
 Approval is **always human-only**: `decide` (every verdict, in every lane),
 `check`, `move` into `auto`, and `rules --set` require `owner` (dashboard browser
 request, or CLI with stdin and stdout on a TTY, `DMUXAI_RUN_ID` unset, and typed
@@ -502,6 +568,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items, launch_allowed}` | 400, 401, 403 |
 | GET | `/api/board/pending` | `?workspace=` | `200` `{items, count}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| GET | `/api/board/{id}/session` | — | `200` `{item_id, work_session, sessions, bindings, warning?}` (read-only) | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` (human headers required) | `200` item + `auto_run` | 400, 401, 403, 404, 409, 422 |
 | POST | `/api/board/{id}/check` | `{text?}` (human headers required) | `200` item | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
@@ -510,7 +577,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | GET | `/api/board/rules` | — | `200` rules JSON | 401, 403 |
 | PUT | `/api/board/rules` | rules JSON | `200` rules JSON | 400, 401, 403 |
 | GET | `/api/board/events` | `?since=SEQ` (SSE) | `event: board` | 400, 401, 403 |
-| POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
+| POST | `/api/board/{id}/ask` | `{text,revise?,agent?,model?,resume?}` | `202` item plus planned `resume` (`--web` only) | 400, 401, 403, 404, 409 |
 | POST | `/api/board/{id}/run` | `{plan_hash?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
 
 Dashboard writes act as `owner`. Owner writes (`POST /decision`, `POST /check`,
@@ -524,6 +591,7 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | --- | --- | --- | --- | --- |
 | GET | `/api/board` | `?lane=`, `?workspace=`, `?all=` | `200` `{items}` | 400, 401, 403 |
 | GET | `/api/board/{id}` | — | `200` item (`previous_steps` when present) | 400, 401, 403, 404 |
+| GET | `/api/board/{id}/session` | — | `200` `{item_id, work_session, sessions, bindings, warning?}` (read-only) | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/decision` | `{verdict,text?,option?,plan_hash?}` | `200` item | 400, 401, 403, 404, 409, 422 |
 | POST | `/api/board/{id}/messages` | `{text}` | `200` item | 400, 401, 403, 404 |
 | POST | `/api/board/{id}/plan` | `{steps, tasks?}` | `200` item | 400, 401, 403, 404, 422 |

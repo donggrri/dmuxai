@@ -917,6 +917,7 @@ pub fn build_custom_command(
             command.env(key, value);
         }
     }
+    crate::process::apply_run_id_env(command.as_std_mut());
     #[cfg(unix)]
     command.process_group(0);
 
@@ -2660,6 +2661,59 @@ image_arg = []
             Some(&Some("agent-override.toml"))
         );
         assert_eq!(env_map.get("CUSTOM_VAR"), Some(&Some("custom-val")));
+    }
+
+    // TC-3804 / FR-3804: with DMUXAI_RUN_ID set in the parent, the custom agent
+    // child (even when its spec tries to clear it), the built-in headless runner
+    // child and the notify hook child all carry the same run id. ACP and
+    // fan-out legs are covered in `src/agent/acp/client.rs` and `src/cli.rs`.
+    #[test]
+    fn tc_3804_run_id_on_all_children() {
+        let _guard = crate::state_path::test_env_lock();
+        let run_id_env = crate::term::policy::RUN_ID_ENV;
+        let child_run_id = |command: &tokio::process::Command| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == run_id_env)
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = CustomAgentSpec {
+            name: "run-id-probe".to_owned(),
+            command: vec!["echo".to_owned()],
+            ..Default::default()
+        };
+        spec.env.insert(run_id_env.to_owned(), String::new());
+        let ctx = SubstitutionContext::new(
+            "probe",
+            tmp.path().to_string_lossy().into_owned(),
+            "ask",
+            "deny",
+        );
+        let hook = vec!["true".to_owned()];
+
+        let previous = std::env::var_os(run_id_env);
+        unsafe { std::env::set_var(run_id_env, "0123456789abcdef") };
+        let custom = build_custom_command(&spec, &ctx, tmp.path()).unwrap();
+        let headless = crate::process::headless_command(std::path::PathBuf::from("agent"));
+        let notify_hook = crate::notify::hook_command(&hook, tmp.path()).unwrap();
+        unsafe { std::env::remove_var(run_id_env) };
+        let custom_outside_run = build_custom_command(&spec, &ctx, tmp.path()).unwrap();
+        let hook_outside_run = crate::notify::hook_command(&hook, tmp.path()).unwrap();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(run_id_env, value),
+                None => std::env::remove_var(run_id_env),
+            }
+        }
+
+        for command in [&custom, &headless, &notify_hook] {
+            assert_eq!(child_run_id(command).as_deref(), Some("0123456789abcdef"));
+        }
+        assert!(child_run_id(&custom_outside_run).is_some_and(|value| !value.is_empty()));
+        assert_eq!(child_run_id(&hook_outside_run), None);
     }
 
     // TC-2082 / FR-2082: custom agent {mcp_config} placeholder dropped with one warning.

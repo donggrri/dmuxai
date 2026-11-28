@@ -31,10 +31,15 @@ pub enum RequestOp {
         newline: bool,
         #[serde(default)]
         secret: bool,
+        /// The caller's `DMUXAI_RUN_ID` (SPEC-board-approval-hardening FR-3805).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     SendKeys {
         name: String,
         keys: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     Read {
         name: String,
@@ -59,6 +64,8 @@ pub enum RequestOp {
         name: String,
         command: String,
         timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
     List,
     Show {
@@ -223,6 +230,7 @@ mod tests {
             text: "hi".to_owned(),
             newline: true,
             secret: false,
+            run_id: None,
         });
         let mut bytes = Vec::new();
         write_request(&mut bytes, &request).unwrap();

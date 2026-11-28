@@ -540,6 +540,139 @@ function boardIsItemRunnable(item) {
   return false;
 }
 
+/* SPEC-board-work-session FR-3825: where the item's runs and asks did their
+   work. Text goes through textContent only; links are buttons without an
+   href, so the dashboard token can never end up in one. */
+var BOARD_SESSION_STATUS_LABELS = {
+  running: 'Running',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  awaiting_approval: 'Awaiting approval'
+};
+
+function boardSessionLinkButton(label, className, onClick) {
+  var btn = boardEl('button', 'board-session-link ' + className, label);
+  btn.type = 'button';
+  btn.addEventListener('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    onClick(btn);
+  });
+  return btn;
+}
+
+function boardSessionMdPath(link, rel) {
+  var ws = String(link.workspace_path || '');
+  if (!ws) { return rel; }
+  return ws.replace(/[\\/]+$/, '') + '/' + rel;
+}
+
+function boardOpenSessionChat(link, errEl) {
+  if (!boardLaunchAllowed || !link.conversation_id) { return; }
+  errEl.textContent = '';
+  var conversation = String(link.conversation_id);
+  var workspace = String(link.workspace_path || '');
+  boardFetchJson('GET', '/api/workspace').then(function (info) {
+    if (info && info.current === workspace) {
+      return boardFetchJson('POST', '/api/command', { command: 'load_conversation', id: conversation })
+        .then(function () {
+          if (typeof window.dmuxaiShowChat === 'function') { window.dmuxaiShowChat(); }
+        });
+    }
+    var switcher = window.dmuxaiSwitchWorkspace;
+    if (typeof switcher !== 'function') {
+      throw new Error('Switching workspace is not available in this dashboard.');
+    }
+    return boardFetchJson('POST', '/api/command', {
+      command: 'prepare_open_conversation', workspace: workspace, id: conversation
+    }).then(function () {
+      return switcher(workspace, { conversation: conversation });
+    }).then(function (res) {
+      if (!res || !res.ok) {
+        throw new Error((res && res.error) || 'Workspace switch failed.');
+      }
+    });
+  }).catch(function (err) {
+    errEl.textContent = (err && err.message) || 'Could not open the conversation.';
+  });
+}
+
+// SPEC-board-ask-resume FR-3836: the chat can continue the work session only
+// when the item has a run link with a conversation.
+var BOARD_CHAT_RESUME_OPTIONS = [
+  ['auto', 'Work session (auto)'],
+  ['fresh', 'Fresh with summary'],
+  ['off', 'Item only']
+];
+var BOARD_CHAT_MODE_RE = /^\[(native|summary) resume \u00b7 ([^\]]+)\] /;
+
+function boardHasWorkSession(item) {
+  var sessions = item && Array.isArray(item.sessions) ? item.sessions : [];
+  return sessions.some(function (link) { return link && link.kind === 'run' && !!link.conversation_id; });
+}
+
+function boardRenderWorkSession(drawer, item) {
+  var sessions = Array.isArray(item.sessions) ? item.sessions.slice().reverse() : [];
+  if (!sessions.length) { return; }
+  var section = boardEl('section', 'board-work-session');
+  section.id = 'board-work-session';
+  section.setAttribute('aria-label', 'Work session');
+  section.appendChild(boardEl('h3', 'board-work-session-title', 'Work session'));
+  var errEl = boardEl('div', 'board-work-session-error');
+  errEl.setAttribute('aria-live', 'polite');
+  var list = boardEl('ul', 'board-work-session-list');
+  sessions.forEach(function (link) {
+    var status = String(link.status || 'unknown');
+    var row = boardEl('li', 'board-session');
+    row.setAttribute('data-kind', String(link.kind || ''));
+    row.setAttribute('data-status', status);
+    var head = boardEl('div', 'board-session-head');
+    head.appendChild(boardEl('span', 'board-session-kind', link.kind === 'ask' ? 'Ask' : 'Run'));
+    var statusEl = boardEl('span', 'board-session-status', BOARD_SESSION_STATUS_LABELS[status] || status);
+    if (/^[a-z_]+$/.test(status)) { statusEl.classList.add('board-session-status-' + status); }
+    head.appendChild(statusEl);
+    var who = [link.agent, link.model].filter(Boolean).join(' / ');
+    if (who) { head.appendChild(boardEl('span', 'board-session-agent', who)); }
+    var age = boardAgeMs(link.ended_ms || link.started_ms);
+    if (age) { head.appendChild(boardEl('span', 'board-session-age', age)); }
+    row.appendChild(head);
+
+    var links = boardEl('div', 'board-session-links');
+    if (link.run_id) {
+      links.appendChild(boardSessionLinkButton('Run', 'board-session-run', function () {
+        if (typeof window.dmuxaiOpenRun === 'function') { window.dmuxaiOpenRun(String(link.run_id)); }
+      }));
+    }
+    if (link.graph_id) {
+      links.appendChild(boardSessionLinkButton('Graph', 'board-session-graph', function () {
+        if (typeof window.dmuxaiShowGraphRun === 'function') { window.dmuxaiShowGraphRun(String(link.graph_id)); }
+      }));
+    }
+    if (link.conversation_id && boardLaunchAllowed) {
+      links.appendChild(boardSessionLinkButton('Open in Chat', 'board-session-chat', function () {
+        boardOpenSessionChat(link, errEl);
+      }));
+    }
+    var mdPaths = Array.isArray(link.md_paths) ? link.md_paths : [];
+    mdPaths.forEach(function (rel) {
+      var path = String(rel);
+      var btn = boardSessionLinkButton(path, 'board-session-md', function (trigger) {
+        if (typeof window.dmuxaiOpenMdViewer === 'function') {
+          window.dmuxaiOpenMdViewer(boardSessionMdPath(link, path), trigger);
+        }
+      });
+      btn.setAttribute('data-md-path', path);
+      links.appendChild(btn);
+    });
+    if (links.childNodes.length) { row.appendChild(links); }
+    list.appendChild(row);
+  });
+  section.appendChild(list);
+  section.appendChild(errEl);
+  drawer.appendChild(section);
+}
+
 function boardRenderDrawer(item) {
   var wrap = document.getElementById('board-drawer-wrap');
   var drawer = document.getElementById('board-drawer');
@@ -554,6 +687,8 @@ function boardRenderDrawer(item) {
   var draftText = preserveDraft ? existingInput.value : '';
   var existingNote = document.getElementById('board-chat-note-only');
   var draftNoteOnly = preserveDraft && existingNote ? !!existingNote.checked : false;
+  var existingResume = document.getElementById('board-chat-resume');
+  var draftResume = preserveDraft && existingResume ? existingResume.value : 'auto';
   var focusWasInput = preserveDraft && document.activeElement === existingInput;
 
   var pendingAsk = boardAskPending[item.id];
@@ -706,6 +841,7 @@ function boardRenderDrawer(item) {
   runWrap.appendChild(runErr);
   drawer.appendChild(runWrap);
   runBtn.addEventListener('click', function () { boardRunItem(item); });
+  boardRenderWorkSession(drawer, item);
 
   var chat = boardEl('section', 'board-chat');
   chat.setAttribute('aria-label', 'Side chat');
@@ -720,7 +856,16 @@ function boardRenderDrawer(item) {
       }
       line.appendChild(boardEl('div', 'board-chat-sender', msg.from || 'unknown'));
       line.appendChild(boardEl('div', 'board-chat-time', boardFormatChatTime(msg.at_ms)));
-      var bubble = boardEl('div', 'board-chat-bubble', msg.text || '');
+      var msgText = msg.text || '';
+      var modeMatch = msg.from === 'planner' ? BOARD_CHAT_MODE_RE.exec(msgText) : null;
+      if (modeMatch) {
+        var modeLabel = (modeMatch[1] === 'native' ? 'Native resume' : 'Summary resume') + ' \u00b7 ' + modeMatch[2];
+        var modeEl = boardEl('div', 'board-chat-mode', modeLabel);
+        modeEl.setAttribute('data-mode', modeMatch[1]);
+        line.appendChild(modeEl);
+        msgText = msgText.slice(modeMatch[0].length);
+      }
+      var bubble = boardEl('div', 'board-chat-bubble', msgText);
       line.appendChild(bubble);
       if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
         window.dmuxaiLinkifyMdPaths(bubble);
@@ -742,6 +887,20 @@ function boardRenderDrawer(item) {
   send.type = 'button';
   send.id = 'board-chat-send';
   chatActions.appendChild(send);
+
+  var resumeSel = document.createElement('select');
+  resumeSel.id = 'board-chat-resume';
+  resumeSel.className = 'board-chat-resume';
+  resumeSel.setAttribute('aria-label', 'Ask mode');
+  BOARD_CHAT_RESUME_OPTIONS.forEach(function (opt) {
+    var option = document.createElement('option');
+    option.value = opt[0];
+    option.textContent = opt[1];
+    resumeSel.appendChild(option);
+  });
+  resumeSel.value = draftResume;
+  resumeSel.hidden = !(boardLaunchAllowed && boardHasWorkSession(item));
+  chatActions.appendChild(resumeSel);
 
   var reviseBtn = boardEl('button', 'btn btn-small', 'Ask & revise plan');
   reviseBtn.type = 'button';
@@ -830,10 +989,10 @@ function boardAskPlanner(id, revise) {
     busy.textContent = 'Asking planner\u2026';
   }
   boardStartAskPoll(id);
-  boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', {
-    text: text,
-    revise: !!revise
-  }).then(function () {
+  var askBody = { text: text, revise: !!revise };
+  var resumeSel = document.getElementById('board-chat-resume');
+  if (!revise && resumeSel && !resumeSel.hidden) { askBody.resume = resumeSel.value; }
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/ask', askBody).then(function () {
     var curTa = document.getElementById('board-chat-input');
     if (curTa) { curTa.value = ''; }
     if (boardSelectedId === id) {

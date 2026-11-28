@@ -1078,6 +1078,27 @@ pub struct HeadlessRequest {
     pub no_spec_first: bool,
 }
 
+/// `run --conversation`: continue stored conversation `conversation_id` with
+/// one agent turn (SPEC-board-ask-resume FR-3830..FR-3834). A turn without a
+/// native resume starts with `summary` (the work-session summary).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeadlessContinuation {
+    pub conversation_id: String,
+    pub summary: String,
+    /// Never resume the provider session (`board ask --resume fresh`).
+    pub force_fresh: bool,
+    /// Run in a new conversation seeded with `summary` and leave
+    /// `conversation_id` untouched (ask during a live board run).
+    pub fork: bool,
+}
+
+/// `resume` in `run --conversation --json`: `native` or `summary` (FR-3830).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeadlessResume {
+    pub mode: String,
+    pub agent: String,
+}
+
 /// FR-2545: persisted plan document for `--approve-plan-id`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HeadlessPendingPlan {
@@ -1146,6 +1167,8 @@ pub struct HeadlessOutcome {
     pub aggregate_skipped: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout_judge: Option<dmuxai::fanout::FanoutJudgeMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<HeadlessResume>,
 }
 
 impl HeadlessOutcome {
@@ -1177,6 +1200,7 @@ impl HeadlessOutcome {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            resume: None,
         }
     }
 
@@ -1615,6 +1639,10 @@ pub struct App {
     headless_read_only: bool,
     /// FR-3513: headless `--no-spec-first` disables spec-first for one run.
     headless_no_spec_first: bool,
+    /// SPEC-board-ask-resume FR-3830: headless `run --conversation`.
+    headless_continuation: Option<HeadlessContinuation>,
+    /// FR-3830: `native` or `summary` for the continuation turn that was sent.
+    headless_resume_mode: Option<&'static str>,
     /// FR-3508: git status snapshot before spec (or lite implement) steps.
     graph_node_spec_snapshot: HashMap<String, Option<BTreeMap<String, String>>>,
     /// Graph ID of the last graph session started or finished during a headless run.
@@ -1836,6 +1864,12 @@ impl App {
 
     pub fn set_headless_meta_sink(&mut self, sink: HeadlessMetaSink) {
         self.headless_meta_sink = Some(sink);
+    }
+
+    /// Makes the next [`App::run_headless`] continue a stored conversation
+    /// (SPEC-board-ask-resume FR-3830).
+    pub fn set_headless_continuation(&mut self, continuation: HeadlessContinuation) {
+        self.headless_continuation = Some(continuation);
     }
 
     fn emit_headless_meta(
@@ -2089,6 +2123,8 @@ impl App {
             headless_plan_only_reply: false,
             headless_read_only: false,
             headless_no_spec_first: false,
+            headless_continuation: None,
+            headless_resume_mode: None,
             graph_node_spec_snapshot: HashMap::new(),
             headless_last_graph_id: None,
             skip_judge_for_tests: false,
@@ -4665,6 +4701,9 @@ impl App {
                     // Only one fresh retry per turn.
                     active.retry_fresh_request = None;
                 }
+                if self.headless_continuation.is_some() {
+                    self.headless_resume_mode = Some("summary");
+                }
                 self.push_system(format!(
                     "{agent}'s saved session was rejected; retrying with a fresh session."
                 ));
@@ -6405,6 +6444,18 @@ impl App {
             }
             self.cursor_session_maybe_read_only = policy == TurnPolicy::ReadOnly;
         }
+        // SPEC-board-ask-resume FR-3830, FR-3831: a continuation turn either
+        // resumes natively or starts fresh with the work-session summary.
+        let seed_summary = self.headless_continuation.as_ref().map(|cont| {
+            if cont.force_fresh {
+                request.resume_session = None;
+            }
+            let projection = match &request.context {
+                RequestContext::Resume { fallback, .. } => fallback.clone(),
+                RequestContext::Fresh(projection) => projection.clone(),
+            };
+            (cont.summary.clone(), projection, request.prompt.clone())
+        });
         let require_file_edits = self.graph_node_expects_file_edits(agent);
         let image_paths_for_message = image_paths.clone();
         let (fallback_context, retry_delta, retry_prompt) = match &request.context {
@@ -6426,6 +6477,13 @@ impl App {
             require_file_edits,
             fanout_worktree,
         );
+        if let Some((summary, projection, raw_prompt)) = &seed_summary {
+            let native = adapter_request.resume_session.is_some();
+            if !native {
+                adapter_request.prompt = render_seeded_prompt(summary, projection, raw_prompt);
+            }
+            self.headless_resume_mode = Some(if native { "native" } else { "summary" });
+        }
         let injected_memory = self.inject_memory(agent, &mut adapter_request);
 
         // Determine the prompt role for this turn.
@@ -6500,7 +6558,12 @@ impl App {
         let retry_fresh_request = if adapter_request.resume_session.is_some() {
             fallback_context.map(|fallback| {
                 let rendered_resume = render_resume_prompt(&retry_delta, &retry_prompt);
-                let rendered_fallback = render_restored_prompt(&fallback, &retry_prompt);
+                let rendered_fallback = match &seed_summary {
+                    Some((summary, _, _)) => {
+                        render_seeded_prompt(summary, &fallback, &retry_prompt)
+                    }
+                    None => render_restored_prompt(&fallback, &retry_prompt),
+                };
                 let prefix = adapter_request
                     .prompt
                     .strip_suffix(&rendered_resume)
@@ -16249,6 +16312,7 @@ impl App {
             aggregate_error,
             aggregate_skipped,
             fanout_judge,
+            resume: None,
         }
     }
 
@@ -16409,13 +16473,42 @@ impl App {
             };
             format!("headless: {suffix}")
         };
-        self.create_conversation(Some(headless_title));
+        let continuation = self.headless_continuation.clone();
+        match continuation.as_ref().filter(|c| !c.fork) {
+            Some(cont) => {
+                let id = StoredConversationId::new(cont.conversation_id.clone());
+                match self.engine.select(ConversationSelection::Existing(id)) {
+                    Ok(snapshot) => self.restore_snapshot(snapshot),
+                    Err(error) => {
+                        let (exit_code, kind) = match error {
+                            ConversationError::ConversationNotFound(_) => {
+                                (dmuxai::agent_api::exit::NOT_FOUND, "not_found")
+                            }
+                            _ => (dmuxai::agent_api::exit::INTERNAL, "internal"),
+                        };
+                        return HeadlessOutcome::failure(
+                            exit_code,
+                            cont.conversation_id.clone(),
+                            req.agent.clone(),
+                            format!("could not open conversation: {error}"),
+                        )
+                        .with_error_kind(kind);
+                    }
+                }
+            }
+            None => self.create_conversation(Some(headless_title)),
+        }
+        if continuation.is_some() {
+            // FR-3830: one agent turn; no judge, planner or spec-first graph.
+            self.engine.set_skip_summary_jobs(true);
+        }
+        self.headless_resume_mode = None;
         if let Some(policy) = headless_turn_policy {
             self.pending_turn_policy = Some(policy);
         }
         let read_only_run = self.pending_turn_policy == Some(TurnPolicy::ReadOnly);
         self.headless_read_only = read_only_run;
-        self.headless_no_spec_first = req.no_spec_first;
+        self.headless_no_spec_first = req.no_spec_first || continuation.is_some();
         let read_only_workspace_before = if read_only_run {
             dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await
         } else {
@@ -16868,6 +16961,10 @@ impl App {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            resume: self.headless_resume_mode.map(|mode| HeadlessResume {
+                mode: mode.to_owned(),
+                agent: runner_name(self.adapters[self.selected].agent()).to_owned(),
+            }),
         }
     }
 
@@ -19221,6 +19318,15 @@ fn render_restored_prompt(context: &ContextProjection, prompt: &str) -> String {
     }
     sections.push(format!("Current request:\n{prompt}"));
     sections.join("\n\n")
+}
+
+/// First prompt of a fresh continuation session: the work-session summary,
+/// then the shared projection and the request (SPEC-board-ask-resume FR-3831).
+fn render_seeded_prompt(summary: &str, context: &ContextProjection, prompt: &str) -> String {
+    if context.summary.is_none() && context.recent.is_empty() {
+        return format!("{summary}\n\nCurrent request:\n{prompt}");
+    }
+    format!("{summary}\n\n{}", render_restored_prompt(context, prompt))
 }
 
 fn render_resume_prompt(delta: &[ProjectedTurn], prompt: &str) -> String {

@@ -149,6 +149,14 @@ pub fn invoke(workspace_root: &std::path::Path, name: &str, args: &Value) -> Val
             Ok(v) => board_ok_json(v),
             Err(e) => board_err_json(e),
         },
+        "board_session" => match board_session(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
+        "board_link" => match board_link(args) {
+            Ok(v) => board_ok_json(v),
+            Err(e) => board_err_json(e),
+        },
         other => board_err_json(ApiError::new(
             exit::USAGE,
             format!("unknown board tool: {other}"),
@@ -236,6 +244,31 @@ fn board_show(args: &Value) -> Result<Value, ApiError> {
     validate_item_id_early(id).map_err(ApiError::from)?;
     let store = open_board_store()?;
     let item = store.get(id).map_err(ApiError::from)?;
+    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+}
+
+/// Read-only work session of an item (SPEC-board-work-session FR-3823).
+fn board_session(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
+    validate_item_id_early(id).map_err(ApiError::from)?;
+    let state_root = crate::state_path::state_base()
+        .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
+    let store = open_board_store()?;
+    let view = super::session::session_view(&store, id, &state_root).map_err(ApiError::from)?;
+    Ok(serde_json::to_value(view).unwrap_or(Value::Null))
+}
+
+/// Link an existing run to an item (SPEC-board-work-session FR-3826).
+fn board_link(args: &Value) -> Result<Value, ApiError> {
+    let id = str_arg(args, "id").ok_or_else(|| usage("id is required"))?;
+    validate_item_id_early(id).map_err(ApiError::from)?;
+    let run_id = str_arg(args, "run_id").ok_or_else(|| usage("run_id is required"))?;
+    if !crate::run_journal::valid_run_id(run_id) {
+        return Err(usage("run_id must be 16 lowercase hex characters"));
+    }
+    let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
+    let store = open_board_store()?;
+    let item = super::session::link_run(&store, id, run_id, &by).map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
 }
 
@@ -499,11 +532,16 @@ fn board_ask(args: &Value) -> Result<Value, ApiError> {
     let revise = args.get("revise").and_then(Value::as_bool).unwrap_or(false);
     let agent = str_arg(args, "agent").map(str::to_owned);
     let model = str_arg(args, "model").map(str::to_owned);
+    let resume = match str_arg(args, "resume") {
+        None => super::resume::ResumeMode::default(),
+        Some(raw) => super::resume::ResumeMode::parse(raw)
+            .ok_or_else(|| usage("resume must be auto, native, fresh or off"))?,
+    };
     let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
     let state_root = crate::state_path::state_base()
         .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?;
     let store = open_board_store()?;
-    let item = super::runner::ask_item(
+    let answer = super::runner::ask_item_report(
         &store,
         super::runner::AskParams {
             id: id.to_owned(),
@@ -513,10 +551,14 @@ fn board_ask(args: &Value) -> Result<Value, ApiError> {
             model,
             by,
             state_root,
+            resume,
         },
     )
     .map_err(ApiError::from)?;
-    Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+    Ok(super::resume::ask_answer_json(
+        &answer.item,
+        answer.resume.as_ref(),
+    ))
 }
 
 fn board_run(args: &Value) -> Result<Value, ApiError> {
@@ -539,4 +581,88 @@ fn board_run(args: &Value) -> Result<Value, ApiError> {
     let item =
         super::runner::launch_detached_board_run(&store, prepared).map_err(ApiError::from)?;
     Ok(serde_json::to_value(item).unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::{SessionKind, SessionStatus, session};
+
+    // TC-3824 / FR-3824, FR-3823, FR-3826: MCP `board_show` includes
+    // `sessions`; `board_session` reports the work session read-only;
+    // `board_link` appends a run link from a manifest and maps unknown runs
+    // to exit 3 and invalid run ids to exit 2.
+    #[test]
+    fn tc_3824_show_includes_sessions() {
+        let _env = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let data = dir.path().join("data");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        unsafe {
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+            std::env::set_var("DMUXAI_DATA_DIR", &data);
+        }
+        let added = invoke(
+            &ws,
+            "board_add",
+            &json!({"title": "mcp sessions", "kind": "feature"}),
+        );
+        let id = added["id"].as_str().unwrap().to_owned();
+        let ws_path = added["workspace"]["path"].as_str().unwrap().to_owned();
+        let store = open_board_store().unwrap();
+        let mut link = session::running_link(SessionKind::Run, std::path::Path::new(&ws_path), 5);
+        link.status = SessionStatus::Completed;
+        link.conversation_id = Some("conv-mcp".to_owned());
+        store.append_session(&id, link, "bot:coord").unwrap();
+
+        let shown = invoke(&ws, "board_show", &json!({"id": id}));
+        assert_eq!(shown["ok"], true);
+        assert_eq!(shown["sessions"][0]["conversation_id"], "conv-mcp");
+        assert_eq!(shown["sessions"][0]["status"], "completed");
+
+        let view = invoke(&ws, "board_session", &json!({"id": id}));
+        assert_eq!(view["ok"], true, "{view}");
+        assert_eq!(view["work_session"]["conversation_id"], "conv-mcp");
+        assert_eq!(view["bindings"], json!([]));
+        assert!(view["warning"].is_string());
+        session::test_support::seed_conversation_db(&state, &ws_path, "conv-mcp", 3);
+        let view = invoke(&ws, "board_session", &json!({"id": id}));
+        assert_eq!(
+            view["bindings"][1],
+            json!({"agent": "cursor", "status": "active"})
+        );
+        assert!(!view.to_string().contains("SECRET"));
+
+        session::test_support::write_manifest(
+            &data,
+            &ws_path,
+            "abcdef0123456789",
+            "completed",
+            Some("conv-linked"),
+            None,
+        );
+        let linked = invoke(
+            &ws,
+            "board_link",
+            &json!({"id": id, "run_id": "abcdef0123456789"}),
+        );
+        assert_eq!(linked["ok"], true, "{linked}");
+        assert_eq!(linked["sessions"][1]["run_id"], "abcdef0123456789");
+        let unknown = invoke(
+            &ws,
+            "board_link",
+            &json!({"id": id, "run_id": "0000000000000000"}),
+        );
+        assert_eq!(unknown["exit_code"], exit::NOT_FOUND);
+        let invalid = invoke(&ws, "board_link", &json!({"id": id, "run_id": "../x"}));
+        assert_eq!(invalid["exit_code"], exit::USAGE);
+        let missing = invoke(&ws, "board_session", &json!({"id": "b000000000001"}));
+        assert_eq!(missing["exit_code"], exit::NOT_FOUND);
+        unsafe {
+            std::env::remove_var("DMUXAI_STATE_DIR");
+            std::env::remove_var("DMUXAI_DATA_DIR");
+        }
+    }
 }
