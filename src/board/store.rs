@@ -12,7 +12,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use serde::{Deserialize, Serialize};
 
 use super::plan::{
-    board_plan_from_pending, pending_hash_for_plan, read_pending_plan, write_board_plan_copy,
+    PendingPlanFile, board_plan_from_pending, expand_pending_plan, pending_hash_for_plan,
+    read_pending_plan, write_board_plan_copy,
 };
 use super::rules::RulesStore;
 use super::{
@@ -20,8 +21,28 @@ use super::{
     ThreadMessage, Verdict, WorkspaceRef, generate_item_id, mask_item_fields, valid_item_id,
     validate_message, validate_new_text, validate_options, validate_ref_url,
 };
+use crate::graph::spec_review::ReviewStatus;
 use crate::state_path::{repo_key, valid_pending_plan_hash};
 use crate::workspace::normalize_workspace_path;
+
+/// Read and verify a pending plan, then store it spec-first expanded for the
+/// item's workspace so the approved plan is the plan that runs (FR-3715).
+fn load_attached_plan(
+    state_root: &Path,
+    workspace: Option<&str>,
+    hash: &str,
+) -> Result<(PendingPlanFile, String), BoardError> {
+    let pending = read_pending_plan(state_root, hash)?;
+    if pending_hash_for_plan(&pending)? != hash {
+        return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
+    }
+    if let Some(workspace) = workspace
+        && let Some(expanded) = expand_pending_plan(Path::new(workspace), state_root, &pending)?
+    {
+        return Ok(expanded);
+    }
+    Ok((pending, hash.to_owned()))
+}
 
 #[derive(Debug, Clone)]
 pub struct AddItemRequest {
@@ -133,6 +154,8 @@ pub struct PendingItem {
     pub grade: Option<super::Grade>,
     pub age_ms: u64,
     pub updated_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_review: Option<super::BoardSpecReview>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -444,16 +467,14 @@ impl BoardStore {
                 thread: Vec::new(),
                 run_ids: Vec::new(),
                 key: req.key.clone(),
+                spec_review: None,
                 created_ms: now_ms(),
                 updated_ms: now_ms(),
                 version: 1,
             };
             if let Some(hash) = req.plan_hash {
-                let pending = read_pending_plan(&req.state_root, &hash)?;
-                let computed = pending_hash_for_plan(&pending)?;
-                if computed != hash {
-                    return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
-                }
+                let (pending, hash) =
+                    load_attached_plan(&req.state_root, item.workspace.path.as_deref(), &hash)?;
                 write_board_plan_copy(&req.state_root, &store.base, &hash)?;
                 item.plan = Some(board_plan_from_pending(pending, hash, None));
                 store.clear_decision_on_plan_change(&mut item);
@@ -535,7 +556,12 @@ impl BoardStore {
             {
                 continue;
             }
+            let spec_review_pending = item
+                .spec_review
+                .as_ref()
+                .is_some_and(|review| review.status == ReviewStatus::Pending);
             let reason = match item.lane {
+                _ if spec_review_pending => "spec_review",
                 Lane::NeedsDecision => "decide",
                 Lane::Unknown if item.checked.is_none() && item.updated_ms >= cutoff => "failed",
                 Lane::Done if item.checked.is_none() && item.updated_ms >= cutoff => "check",
@@ -552,6 +578,7 @@ impl BoardStore {
                 grade: item.grade,
                 age_ms: now.saturating_sub(item.updated_ms),
                 updated_ms: item.updated_ms,
+                spec_review: item.spec_review,
             });
         }
         entries.sort_by(|a, b| {
@@ -709,14 +736,11 @@ impl BoardStore {
         }
         let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
-            let pending = read_pending_plan(state_root, hash)?;
-            let computed = pending_hash_for_plan(&pending)?;
-            if computed != hash {
-                return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
-            }
-            write_board_plan_copy(state_root, &store.base, hash)?;
+            let (pending, hash) =
+                load_attached_plan(state_root, item.workspace.path.as_deref(), hash)?;
+            write_board_plan_copy(state_root, &store.base, &hash)?;
             let prev_lane = item.lane;
-            let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
+            let plan = board_plan_from_pending(pending, hash, item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
             item.version += 1;
@@ -745,14 +769,11 @@ impl BoardStore {
         }
         let (item, notify_needs_decision) = self.with_lock(|store| {
             let mut item = store.load_item_inner(id)?;
-            let pending = read_pending_plan(_state_root, hash)?;
-            let computed = pending_hash_for_plan(&pending)?;
-            if computed != hash {
-                return Err(BoardError::Failed("pending plan hash mismatch".to_owned()));
-            }
-            write_board_plan_copy(_state_root, &store.base, hash)?;
+            let (pending, hash) =
+                load_attached_plan(_state_root, item.workspace.path.as_deref(), hash)?;
+            write_board_plan_copy(_state_root, &store.base, &hash)?;
             let prev_lane = item.lane;
-            let plan = board_plan_from_pending(pending, hash.to_owned(), item.plan.as_ref());
+            let plan = board_plan_from_pending(pending, hash, item.plan.as_ref());
             item.plan = Some(plan);
             store.clear_decision_on_plan_change(&mut item);
             item.version += 1;
@@ -1042,6 +1063,52 @@ impl BoardStore {
             item.updated_ms = now_ms();
             store.save_item_inner(&item)?;
             store.append_event(id, EventKind::Decision, item.version, &req.by)?;
+            Ok(item)
+        })
+    }
+
+    /// Store the item's spec review and optionally append a masked thread
+    /// message; never changes the lane or the decision (SPEC-spec-review-gate
+    /// FR-3711).
+    pub fn set_spec_review(
+        &self,
+        id: &str,
+        review: super::BoardSpecReview,
+        message: Option<(&str, &str)>,
+    ) -> Result<BoardItem, BoardError> {
+        if !valid_item_id(id) {
+            return Err(BoardError::Usage("invalid board item id".to_owned()));
+        }
+        self.with_lock(|store| {
+            let mut item = store.load_item_inner(id)?;
+            if item.spec_review.as_ref() == Some(&review) && message.is_none() {
+                return Ok(item);
+            }
+            item.spec_review = Some(review.clone());
+            let by = match message {
+                Some((from, text)) => {
+                    let masked = crate::run_journal::mask_sensitive_tokens(text);
+                    if item.thread.len() >= THREAD_MAX {
+                        item.thread.remove(0);
+                    }
+                    item.thread.push(ThreadMessage {
+                        from: from.to_owned(),
+                        text: masked.chars().take(super::TEXT_MAX).collect(),
+                        at_ms: now_ms(),
+                    });
+                    from
+                }
+                None => "owner",
+            };
+            item.version += 1;
+            item.updated_ms = now_ms();
+            store.save_item_inner(&item)?;
+            let kind = if message.is_some() {
+                EventKind::Message
+            } else {
+                EventKind::Updated
+            };
+            store.append_event(id, kind, item.version, by)?;
             Ok(item)
         })
     }

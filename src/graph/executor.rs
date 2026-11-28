@@ -25,13 +25,23 @@ fn workflow_settings_from_snapshot(snap: &super::types::WorkflowSnapshot) -> Wor
     }
 }
 
-fn node_prompt(job: &str, plan: &GraphPlan, role: NodeRole, node_id: &str) -> String {
+fn node_prompt(
+    job: &str,
+    plan: &GraphPlan,
+    role: NodeRole,
+    node_id: &str,
+    spec_feedback: Option<&str>,
+) -> String {
     let mut prompt = node_send_prompt(job, plan);
     if let Some(snap) = plan.workflow.as_ref() {
         match role {
             NodeRole::Spec => {
                 prompt.push_str("\n\n");
                 prompt.push_str(&spec_node_directive(&snap.spec_dir));
+                if let Some(block) = spec_feedback {
+                    prompt.push_str("\n\n");
+                    prompt.push_str(block);
+                }
             }
             NodeRole::Implement | NodeRole::Draft if node_has_spec_ancestor(plan, node_id) => {
                 prompt.push_str("\n\n");
@@ -94,6 +104,19 @@ pub struct GraphRunSession {
     node_turns: HashMap<String, String>,
     /// Ready nodes waiting on adapter availability (FR-976); skip in [`schedule`].
     deferred_ready: HashSet<String>,
+    /// Human spec review hold (SPEC-spec-review-gate FR-3702).
+    spec_review: SpecReviewHold,
+}
+
+/// While `enabled` and not `released`, no step that depends on a spec step starts.
+#[derive(Debug, Clone, Default)]
+struct SpecReviewHold {
+    enabled: bool,
+    released: bool,
+    /// Rendered reviewer-feedback DATA block for the spec step re-run (FR-3705).
+    feedback_block: Option<String>,
+    /// Status-line hint while a review is pending (FR-3702).
+    wait_hint: Option<String>,
 }
 
 pub type GraphSession = GraphRunSession;
@@ -105,7 +128,137 @@ impl GraphRunSession {
             active: HashSet::new(),
             node_turns: HashMap::new(),
             deferred_ready: HashSet::new(),
+            spec_review: SpecReviewHold::default(),
         }
+    }
+
+    /// Arms the human spec review hold when the plan has a spec step
+    /// (SPEC-spec-review-gate FR-3702). Returns whether the hold is armed.
+    pub fn enable_spec_review(&mut self) -> bool {
+        let has_spec = self
+            .run
+            .plan
+            .nodes
+            .iter()
+            .any(|node| node.role == NodeRole::Spec);
+        if !has_spec {
+            return false;
+        }
+        self.spec_review.enabled = true;
+        self.spec_review.released = false;
+        true
+    }
+
+    pub fn spec_review_enabled(&self) -> bool {
+        self.spec_review.enabled
+    }
+
+    fn spec_review_holds(&self, plan: &GraphPlan, node_id: &str, role: NodeRole) -> bool {
+        self.spec_review.enabled
+            && !self.spec_review.released
+            && role != NodeRole::Spec
+            && node_has_spec_ancestor(plan, node_id)
+    }
+
+    /// Spec steps awaiting a human check: every spec ancestor of a not-yet-started
+    /// write step has completed, the hold is armed and no review released it yet.
+    pub fn spec_review_due(&self) -> Option<Vec<String>> {
+        if !self.spec_review.enabled || self.spec_review.released {
+            return None;
+        }
+        let plan = &self.run.plan;
+        let mut spec_ids: Vec<String> = Vec::new();
+        for node in &plan.nodes {
+            let write = matches!(node.role, NodeRole::Implement | NodeRole::Draft);
+            let pending = matches!(
+                node.status,
+                GraphNodeStatus::Pending | GraphNodeStatus::Ready
+            );
+            if !write || !pending {
+                continue;
+            }
+            for ancestor in spec_ancestors(plan, &node.id) {
+                if !spec_ids.contains(&ancestor) {
+                    spec_ids.push(ancestor);
+                }
+            }
+        }
+        if spec_ids.is_empty() {
+            return None;
+        }
+        let all_done = spec_ids.iter().all(|id| {
+            plan.nodes
+                .iter()
+                .find(|node| &node.id == id)
+                .is_some_and(|node| node.status == GraphNodeStatus::Completed)
+        });
+        if !all_done {
+            return None;
+        }
+        spec_ids.sort();
+        Some(spec_ids)
+    }
+
+    /// Marks the run as waiting for a spec review and sets the status-line hint.
+    pub fn begin_spec_review_wait(&mut self, hint: String) {
+        self.spec_review.wait_hint = Some(hint);
+        if matches!(
+            self.run.phase,
+            GraphRunPhase::Active | GraphRunPhase::AwaitingSpecReview
+        ) {
+            self.run.phase = GraphRunPhase::AwaitingSpecReview;
+        }
+    }
+
+    fn end_spec_review_wait(&mut self) {
+        self.spec_review.wait_hint = None;
+        if self.run.phase == GraphRunPhase::AwaitingSpecReview {
+            self.run.phase = GraphRunPhase::Active;
+        }
+    }
+
+    /// The reviewer approved: dependent steps may start now.
+    pub fn release_spec_review(&mut self) -> Vec<GraphAction> {
+        self.spec_review.released = true;
+        self.spec_review.feedback_block = None;
+        self.end_spec_review_wait();
+        self.schedule()
+    }
+
+    /// The reviewer asked for changes: the spec steps run again with the
+    /// feedback block in their prompt, then the run pauses for review again
+    /// (SPEC-spec-review-gate FR-3705).
+    pub fn reopen_spec_steps(
+        &mut self,
+        spec_ids: &[String],
+        feedback_block: String,
+    ) -> Vec<GraphAction> {
+        for node in &mut self.run.plan.nodes {
+            if spec_ids.contains(&node.id) && node.role == NodeRole::Spec {
+                node.status = GraphNodeStatus::Ready;
+                node.attempt = 0;
+                node.finished_at_ms = None;
+                self.deferred_ready.remove(&node.id);
+            }
+        }
+        self.spec_review.released = false;
+        self.spec_review.feedback_block = Some(feedback_block);
+        self.end_spec_review_wait();
+        self.schedule()
+    }
+
+    /// The spec review ended without approval: unstarted steps are skipped.
+    pub fn skip_unstarted_steps(&mut self) {
+        for node in &mut self.run.plan.nodes {
+            if matches!(
+                node.status,
+                GraphNodeStatus::Pending | GraphNodeStatus::Ready | GraphNodeStatus::WaitingGate
+            ) && node.role != NodeRole::Orchestrate
+            {
+                node.status = GraphNodeStatus::Skipped;
+            }
+        }
+        self.spec_review.wait_hint = None;
     }
 
     pub fn mark_node_deferred(&mut self, node_id: &str) {
@@ -157,7 +310,13 @@ impl GraphRunSession {
             node_id: node.id.clone(),
             runner: node.runner.clone(),
             model_id: node.model_id.clone(),
-            prompt: node_prompt(&node.job, &self.run.plan, node.role, &node.id),
+            prompt: node_prompt(
+                &node.job,
+                &self.run.plan,
+                node.role,
+                &node.id,
+                self.spec_review.feedback_block.as_deref(),
+            ),
             role: node.role,
         })
     }
@@ -303,6 +462,10 @@ impl GraphRunSession {
                 index += 1;
                 continue;
             }
+            if self.spec_review_holds(&plan, &node_id, role) {
+                index += 1;
+                continue;
+            }
             if role == NodeRole::Orchestrate {
                 index += 1;
                 continue;
@@ -324,7 +487,13 @@ impl GraphRunSession {
                 node_id: node_id.clone(),
                 runner: self.run.plan.nodes[index].runner.clone(),
                 model_id: self.run.plan.nodes[index].model_id.clone(),
-                prompt: node_prompt(&job, &self.run.plan, role, &node_id),
+                prompt: node_prompt(
+                    &job,
+                    &self.run.plan,
+                    role,
+                    &node_id,
+                    self.spec_review.feedback_block.as_deref(),
+                ),
                 role,
             };
 
@@ -404,6 +573,10 @@ impl GraphRunSession {
         }
         let m = non_orch.len();
 
+        if let Some(hint) = self.spec_review.wait_hint.as_ref() {
+            return Some(hint.clone());
+        }
+
         if let Some(pos) = non_orch
             .iter()
             .position(|n| self.active.contains(&n.id) || n.status == GraphNodeStatus::Running)
@@ -462,6 +635,28 @@ impl GraphRunSession {
             current_node.id, current_node.role, current_node.runner
         ))
     }
+}
+
+/// Spec-role ancestors of `node_id`.
+fn spec_ancestors(plan: &GraphPlan, node_id: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack = vec![node_id.to_owned()];
+    let mut out = Vec::new();
+    while let Some(current) = stack.pop() {
+        for edge in plan.edges.iter().filter(|edge| edge.to == current) {
+            if seen.insert(edge.from.clone()) {
+                stack.push(edge.from.clone());
+                if plan
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == edge.from && node.role == NodeRole::Spec)
+                {
+                    out.push(edge.from.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 fn dependencies_met(plan: &GraphPlan, node_id: &str, completed: &HashSet<String>) -> bool {

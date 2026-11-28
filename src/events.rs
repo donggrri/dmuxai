@@ -448,6 +448,7 @@ fn phase_str(phase: GraphRunPhase) -> &'static str {
         GraphRunPhase::AwaitingApproval => "awaiting_approval",
         GraphRunPhase::Rejected => "rejected",
         GraphRunPhase::Cancelled => "cancelled",
+        GraphRunPhase::AwaitingSpecReview => "awaiting_spec_review",
     }
 }
 

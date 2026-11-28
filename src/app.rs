@@ -31,6 +31,10 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
+use dmuxai::graph::spec_review::{
+    DecideRequest as SpecDecideRequest, GateOutcome, ReviewStatus, SpecReviewConfig,
+    SpecReviewGate, SpecReviewStore, SpecReviewSummary, Verdict as SpecVerdict,
+};
 use dmuxai::{
     attachments::{
         ImageAttachmentStore, RunnerKind as AttachmentRunnerKind, image_paths_in_text,
@@ -57,20 +61,20 @@ use dmuxai::{
         AllowedRunner, Approval, ApprovalState, DecisionBy, DynamicNodeSpec, FallbackCause,
         GraphAction, GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, GraphRun, GraphRunListCache,
         GraphRunPhase, GraphRunSession, GraphStopReason, GraphStore, MAX_PLAN_REVISIONS,
-        NodeAssignment, NodeRole, NodeTurnPolicy, OverrideKind, PanelLineKind, PlanChange,
-        PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode, PlanPromptRequest,
-        PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo, PlannerIoKind,
-        QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, SpecGateResult, TaskEdit, Triage,
-        TriageSource, WorkflowSnapshot, apply_replan, apply_spec_first,
+        NodeAssignment, NodeRole, NodeTurnPolicy, OverrideKind, PanelLine, PanelLineKind,
+        PlanChange, PlanChangeKind, PlanChangeTrigger, PlanContext, PlanDoc, PlanPromptMode,
+        PlanPromptRequest, PlanRevision, PlanStep, PlanTask, PlannerCalls, PlannerIo,
+        PlannerIoKind, QUESTION_ANSWER_HINT, ReplanDoc, ReplanTrigger, Route, SpecGateResult,
+        TaskEdit, Triage, TriageSource, WorkflowSnapshot, apply_replan, apply_spec_first,
         approval_panel_lines_with_skills, budget_allows, build_judge_prompt, build_plan_prompt,
         build_replan_prompt, cap_plan_response_excerpt, cap_replan_step_summary, cap_revision_raw,
-        check_marker_gate, check_spec_gate, diff_plan_steps, diff_plan_tasks, ensure_spec_dir,
-        fallback_plan, graph_plan_from_revision_steps, heuristic_route, is_question_prompt,
-        is_trivial_prompt, judge_line_text, judging_line_text, lite_directive,
+        changed_spec_paths, check_marker_gate, check_spec_gate, diff_plan_steps, diff_plan_tasks,
+        ensure_spec_dir, fallback_plan, graph_plan_from_revision_steps, heuristic_route,
+        is_question_prompt, is_trivial_prompt, judge_line_text, judging_line_text, lite_directive,
         next_plan_change_rev, node_turn_policy, parse_add_nodes_marker, parse_plan, parse_replan,
         parse_replan_marker, parse_verdict, pin_graph_plan_runners, plan_json_for_edit,
         replan_allowed, replan_revision_steps, revision_needs_approval, run_test_command, save_run,
-        spec_snapshot, strip_add_nodes_marker, strip_replan_marker, task_counter_text,
+        spec_snapshot_in, strip_add_nodes_marker, strip_replan_marker, task_counter_text,
         three_step_plan, validate_add_nodes, validate_plan_with_limit, write_tasks_file_if_enabled,
     },
     mcp::config::ResolvedMcpServer,
@@ -1076,6 +1080,23 @@ pub struct HeadlessRequest {
     pub todo_id: Option<String>,
     pub model: Option<String>,
     pub no_spec_first: bool,
+    /// FR-3701: skip the human spec review for this run only.
+    pub no_spec_review: bool,
+}
+
+/// TUI state of one pending spec review round (FR-3716).
+#[derive(Debug, Clone, Default)]
+struct SpecReviewPanel {
+    review_id: String,
+    round: u32,
+    spec_paths: Vec<String>,
+    spec_digest: String,
+    /// Esc hid the panel; the status line keeps the waiting hint.
+    hidden: bool,
+    decided: bool,
+    /// Feedback being typed after `c`.
+    feedback: Option<String>,
+    notice: Option<String>,
 }
 
 /// FR-2545: persisted plan document for `--approve-plan-id`.
@@ -1146,6 +1167,9 @@ pub struct HeadlessOutcome {
     pub aggregate_skipped: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fanout_judge: Option<dmuxai::fanout::FanoutJudgeMeta>,
+    /// FR-3717: spec review state when the run requested one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_review: Option<SpecReviewSummary>,
 }
 
 impl HeadlessOutcome {
@@ -1177,6 +1201,7 @@ impl HeadlessOutcome {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            spec_review: None,
         }
     }
 
@@ -1615,6 +1640,18 @@ pub struct App {
     headless_read_only: bool,
     /// FR-3513: headless `--no-spec-first` disables spec-first for one run.
     headless_no_spec_first: bool,
+    /// FR-3701: headless `--no-spec-review` skips the human spec review.
+    headless_no_spec_review: bool,
+    /// True while `run_headless` drives a run.
+    headless_run: bool,
+    /// FR-3702: the human spec review controller of the current graph run.
+    spec_review_gate: Option<SpecReviewGate>,
+    /// FR-3716: the TUI spec review panel of the pending review round.
+    spec_review_panel: Option<SpecReviewPanel>,
+    /// FR-3710: where `spec_review_*` journal lines go (the run journal copy).
+    spec_review_journal: Option<SpecReviewJournal>,
+    /// FR-3717: last spec review summary of the headless run.
+    headless_spec_review: Option<SpecReviewSummary>,
     /// FR-3508: git status snapshot before spec (or lite implement) steps.
     graph_node_spec_snapshot: HashMap<String, Option<BTreeMap<String, String>>>,
     /// Graph ID of the last graph session started or finished during a headless run.
@@ -1734,6 +1771,9 @@ pub struct App {
 
 pub type ProgressSink = Box<dyn FnMut(&str) + Send>;
 
+/// FR-3710: shared writer for `spec_review_*` journal lines.
+type SpecReviewJournal = Arc<Mutex<Box<dyn FnMut(&str) + Send>>>;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeadlessRunMeta {
     pub graph_id: Option<String>,
@@ -1832,6 +1872,331 @@ fn program_is_executable_os(
 impl App {
     pub fn set_progress_sink(&mut self, sink: ProgressSink) {
         self.progress_sink = Some(sink);
+    }
+
+    /// FR-3710: receives one JSON line per `spec_review_*` event (the CLI
+    /// writes them to the run journal copy; they never reach stderr).
+    pub fn set_spec_review_journal(&mut self, sink: Box<dyn FnMut(&str) + Send>) {
+        self.spec_review_journal = Some(Arc::new(Mutex::new(sink)));
+    }
+
+    /// FR-3702: whether the human spec review pauses this run.
+    fn spec_review_wanted(&self) -> bool {
+        !self.headless_no_spec_review
+            && !self.headless_no_spec_first
+            && !self.headless_read_only
+            && self.settings.workflow.spec_review_enabled()
+    }
+
+    /// Builds the gate for a run with a spec step (FR-3702); `Err` is a
+    /// fail-closed message when the record store cannot be used.
+    fn build_spec_review_gate(&self, run: &GraphRun) -> Result<SpecReviewGate, String> {
+        let store = SpecReviewStore::open_default()
+            .map_err(|error| format!("spec review unavailable: {error}"))?;
+        let spec_dir = run
+            .plan
+            .workflow
+            .as_ref()
+            .map(|w| w.spec_dir.clone())
+            .unwrap_or_else(|| self.settings.workflow.spec_dir.clone());
+        let mut gate = SpecReviewGate::new(
+            store,
+            SpecReviewConfig::from_settings(&self.settings.workflow),
+            self.workspace_root.clone(),
+            spec_dir,
+            run.plan.id.clone(),
+            std::env::var(dmuxai::term::policy::RUN_ID_ENV).unwrap_or_default(),
+            &run.plan.user_prompt,
+        );
+        gate.set_board_item_id(std::env::var("DMUXAI_BOARD_ITEM_ID").ok());
+        if let Some(journal) = self.spec_review_journal.clone() {
+            gate.set_journal(Some(Box::new(move |line: &str| {
+                let mut guard = journal.lock().unwrap_or_else(|e| e.into_inner());
+                (*guard)(line);
+            })));
+        }
+        Ok(gate)
+    }
+
+    fn emit_spec_review_progress(&mut self, kind: &str, summary: &str) {
+        let Some(sink) = self.progress_sink.as_mut() else {
+            return;
+        };
+        let summary = crate::progress::sanitize_summary(summary, 240);
+        let line = crate::progress::ProgressLine::new(unix_ms_now(), "dmuxai", kind, summary);
+        sink(&line.to_json());
+    }
+
+    fn remember_spec_review_summary(&mut self) {
+        if let Some(summary) = self.spec_review_gate.as_ref().and_then(|g| g.summary()) {
+            self.headless_spec_review = Some(summary.clone());
+        }
+    }
+
+    /// Ends the gate when its run ended: an open record becomes `cancelled`
+    /// (FR-3704). A decided record is untouched.
+    fn finish_spec_review_gate(&mut self) {
+        if let Some(mut gate) = self.spec_review_gate.take() {
+            let summary = gate.cancel();
+            if summary.is_some() {
+                self.headless_spec_review = summary;
+            } else if let Some(summary) = gate.summary() {
+                self.headless_spec_review = Some(summary.clone());
+            }
+        }
+    }
+
+    /// FR-3704: Ctrl-C while the run waits for a human ends the run.
+    fn cancel_spec_review_wait(&mut self) {
+        let waiting = self
+            .spec_review_gate
+            .as_ref()
+            .is_some_and(|gate| gate.is_waiting());
+        if !waiting {
+            return;
+        }
+        self.finish_spec_review_gate();
+        if let Some(session) = self.graph_session.as_mut() {
+            session.skip_unstarted_steps();
+        }
+        self.dispatch_graph_actions(vec![GraphAction::Cancelled("cancelled by user".to_owned())]);
+    }
+
+    /// Polls the review record at most twice per second while a run waits
+    /// (FR-3704, NFR-3700); never starts an agent turn.
+    fn poll_spec_review(&mut self) {
+        let Some(gate) = self.spec_review_gate.as_mut() else {
+            return;
+        };
+        if !gate.is_waiting() {
+            return;
+        }
+        let Some(session) = self.graph_session.as_mut() else {
+            return;
+        };
+        let outcome = gate.poll(session, Instant::now());
+        match outcome {
+            GateOutcome::Idle => {}
+            GateOutcome::Heartbeat(text) => self.emit_spec_review_progress("heartbeat", &text),
+            GateOutcome::Approved { round, actions } => {
+                self.remember_spec_review_summary();
+                self.emit_spec_review_progress(
+                    "spec_review",
+                    &format!("spec review approved (round {round})"),
+                );
+                self.dispatch_graph_actions(actions);
+            }
+            GateOutcome::ChangesRequested { round, actions } => {
+                self.remember_spec_review_summary();
+                self.emit_spec_review_progress(
+                    "spec_review",
+                    &format!(
+                        "spec review: changes requested (round {round}); rerunning the spec step"
+                    ),
+                );
+                self.dispatch_graph_actions(actions);
+            }
+            GateOutcome::Stopped { message, .. } => {
+                self.remember_spec_review_summary();
+                self.dispatch_graph_actions(vec![GraphAction::Failed(message.clone())]);
+                self.push_system(message);
+            }
+        }
+    }
+
+    /// Shows the TUI spec review panel for a newly pending round and drops it
+    /// when the gate stops waiting (FR-3716).
+    fn sync_spec_review_panel(&mut self) {
+        let Some(gate) = self
+            .spec_review_gate
+            .as_ref()
+            .filter(|gate| gate.is_waiting())
+        else {
+            if self.spec_review_panel.take().is_some() {
+                self.dirty = true;
+            }
+            return;
+        };
+        if self
+            .spec_review_panel
+            .as_ref()
+            .is_some_and(|panel| panel.round == gate.round())
+        {
+            return;
+        }
+        let Ok(record) = gate.store().load(gate.review_id()) else {
+            return;
+        };
+        if record.status != ReviewStatus::Pending {
+            return;
+        }
+        self.spec_review_panel = Some(SpecReviewPanel {
+            review_id: record.review_id,
+            round: record.round,
+            spec_paths: record.spec_paths,
+            spec_digest: record.spec_digest,
+            ..SpecReviewPanel::default()
+        });
+        self.dirty = true;
+    }
+
+    fn spec_review_panel_visible(&self) -> bool {
+        self.spec_review_panel
+            .as_ref()
+            .is_some_and(|panel| !panel.hidden && !panel.decided)
+    }
+
+    /// Keys of the visible spec review panel (FR-3716); `true` when consumed.
+    fn handle_spec_review_panel_key(&mut self, key: KeyEvent) -> bool {
+        if !self.spec_review_panel_visible() {
+            return false;
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let typing_feedback = self
+            .spec_review_panel
+            .as_ref()
+            .is_some_and(|panel| panel.feedback.is_some());
+        if typing_feedback {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(panel) = self.spec_review_panel.as_mut() {
+                        panel.feedback = None;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r') => {
+                    let text = self
+                        .spec_review_panel
+                        .as_ref()
+                        .and_then(|panel| panel.feedback.clone())
+                        .unwrap_or_default();
+                    if text.trim().is_empty() {
+                        if let Some(panel) = self.spec_review_panel.as_mut() {
+                            panel.notice =
+                                Some("Feedback is required to request changes.".to_owned());
+                        }
+                    } else {
+                        self.decide_spec_review(SpecVerdict::RequestChanges, Some(text));
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(feedback) = self
+                        .spec_review_panel
+                        .as_mut()
+                        .and_then(|panel| panel.feedback.as_mut())
+                    {
+                        feedback.pop();
+                    }
+                }
+                KeyCode::Char(character) if plain => {
+                    if let Some(feedback) = self
+                        .spec_review_panel
+                        .as_mut()
+                        .and_then(|panel| panel.feedback.as_mut())
+                    {
+                        feedback.push(character);
+                    }
+                }
+                _ => return false,
+            }
+            self.dirty = true;
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(panel) = self.spec_review_panel.as_mut() {
+                    panel.hidden = true;
+                }
+            }
+            KeyCode::Char('a') if plain && self.input.is_empty() => {
+                self.decide_spec_review(SpecVerdict::Approve, None);
+            }
+            KeyCode::Char('c') if plain && self.input.is_empty() => {
+                if let Some(panel) = self.spec_review_panel.as_mut() {
+                    panel.feedback = Some(String::new());
+                    panel.notice = None;
+                }
+            }
+            KeyCode::Char('x') if plain && self.input.is_empty() => {
+                self.decide_spec_review(SpecVerdict::Reject, None);
+            }
+            _ => return false,
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Records a TUI decision through the review record (FR-3707, FR-3716);
+    /// the run reacts on its next poll.
+    fn decide_spec_review(&mut self, verdict: SpecVerdict, text: Option<String>) {
+        let (Some(gate), Some(panel)) = (
+            self.spec_review_gate.as_ref(),
+            self.spec_review_panel.as_ref(),
+        ) else {
+            return;
+        };
+        let result = gate.store().decide(
+            &panel.review_id,
+            &SpecDecideRequest {
+                verdict,
+                text: text.as_deref(),
+                spec_digest: Some(&panel.spec_digest),
+                by: "owner",
+            },
+        );
+        let round = panel.round;
+        match result {
+            Ok(_) => {
+                if let Some(panel) = self.spec_review_panel.as_mut() {
+                    panel.decided = true;
+                    panel.feedback = None;
+                }
+                let label = match verdict {
+                    SpecVerdict::Approve => "approved",
+                    SpecVerdict::RequestChanges => "changes requested",
+                    SpecVerdict::Reject => "rejected",
+                };
+                self.push_system(format!("Spec review {label} (round {round})."));
+                self.poll_spec_review();
+            }
+            Err(error) => {
+                if let Some(panel) = self.spec_review_panel.as_mut() {
+                    panel.notice = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn spec_review_panel_lines(&self) -> Vec<PanelLine> {
+        let Some(panel) = self.spec_review_panel.as_ref() else {
+            return Vec::new();
+        };
+        let line = |kind: PanelLineKind, text: String| PanelLine { kind, text };
+        let mut lines = vec![line(
+            PanelLineKind::Header,
+            format!("Spec review (round {})", panel.round),
+        )];
+        for path in &panel.spec_paths {
+            lines.push(line(PanelLineKind::Step, format!("  {path}")));
+        }
+        match &panel.feedback {
+            Some(feedback) => {
+                lines.push(line(PanelLineKind::Job, format!("Feedback: {feedback}_")));
+                lines.push(line(
+                    PanelLineKind::Hint,
+                    "Enter send · Esc cancel".to_owned(),
+                ));
+            }
+            None => lines.push(line(
+                PanelLineKind::Hint,
+                "a approve · c request changes · x reject · Esc hide".to_owned(),
+            )),
+        }
+        if let Some(notice) = &panel.notice {
+            lines.push(line(PanelLineKind::Warning, notice.clone()));
+        }
+        lines
     }
 
     pub fn set_headless_meta_sink(&mut self, sink: HeadlessMetaSink) {
@@ -2090,6 +2455,12 @@ impl App {
             headless_read_only: false,
             headless_no_spec_first: false,
             graph_node_spec_snapshot: HashMap::new(),
+            headless_no_spec_review: false,
+            headless_run: false,
+            spec_review_gate: None,
+            spec_review_panel: None,
+            spec_review_journal: None,
+            headless_spec_review: None,
             headless_last_graph_id: None,
             skip_judge_for_tests: false,
             last_group_expanded: false,
@@ -2380,6 +2751,8 @@ impl App {
         self.check_triage_timeout(Instant::now());
         self.check_plan_timeout(Instant::now());
         self.check_replan_timeout(Instant::now());
+        self.poll_spec_review();
+        self.sync_spec_review_panel();
         if let Some(summary) = self.skill_interview_finish.take() {
             self.finish_skill_interview(summary);
         }
@@ -5251,6 +5624,9 @@ impl App {
         }
         if self.slash_preview.is_some() {
             self.handle_slash_preview_key(key);
+            return;
+        }
+        if self.handle_spec_review_panel_key(key) {
             return;
         }
 
@@ -8859,7 +9235,17 @@ impl App {
             let spec_dir = snap.spec_dir.clone();
             let lite = snap.lite;
             match check_spec_gate(before.as_ref(), &self.workspace_root, &spec_dir, lite) {
-                SpecGateResult::Ok => {}
+                SpecGateResult::Ok => {
+                    if role == NodeRole::Spec
+                        && let Some(gate) = self.spec_review_gate.as_mut()
+                    {
+                        gate.add_spec_paths(changed_spec_paths(
+                            before.as_ref(),
+                            &self.workspace_root,
+                            &spec_dir,
+                        ));
+                    }
+                }
                 SpecGateResult::Skipped(note) => self.push_system(note.to_owned()),
                 SpecGateResult::Failed(message) => return (false, Some(message)),
             }
@@ -11799,11 +12185,26 @@ impl App {
             }
         }
         let error = policy_error.as_deref().or(error);
+        let mut spec_review_hint: Option<String> = None;
+        let mut spec_review_error: Option<String> = None;
         let (actions, failed_message, run_snapshot) = {
             let Some(session) = self.graph_session.as_mut() else {
                 return;
             };
-            let actions = session.on_node_finished(&node_id, success);
+            let mut actions = session.on_node_finished(&node_id, success);
+            if success && let Some(gate) = self.spec_review_gate.as_mut() {
+                match gate.after_node_finished(session, Instant::now()) {
+                    Ok(Some(hint)) => spec_review_hint = Some(hint),
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Fail closed: no review means no implementation.
+                        let message = format!("spec review unavailable: {error}");
+                        session.skip_unstarted_steps();
+                        actions = vec![GraphAction::Failed(message.clone())];
+                        spec_review_error = Some(message);
+                    }
+                }
+            }
             self.graph_assignment_line =
                 resolved_assignment_line(&self.model_catalogs, Some(&self.settings), session);
             let _ = save_run(&self.workspace_root, session.run());
@@ -11820,6 +12221,15 @@ impl App {
         };
         self.restore_graph_node_turn_policy(&node_id);
         self.sync_tasks_file_for_run(&run_snapshot);
+        self.remember_spec_review_summary();
+        if let Some(hint) = spec_review_hint {
+            self.emit_spec_review_progress("spec_review", &hint);
+        }
+        if let Some(message) = spec_review_error {
+            self.dispatch_graph_actions(actions);
+            self.push_system(message);
+            return;
+        }
         if let Some(message) = failed_message
             && self.graph_session_is_multi_step()
         {
@@ -12085,6 +12495,8 @@ impl App {
             todo_id,
             dynamic_cap,
             dynamic_added: None,
+            spec_review: None,
+            plan_hash: None,
         }
     }
 
@@ -13197,7 +13609,18 @@ impl App {
                 self.graph_assignment_line
             ));
         }
-        let actions = session.schedule();
+        self.spec_review_gate = None;
+        let mut gate_error = None;
+        if self.spec_review_wanted() && session.enable_spec_review() {
+            match self.build_spec_review_gate(session.run()) {
+                Ok(gate) => self.spec_review_gate = Some(gate),
+                Err(message) => gate_error = Some(message),
+            }
+        }
+        let actions = match &gate_error {
+            Some(message) => vec![GraphAction::Failed(message.clone())],
+            None => session.schedule(),
+        };
         let _ = save_run(&self.workspace_root, session.run());
         let graph_id = session.run().plan.id.clone();
         let (runner, model) = session
@@ -13211,6 +13634,9 @@ impl App {
         self.graph_session = Some(session);
         self.emit_headless_meta(Some(graph_id), runner, model);
         self.dispatch_graph_actions(actions);
+        if let Some(message) = gate_error {
+            self.push_system(message);
+        }
     }
 
     fn dispatch_graph_actions(&mut self, actions: Vec<GraphAction>) {
@@ -13230,6 +13656,7 @@ impl App {
                     ));
                 }
                 GraphAction::Completed => {
+                    self.finish_spec_review_gate();
                     if !self.quiet_graph_run {
                         self.push_system("Graph run completed.");
                     }
@@ -13281,6 +13708,7 @@ impl App {
                     break;
                 }
                 GraphAction::Cancelled(detail) => {
+                    self.finish_spec_review_gate();
                     self.push_system(graph_stop_notice(&GraphStopReason::Cancelled(
                         detail.clone(),
                     )));
@@ -13331,6 +13759,7 @@ impl App {
                     break;
                 }
                 GraphAction::Failed(message) => {
+                    self.finish_spec_review_gate();
                     if self.graph_session_is_multi_step() {
                         self.push_system(graph_stop_notice(&GraphStopReason::Failed(
                             message.clone(),
@@ -13478,9 +13907,14 @@ impl App {
             .is_some_and(|w| w.lite)
             && matches!(role, NodeRole::Implement | NodeRole::Draft);
         if role == NodeRole::Spec || lite_implement {
-            let spec_dir = self.settings.workflow.spec_dir.as_str();
-            let _ = ensure_spec_dir(&self.workspace_root, spec_dir);
-            let snap = spec_snapshot(&self.workspace_root);
+            let spec_dir = self
+                .graph_session
+                .as_ref()
+                .and_then(|s| s.run().plan.workflow.as_ref())
+                .map(|w| w.spec_dir.clone())
+                .unwrap_or_else(|| self.settings.workflow.spec_dir.clone());
+            let _ = ensure_spec_dir(&self.workspace_root, &spec_dir);
+            let snap = spec_snapshot_in(&self.workspace_root, &spec_dir);
             self.graph_node_spec_snapshot
                 .insert(node_id.to_owned(), snap);
         }
@@ -15142,6 +15576,8 @@ impl App {
         self.headless_plan_only_reply = false;
         self.headless_read_only = false;
         self.headless_no_spec_first = false;
+        self.headless_no_spec_review = false;
+        self.headless_run = false;
     }
 
     fn headless_outcome_exit_7(
@@ -15349,7 +15785,7 @@ impl App {
             }
         };
         graph_plan.dynamic_cap = pending.dynamic_cap;
-        let _inserted = self.apply_spec_first_invariants(&mut graph_plan);
+        let inserted = self.apply_spec_first_invariants(&mut graph_plan);
         let doc = PlanDoc {
             steps: pending.steps.clone(),
             tasks: pending.tasks.clone(),
@@ -15386,7 +15822,28 @@ impl App {
             adapter_sent: false,
         };
         self.begin_user_prompt_turn();
+        // FR-3715: the hash of the steps that run; it equals the approved id
+        // only when the stored plan needed no spec-first insertion.
+        let executed = HeadlessPendingPlan {
+            prompt: pending.prompt.clone(),
+            tasks: pending.tasks.clone(),
+            steps: if inserted.is_empty() {
+                pending.steps.clone()
+            } else {
+                Self::steps_from_graph_plan(&graph_plan)
+            },
+            dynamic_cap: pending.dynamic_cap,
+        };
+        let executed_hash: Option<String> = serde_json::to_string(&executed).ok().map(|json| {
+            dmuxai::docs::sha256_hex(json.as_bytes())
+                .chars()
+                .take(16)
+                .collect()
+        });
         self.finish_validated_plan(pending_plan, &doc, graph_plan);
+        if let Some(run) = self.last_graph_run.as_mut() {
+            run.plan_hash = executed_hash;
+        }
         if let Err(error) = self.approve_awaiting_plan(DecisionBy::Cli) {
             return Err(fail(
                 dmuxai::agent_api::exit::FAILED,
@@ -16249,6 +16706,7 @@ impl App {
             aggregate_error,
             aggregate_skipped,
             fanout_judge,
+            spec_review: None,
         }
     }
 
@@ -16416,6 +16874,10 @@ impl App {
         let read_only_run = self.pending_turn_policy == Some(TurnPolicy::ReadOnly);
         self.headless_read_only = read_only_run;
         self.headless_no_spec_first = req.no_spec_first;
+        self.headless_no_spec_review = req.no_spec_review;
+        self.headless_run = true;
+        self.headless_spec_review = None;
+        self.spec_review_gate = None;
         let read_only_workspace_before = if read_only_run {
             dmuxai::workspace::git_worktree_fingerprint(&self.workspace_root).await
         } else {
@@ -16604,6 +17066,7 @@ impl App {
             loop {
                 if cancel.load(Ordering::Relaxed) {
                     cancelled = true;
+                    self.cancel_spec_review_wait();
                     for &agent in &self.busy_agents {
                         let idx = adapter_index(agent);
                         if idx < self.adapters.len() {
@@ -16658,6 +17121,7 @@ impl App {
                 }
                 dirty |= cmd_changed || drain.changed || self.dirty;
                 self.dirty = false;
+                self.poll_spec_review();
                 self.emit_progress_heartbeats();
 
                 dashboard_dirty |= drain.changed || dirty;
@@ -16868,6 +17332,7 @@ impl App {
             aggregate_error: None,
             aggregate_skipped: None,
             fanout_judge: None,
+            spec_review: self.headless_spec_review.take(),
         }
     }
 
@@ -17240,7 +17705,7 @@ impl App {
     }
 
     fn wants_approval_panel(&self) -> bool {
-        self.awaiting_approval_run().is_some()
+        self.awaiting_approval_run().is_some() || self.spec_review_panel_visible()
     }
 
     fn graph_run_for_task_counter(&self) -> Option<&GraphRun> {
@@ -17278,8 +17743,10 @@ impl App {
         if room == 0 {
             return 0;
         }
-        let run = self.awaiting_approval_run().expect("approval panel wanted");
-        let line_count = self.approval_lines(run, width.max(1) as usize).len();
+        let line_count = match self.awaiting_approval_run() {
+            Some(run) => self.approval_lines(run, width.max(1) as usize).len(),
+            None => self.spec_review_panel_lines().len(),
+        };
         if line_count == 0 {
             return 0;
         }
@@ -17783,9 +18250,11 @@ impl App {
     }
 
     fn draw_approval_panel(&mut self, frame: &mut Frame, area: Rect) {
-        let run = self.awaiting_approval_run().expect("approval panel area");
         let width = area.width.max(1) as usize;
-        let panel_lines = self.approval_lines(run, width);
+        let panel_lines = match self.awaiting_approval_run() {
+            Some(run) => self.approval_lines(run, width),
+            None => self.spec_review_panel_lines(),
+        };
         if panel_lines.is_empty() {
             return;
         }
@@ -27821,6 +28290,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -27995,6 +28465,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         releaser.join().unwrap();
@@ -28073,6 +28544,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
 
@@ -28117,6 +28589,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         lock.release();
@@ -28161,6 +28634,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -28203,6 +28677,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         lock.release();
@@ -28281,6 +28756,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
 
@@ -28337,6 +28813,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, Arc::clone(&cancel)).await;
         assert!(!outcome.ok);
@@ -28356,6 +28833,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -28426,6 +28904,7 @@ out3
                 todo_id: None,
                 model: Some("gemini-4-argon-fast".to_owned()),
                 no_spec_first: false,
+                no_spec_review: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28449,6 +28928,7 @@ out3
                 todo_id: None,
                 model: Some("composer-2.5-fast".to_owned()),
                 no_spec_first: false,
+                no_spec_review: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(!outcome.ok);
@@ -28508,6 +28988,7 @@ out3
             todo_id: None,
             model: Some("gemini-3.8-flash-high".to_owned()),
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -28577,6 +29058,7 @@ out3
             todo_id: None,
             model: model.map(str::to_owned),
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29048,6 +29530,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29795,6 +30278,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app
             .run_headless(req, Arc::new(AtomicBool::new(false)))
@@ -29874,6 +30358,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -29915,6 +30400,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = tokio::time::timeout(Duration::from_secs(20), app.run_headless(req, cancel))
             .await
@@ -30106,6 +30592,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -30226,6 +30713,7 @@ out3
                 todo_id: None,
                 model: None,
                 no_spec_first: true,
+                no_spec_review: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(outcome.ok, "chat_enabled={chat_enabled}");
@@ -30369,6 +30857,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert_eq!(outcome.exit_code, 0);
@@ -30439,6 +30928,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome2 = app_no_sink.run_headless(req2, cancel2).await;
         assert_eq!(outcome2.exit_code, 0);
@@ -30612,6 +31102,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -30691,6 +31182,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -30721,6 +31213,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req_gated, Arc::clone(&cancel)).await;
         assert_eq!(outcome.exit_code, 7);
@@ -30772,6 +31265,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome2 = app.run_headless(req_approved, cancel).await;
         assert_eq!(outcome2.exit_code, 0);
@@ -30798,6 +31292,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert_eq!(outcome.exit_code, 7);
@@ -30861,6 +31356,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok, "read-only turn must not be gated: {outcome:?}");
@@ -30921,6 +31417,7 @@ out3
                 todo_id: None,
                 model: None,
                 no_spec_first: false,
+                no_spec_review: false,
             };
             let outcome = app.run_headless(req, cancel).await;
             assert!(
@@ -31050,6 +31547,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok, "board ask must not exit 7: {outcome:?}");
@@ -31103,6 +31601,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(outcome.ok);
@@ -31182,6 +31681,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         assert!(!outcome.ok);
@@ -32871,6 +33371,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outcome = app.run_headless(req, cancel).await;
@@ -34558,6 +35059,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
 
         let result = app.headless_submit_prompt(&req);
@@ -37225,6 +37727,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         }
     }
 
@@ -37370,6 +37873,270 @@ out3
         assert!(!mismatch.ok);
         assert!(path.is_file(), "a mismatched plan is not consumed");
         assert_eq!(sent.lock().unwrap().len(), 0);
+    }
+
+    // TC-3715 / FR-3715, FR-3503 (#374): a board plan stored spec-first
+    // expanded runs unchanged, so the approved hash is the executed plan's
+    // hash; an unexpanded plan runs with inserted steps and a different hash.
+    #[tokio::test]
+    async fn tc_3715_approved_expanded_plan_hash_equals_executed_plan_hash() {
+        pin_test_state_dir();
+        let (mut app, _sent) = test_app();
+        app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
+        let prompt = "board plan runs as approved";
+        let steps = vec![PlanStep {
+            id: "step-1".to_owned(),
+            role: "implement".to_owned(),
+            job: "edit".to_owned(),
+            runner: "codex".to_owned(),
+            model: Some("composer-2.5".to_owned()),
+            depends_on: Vec::new(),
+            sensitive: None,
+            task: None,
+            ..Default::default()
+        }];
+        let limits = app.graph_limits();
+        let graph = app
+            .with_plan_context(prompt, |ctx| {
+                graph_plan_from_revision_steps("p", prompt, "m", &[], &steps, limits, ctx)
+            })
+            .expect("one-step plan validates");
+        let (expanded, inserted) =
+            dmuxai::graph::expand_plan_steps(&steps, &graph, &app.settings.workflow);
+        assert_eq!(inserted, ["spec-1", "test-1"]);
+        let ids: Vec<&str> = expanded.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["spec-1", "step-1", "test-1"]);
+
+        let state = dmuxai::state_path::state_base().unwrap();
+        let write = |steps: Vec<PlanStep>| -> String {
+            let json = serde_json::to_string(&HeadlessPendingPlan {
+                prompt: prompt.to_owned(),
+                tasks: Vec::new(),
+                steps,
+                dynamic_cap: None,
+            })
+            .unwrap();
+            let hash: String = dmuxai::docs::sha256_hex(json.as_bytes())
+                .chars()
+                .take(16)
+                .collect();
+            let dir = state.join("graph-pending");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{hash}.json")), json).unwrap();
+            hash
+        };
+
+        let approved = write(expanded);
+        app.headless_start_approved_plan(&graph_headless_request(prompt, Some(approved.clone())))
+            .expect("approved plan starts");
+        let run = app.graph_session.as_ref().expect("run started").run();
+        assert_eq!(run.plan_hash.as_deref(), Some(approved.as_str()));
+        let executed: Vec<&str> = run
+            .plan
+            .nodes
+            .iter()
+            .filter(|n| n.role != NodeRole::Orchestrate)
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(executed, ["spec-1", "step-1", "test-1"]);
+        let saved = dmuxai::graph::load_run(&app.workspace_root, &run.plan.id).unwrap();
+        assert_eq!(saved.plan_hash.as_deref(), Some(approved.as_str()));
+
+        app.graph_session = None;
+        app.spec_review_gate = None;
+        let legacy = write(steps);
+        app.headless_start_approved_plan(&graph_headless_request(prompt, Some(legacy.clone())))
+            .expect("unexpanded plan starts");
+        let run = app.graph_session.as_ref().expect("run started").run();
+        assert_ne!(run.plan_hash.as_deref(), Some(legacy.as_str()));
+    }
+
+    fn spec_review_tui_fixture(
+        app: &mut App,
+        review_id: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, SpecReviewStore) {
+        let ws = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("docs/specs")).unwrap();
+        std::fs::write(ws.path().join("docs/specs/SPEC-x.md"), "spec v1").unwrap();
+        let node = |id: &str, role: NodeRole| GraphNode {
+            id: id.to_owned(),
+            role,
+            job: format!("job {id}"),
+            runner: "codex".to_owned(),
+            model_id: "gpt-5.5".to_owned(),
+            skill: None,
+            requires_gate: false,
+            status: GraphNodeStatus::Pending,
+            attempt: 0,
+            task: None,
+            started_at_ms: None,
+            finished_at_ms: None,
+            test_gate: None,
+        };
+        let mut session = GraphRunSession::new(GraphRun {
+            plan: GraphPlan {
+                id: review_id.to_owned(),
+                user_prompt: "tui spec review".to_owned(),
+                nodes: vec![
+                    node("spec-1", NodeRole::Spec),
+                    node("step-1", NodeRole::Implement),
+                ],
+                edges: vec![GraphEdge {
+                    from: "spec-1".to_owned(),
+                    to: "step-1".to_owned(),
+                }],
+                ..Default::default()
+            },
+            conversation_id: "conv".to_owned(),
+            phase: GraphRunPhase::Active,
+            ..Default::default()
+        });
+        assert!(session.enable_spec_review());
+        let _ = session.schedule();
+        let store = SpecReviewStore::new(state.path());
+        // A long poll interval keeps the app's own polls idle; the test polls.
+        let mut gate = SpecReviewGate::new(
+            store.clone(),
+            SpecReviewConfig {
+                timeout: Duration::from_secs(3600),
+                max_rounds: 3,
+                poll_interval: Duration::from_secs(3600),
+                heartbeat_interval: Duration::from_secs(3600),
+            },
+            ws.path().to_path_buf(),
+            "docs/specs".to_owned(),
+            review_id.to_owned(),
+            "rid".to_owned(),
+            "tui spec review",
+        );
+        gate.add_spec_paths(["docs/specs/SPEC-x.md".to_owned()]);
+        let _ = session.on_node_finished("spec-1", true);
+        assert!(
+            gate.after_node_finished(&mut session, Instant::now())
+                .unwrap()
+                .is_some()
+        );
+        app.graph_session = Some(session);
+        app.spec_review_gate = Some(gate);
+        (ws, state, store)
+    }
+
+    fn poll_gate_later(app: &mut App) -> GateOutcome {
+        let gate = app.spec_review_gate.as_mut().unwrap();
+        let session = app.graph_session.as_mut().unwrap();
+        gate.poll(session, Instant::now() + Duration::from_secs(7200))
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    // TC-3716 / FR-3716: the TUI panel shows the paths; `c` + feedback, `a`
+    // and `x` decide through the record and the run reacts; Esc hides the
+    // panel without deciding and the status line keeps the waiting hint.
+    #[test]
+    fn tc_3716_tui_spec_review_panel_keys() {
+        let (mut app, _sent) = test_app();
+        let (_ws, _state, store) = spec_review_tui_fixture(&mut app, "tui-review-1");
+        app.sync_spec_review_panel();
+        assert!(app.spec_review_panel_visible());
+        assert!(app.wants_approval_panel());
+        let lines: Vec<String> = app
+            .spec_review_panel_lines()
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(lines[0], "Spec review (round 1)");
+        assert!(lines.iter().any(|l| l.contains("docs/specs/SPEC-x.md")));
+
+        // A key typed into a non-empty prompt is text, not a decision.
+        app.input = "x".to_owned();
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.input, "xa");
+        app.input.clear();
+
+        // `c` with empty feedback is refused; with feedback it requests changes.
+        press(&mut app, KeyCode::Char('c'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            store.load("tui-review-1").unwrap().status,
+            ReviewStatus::Pending
+        );
+        for ch in "add errors".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        let record = store.load("tui-review-1").unwrap();
+        assert_eq!(record.status, ReviewStatus::ChangesRequested);
+        assert_eq!(record.feedback.as_deref(), Some("add errors"));
+        assert_eq!(record.by.as_deref(), Some("owner"));
+        assert!(!app.spec_review_panel_visible());
+        assert!(matches!(
+            poll_gate_later(&mut app),
+            GateOutcome::ChangesRequested { round: 1, .. }
+        ));
+
+        // The spec step re-ran: round 2 shows a new panel; Esc hides it only.
+        std::fs::write(_ws.path().join("docs/specs/SPEC-x.md"), "spec v2").unwrap();
+        {
+            let session = app.graph_session.as_mut().unwrap();
+            let _ = session.on_node_finished("spec-1", true);
+            let gate = app.spec_review_gate.as_mut().unwrap();
+            assert!(
+                gate.after_node_finished(session, Instant::now())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        app.sync_spec_review_panel();
+        assert!(app.spec_review_panel_visible());
+        assert_eq!(
+            app.spec_review_panel_lines()[0].text,
+            "Spec review (round 2)"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.spec_review_panel_visible());
+        app.sync_spec_review_panel();
+        assert!(
+            !app.spec_review_panel_visible(),
+            "Esc keeps the round hidden"
+        );
+        assert_eq!(
+            store.load("tui-review-1").unwrap().status,
+            ReviewStatus::Pending
+        );
+        let status = app.graph_session.as_ref().unwrap().status_line().unwrap();
+        assert!(status.contains("spec review: waiting"), "{status}");
+
+        // `a` approves (the panel is shown again for the test).
+        app.spec_review_panel.as_mut().unwrap().hidden = false;
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(
+            store.load("tui-review-1").unwrap().status,
+            ReviewStatus::Approved
+        );
+        assert!(matches!(
+            poll_gate_later(&mut app),
+            GateOutcome::Approved { round: 2, .. }
+        ));
+        app.sync_spec_review_panel();
+        assert!(app.spec_review_panel.is_none());
+
+        // `x` rejects another run's review; the run stops.
+        let (mut app, _sent) = test_app();
+        let (_ws2, _state2, store) = spec_review_tui_fixture(&mut app, "tui-review-2");
+        app.sync_spec_review_panel();
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            store.load("tui-review-2").unwrap().status,
+            ReviewStatus::Rejected
+        );
+        assert!(matches!(
+            poll_gate_later(&mut app),
+            GateOutcome::Stopped { .. }
+        ));
     }
 
     // TC-2550 / FR-2550: a non-hex --approve-plan-id is usage exit 2 before
@@ -40458,6 +41225,7 @@ out3
             todo_id: None,
             model: None,
             no_spec_first: false,
+            no_spec_review: false,
         };
         let outcome = app.run_headless(req, cancel).await;
         let sp = outcome
@@ -41875,6 +42643,7 @@ out3
     fn tc_3505_simple_runs_three_steps() {
         let mut h = plan_gate_test_app();
         h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.spec_review = Some(false);
         h.app.settings.workflow.test_command = "true".to_owned();
         h.app.input = "please verify the release notes".to_owned();
         h.app.submit_prompt();
@@ -41919,6 +42688,7 @@ out3
         let (mut app, _) = test_app();
         app.skip_judge_for_tests = false;
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         app.settings.workflow.test_command = "true".to_owned();
         app.submit_direct_run("fix the bug".into(), Agent::Codex, OverrideKind::Direct);
         let session = app.graph_session.as_ref().expect("graph");
@@ -41955,6 +42725,7 @@ out3
             test_app_with_engine_and_event_sender(engine, dir.path().to_path_buf());
         app.set_headless(true);
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         app.settings.workflow.test_command = "true".to_owned();
         let workspace = dir.path().to_path_buf();
         let sent_bg = Arc::clone(&sent);
@@ -42011,6 +42782,7 @@ out3
                     todo_id: None,
                     model: None,
                     no_spec_first: false,
+                    no_spec_review: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -42025,6 +42797,7 @@ out3
         let (mut app, sent, event_tx) = test_app_with_event_sender();
         app.set_headless(true);
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         complete_first_headless_request(&sent, event_tx, "answer");
         let outcome = app
             .run_headless(
@@ -42039,6 +42812,7 @@ out3
                     todo_id: None,
                     model: None,
                     no_spec_first: false,
+                    no_spec_review: false,
                 },
                 Arc::new(AtomicBool::new(false)),
             )
@@ -42053,6 +42827,7 @@ out3
     fn tc_3503_planner_plan_gets_spec_and_test() {
         let (mut app, _) = test_app();
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         let mut plan = fallback_plan("ship", "codex", None, "test").unwrap().plan;
         let inserted = app.apply_spec_first_invariants(&mut plan);
         assert_eq!(inserted, vec!["spec-1", "test-1"]);
@@ -42094,6 +42869,7 @@ out3
             .unwrap();
         let mut h = plan_gate_harness_in_workspace(dir.path().to_path_buf(), &[]);
         h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.spec_review = Some(false);
         h.app.settings.workflow.test_command = "true".to_owned();
         h.app
             .submit_direct_run("fix".into(), Agent::Codex, OverrideKind::Direct);
@@ -42134,6 +42910,7 @@ out3
             .unwrap();
         let mut h = plan_gate_harness_in_workspace(dir.path().to_path_buf(), &[]);
         h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.spec_review = Some(false);
         h.app.settings.workflow.test_command = "exit 3".to_owned();
         h.app
             .submit_direct_run("fix".into(), Agent::Codex, OverrideKind::Direct);
@@ -42163,6 +42940,7 @@ out3
             .unwrap();
         let mut h = plan_gate_harness_in_workspace(dir.path().to_path_buf(), &[]);
         h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.spec_review = Some(false);
         h.app.settings.workflow.test_command.clear();
         h.app.settings.workflow.require_tests = true;
         h.app
@@ -42191,6 +42969,7 @@ out3
     fn tc_3514_spec_stage_skill_injected() {
         let mut h = stage_skill_harness("[stages.spec]\nskills = [\"grill-me\"]\n");
         h.app.settings.workflow.spec_first = SpecFirstMode::Full;
+        h.app.settings.workflow.spec_review = Some(false);
         h.app.settings.workflow.test_command = "true".to_owned();
         h.app
             .submit_direct_run("feature".into(), Agent::Codex, OverrideKind::Direct);
@@ -42203,6 +42982,7 @@ out3
     fn tc_3507_question_exempt_from_spec_first() {
         let (mut app, _) = test_app();
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         assert!(app.spec_first_exempt("why is it broken?", TriageSource::Heuristic, "short"));
         let run = app
             .build_one_node_run(
@@ -42226,6 +43006,7 @@ out3
     fn tc_3507_trivial_short_prompt_exempt() {
         let (mut app, _) = test_app();
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         assert!(app.spec_first_exempt("hi", TriageSource::Heuristic, "short prompt"));
         let run = app
             .build_one_node_run(
@@ -42270,6 +43051,7 @@ out3
     fn tc_3507_headless_no_spec_first_off() {
         let (mut app, _) = test_app();
         app.settings.workflow.spec_first = SpecFirstMode::Full;
+        app.settings.workflow.spec_review = Some(false);
         app.headless_no_spec_first = true;
         assert_eq!(app.spec_first_mode(), SpecFirstMode::Off);
     }

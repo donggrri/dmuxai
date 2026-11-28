@@ -107,8 +107,8 @@ Usage:
   dmuxai serve [--port N] [--bind ADDR] [--allow-remote]
   dmuxai --web [--port N] [--bind ADDR] [--allow-remote] [--new]
   dmuxai mcp-memory [--workspace DIR] [--vault PATH] [--dir DIR] [--project NAME]
-  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--write] [--keep-worktrees] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--no-spec-first] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
-  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--approve-plan] [--no-spec-first] [--progress] [--json] [--trust-workspace-config]
+  dmuxai run <prompt|-> [--agent ID] [--agents RUNNERS] [--write] [--keep-worktrees] [--min-ok N] [--judge AGENT[:MODEL]] [--model M] [--approve-plan] [--no-spec-first] [--no-spec-review] [--approve-plan-id HASH] [--allow-sensitive] [--graph] [--progress] [--json] [--trust-workspace-config]
+  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--approve-plan] [--no-spec-first] [--no-spec-review] [--progress] [--json] [--trust-workspace-config]
   dmuxai trust [--status] [--json] [--revoke] [--yes]
   dmuxai todo add <title> [--body TEXT] [--json]
   dmuxai todo list [--status open|running|done] [--json]
@@ -123,6 +123,7 @@ Usage:
   dmuxai term wait NAME --match REGEX|--idle MS --timeout DUR [--since N] | term exec NAME <command> [--timeout DUR]
   dmuxai term approve <id> [--json] | term list|show|resize|close|reopen ...
   dmuxai board add|list|show|…   Coordinator decision board (user-level)
+  dmuxai spec-review list|show|approve|request-changes|reject   Human spec review (needs a terminal)
   dmuxai mcp
   dmuxai init [--workspace] [--force]
 
@@ -1445,7 +1446,7 @@ mod tests {
         assert_eq!(
             todo_run,
             vec![
-                "  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--approve-plan] [--no-spec-first] [--progress] [--json] [--trust-workspace-config]",
+                "  dmuxai todo run <id> [--agent ID | --graph] [--model M] [--approve-plan] [--no-spec-first] [--no-spec-review] [--progress] [--json] [--trust-workspace-config]",
             ]
         );
         let trust: Vec<&str> = USAGE
@@ -1723,8 +1724,18 @@ mod tests {
     #[test]
     fn tc_2830_subcommand_help_is_local() {
         let subcommands = [
-            "run", "todo", "status", "events", "mcp", "init", "trust", "runs", "runners", "models",
+            "run",
+            "todo",
+            "status",
+            "events",
+            "mcp",
+            "init",
+            "trust",
+            "runs",
+            "runners",
+            "models",
             "fanout",
+            "spec-review",
         ];
         for sub in subcommands {
             for flag in ["--help", "-h"] {

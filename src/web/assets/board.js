@@ -38,6 +38,14 @@ var boardAskPollId = null;
 var boardLastFocus = null;
 var boardLastFocusItemId = null;
 var boardNeedsFocus = false;
+var boardSpecNotice = null;
+var BOARD_SPEC_VERDICT_LABELS = {
+  approved: 'Spec approved',
+  changes_requested: 'Changes requested',
+  rejected: 'Spec rejected',
+  expired: 'Spec review expired',
+  cancelled: 'Spec review cancelled'
+};
 
 function boardToken() {
   try { return window.sessionStorage.getItem(BOARD_TOKEN_KEY); } catch (err) { return null; }
@@ -107,13 +115,144 @@ function boardAgeMs(ms) {
   return Math.floor(hrs / 24) + 'd';
 }
 
+/* SPEC-spec-review-gate FR-3714: a run paused for a human spec review. */
+function boardSpecReviewPending(item) {
+  return !!(item && item.spec_review && item.spec_review.status === 'pending');
+}
+
+/* FR-3715: a plan awaiting the owner's decision. */
+function boardPlanReviewPending(item) {
+  return !!(item && item.lane === 'needs_decision' && item.plan);
+}
+
+function boardReviewBadges(item) {
+  var wrap = boardEl('div', 'board-review-badges');
+  if (boardPlanReviewPending(item)) {
+    wrap.appendChild(boardEl('span', 'board-review-badge board-review-badge-plan', 'Plan review'));
+  }
+  if (boardSpecReviewPending(item)) {
+    wrap.appendChild(boardEl('span', 'board-review-badge board-review-badge-spec', 'Spec review'));
+  }
+  return wrap.childNodes.length ? wrap : null;
+}
+
+function boardSpecPathTarget(item, path) {
+  var ws = item && item.workspace && item.workspace.path ? String(item.workspace.path) : '';
+  if (!ws || path.charAt(0) === '/') { return path; }
+  return ws.replace(/[/\\]+$/, '') + '/' + path;
+}
+
+function boardRenderSpecReview(drawer, item, draft) {
+  var review = item.spec_review;
+  if (!review) { return; }
+  var section = boardEl('section', 'board-spec-review');
+  section.id = 'board-spec-review';
+  var title = boardEl('h4', 'board-review-title', 'Spec review (round ' + (review.round || 1) + ')');
+  title.id = 'board-spec-review-title';
+  section.appendChild(title);
+  var list = boardEl('ul', 'board-spec-paths');
+  var paths = review.spec_paths || [];
+  for (var i = 0; i < paths.length; i++) {
+    var li = document.createElement('li');
+    var link = boardEl('a', 'md-path-link', paths[i]);
+    link.href = '#';
+    link.setAttribute('data-md-path', boardSpecPathTarget(item, paths[i]));
+    li.appendChild(link);
+    list.appendChild(li);
+  }
+  section.appendChild(list);
+  if (review.status === 'pending') {
+    var ta = document.createElement('textarea');
+    ta.id = 'board-spec-feedback';
+    ta.className = 'board-spec-feedback';
+    ta.rows = 3;
+    ta.placeholder = 'Feedback (required for Request changes)';
+    ta.setAttribute('aria-label', 'Spec review feedback');
+    if (draft) { ta.value = draft; }
+    section.appendChild(ta);
+    var actions = boardEl('div', 'board-spec-review-actions');
+    [
+      { id: 'board-spec-approve', label: 'Approve spec', verdict: 'approve', cls: 'btn btn-small btn-primary' },
+      { id: 'board-spec-request-changes', label: 'Request changes', verdict: 'request_changes', cls: 'btn btn-small' },
+      { id: 'board-spec-reject', label: 'Reject spec', verdict: 'reject', cls: 'btn btn-small btn-danger' }
+    ].forEach(function (spec) {
+      var btn = boardEl('button', spec.cls, spec.label);
+      btn.type = 'button';
+      btn.id = spec.id;
+      btn.addEventListener('click', function () { boardSpecReviewDecide(item, spec.verdict); });
+      actions.appendChild(btn);
+    });
+    section.appendChild(actions);
+  } else {
+    var verdict = boardEl('p', 'board-spec-verdict',
+      (BOARD_SPEC_VERDICT_LABELS[review.status] || review.status) + ' (round ' + (review.round || 1) + ')');
+    verdict.id = 'board-spec-verdict';
+    section.appendChild(verdict);
+  }
+  var notice = boardEl('p', 'board-plan-notice board-spec-notice');
+  notice.id = 'board-spec-notice';
+  notice.setAttribute('aria-live', 'polite');
+  if (boardSpecNotice && boardSpecNotice.id === item.id) {
+    notice.textContent = boardSpecNotice.text;
+  } else {
+    notice.hidden = true;
+  }
+  section.appendChild(notice);
+  drawer.appendChild(section);
+}
+
+function boardShowSpecNotice(id, text) {
+  boardSpecNotice = { id: id, text: text };
+  var notice = document.getElementById('board-spec-notice');
+  if (notice && boardSelectedId === id) {
+    notice.textContent = text;
+    notice.hidden = false;
+  }
+}
+
+function boardSpecReviewDecide(item, verdict) {
+  var review = item && item.spec_review;
+  if (!review) { return; }
+  var body = { verdict: verdict, spec_digest: review.spec_digest || '' };
+  var ta = document.getElementById('board-spec-feedback');
+  var text = ta ? ta.value.trim() : '';
+  if (verdict === 'request_changes' && !text) {
+    boardShowSpecNotice(item.id, 'Request changes needs feedback.');
+    if (ta) { try { ta.focus(); } catch (err) { /* ignore */ } }
+    return;
+  }
+  if (text && verdict !== 'approve') { body.text = text; }
+  if (verdict === 'reject' && !window.confirm('Reject this spec? The run stops.')) { return; }
+  boardFetchJson('POST', '/api/board/' + encodeURIComponent(item.id) + '/spec-review', body, true)
+    .then(function (updated) {
+      boardSpecNotice = null;
+      if (ta) { ta.value = ''; }
+      if (updated && boardSelectedId === item.id) {
+        boardSelectedItem = updated;
+        boardRenderDrawer(updated);
+      }
+      boardRefreshList();
+    })
+    .catch(function (err) {
+      var msg = (err && err.message) ? err.message : 'Spec review decision failed';
+      if (err && err.status === 409 && /spec changed/i.test(msg)) {
+        msg = 'The spec changed since it was shown \u2014 reload to review the new version.';
+      } else if (err && err.status === 403) {
+        msg = 'Refused (403): decide with a click in the dashboard.';
+      }
+      boardShowSpecNotice(item.id, msg);
+    });
+}
+
 function boardUpdateBadge() {
   var toggle = document.getElementById('board-toggle');
   var badge = document.getElementById('board-badge');
   if (!toggle || !badge) { return; }
   var count = 0;
   for (var i = 0; i < boardItems.length; i++) {
-    if (boardItems[i].lane === 'needs_decision') { count += 1; }
+    if (boardItems[i].lane === 'needs_decision' || boardSpecReviewPending(boardItems[i])) {
+      count += 1;
+    }
   }
   if (count > 0) {
     badge.hidden = false;
@@ -148,12 +287,15 @@ function boardRenderMyDecisions(container, items) {
   var any = false;
   for (var i = 0; i < items.length; i++) {
     var item = items[i];
-    if (item.lane !== 'needs_decision') { continue; }
+    var specPending = boardSpecReviewPending(item);
+    if (item.lane !== 'needs_decision' && !specPending) { continue; }
     any = true;
     var card = boardEl('div', 'board-decision-card');
     card.setAttribute('tabindex', '0');
     card.setAttribute('data-item-id', item.id);
     card.appendChild(boardEl('div', 'board-decision-title', item.title));
+    var myBadges = boardReviewBadges(item);
+    if (myBadges) { card.appendChild(myBadges); }
     var meta = [
       boardBasename(item.workspace && item.workspace.path),
       item.kind,
@@ -166,6 +308,16 @@ function boardRenderMyDecisions(container, items) {
       card.appendChild(boardEl('div', 'board-decision-recommendation', item.recommendation));
     }
     var actions = boardEl('div', 'board-decision-actions');
+    if (item.lane !== 'needs_decision') {
+      var reviewBtn = boardEl('button', 'btn btn-small btn-primary', 'Review spec');
+      reviewBtn.type = 'button';
+      reviewBtn.setAttribute('data-board-action', 'open_spec_review');
+      reviewBtn.setAttribute('data-item-id', item.id);
+      actions.appendChild(reviewBtn);
+      card.appendChild(actions);
+      row.appendChild(card);
+      continue;
+    }
     if (item.options && item.options.length) {
       for (var oi = 0; oi < item.options.length; oi++) {
         var optBtn = boardEl('button', 'btn btn-small', item.options[oi]);
@@ -266,6 +418,8 @@ function boardRenderKanban(root, items) {
       card.appendChild(boardEl('div', 'board-card-title', item.title));
       var sub = boardBasename(item.workspace && item.workspace.path) + ' · ' + item.kind;
       card.appendChild(boardEl('div', 'board-card-meta board-decision-meta', sub));
+      var badges = boardReviewBadges(item);
+      if (badges) { card.appendChild(badges); }
       var menu = document.createElement('select');
       menu.className = 'board-card-menu';
       menu.setAttribute('aria-label', 'Move lane');
@@ -492,6 +646,7 @@ function boardFormatChatTime(ms) {
 function boardRenderPlanTable(tbody, plan) {
   tbody.textContent = '';
   if (!plan || !plan.steps) { return; }
+  var added = plan.spec_first_added || [];
   for (var i = 0; i < plan.steps.length; i++) {
     var step = plan.steps[i];
     var tr = document.createElement('tr');
@@ -504,6 +659,10 @@ function boardRenderPlanTable(tbody, plan) {
         val = val.join(',');
       }
       td.appendChild(boardPlanFieldInput(fields[fi], val));
+      if (fields[fi] === 'job' && added.indexOf(step.id) >= 0) {
+        tr.classList.add('board-plan-step-added');
+        td.appendChild(boardEl('span', 'board-plan-step-note', 'added by spec-first'));
+      }
       tr.appendChild(td);
     }
     var delTd = document.createElement('td');
@@ -555,6 +714,8 @@ function boardRenderDrawer(item) {
   var existingNote = document.getElementById('board-chat-note-only');
   var draftNoteOnly = preserveDraft && existingNote ? !!existingNote.checked : false;
   var focusWasInput = preserveDraft && document.activeElement === existingInput;
+  var existingSpecFeedback = document.getElementById('board-spec-feedback');
+  var specDraft = existingSpecFeedback && prevItemId === item.id ? existingSpecFeedback.value : '';
 
   var pendingAsk = boardAskPending[item.id];
   if (pendingAsk && !pendingAsk.error) {
@@ -589,7 +750,14 @@ function boardRenderDrawer(item) {
   if (typeof window.dmuxaiLinkifyMdPaths === 'function') {
     window.dmuxaiLinkifyMdPaths(summaryEl);
   }
+  boardRenderSpecReview(drawer, item, specDraft);
+  var planReview = boardPlanReviewPending(item);
   if (item.plan) {
+    if (planReview) {
+      var planTitle = boardEl('h4', 'board-review-title', 'Plan review');
+      planTitle.id = 'board-plan-review-title';
+      drawer.appendChild(planTitle);
+    }
     drawer.appendChild(boardEl('p', 'board-plan-meta',
       (item.plan.hash || '—') + ' · revision ' + item.plan.revision));
     if (boardPlanConflict) {
@@ -644,6 +812,24 @@ function boardRenderDrawer(item) {
     var errBox = boardEl('div', 'board-plan-errors');
     errBox.id = 'board-plan-errors';
     drawer.appendChild(errBox);
+    if (planReview) {
+      var reviewActions = boardEl('div', 'board-plan-review-actions');
+      reviewActions.setAttribute('aria-label', 'Plan review');
+      var planApprove = boardEl('button', 'btn btn-small btn-primary', 'Approve');
+      planApprove.type = 'button';
+      planApprove.id = 'board-plan-approve';
+      planApprove.addEventListener('click', function () { boardDecide(item.id, 'approve'); });
+      reviewActions.appendChild(planApprove);
+      var planReject = boardEl('button', 'btn btn-small btn-danger', 'Reject');
+      planReject.type = 'button';
+      planReject.id = 'board-plan-reject';
+      planReject.addEventListener('click', function () {
+        if (!window.confirm('Reject this item?')) { return; }
+        boardDecide(item.id, 'reject');
+      });
+      reviewActions.appendChild(planReject);
+      drawer.appendChild(reviewActions);
+    }
     if (item.plan.previous_steps && item.plan.previous_steps.length) {
       var diff = boardEl('details', 'board-plan-diff');
       var sum = document.createElement('summary');
@@ -1178,6 +1364,10 @@ function boardOnActionClick(e) {
   if (!action || !id) { return false; }
   e.stopPropagation();
   var card = btn.closest('.board-decision-card');
+  if (action === 'open_spec_review') {
+    boardOpenDrawer(id);
+    return true;
+  }
   if (action === 'request_changes') {
     boardEnsureRequestChangesForm(card, id);
     return true;

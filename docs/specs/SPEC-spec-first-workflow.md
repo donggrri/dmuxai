@@ -4,7 +4,7 @@ Status: approved (Dongjin 2026-11-27)
 Owner: Dongjin
 Created: 2026-11-27
 Baseline: `70e9df7`
-Related: #368, SPEC-plan-gate FR-937 FR-953 FR-1613, SPEC-stage-skills FR-1500 FR-1514, #301 (overhead)
+Related: #368, SPEC-plan-gate FR-937 FR-953 FR-1613, SPEC-stage-skills FR-1500 FR-1514, #301 (overhead), SPEC-spec-review-gate (human spec review after the spec step, FR-3700..FR-3717)
 
 ## 1. Decision summary
 
@@ -24,7 +24,7 @@ AGENTS.md, README.md, MISSION.md and docs/WORKFLOW.md say every behavior change 
 
 - Write fan-out (`--agents … --write`) legs: unchanged in this version (each leg is its own worktree); tracked as a follow-up.
 - Sandboxing the agent's file access. The spec step is checked after the fact (FR-3508), not prevented from writing.
-- Judging spec quality. dmuxai checks that a spec file changed, not what it says.
+- Judging spec quality. dmuxai checks that a spec file changed, not what it says. A **human** reviews it: with `spec_first = "full"` the run pauses after the spec step for a spec review on the board, the TUI or `dmuxai spec-review` (SPEC-spec-review-gate, on by default; opt out with `[workflow] spec_review = "off"` or `--no-spec-review`).
 
 ### Assumptions and open questions
 
@@ -89,4 +89,5 @@ AGENTS.md, README.md, MISSION.md and docs/WORKFLOW.md say every behavior change 
 - Spec first in the dmuxai workflow (t788u).
 - `full` is the default; simple and `--agent` runs become `spec → implement → test`.
 - Missing spec/test steps are auto-inserted.
+- 2026-11-28 (t793u): the spec and the plan both need a human check shown on the board; see SPEC-spec-review-gate.
 - dmuxai's own orchestration config sets `test_command = "scripts/gate.sh"` (user config, so no workspace trust is needed). `test_command` is a restricted key: a workspace value applies only to a trusted workspace.

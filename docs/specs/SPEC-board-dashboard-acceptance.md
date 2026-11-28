@@ -4,7 +4,7 @@ Status: approved · Target: v0.4.2
 Owner: DmuxAI
 Created: 2026-11-28
 Baseline: `main` after PR #363, #364, #365, #366
-Related: SPEC-decision-board, SPEC-board-ux-042, SPEC-board-approve-autorun, SPEC-runner-status, SPEC-headless-gate-env, SPEC-web-local-access
+Related: SPEC-decision-board, SPEC-board-ux-042, SPEC-board-approve-autorun, SPEC-runner-status, SPEC-headless-gate-env, SPEC-web-local-access, SPEC-spec-review-gate (board spec review and the "Plan review" label, FR-3711..FR-3715, TC-3714 extends `tests/web_board_e2e.rs`), SPEC-dashboard-feature-coverage
 
 ## 1. Purpose
 

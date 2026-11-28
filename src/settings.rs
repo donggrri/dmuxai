@@ -124,8 +124,13 @@ pub struct WorkspaceSettings {
     pub browse_roots: Vec<String>,
 }
 
-pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] =
-    &["needs_decision", "decision", "message", "run_finished"];
+pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] = &[
+    "needs_decision",
+    "decision",
+    "message",
+    "run_finished",
+    "spec_review",
+];
 
 /// Placeholder for unknown `[board]` TOML keys so `BoardSettings` keeps `Eq`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -208,6 +213,25 @@ pub struct WorkflowSettings {
     pub spec_dir: String,
     pub test_command: String,
     pub test_timeout_secs: u64,
+    /// Explicit `spec_review` (SPEC-spec-review-gate FR-3700); `None` follows `spec_first`.
+    pub spec_review: Option<bool>,
+    pub spec_review_timeout_secs: u64,
+    pub spec_review_max_rounds: u32,
+}
+
+/// Default and minimum `spec_review_timeout_secs` (FR-3700).
+pub const SPEC_REVIEW_TIMEOUT_DEFAULT_SECS: u64 = 86_400;
+pub const SPEC_REVIEW_TIMEOUT_MIN_SECS: u64 = 60;
+pub const SPEC_REVIEW_MAX_ROUNDS_DEFAULT: u32 = 5;
+pub const SPEC_REVIEW_MAX_ROUNDS_MAX: u32 = 20;
+
+impl WorkflowSettings {
+    /// Whether a human spec review pauses spec-first runs (FR-3700): an explicit
+    /// `spec_review` wins, otherwise on exactly when `spec_first = "full"`.
+    pub fn spec_review_enabled(&self) -> bool {
+        self.spec_review
+            .unwrap_or(self.spec_first == SpecFirstMode::Full)
+    }
 }
 
 impl Default for WorkflowSettings {
@@ -218,6 +242,9 @@ impl Default for WorkflowSettings {
             spec_dir: "docs/specs".to_owned(),
             test_command: String::new(),
             test_timeout_secs: 1800,
+            spec_review: None,
+            spec_review_timeout_secs: SPEC_REVIEW_TIMEOUT_DEFAULT_SECS,
+            spec_review_max_rounds: SPEC_REVIEW_MAX_ROUNDS_DEFAULT,
         }
     }
 }
@@ -511,6 +538,15 @@ struct WorkflowToml {
     spec_dir: Option<toml::Value>,
     test_command: Option<toml::Value>,
     test_timeout_secs: Option<toml::Value>,
+    spec_review: Option<toml::Value>,
+    spec_review_timeout_secs: Option<toml::Value>,
+    spec_review_max_rounds: Option<toml::Value>,
+}
+
+/// `spec_review = "off"` removes a human gate, so a workspace may set it only
+/// when trusted (SPEC-spec-review-gate FR-3700).
+fn workflow_spec_review_is_off(value: &toml::Value) -> bool {
+    matches!(value, toml::Value::String(raw) if raw.trim().eq_ignore_ascii_case("off"))
 }
 
 /// `[terminal]` (SPEC-terminal-sessions FR-2614, FR-2630).
@@ -1673,6 +1709,48 @@ impl DmuxSettings {
                     .push("[workflow] test_timeout_secs ignored: expected an integer".to_owned()),
             }
         }
+        if let Some(value) = workflow.spec_review {
+            match value {
+                toml::Value::String(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                    "on" => self.workflow.spec_review = Some(true),
+                    "off" => self.workflow.spec_review = Some(false),
+                    _ => self.config_warnings.push(format!(
+                        "[workflow] spec_review = \"{raw}\" ignored: expected on or off"
+                    )),
+                },
+                _ => self
+                    .config_warnings
+                    .push("[workflow] spec_review ignored: expected a string".to_owned()),
+            }
+        }
+        if let Some(value) = workflow.spec_review_timeout_secs {
+            match value {
+                toml::Value::Integer(secs) if secs >= SPEC_REVIEW_TIMEOUT_MIN_SECS as i64 => {
+                    self.workflow.spec_review_timeout_secs = secs as u64;
+                }
+                toml::Value::Integer(_) => self.config_warnings.push(format!(
+                    "[workflow] spec_review_timeout_secs ignored: must be at least {SPEC_REVIEW_TIMEOUT_MIN_SECS}"
+                )),
+                _ => self.config_warnings.push(
+                    "[workflow] spec_review_timeout_secs ignored: expected an integer".to_owned(),
+                ),
+            }
+        }
+        if let Some(value) = workflow.spec_review_max_rounds {
+            match value {
+                toml::Value::Integer(rounds)
+                    if (1..=i64::from(SPEC_REVIEW_MAX_ROUNDS_MAX)).contains(&rounds) =>
+                {
+                    self.workflow.spec_review_max_rounds = rounds as u32;
+                }
+                toml::Value::Integer(_) => self.config_warnings.push(format!(
+                    "[workflow] spec_review_max_rounds ignored: must be 1..={SPEC_REVIEW_MAX_ROUNDS_MAX}"
+                )),
+                _ => self.config_warnings.push(
+                    "[workflow] spec_review_max_rounds ignored: expected an integer".to_owned(),
+                ),
+            }
+        }
     }
 
     fn merge_terminal(&mut self, terminal: TerminalToml) {
@@ -1958,6 +2036,14 @@ fn restricted_workspace_keys_with_user(
         keys.push("workflow.test_command".to_owned());
     }
     if parsed
+        .workflow
+        .as_ref()
+        .and_then(|w| w.spec_review.as_ref())
+        .is_some_and(workflow_spec_review_is_off)
+    {
+        keys.push("workflow.spec_review".to_owned());
+    }
+    if parsed
         .fanout
         .as_ref()
         .and_then(|fanout| fanout.company_workspace)
@@ -2118,6 +2204,13 @@ fn strip_restricted_workspace_keys_with_user(
     parsed.terminal = None;
     if let Some(workflow) = &mut parsed.workflow {
         workflow.test_command = None;
+        if workflow
+            .spec_review
+            .as_ref()
+            .is_some_and(workflow_spec_review_is_off)
+        {
+            workflow.spec_review = None;
+        }
     }
     if let Some(fanout) = &mut parsed.fanout {
         fanout.company_workspace = None;
@@ -2339,6 +2432,15 @@ pub fn restricted_workspace_details_from(
                 }
             }
         }
+    }
+
+    if parsed
+        .workflow
+        .as_ref()
+        .and_then(|w| w.spec_review.as_ref())
+        .is_some_and(workflow_spec_review_is_off)
+    {
+        details.push(("workflow.spec_review".to_owned(), "off".to_owned()));
     }
 
     if let Some(terminal) = &parsed.terminal {
@@ -7790,5 +7892,148 @@ require_tests = "no"
                 .iter()
                 .any(|w| w.contains("test_command") || w.contains("not trusted"))
         );
+    }
+
+    fn spec_review_ws(toml: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("dmuxai.toml"), toml).unwrap();
+        (dir, ws)
+    }
+
+    fn trusted_env() -> RuntimeEnv {
+        RuntimeEnv {
+            trust_workspace_config: true,
+            ..RuntimeEnv::default()
+        }
+    }
+
+    // TC-3700 / FR-3700: defaults follow spec_first.
+    #[test]
+    fn tc_3700_spec_review_defaults_follow_spec_first() {
+        let s = DmuxSettings::default();
+        assert!(s.workflow.spec_review_enabled());
+        assert_eq!(s.workflow.spec_review_timeout_secs, 86_400);
+        assert_eq!(s.workflow.spec_review_max_rounds, 5);
+        for (mode, expected) in [("full", true), ("lite", false), ("off", false)] {
+            let (_dir, ws) = spec_review_ws(&format!("[workflow]\nspec_first = \"{mode}\"\n"));
+            let settings = DmuxSettings::load_with_user_config(&ws, None);
+            assert_eq!(settings.workflow.spec_review_enabled(), expected, "{mode}");
+        }
+    }
+
+    // TC-3700 / FR-3700: explicit values, key-by-key workspace override of the user value.
+    #[test]
+    fn tc_3700_spec_review_parse_and_override() {
+        let (dir, ws) = spec_review_ws(
+            "[workflow]\nspec_review = \"off\"\nspec_review_timeout_secs = 120\nspec_review_max_rounds = 7\n",
+        );
+        let user = dir.path().join("user.toml");
+        std::fs::write(
+            &user,
+            "[workflow]\nspec_review = \"on\"\nspec_review_timeout_secs = 600\nspec_review_max_rounds = 3\nspec_first = \"lite\"\n",
+        )
+        .unwrap();
+        let settings =
+            DmuxSettings::load_with_user_config_and_env(&ws, Some(&user), &trusted_env());
+        assert_eq!(settings.workflow.spec_review, Some(false));
+        assert!(!settings.workflow.spec_review_enabled());
+        assert_eq!(settings.workflow.spec_review_timeout_secs, 120);
+        assert_eq!(settings.workflow.spec_review_max_rounds, 7);
+        // Keys the workspace does not set keep the user value.
+        std::fs::write(
+            ws.join("dmuxai.toml"),
+            "[workflow]\nspec_review_max_rounds = 9\n",
+        )
+        .unwrap();
+        let settings =
+            DmuxSettings::load_with_user_config_and_env(&ws, Some(&user), &trusted_env());
+        assert_eq!(settings.workflow.spec_review, Some(true));
+        assert_eq!(settings.workflow.spec_review_timeout_secs, 600);
+        assert_eq!(settings.workflow.spec_review_max_rounds, 9);
+    }
+
+    // TC-3700 / FR-3700: invalid values warn and keep the default; boundaries accepted.
+    #[test]
+    fn tc_3700_spec_review_invalid_values_warn() {
+        let (_dir, ws) = spec_review_ws(
+            "[workflow]\nspec_review = \"maybe\"\nspec_review_timeout_secs = 59\nspec_review_max_rounds = 21\n",
+        );
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &trusted_env());
+        assert_eq!(settings.workflow.spec_review, None);
+        assert_eq!(settings.workflow.spec_review_timeout_secs, 86_400);
+        assert_eq!(settings.workflow.spec_review_max_rounds, 5);
+        for key in [
+            "spec_review ",
+            "spec_review_timeout_secs",
+            "spec_review_max_rounds",
+        ] {
+            assert!(
+                settings.config_warnings.iter().any(|w| w.contains(key)),
+                "{key}: {:?}",
+                settings.config_warnings
+            );
+        }
+        let (_dir, ws) = spec_review_ws(
+            "[workflow]\nspec_review = true\nspec_review_timeout_secs = \"x\"\nspec_review_max_rounds = 0\n",
+        );
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &trusted_env());
+        assert_eq!(settings.workflow.spec_review, None);
+        assert_eq!(settings.workflow.spec_review_max_rounds, 5);
+        let (_dir, ws) = spec_review_ws(
+            "[workflow]\nspec_review_timeout_secs = 60\nspec_review_max_rounds = 20\n",
+        );
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &trusted_env());
+        assert_eq!(settings.workflow.spec_review_timeout_secs, 60);
+        assert_eq!(settings.workflow.spec_review_max_rounds, 20);
+    }
+
+    // TC-3700 / FR-3700: an untrusted workspace cannot turn the gate off; "on" is fine.
+    #[test]
+    fn tc_3700_untrusted_workspace_off_is_ignored() {
+        let (dir, ws) = spec_review_ws("[workflow]\nspec_review = \"off\"\n");
+        let env = RuntimeEnv {
+            dmuxai_state_dir: Some(dir.path().join("state")),
+            trust_workspace_config: false,
+            ..RuntimeEnv::default()
+        };
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &env);
+        assert!(settings.workflow.spec_review_enabled());
+        assert_eq!(settings.workflow.spec_review, None);
+        match &settings.workspace_trust {
+            WorkspaceTrustStatus::Untrusted { ignored, .. } => {
+                assert!(
+                    ignored.contains(&"workflow.spec_review".to_owned()),
+                    "{ignored:?}"
+                );
+            }
+            other => panic!("expected untrusted, got {other:?}"),
+        }
+        assert!(
+            settings
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("workflow.spec_review"))
+        );
+        std::fs::write(ws.join("dmuxai.toml"), "[workflow]\nspec_review = \"on\"\n").unwrap();
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, None, &env);
+        assert_eq!(settings.workflow.spec_review, Some(true));
+        assert!(!matches!(
+            settings.workspace_trust,
+            WorkspaceTrustStatus::Untrusted { .. }
+        ));
+        // The user config may turn it off.
+        let user = dir.path().join("user.toml");
+        std::fs::write(&user, "[workflow]\nspec_review = \"off\"\n").unwrap();
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user), &env);
+        assert_eq!(
+            settings.workflow.spec_review,
+            Some(true),
+            "workspace on overrides"
+        );
+        std::fs::remove_file(ws.join("dmuxai.toml")).unwrap();
+        let settings = DmuxSettings::load_with_user_config_and_env(&ws, Some(&user), &env);
+        assert!(!settings.workflow.spec_review_enabled());
     }
 }

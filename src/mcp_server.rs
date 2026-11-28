@@ -22,6 +22,7 @@ pub struct RunArgs {
     pub graph: bool,
     pub todo_id: Option<String>,
     pub no_spec_first: bool,
+    pub no_spec_review: bool,
 }
 
 /// Operations behind the MCP tools. Each returns a JSON value that becomes
@@ -89,6 +90,10 @@ fn tool_definitions() -> Value {
                     "no_spec_first": {
                         "type": "boolean",
                         "description": "Disable spec-first workflow for this run (same as dmuxai run --no-spec-first)"
+                    },
+                    "no_spec_review": {
+                        "type": "boolean",
+                        "description": "Skip the human spec review for this run (same as dmuxai run --no-spec-review)"
                     },
                     "todo_id": { "type": "string", "description": "Run this to-do instead of a prompt" }
                 }
@@ -389,6 +394,10 @@ fn call_tool(backend: &dyn McpBackend, name: &str, args: &Value) -> Result<Value
                 todo_id: str_arg(args, "todo_id").map(str::to_owned),
                 no_spec_first: args
                     .get("no_spec_first")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                no_spec_review: args
+                    .get("no_spec_review")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
             };
@@ -864,6 +873,47 @@ mod tests {
         assert!(out.contains("\"id\":1"));
     }
 
+    // TC-3701 / FR-3701: MCP `run` accepts `no_spec_review`.
+    #[test]
+    fn tc_3701_mcp_run_no_spec_review() {
+        let stub = Stub::default();
+        let result = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run","arguments":{"prompt":"x","agent":"agy","no_spec_review":true}}}),
+        );
+        assert_eq!(result["result"]["isError"], false);
+        assert!(stub.runs.lock().unwrap()[0].no_spec_review);
+        let schema = tool_definitions().to_string();
+        assert!(schema.contains("no_spec_review"));
+    }
+
+    // TC-3708 / FR-3708: MCP exposes no spec review decision (or any spec review) tool.
+    #[test]
+    fn tc_3708_mcp_has_no_spec_review_tool() {
+        let stub = Stub::default();
+        let list = call(&stub, json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}));
+        let tools = list["result"]["tools"].as_array().expect("tools array");
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or_default();
+            assert!(
+                !name.contains("spec_review") && !name.contains("spec-review"),
+                "{name}"
+            );
+            assert!(
+                !name.contains("approve") && !name.contains("decide"),
+                "{name}"
+            );
+        }
+        let denied = call(
+            &stub,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"spec_review_decide","arguments":{"id":"x","verdict":"approve"}}}),
+        );
+        assert!(
+            denied.get("error").is_some() || denied["result"]["isError"] == true,
+            "{denied}"
+        );
+    }
+
     // TC-3513 / FR-3513: MCP `run` accepts `no_spec_first`.
     #[test]
     fn tc_3513_mcp_run_no_spec_first() {
@@ -898,6 +948,7 @@ mod tests {
                     graph: false,
                     todo_id: None,
                     no_spec_first: false,
+                    no_spec_review: false,
                 }
             );
         }

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::run_journal::{mask_sensitive_tokens, truncate_tail_utf8};
 use crate::settings::{SpecFirstMode, WorkflowSettings};
 
-use super::plan_doc::PLAN_PROMPT;
+use super::plan_doc::{PLAN_PROMPT, PlanStep};
 use super::replan::REPLAN_PROMPT;
 use super::types::{GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, NodeRole};
 
@@ -275,6 +275,71 @@ pub fn apply_spec_first(plan: &mut GraphPlan, wf: &WorkflowSettings) -> Vec<Stri
     inserted
 }
 
+/// Expands plan steps the way [`apply_spec_first`] expands their graph
+/// (FR-3503, FR-3715). `graph` must be the validated graph of `steps`.
+/// Returns the steps a run executes and the ids of the inserted steps;
+/// existing steps keep their fields and only gain the new dependencies.
+pub fn expand_plan_steps(
+    steps: &[PlanStep],
+    graph: &GraphPlan,
+    wf: &WorkflowSettings,
+) -> (Vec<PlanStep>, Vec<String>) {
+    let mut expanded = graph.clone();
+    let inserted = apply_spec_first(&mut expanded, wf);
+    if inserted.is_empty() {
+        return (steps.to_vec(), inserted);
+    }
+    let template_step = first_write_step(graph)
+        .and_then(|node| steps.iter().find(|step| step.id == node.id))
+        .cloned()
+        .unwrap_or_default();
+    let incoming = build_incoming(&expanded);
+    let out = expanded
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let deps = incoming.get(&node.id).cloned().unwrap_or_default();
+            if let Some(step) = steps.iter().find(|step| step.id == node.id) {
+                let mut step = step.clone();
+                for dep in deps {
+                    if !step.depends_on.contains(&dep) {
+                        step.depends_on.push(dep);
+                    }
+                }
+                Some(step)
+            } else if inserted.contains(&node.id) {
+                Some(PlanStep {
+                    id: node.id.clone(),
+                    role: node.role.to_string(),
+                    job: node.job.clone(),
+                    runner: template_step.runner.clone(),
+                    model: template_step.model.clone(),
+                    depends_on: deps,
+                    sensitive: None,
+                    task: template_step.task.clone(),
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    (out, inserted)
+}
+
+/// Whether a step carries the fixed job [`apply_spec_first`] gives the spec
+/// and test steps it inserts for `user_prompt` (FR-3715).
+pub fn is_spec_first_step(role: &str, job: &str, user_prompt: &str) -> bool {
+    match role {
+        "spec" => {
+            job.starts_with("Write or update the spec under ")
+                && job.ends_with(&format!(" for: {user_prompt}"))
+        }
+        "test" => job == format!("Run the tests for: {user_prompt}"),
+        _ => false,
+    }
+}
+
 /// Builds the spec → implement → test graph for simple runs (FR-3505).
 pub fn three_step_plan(base: GraphPlan) -> GraphPlan {
     let wf = WorkflowSettings {
@@ -356,6 +421,31 @@ fn ignore_dmuxai_path(path: &str) -> bool {
 
 /// Workspace git porcelain snapshot (FR-3508).
 pub fn spec_snapshot(workspace: &Path) -> Option<BTreeMap<String, String>> {
+    snapshot_impl(workspace, None)
+}
+
+/// Like [`spec_snapshot`], but entries under `spec_dir` also carry a size and
+/// modification-time fingerprint, so a spec file that stays untracked or
+/// modified between two snapshots still counts as changed when a step rewrites
+/// it (a spec re-run after Request changes, SPEC-spec-review-gate FR-3705).
+pub fn spec_snapshot_in(workspace: &Path, spec_dir: &str) -> Option<BTreeMap<String, String>> {
+    snapshot_impl(workspace, Some(spec_dir))
+}
+
+fn file_fingerprint(workspace: &Path, path: &str) -> String {
+    let Ok(meta) = std::fs::symlink_metadata(workspace.join(path)) else {
+        return "|gone".to_owned();
+    };
+    let nanos = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("|{}:{nanos}", meta.len())
+}
+
+fn snapshot_impl(workspace: &Path, spec_dir: Option<&str>) -> Option<BTreeMap<String, String>> {
     if !workspace.join(".git").exists() {
         let output = Command::new("git")
             .args(["rev-parse", "--git-dir"])
@@ -401,6 +491,13 @@ pub fn spec_snapshot(workspace: &Path) -> Option<BTreeMap<String, String>> {
             map.insert(path, status);
         }
     }
+    if let Some(dir) = spec_dir {
+        for (path, status) in map.iter_mut() {
+            if path_under_spec_dir(path, dir) {
+                status.push_str(&file_fingerprint(workspace, path));
+            }
+        }
+    }
     Some(map)
 }
 
@@ -408,18 +505,12 @@ pub fn ensure_spec_dir(workspace: &Path, spec_dir: &str) -> io::Result<()> {
     std::fs::create_dir_all(workspace.join(spec_dir))
 }
 
-pub fn check_spec_gate(
+fn changed_since(
     before: Option<&BTreeMap<String, String>>,
-    workspace: &Path,
-    spec_dir: &str,
-    lite: bool,
-) -> SpecGateResult {
-    let after = match spec_snapshot(workspace) {
-        Some(map) => map,
-        None => return SpecGateResult::Skipped("spec gate skipped (not a git workspace)"),
-    };
+    after: &BTreeMap<String, String>,
+) -> Vec<String> {
     let mut changed = Vec::new();
-    for (path, status) in &after {
+    for (path, status) in after {
         if ignore_dmuxai_path(path) {
             continue;
         }
@@ -431,6 +522,37 @@ pub fn check_spec_gate(
             changed.push(path.clone());
         }
     }
+    changed
+}
+
+/// Workspace-relative paths under `spec_dir` that changed since `before`
+/// (the paths a spec review shows, SPEC-spec-review-gate FR-3703). Sorted; never
+/// contains a path outside `spec_dir` or one that escapes the workspace.
+pub fn changed_spec_paths(
+    before: Option<&BTreeMap<String, String>>,
+    workspace: &Path,
+    spec_dir: &str,
+) -> Vec<String> {
+    let Some(after) = snapshot_impl(workspace, Some(spec_dir)) else {
+        return Vec::new();
+    };
+    changed_since(before, &after)
+        .into_iter()
+        .filter(|path| path_under_spec_dir(path, spec_dir) && !path.split('/').any(|c| c == ".."))
+        .collect()
+}
+
+pub fn check_spec_gate(
+    before: Option<&BTreeMap<String, String>>,
+    workspace: &Path,
+    spec_dir: &str,
+    lite: bool,
+) -> SpecGateResult {
+    let after = match snapshot_impl(workspace, Some(spec_dir)) {
+        Some(map) => map,
+        None => return SpecGateResult::Skipped("spec gate skipped (not a git workspace)"),
+    };
+    let changed = changed_since(before, &after);
 
     if changed.is_empty() {
         return SpecGateResult::Failed(format!("spec step did not write a spec under {spec_dir}"));

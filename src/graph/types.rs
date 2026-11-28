@@ -239,6 +239,13 @@ pub struct GraphRun {
     /// Count of dynamically added nodes so far (SPEC-graph-dynamic-nodes FR-2942).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_added: Option<usize>,
+    /// Latest human spec review status and round (SPEC-spec-review-gate FR-3710).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_review: Option<super::spec_review::SpecReviewSummary>,
+    /// Pending-plan hash of the executed steps for a run started with
+    /// `--approve-plan-id` (FR-3715).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_hash: Option<String>,
 }
 
 /// FR-943: at most five plan revisions per run.
@@ -291,6 +298,9 @@ pub enum GraphRunPhase {
     AwaitingApproval,
     Rejected,
     Cancelled,
+    /// Spec step(s) done; a human reviews the spec before dependent steps start
+    /// (SPEC-spec-review-gate FR-3702).
+    AwaitingSpecReview,
 }
 
 /// Who made a plan decision (FR-946).

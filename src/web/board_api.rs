@@ -23,6 +23,9 @@ use crate::board::{
     SayRequest, Verdict, default_actor_by, default_rules, edit_plan_from_json, resolve_actor,
     unmasked_prompt_from_item_plan, valid_item_id,
 };
+use crate::graph::spec_review::{
+    DecideRequest as SpecDecideRequest, ReviewError, SpecReviewStore, Verdict as SpecVerdict,
+};
 use crate::graph::{PlanStep, PlanTask};
 use crate::web::server::{error_json, json_ok};
 
@@ -68,6 +71,7 @@ where
         )
         .route("/api/board/{id}", get(board_get))
         .route("/api/board/{id}/decision", post(board_decision))
+        .route("/api/board/{id}/spec-review", post(board_spec_review))
         .route("/api/board/{id}/check", post(board_check))
         .route("/api/board/{id}/messages", post(board_messages))
         .route("/api/board/{id}/plan", post(board_plan))
@@ -313,6 +317,96 @@ async fn board_decision(
             json_ok(StatusCode::OK, &value)
         }
         Err(error) => board_error_response(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct SpecReviewBody {
+    verdict: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    spec_digest: Option<String>,
+}
+
+fn spec_review_error_response(error: ReviewError) -> Response {
+    let status = match &error {
+        ReviewError::Usage(_) => StatusCode::BAD_REQUEST,
+        ReviewError::NotFound(_) => StatusCode::NOT_FOUND,
+        ReviewError::Conflict(_) => StatusCode::CONFLICT,
+        ReviewError::Forbidden(_) => StatusCode::FORBIDDEN,
+        ReviewError::Corrupt(_) | ReviewError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    error_json(status, &error.to_string())
+}
+
+/// Decides the pending spec review of a board item's run
+/// (SPEC-spec-review-gate FR-3707, FR-3708, FR-3713).
+async fn board_spec_review(
+    State(state): State<BoardApiState>,
+    headers: axum::http::HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    axum::Json(body): axum::Json<SpecReviewBody>,
+) -> Response {
+    if let Some(resp) = human_browser_rejection(&headers) {
+        return resp;
+    }
+    if !valid_item_id(&id) {
+        return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
+    }
+    let Some(verdict) = SpecVerdict::parse(&body.verdict) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid verdict");
+    };
+    let text = body
+        .text
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty());
+    if verdict == SpecVerdict::RequestChanges && text.is_none() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "request changes needs non-empty feedback",
+        );
+    }
+    let by = match resolve_actor(None, BoardCaller::Dashboard) {
+        Ok(actor) => actor,
+        Err(error) => return board_error_response(error),
+    };
+    let reviews = SpecReviewStore::new(&state.state_root);
+    let result = tokio::task::spawn_blocking(move || -> Result<BoardItem, Box<Response>> {
+        let store = open_store(&state.board_base).map_err(|e| Box::new(board_error_response(e)))?;
+        let item = store
+            .get(&id)
+            .map_err(|e| Box::new(board_error_response(e)))?;
+        let Some(review) = item.spec_review else {
+            return Err(Box::new(error_json(
+                StatusCode::NOT_FOUND,
+                "item has no spec review",
+            )));
+        };
+        let record = reviews
+            .decide(
+                &review.review_id,
+                &SpecDecideRequest {
+                    verdict,
+                    text: text.as_deref(),
+                    spec_digest: body.spec_digest.as_deref(),
+                    by: &by,
+                },
+            )
+            .map_err(|e| Box::new(spec_review_error_response(e)))?;
+        let updated = crate::board::BoardSpecReview {
+            status: record.status,
+            ..review
+        };
+        store
+            .set_spec_review(&id, updated, None)
+            .map_err(|e| Box::new(board_error_response(e)))
+    })
+    .await;
+    match result {
+        Ok(Ok(item)) => json_ok(StatusCode::OK, &item_response(item)),
+        Ok(Err(resp)) => *resp,
+        Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
 }
 
@@ -1858,5 +1952,378 @@ mod tests {
                 None => std::env::remove_var("DMUXAI_BOARD_SELF_BIN"),
             }
         }
+    }
+
+    /// A board item whose run waits on a pending spec review record.
+    fn seed_spec_review(store: &BoardStore, state: &Path, review_id: &str) -> String {
+        use crate::graph::spec_review::{ReviewStatus, SpecReviewRecord};
+        let id = seed_item(store, state);
+        let record = SpecReviewRecord {
+            review_id: review_id.to_owned(),
+            graph_id: review_id.to_owned(),
+            run_id: "run-1".to_owned(),
+            workspace: "/workspace".to_owned(),
+            prompt_summary: "ship".to_owned(),
+            spec_paths: vec!["docs/specs/SPEC-x.md".to_owned()],
+            spec_digest: "digest-1".to_owned(),
+            round: 1,
+            max_rounds: 5,
+            status: ReviewStatus::Pending,
+            created_ms: 1,
+            updated_ms: 1,
+            board_item_id: Some(id.clone()),
+            verdict: None,
+            by: None,
+            feedback: None,
+            decided_ms: None,
+        };
+        SpecReviewStore::new(state).create(&record).unwrap();
+        store
+            .set_spec_review(
+                &id,
+                crate::board::BoardSpecReview {
+                    review_id: review_id.to_owned(),
+                    status: ReviewStatus::Pending,
+                    round: 1,
+                    spec_paths: record.spec_paths.clone(),
+                    spec_digest: record.spec_digest.clone(),
+                },
+                None,
+            )
+            .unwrap();
+        id
+    }
+
+    fn spec_review_post(
+        id: &str,
+        token: &str,
+        body: &str,
+        human: bool,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{id}/spec-review"))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json");
+        if human {
+            builder = builder
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("X-Dmuxai-Human", "1");
+        }
+        builder
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    // TC-3708 / FR-3708 (http): a spec review POST without the human browser
+    // headers is 403 and leaves the record and the item unchanged.
+    #[tokio::test]
+    async fn tc_3708_spec_review_post_requires_human_headers() {
+        use crate::graph::spec_review::ReviewStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let store = BoardStore::open(board.clone()).unwrap();
+        let id = seed_spec_review(&store, &state, "graph-708");
+        let token = "boardtesttoken";
+        let router = test_router(board, state.clone(), token);
+        let before = store.get(&id).unwrap();
+        let resp = router
+            .oneshot(spec_review_post(
+                &id,
+                token,
+                r#"{"verdict":"approve","spec_digest":"digest-1"}"#,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let record = SpecReviewStore::new(&state).load("graph-708").unwrap();
+        assert_eq!(record.status, ReviewStatus::Pending);
+        assert!(record.by.is_none());
+        assert_eq!(store.get(&id).unwrap().version, before.version);
+    }
+
+    // TC-3713 / FR-3713: verdicts, validation, digest and pending checks,
+    // GET item and GET pending include `spec_review`.
+    #[tokio::test]
+    async fn tc_3713_spec_review_endpoint_codes_and_payloads() {
+        use crate::graph::spec_review::ReviewStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let store = BoardStore::open(board.clone()).unwrap();
+        let token = "boardtesttoken";
+        let router = test_router(board, state.clone(), token);
+        let reviews = SpecReviewStore::new(&state);
+        let approve_id = seed_spec_review(&store, &state, "graph-a");
+        let changes_id = seed_spec_review(&store, &state, "graph-c");
+        let reject_id = seed_spec_review(&store, &state, "graph-r");
+        let plain_id = seed_item(&store, &state);
+
+        let get = |uri: String| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{approve_id}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let item: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(item["spec_review"]["status"], "pending");
+        assert_eq!(item["spec_review"]["round"], 1);
+        assert_eq!(item["spec_review"]["spec_digest"], "digest-1");
+        assert_eq!(item["spec_review"]["spec_paths"][0], "docs/specs/SPEC-x.md");
+
+        let resp = router
+            .clone()
+            .oneshot(get("/api/board/pending".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let pending: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let entry = pending["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == approve_id.as_str())
+            .expect("pending list includes the spec review item");
+        assert_eq!(entry["reason"], "spec_review");
+        assert_eq!(entry["spec_review"]["status"], "pending");
+
+        let post = |id: &str, body: &str| spec_review_post(id, token, body, true);
+        let status_of = |resp: &axum::response::Response| resp.status();
+
+        // 400: invalid id, invalid verdict, empty feedback for request_changes.
+        let resp = router
+            .clone()
+            .oneshot(post("not-an-id", r#"{"verdict":"approve"}"#))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::BAD_REQUEST);
+        let resp = router
+            .clone()
+            .oneshot(post(&approve_id, r#"{"verdict":"maybe"}"#))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::BAD_REQUEST);
+        let resp = router
+            .clone()
+            .oneshot(post(
+                &changes_id,
+                r#"{"verdict":"request_changes","text":"   "}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::BAD_REQUEST);
+
+        // 404: unknown item, item without a review.
+        let resp = router
+            .clone()
+            .oneshot(post("b000000000001", r#"{"verdict":"approve"}"#))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::NOT_FOUND);
+        let resp = router
+            .clone()
+            .oneshot(post(&plain_id, r#"{"verdict":"approve"}"#))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::NOT_FOUND);
+
+        // 409: stale digest.
+        let resp = router
+            .clone()
+            .oneshot(post(
+                &approve_id,
+                r#"{"verdict":"approve","spec_digest":"old"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::CONFLICT);
+        assert!(
+            body_string(resp)
+                .await
+                .contains("spec changed since it was shown; reload")
+        );
+        assert_eq!(
+            reviews.load("graph-a").unwrap().status,
+            ReviewStatus::Pending
+        );
+
+        // 200: each verdict returns the updated item.
+        let resp = router
+            .clone()
+            .oneshot(post(
+                &approve_id,
+                r#"{"verdict":"approve","spec_digest":"digest-1"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::OK);
+        let item: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(item["id"], approve_id.as_str());
+        assert_eq!(item["spec_review"]["status"], "approved");
+        assert_eq!(item["lane"], "needs_decision");
+        let record = reviews.load("graph-a").unwrap();
+        assert_eq!(record.status, ReviewStatus::Approved);
+        assert_eq!(record.by.as_deref(), Some("owner"));
+
+        let resp = router
+            .clone()
+            .oneshot(post(
+                &changes_id,
+                r#"{"verdict":"request_changes","text":"add errors","spec_digest":"digest-1"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::OK);
+        let item: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(item["spec_review"]["status"], "changes_requested");
+        assert_eq!(
+            reviews.load("graph-c").unwrap().feedback.as_deref(),
+            Some("add errors")
+        );
+
+        let resp = router
+            .clone()
+            .oneshot(post(
+                &reject_id,
+                r#"{"verdict":"reject","spec_digest":"digest-1"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::OK);
+        let item: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(item["spec_review"]["status"], "rejected");
+
+        // 409: a decided review is not pending.
+        let resp = router
+            .clone()
+            .oneshot(post(
+                &approve_id,
+                r#"{"verdict":"reject","spec_digest":"digest-1"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status_of(&resp), StatusCode::CONFLICT);
+        assert!(
+            body_string(resp)
+                .await
+                .contains("spec review is not pending")
+        );
+
+        // Decided reviews leave the pending list (the plan decision remains).
+        let resp = router
+            .clone()
+            .oneshot(get("/api/board/pending".to_owned()))
+            .await
+            .unwrap();
+        let pending: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        let entry = pending["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == approve_id.as_str())
+            .unwrap();
+        assert_eq!(entry["reason"], "decide");
+    }
+
+    // TC-3715 / FR-3715, FR-3503 (#374): dashboard Save plan stores the
+    // spec-first expanded plan and marks the inserted steps.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn tc_3715_save_plan_stores_spec_first_expanded_plan() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let xdg = dir.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("dmuxai")).unwrap();
+        std::fs::write(
+            xdg.join("dmuxai").join("dmuxai.toml"),
+            "[workflow]\nspec_first = \"full\"\n",
+        )
+        .unwrap();
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+
+        let store = BoardStore::open(board.clone()).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "save plan".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let research = r#"{"tasks":[{"id":"task-1","title":"do it","done_check":"done","size":"small","depends_on":[]}],"steps":[{"id":"step-1","role":"research","job":"look","runner":"cursor","depends_on":[],"task":"task-1"}]}"#;
+        let (_, hash) = edit_plan_from_json(&workspace, &state, "ship it", research, None).unwrap();
+        store
+            .attach_plan(&item.id, &hash, &state, "bot:coord")
+            .unwrap();
+
+        let token = "boardtesttoken";
+        let router = test_router(board, state.clone(), token);
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/board/{}/plan", item.id))
+                    .header("Host", "localhost:7420")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"steps":[{"id":"step-1","role":"implement","job":"edit","runner":"cursor","model":null,"depends_on":[],"task":"task-1"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = body_string(resp).await;
+        unsafe {
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let item: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let ids: Vec<&str> = item["plan"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["spec-1", "step-1", "test-1"]);
+        assert_eq!(
+            item["plan"]["spec_first_added"],
+            serde_json::json!(["spec-1", "test-1"])
+        );
+        let stored_hash = item["plan"]["hash"].as_str().unwrap();
+        let pending = crate::board::read_pending_plan(&state, stored_hash).unwrap();
+        assert_eq!(pending.steps.len(), 3);
     }
 }

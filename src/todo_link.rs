@@ -309,6 +309,8 @@ mod tests {
             todo_id: None,
             dynamic_cap: None,
             dynamic_added: None,
+            spec_review: None,
+            plan_hash: None,
         };
         links.commit_pending_graph("plan-1", &mut run);
         assert_eq!(run.todo_id, Some(todo_id.clone()));

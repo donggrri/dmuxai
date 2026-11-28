@@ -12,6 +12,12 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - **Runner status and enable switch (SPEC-runner-status).** `dmuxai runners status [--json] [--agent ID]` shows, for cursor-agent and agy, whether the CLI is installed, its version and whether it is signed in (account masked, login hint), using only `--version`, `status --format json`, `models` style probes that never start a model turn. `dmuxai runners enable|disable <id>` writes `[runners.<id>] enabled` to the user config; a disabled runner is refused by `run` and graph routing. The same status is available at `GET /api/runners/status`, the MCP tool `runners_status`, and a new Runners panel in the dashboard More menu (status badge, Refresh, enable switch). Nothing is probed at startup or during runs.
 
+- **Human spec review and plan review on the board (SPEC-spec-review-gate).** With spec-first on, a run pauses after the spec step until a person approves the spec (`awaiting_spec_review`); steps after it do not start. Decide on the board (`Spec review` badge, spec links in the Markdown viewer, Approve spec / Request changes / Reject spec), in the TUI panel (`a` / `c` / `x`), or with `dmuxai spec-review list|show|approve|request-changes|reject` from a terminal. Agents, MCP and `--approve-plan` cannot approve a spec review. Settings: `[workflow] spec_review`, `spec_review_timeout_secs`, `spec_review_max_rounds`; per run `--no-spec-review` (MCP `no_spec_review`). Board items waiting on a plan show a `Plan review` badge.
+
+### Fixed
+
+- Board: the plan the owner approves is now the plan that runs. `board plan --edit`, dashboard Save plan and `board add --plan-hash` store the spec-first expanded plan (spec-1 / test-1 marked `added by spec-first`), so the approved hash matches the executed graph (#374).
+
 ### Tests
 
 - Board and dashboard acceptance spec (SPEC-board-dashboard-acceptance, FR/TC-3600..3610) with 11 headless-Chrome end-to-end tests (`tests/web_board_e2e.rs`, run with `--ignored`).
