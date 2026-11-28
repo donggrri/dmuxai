@@ -35,8 +35,10 @@
     return node;
   }
 
-  function api(method, path, body) {
+  function api(method, path, body, human) {
     var headers = { 'X-Dmuxai-Client': '1' };
+    // FR-3762: proposal approve/reject are human-only; sent from a click handler only.
+    if (human === true) { headers['X-Dmuxai-Human'] = '1'; }
     if (token) { headers.Authorization = 'Bearer ' + token; }
     var init = { method: method, headers: headers, cache: 'no-store' };
     if (body !== undefined) {
@@ -223,7 +225,7 @@
   function proposalAction(path, busyLabel, doneLabel) {
     setStatus(busyLabel, false);
     return withRequest(
-      api('POST', path)
+      api('POST', path, undefined, true)
         .then(function (payload) {
           setStatus(
             payload && payload.message ? String(payload.message) : doneLabel,

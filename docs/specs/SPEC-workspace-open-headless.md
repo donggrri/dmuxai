@@ -37,3 +37,5 @@ with Switch and Open disabled for that whole time, and no window ever opened.
 | TC-1488 | FR-1474 | Manual: Open in new window on another folder; in that dashboard ask grok, cursor and agy (`gemini-3.8-flash`) to run `pwd`. Pass: each prints the new folder |
 | TC-1489 | FR-1475 | Manual: chat in workspace A, Switch to B, Switch back to A. Pass: A's conversation is listed and loads with its messages |
 | TC-1490 | FR-1473, FR-872 | Manual: dialog with a git repo, a plain folder, a missing path, a `chmod 000` folder; Up, a DIRECTORIES pick, a RECENT pick. Pass: valid paths enable Switch/Open; missing → "does not exist", no permission → "not writable" with both buttons disabled; browsing fills the path |
+
+Amendment (SPEC-dashboard-feature-coverage §6): TC-1489 is automated by TC-3759 (`tests/web_session_sidebar.rs`) and TC-1490 by TC-3760 (`tests/web_workspace_dir.rs`).

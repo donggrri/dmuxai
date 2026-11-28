@@ -52,3 +52,5 @@ see FR-1623).
 | TC-1670 | FR-1669 | Automated: `tc_1670_finished_background_turn_shows_activity`. Background turn emits activity then `Completed` while another conversation is displayed; switch back to A. Expected: activity rows are present with the finished assistant reply. |
 | TC-1671 | FR-1669 | Automated: `tc_1671_repeated_switch_back_keeps_background_activity`. Background turn emits activity and completes while another conversation is displayed; switch back to A, switch away, switch back to A again. Expected: activity rows still appear exactly once before the assistant reply on each return to A. |
 | TC-1672 | FR-1669 | Automated: `tc_1672_multi_turn_offscreen_activity_stays_per_turn`. Two turns in A each produce activity (turn 1 while displayed, turn 2 in the background); switch away and back twice. Expected: each turn's activity row sits between its own user prompt and its own assistant reply, exactly once. |
+
+Amendment (SPEC-dashboard-feature-coverage §6): TC-1622 is also automated by TC-3759 (`tests/web_session_sidebar.rs`); the light-theme screenshot stays manual.

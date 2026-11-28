@@ -353,7 +353,7 @@ fn assert_sent_once_and_shown_at_once(outcome: &Outcome) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn prompt_is_sent_and_shown_once_in_headless_chrome() {
+async fn tc_3751_prompt_is_sent_and_shown_once_in_headless_chrome() {
     let Some(outcome) = run_scenario(Scenario::PostedLater).await else {
         return;
     };
@@ -387,7 +387,7 @@ async fn prompt_is_sent_and_shown_once_in_headless_chrome() {
 // (the server shows it as a pending prompt), with no timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn prompt_waiting_for_plan_approval_stays_once() {
+async fn tc_3751_prompt_waiting_for_plan_approval_stays_once() {
     let Some(outcome) = run_scenario(Scenario::PlanWaits).await else {
         return;
     };
@@ -412,7 +412,7 @@ async fn prompt_waiting_for_plan_approval_stays_once() {
 // Review fix (#82): accepted (202) and then refused: no ghost message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn prompt_refused_after_accept_leaves_no_ghost() {
+async fn tc_3751_prompt_refused_after_accept_leaves_no_ghost() {
     let Some(outcome) = run_scenario(Scenario::RefusedLater).await else {
         return;
     };
@@ -442,7 +442,7 @@ async fn prompt_refused_after_accept_leaves_no_ghost() {
 // server copy arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn two_quick_sends_each_show_once() {
+async fn tc_3751_two_quick_sends_each_show_once() {
     let Some(outcome) = run_scenario(Scenario::TwoSends).await else {
         return;
     };

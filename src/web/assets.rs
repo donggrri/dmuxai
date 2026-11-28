@@ -2681,6 +2681,31 @@ mod tests {
         assert!(BOARD_CSS.contains(".board-spec-review"));
     }
 
+    // TC-3762 / FR-3762: the dashboard sends the human header for approvals
+    // (and only for them), never on plain reads or saves.
+    #[test]
+    fn tc_3762_assets_send_human_headers_for_approvals() {
+        for (name, js) in [("memory.js", MEMORY_JS), ("skills.js", SKILLS_JS)] {
+            assert!(
+                js.contains("headers['X-Dmuxai-Human'] = '1'"),
+                "{name} must be able to send X-Dmuxai-Human"
+            );
+            assert!(
+                js.contains("if (human === true)"),
+                "{name} sends the human header only when asked"
+            );
+        }
+        assert!(
+            SKILLS_JS.contains("api('POST', '/api/skills/approve', { source: r.skill }, true)")
+        );
+        assert!(
+            !SKILLS_JS
+                .contains("api('POST', '/api/skills', { stage: entry.stage, skills: list }, true)")
+        );
+        assert!(MEMORY_JS.contains("api('POST', path, undefined, true)"));
+        assert!(!MEMORY_JS.contains("{ text: text, target: target }, true)"));
+        assert!(!MEMORY_JS.contains("api('GET', '/api/memory', undefined, true)"));
+
     // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
     #[test]
     fn tc_3134_drawer_ask_and_run_controls_hidden_in_serve() {

@@ -82,7 +82,9 @@ where
         .with_state(state)
 }
 
-fn human_browser_rejection(headers: &axum::http::HeaderMap) -> Option<Response> {
+/// Shared human-only rule (SPEC-decision-board FR-3138, SPEC-dashboard-feature-coverage
+/// FR-3762): browser fetch metadata plus `X-Dmuxai-Human: 1`.
+pub(crate) fn human_browser_rejection(headers: &axum::http::HeaderMap) -> Option<Response> {
     let sec_site = headers
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
@@ -101,7 +103,7 @@ fn human_browser_rejection(headers: &axum::http::HeaderMap) -> Option<Response> 
     } else {
         Some(error_json(
             StatusCode::FORBIDDEN,
-            "human browser headers required for this board action",
+            "human browser headers required for this action",
         ))
     }
 }
@@ -1109,6 +1111,93 @@ mod tests {
             .unwrap();
         let resp = router.oneshot(bad).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // TC-3756 / FR-3756: a scripted PUT without the human browser headers is
+    // refused with 403 and changes nothing; GET shows the saved rules.
+    #[tokio::test]
+    async fn tc_3756_rules_put_requires_human_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let _ = BoardStore::open(board.clone()).unwrap();
+        let token = "boardtesttoken";
+        let router = test_router(board, state, token);
+        let rules_get = |router: axum::Router| async move {
+            let req = axum::http::Request::builder()
+                .uri("/api/board/rules")
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        let put = |headers: &[(&str, &str)], body: &str| {
+            let mut b = axum::http::Request::builder()
+                .method("PUT")
+                .uri("/api/board/rules")
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json");
+            for (name, value) in headers {
+                b = b.header(*name, *value);
+            }
+            b.body(axum::body::Body::from(body.to_owned())).unwrap()
+        };
+        let human = [
+            ("Sec-Fetch-Site", "same-origin"),
+            ("Sec-Fetch-Mode", "cors"),
+            ("X-Dmuxai-Human", "1"),
+        ];
+        let body = r#"{"default_lane":"needs_decision","rules":[{"kind":"debug","lane":"auto"}]}"#;
+        let before = rules_get(router.clone()).await;
+
+        // Failure: scripted, cross-site, no mode, wrong marker.
+        let refused: [&[(&str, &str)]; 5] = [
+            &[],
+            &[("X-Dmuxai-Human", "1")],
+            &[
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", "cors"),
+            ],
+            &[
+                ("Sec-Fetch-Site", "cross-site"),
+                ("Sec-Fetch-Mode", "cors"),
+                ("X-Dmuxai-Human", "1"),
+            ],
+            &[
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", "cors"),
+                ("X-Dmuxai-Human", "yes"),
+            ],
+        ];
+        for headers in refused {
+            let resp = router.clone().oneshot(put(headers, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{headers:?}");
+        }
+        assert_eq!(rules_get(router.clone()).await, before, "403 saves nothing");
+
+        // Success: the human headers save and GET returns the new rules.
+        let resp = router.clone().oneshot(put(&human, body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let after = rules_get(router.clone()).await;
+        assert_eq!(after["rules"][0]["kind"], "debug");
+        assert_eq!(after["rules"][0]["lane"], "auto");
+
+        // Boundary: invalid rule with human headers is 400 and keeps the saved rules.
+        let resp = router
+            .clone()
+            .oneshot(put(&human, r#"{"default_lane":"nope","rules":[]}"#))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(rules_get(router).await, after);
     }
 
     // TC-3127 / NFR-3120: list 500 items under 300 ms over HTTP.

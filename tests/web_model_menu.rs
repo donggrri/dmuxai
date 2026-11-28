@@ -230,7 +230,7 @@ print(json.dumps(out))
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Chrome/Chromium and python playwright; run with --ignored"]
-async fn model_menu_search_keyboard_and_no_fast_in_headless_chrome() {
+async fn tc_3752_model_menu_search_keyboard_and_no_fast_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

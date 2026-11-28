@@ -103,6 +103,8 @@ In scope: the header (`Diff`, `Graph` buttons), `src/web/assets/index.html`, `ap
 | TC-1985 | FR-1985 | unit (asset, integration) | JS/CSS assets and web API test | Asset checks for banner markup, classes, continue/cancel commands, approval text, no `innerHTML`; `POST /api/command` with `graph_continue` returns error when not waiting and not accepted as prompt | `src/web/assets.rs` `session_gate_banner_assets`, `tests/web_workspace_open.rs` `tc_1985_graph_continue_without_waiting_gate_errors` |
 | TC-1213 | FR-1217, FR-1219, FR-1220, FR-1221, UX-1202 | manual (headless Chromium) | `dmuxai --web` with a fake grok (tool calls) and the demo agent | Screenshots: live run row, actions expanded, approval card, Graph auto-open, step → Graph, file → Diff, dark theme | PR screenshots `dash-fullwidth-1440-chat-*.png`, `*-approval-*.png`, `*-at-step.png`, `*-at-file.png` |
 
+Amendment (SPEC-dashboard-feature-coverage §6): switching A -> B -> A in TC-1220 is automated by TC-3759 (`tests/web_session_sidebar.rs`); the screenshots stay manual.
+
 ## 6. Exit criteria
 
 TC-1200..TC-1202, TC-1205, TC-1206, TC-1209, TC-1212, TC-1214..TC-1217, TC-1219 and TC-1221..TC-1223, TC-1225 pass in the local gates (fmt, clippy, tests); TC-1204, TC-1207, TC-1208, TC-1211, TC-1218, TC-1224, TC-851 and the other web e2e tests pass with `--ignored`; the TC-1203, TC-1210, TC-1213, TC-1220 and TC-1226 screenshots are reviewed by Dongjin before the release.

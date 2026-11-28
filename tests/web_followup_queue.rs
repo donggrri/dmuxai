@@ -157,7 +157,7 @@ fn msg(index: usize, role: &str, content: &str, streaming: bool) -> SessionMessa
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn followups_queue_in_order_and_survive_stop_in_headless_chrome() {
+async fn tc_1230_1231_1232_1233_1234_1235_1236_3753_followups_queue_in_order_and_survive_stop() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

@@ -10,6 +10,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -462,4 +464,156 @@ print(json.dumps(out))
         parsed["switched_workspace"].as_str(),
         Some(ws_b.to_string_lossy().as_ref())
     );
+}
+
+// TC-3760 (FR-3760): workspace dialog validation states (automates the
+// manual workspace-open-headless dialog check): git repo and plain folder enable
+// Switch/Open, a missing path says `does not exist`, an unreadable folder shows
+// the error, Up and a recent pick fill the path.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3760_workspace_dialog_validation_states() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some((chrome, python)) = common::prepare() else {
+        return;
+    };
+    let env = common::setup_env();
+    env.write_chat_agents_config("");
+    let repo = env.home.join("repo");
+    let plain = env.home.join("plain");
+    let missing = env.home.join("missing-dir");
+    let locked = env.home.join("locked");
+    for dir in [&repo, &plain, &locked] {
+        std::fs::create_dir_all(dir).expect("dir");
+    }
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status();
+    if !git.map(|s| s.success()).unwrap_or(false) {
+        std::fs::create_dir_all(repo.join(".git")).expect(".git dir");
+    }
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    // Root ignores directory modes: the unreadable case cannot be provoked then.
+    let unreadable_possible = std::fs::read_dir(&locked).is_err();
+    let (_guard, url) = common::start_web(&env, &[]);
+    let paths = serde_json::json!({
+        "repo": repo, "plain": plain, "missing": missing, "locked": locked,
+        "unreadable_possible": unreadable_possible,
+    })
+    .to_string();
+
+    let script = r##"
+import json, sys
+from playwright.sync_api import sync_playwright
+
+chrome, url, paths = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+out = {}
+
+def state(page):
+    return page.evaluate("""() => ({
+      reason: document.getElementById('workspace-reason').hidden ? '' : document.getElementById('workspace-reason').textContent,
+      switch_disabled: document.getElementById('workspace-switch').disabled,
+      open_disabled: document.getElementById('workspace-open').disabled,
+      path: document.getElementById('workspace-path').value,
+    })""")
+
+def type_path(page, path, want_reason=None, want_enabled=None):
+    page.fill('#workspace-path', path)
+    page.wait_for_function(
+        """([want_reason, want_enabled]) => {
+          const r = document.getElementById('workspace-reason');
+          const reason = r.hidden ? '' : r.textContent;
+          const sw = document.getElementById('workspace-switch');
+          if (want_enabled === true) { return !sw.disabled && reason === ''; }
+          if (want_enabled === false) { return sw.disabled && (!want_reason || reason.includes(want_reason)); }
+          return true;
+        }""",
+        arg=[want_reason, want_enabled], timeout=10000)
+    return state(page)
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    page.goto(url, wait_until='domcontentloaded', timeout=20000)
+    page.wait_for_selector('#workspace-button', timeout=20000)
+    page.click('#workspace-button')
+    page.wait_for_selector('#workspace-dialog:not([hidden])', timeout=10000)
+    out['recent_items'] = page.evaluate(
+        "() => [...document.querySelectorAll('#workspace-recent .workspace-recent-btn')].map(b => b.title)")
+    out['current'] = page.inner_text('#workspace-current')
+
+    out['repo'] = type_path(page, paths['repo'], None, True)
+    out['plain'] = type_path(page, paths['plain'], None, True)
+    out['missing'] = type_path(page, paths['missing'], 'does not exist', False)
+    if paths['unreadable_possible']:
+        page.fill('#workspace-path', paths['locked'])
+        page.wait_for_function(
+            "() => { const r = document.getElementById('workspace-reason'); return !r.hidden && r.textContent.length > 0; }",
+            timeout=10000)
+        out['locked'] = state(page)
+
+    # A DIRECTORIES pick fills the path, then Up fills the parent path.
+    page.locator('#workspace-browser .workspace-dir-btn[data-path$="/plain"]').click()
+    page.wait_for_function(
+        "(p) => document.getElementById('workspace-path').value === p", arg=paths['plain'], timeout=10000)
+    out['pick_path'] = page.input_value('#workspace-path')
+    page.wait_for_function("() => !document.getElementById('workspace-up').disabled", timeout=10000)
+    page.click('#workspace-up')
+    page.wait_for_function(
+        "(p) => document.getElementById('workspace-path').value !== p", arg=paths['plain'], timeout=10000)
+    out['up_path'] = page.input_value('#workspace-path')
+
+    # a recent pick fills the path
+    if out['recent_items']:
+        page.locator('#workspace-recent .workspace-recent-btn').first.click()
+        page.wait_for_function(
+            "(p) => document.getElementById('workspace-path').value === p",
+            arg=out['recent_items'][0], timeout=10000)
+        out['recent_path'] = page.input_value('#workspace-path')
+    browser.close()
+print(json.dumps(out))
+"##;
+    let result = common::run_probe(&python, &chrome, script, &[&url, &paths]);
+    // Restore the mode so the temp dir can be removed.
+    let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+
+    for key in ["repo", "plain"] {
+        assert_eq!(result[key]["switch_disabled"], false, "{key}: {result}");
+        assert_eq!(result[key]["open_disabled"], false, "{key}: {result}");
+        assert_eq!(result[key]["reason"], "", "{key}: {result}");
+    }
+    assert_eq!(result["missing"]["switch_disabled"], true, "{result}");
+    assert_eq!(result["missing"]["open_disabled"], true, "{result}");
+    assert!(
+        result["missing"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not exist"),
+        "{result}"
+    );
+    if unreadable_possible {
+        assert_eq!(result["locked"]["switch_disabled"], true, "{result}");
+        assert_eq!(result["locked"]["open_disabled"], true, "{result}");
+        assert!(
+            !result["locked"]["reason"].as_str().unwrap_or("").is_empty(),
+            "unreadable folder shows an error: {result}"
+        );
+    } else {
+        println!("SKIP: unreadable-folder case (directory modes are not enforced here)");
+    }
+    assert_eq!(result["pick_path"], plain.to_str().unwrap(), "{result}");
+    let up = result["up_path"].as_str().unwrap_or("");
+    assert_eq!(
+        up,
+        env.home.to_str().unwrap(),
+        "Up goes to the parent: {result}"
+    );
+    if let Some(first) = result["recent_items"].as_array().and_then(|r| r.first()) {
+        assert_eq!(result["recent_path"], *first, "{result}");
+    } else {
+        println!("no recent workspaces listed; recent pick not exercised");
+    }
 }

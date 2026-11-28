@@ -81,7 +81,7 @@ fn session(revision_note: &str) -> SessionView {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs Chrome/Chromium; run with --ignored"]
-async fn copy_button_copies_raw_markdown_in_headless_chrome() {
+async fn tc_3750_copy_button_copies_raw_markdown_in_headless_chrome() {
     let Some(chrome) = find_chrome() else {
         println!("SKIP: no Chrome/Chromium found (set DMUXAI_CHROME)");
         return;

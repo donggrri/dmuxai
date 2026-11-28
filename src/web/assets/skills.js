@@ -17,8 +17,10 @@
     return node;
   }
 
-  function api(method, path, body) {
+  function api(method, path, body, human) {
     var headers = { 'X-Dmuxai-Client': '1' };
+    // FR-3762: approvals are human-only; sent from a click handler only.
+    if (human === true) { headers['X-Dmuxai-Human'] = '1'; }
     if (token) { headers.Authorization = 'Bearer ' + token; }
     var init = { method: method, headers: headers, cache: 'no-store' };
     if (body !== undefined) {
@@ -103,7 +105,7 @@
       btn.type = 'button';
       btn.addEventListener('click', function () {
         if (!window.confirm('Approve the pinned commit of ' + r.skill + '? Its SKILL.md will be sent to agents.')) { return; }
-        api('POST', '/api/skills/approve', { source: r.skill })
+        api('POST', '/api/skills/approve', { source: r.skill }, true)
           .then(function (d) { render(d, null); })
           .catch(function (err) { render(data, String(err.message || err)); });
       });
