@@ -349,15 +349,31 @@ struct SkillsApproveBody {
     source: String,
 }
 
+/// FR-3762 owner approvals use the board human rule, including the WSL host
+/// Origin fallback of FR-3810 on the WSL interface listener.
+fn human_approval_rejection(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: &crate::web::board_api::PeerInfo,
+) -> Option<Response> {
+    crate::web::board_api::human_rejection(
+        crate::web::board_api::wsl_trusted_host_peer(&state.access),
+        headers,
+        peer,
+    )
+}
+
 /// FR-1502: one-time approval of a pinned git skill commit from the dashboard.
 ///
 /// FR-3762: human-only, same browser-header rule as board decisions.
 async fn post_skills_approve(
+    State(state): State<AppState>,
+    peer: crate::web::board_api::PeerInfo,
     Ws(ws): Ws,
     headers: HeaderMap,
     ApiJson(body): ApiJson<SkillsApproveBody>,
 ) -> Response {
-    if let Some(resp) = crate::web::board_api::human_browser_rejection(&headers) {
+    if let Some(resp) = human_approval_rejection(&state, &headers, &peer) {
         return resp;
     }
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
@@ -753,11 +769,13 @@ async fn post_memory_save(Ws(ws): Ws, ApiJson(body): ApiJson<MemorySaveBody>) ->
 
 /// FR-3762: human-only, same browser-header rule as board decisions.
 async fn post_memory_proposal_approve(
+    State(state): State<AppState>,
+    peer: crate::web::board_api::PeerInfo,
     Ws(ws): Ws,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(resp) = crate::web::board_api::human_browser_rejection(&headers) {
+    if let Some(resp) = human_approval_rejection(&state, &headers, &peer) {
         return resp;
     }
     let Some(memory) = memory_handle(&ws) else {
@@ -779,11 +797,13 @@ async fn post_memory_proposal_approve(
 
 /// FR-3762: human-only, same browser-header rule as board decisions.
 async fn post_memory_proposal_reject(
+    State(state): State<AppState>,
+    peer: crate::web::board_api::PeerInfo,
     Ws(ws): Ws,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(resp) = crate::web::board_api::human_browser_rejection(&headers) {
+    if let Some(resp) = human_approval_rejection(&state, &headers, &peer) {
         return resp;
     }
     let Some(memory) = memory_handle(&ws) else {
@@ -2631,6 +2651,7 @@ pub fn build_router_with_directory_access(
             crate::web::board_api::board_base_from_services(&state.workspaces.focused().services),
             crate::web::board_api::state_root_from_services(&state.workspaces.focused().services),
             state.workspaces.focused().services.web_attached,
+            &state.access,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),

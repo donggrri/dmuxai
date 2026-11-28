@@ -13,11 +13,24 @@ use crate::graph::{
 use crate::settings::DmuxSettings;
 use crate::state_path::valid_pending_plan_hash;
 
+/// `graph-pending/<hash>.json`, shared with the headless planner
+/// (`--approve-plan-id`, FR-2545) so both sides hash the same bytes (FR-3813).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingPlanFile {
     pub prompt: String,
     pub tasks: Vec<PlanTask>,
     pub steps: Vec<PlanStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_cap: Option<usize>,
+}
+
+impl PendingPlanFile {
+    /// Canonical JSON and its plan hash (first 16 hex chars of its sha256).
+    pub fn json_and_hash(&self) -> Result<(String, String), serde_json::Error> {
+        let json = serde_json::to_string(self)?;
+        let hash = sha256_hex(json.as_bytes()).chars().take(16).collect();
+        Ok((json, hash))
+    }
 }
 
 pub fn pending_plan_path(state: &Path, hash: &str) -> PathBuf {
@@ -190,21 +203,32 @@ pub fn read_pending_plan(state: &Path, hash: &str) -> Result<PendingPlanFile, Bo
 }
 
 pub fn pending_hash_for_plan(plan: &PendingPlanFile) -> Result<String, BoardError> {
-    let json = serde_json::to_string(plan).map_err(|e| BoardError::Internal(e.to_string()))?;
-    Ok(sha256_hex(json.as_bytes())
-        .chars()
-        .take(16)
-        .collect::<String>())
+    plan.json_and_hash()
+        .map(|(_, hash)| hash)
+        .map_err(|e| BoardError::Internal(e.to_string()))
 }
 
 pub fn write_pending_plan(state: &Path, plan: &PendingPlanFile) -> Result<String, BoardError> {
-    let hash = pending_hash_for_plan(plan)?;
+    let (json, hash) = plan
+        .json_and_hash()
+        .map_err(|e| BoardError::Internal(e.to_string()))?;
     let dir = state.join("graph-pending");
     crate::board::store::ensure_dir(&dir)?;
     let path = dir.join(format!("{hash}.json"));
-    let json = serde_json::to_string(plan).map_err(|e| BoardError::Internal(e.to_string()))?;
     crate::board::store::atomic_write(&path, json.as_bytes())?;
     Ok(hash)
+}
+
+/// The unmasked pending plan behind an item's current plan, if it has one.
+pub fn unmasked_pending_from_item_plan(
+    state_root: &Path,
+    board_base: &Path,
+    plan: Option<&super::BoardPlan>,
+) -> Result<Option<PendingPlanFile>, BoardError> {
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    read_pending_or_board_copy(state_root, board_base, &plan.hash).map(Some)
 }
 
 pub fn unmasked_prompt_from_item_plan(
@@ -212,11 +236,7 @@ pub fn unmasked_prompt_from_item_plan(
     board_base: &Path,
     plan: Option<&super::BoardPlan>,
 ) -> Result<Option<String>, BoardError> {
-    let Some(plan) = plan else {
-        return Ok(None);
-    };
-    let pending = read_pending_or_board_copy(state_root, board_base, &plan.hash)?;
-    Ok(Some(pending.prompt))
+    Ok(unmasked_pending_from_item_plan(state_root, board_base, plan)?.map(|p| p.prompt))
 }
 
 /// Runner list and model hints for board plan edits. This is a pre-check only;
@@ -271,6 +291,26 @@ pub fn edit_plan_from_json(
     json_text: &str,
     inherit_tasks: Option<Vec<PlanTask>>,
 ) -> Result<(PendingPlanFile, String), BoardError> {
+    edit_plan_from_json_keep_cap(
+        workspace_root,
+        state_root,
+        stored_prompt,
+        json_text,
+        inherit_tasks,
+        None,
+    )
+}
+
+/// Like [`edit_plan_from_json`], carrying the approved `dynamic_cap` of the
+/// plan being edited into the new pending plan (FR-3813).
+pub fn edit_plan_from_json_keep_cap(
+    workspace_root: &Path,
+    state_root: &Path,
+    stored_prompt: &str,
+    json_text: &str,
+    inherit_tasks: Option<Vec<PlanTask>>,
+    dynamic_cap: Option<usize>,
+) -> Result<(PendingPlanFile, String), BoardError> {
     let mut doc = parse_plan(json_text).map_err(|errors| {
         BoardError::Failed(
             errors
@@ -294,7 +334,8 @@ pub fn edit_plan_from_json(
     if let Some(expanded) = expand_doc(&settings, &normalized_prompt, &doc, &graph) {
         doc = expanded;
     }
-    let plan = pending_from_doc(&normalized_prompt, &doc);
+    let mut plan = pending_from_doc(&normalized_prompt, &doc);
+    plan.dynamic_cap = dynamic_cap;
     let hash = write_pending_plan(state_root, &plan)?;
     Ok((plan, hash))
 }
@@ -373,6 +414,7 @@ pub fn expand_pending_plan(
         prompt: pending.prompt.clone(),
         tasks: expanded.tasks,
         steps: expanded.steps,
+        dynamic_cap: pending.dynamic_cap,
     };
     let hash = write_pending_plan(state_root, &plan)?;
     Ok(Some((plan, hash)))
@@ -383,6 +425,7 @@ pub fn pending_from_doc(prompt: &str, doc: &PlanDoc) -> PendingPlanFile {
         prompt: super::normalize_plan_prompt(prompt),
         tasks: doc.tasks.clone(),
         steps: doc.steps.clone(),
+        dynamic_cap: None,
     }
 }
 
@@ -622,6 +665,7 @@ mod tests {
             prompt: "ship it".to_owned(),
             tasks: raw_doc.tasks,
             steps: raw_doc.steps,
+            dynamic_cap: None,
         };
         let raw_hash = write_pending_plan(&state, &raw).unwrap();
         let store = BoardStore::open(state.join("board")).unwrap();
@@ -660,6 +704,164 @@ mod tests {
         assert_eq!(off_pending.steps.len(), 1);
         restore_xdg(prev);
         drop(guard);
+    }
+
+    // TC-3813 / FR-3813: a pending plan with `dynamic_cap` written by the headless
+    // planner attaches by hash, board edits keep the cap, and plans without a
+    // cap hash exactly as before.
+    #[test]
+    fn tc_3813_dynamic_cap_hash_roundtrip() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        ensure_dir(&state.join("graph-pending")).unwrap();
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let (guard, prev) = spec_first_user_config(dir.path(), "off");
+
+        // Bytes exactly as `headless_write_pending_plan` serializes them.
+        let step = r#"{"id":"step-1","role":"implement","job":"edit","runner":"cursor","depends_on":[],"task":"task-1"}"#;
+        let task = r#"{"id":"task-1","title":"do it","done_check":"done","areas":[],"size":"small","depends_on":[]}"#;
+        let headless_json =
+            format!(r#"{{"prompt":"ship it","tasks":[{task}],"steps":[{step}],"dynamic_cap":3}}"#);
+        let headless_hash: String = sha256_hex(headless_json.as_bytes())
+            .chars()
+            .take(16)
+            .collect();
+        std::fs::write(pending_plan_path(&state, &headless_hash), &headless_json).unwrap();
+
+        let pending = read_pending_plan(&state, &headless_hash).unwrap();
+        assert_eq!(pending.dynamic_cap, Some(3));
+        assert_eq!(pending_hash_for_plan(&pending).unwrap(), headless_hash);
+        assert_eq!(pending.json_and_hash().unwrap().0, headless_json);
+
+        let item = store
+            .add(AddItemRequest {
+                title: "dynamic".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(headless_hash.clone()),
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .expect("board add --plan-hash accepts a dynamic plan");
+        let attached = store
+            .attach_plan(&item.id, &headless_hash, &state, "bot:test")
+            .expect("board plan --hash accepts a dynamic plan");
+        assert_eq!(attached.plan.as_ref().unwrap().hash, headless_hash);
+
+        // Edit through the same path the dashboard, CLI and MCP use.
+        let stored = unmasked_pending_from_item_plan(&state, &board_base, attached.plan.as_ref())
+            .unwrap()
+            .unwrap();
+        let edited_json = sample_plan_json().replace("\"edit\"", "\"edit-more\"");
+        let (edited, edited_hash) = edit_plan_from_json_keep_cap(
+            &workspace,
+            &state,
+            &stored.prompt,
+            &edited_json,
+            attached.plan.as_ref().map(|p| p.tasks.clone()),
+            stored.dynamic_cap,
+        )
+        .unwrap();
+        assert_eq!(edited.dynamic_cap, Some(3));
+        let edited_bytes = std::fs::read(pending_plan_path(&state, &edited_hash)).unwrap();
+        let edited_prefix: String = sha256_hex(&edited_bytes).chars().take(16).collect();
+        assert_eq!(edited_prefix, edited_hash);
+        assert!(String::from_utf8_lossy(&edited_bytes).contains("\"dynamic_cap\":3"));
+        let revised = store
+            .edit_plan(&item.id, &edited_hash, &workspace, &state, "bot:test")
+            .unwrap();
+        assert_eq!(revised.plan.as_ref().unwrap().hash, edited_hash);
+        assert_eq!(
+            read_pending_plan(&state, &edited_hash).unwrap().dynamic_cap,
+            Some(3)
+        );
+
+        // FR-3715 with FR-3813: spec-first on, `board add --plan-hash` verifies
+        // the planner's hash, then stores the expanded plan under the hash of
+        // its own bytes, which keep `dynamic_cap`; re-saving it is a no-op.
+        restore_xdg(prev);
+        drop(guard);
+        let (guard, prev) = spec_first_user_config(dir.path(), "full");
+        let expanded_item = store
+            .add(AddItemRequest {
+                title: "dynamic expanded".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(headless_hash.clone()),
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let expanded_plan = expanded_item.plan.as_ref().unwrap();
+        assert_ne!(expanded_plan.hash, headless_hash);
+        assert_eq!(expanded_plan.spec_first_added, ["spec-1", "test-1"]);
+        let expanded_bytes = std::fs::read(pending_plan_path(&state, &expanded_plan.hash)).unwrap();
+        let expanded_prefix: String = sha256_hex(&expanded_bytes).chars().take(16).collect();
+        assert_eq!(expanded_prefix, expanded_plan.hash);
+        let expanded = read_pending_plan(&state, &expanded_plan.hash).unwrap();
+        assert_eq!(expanded.dynamic_cap, Some(3));
+        assert_eq!(expanded.steps.len(), 3);
+        let resaved =
+            serde_json::json!({ "tasks": expanded.tasks, "steps": expanded.steps }).to_string();
+        let (resaved_plan, resaved_hash) = edit_plan_from_json_keep_cap(
+            &workspace,
+            &state,
+            &expanded.prompt,
+            &resaved,
+            None,
+            expanded.dynamic_cap,
+        )
+        .unwrap();
+        assert_eq!(resaved_plan.dynamic_cap, Some(3));
+        assert_eq!(resaved_hash, expanded_plan.hash);
+        restore_xdg(prev);
+        drop(guard);
+
+        // Boundary: no cap -> no `dynamic_cap` key, hash of the legacy bytes.
+        let legacy_json = format!(r#"{{"prompt":"ship it","tasks":[{task}],"steps":[{step}]}}"#);
+        let legacy: PendingPlanFile = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.dynamic_cap, None);
+        let (legacy_out, legacy_hash) = legacy.json_and_hash().unwrap();
+        assert_eq!(legacy_out, legacy_json);
+        assert_eq!(
+            legacy_hash,
+            sha256_hex(legacy_json.as_bytes())
+                .chars()
+                .take(16)
+                .collect::<String>()
+        );
+        assert_ne!(legacy_hash, headless_hash);
+
+        // Failure: a tampered cap no longer matches the planner's hash.
+        let tampered = headless_json.replace("\"dynamic_cap\":3", "\"dynamic_cap\":8");
+        let tampered_hash: String = sha256_hex(tampered.as_bytes()).chars().take(16).collect();
+        std::fs::write(pending_plan_path(&state, &headless_hash), &tampered).unwrap();
+        let err = store
+            .attach_plan(&item.id, &headless_hash, &state, "bot:test")
+            .unwrap_err();
+        assert!(matches!(err, BoardError::Failed(_)), "{err}");
+        assert_ne!(tampered_hash, headless_hash);
     }
 
     #[test]

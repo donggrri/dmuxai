@@ -1,6 +1,6 @@
 # SPEC: Board web fixes (WSL human actions, plan save fields, dynamic plan hash, stale-plan notice)
 
-Status: approved (Dongjin 2026-11-28)
+Status: implemented
 Owner: Dongjin
 Created: 2026-11-28
 Baseline: `068b920`

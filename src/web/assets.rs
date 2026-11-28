@@ -2827,6 +2827,45 @@ mod tests {
         assert!(BOARD_JS.contains("No answer yet"));
     }
 
+    // TC-3812 (FR-3812): Save plan starts each row from its original step, so
+    // fields the table does not edit (task, sensitive, ...) survive, and new rows
+    // join the first task.
+    #[test]
+    fn tc_3812_board_save_keeps_step_fields() {
+        let collect_fn = js_between(
+            BOARD_JS,
+            "function boardCollectSteps",
+            "function boardSavePlan",
+        );
+        assert!(collect_fn.contains("plan.steps"));
+        assert!(collect_fn.contains("row.getAttribute('data-step-index')"));
+        assert!(collect_fn.contains("original[parseInt(index, 10)]"));
+        assert!(collect_fn.contains("for (var key in base)"));
+        assert!(collect_fn.contains("step[key] = base[key]"));
+        assert!(collect_fn.contains("tasks[0].id"));
+        assert!(collect_fn.contains("step.task = firstTaskId"));
+        assert!(
+            !collect_fn.contains("task: null"),
+            "a fresh step object must not clear the original task"
+        );
+
+        let save_fn = js_between(
+            BOARD_JS,
+            "function boardSavePlan",
+            "function boardAddPlanStep",
+        );
+        assert!(save_fn.contains("boardCollectSteps(plan)"));
+        assert!(save_fn.contains("boardSelectedItem.plan"));
+        assert!(BOARD_JS.contains("boardSavePlan(item.id, item.plan)"));
+
+        let render_fn = js_between(
+            BOARD_JS,
+            "function boardRenderPlanTable",
+            "function boardCountPlannerMessages",
+        );
+        assert!(render_fn.contains("tr.setAttribute('data-step-index', String(i))"));
+    }
+
     // TC-3417 (FR-3416, FR-3417)
     #[tokio::test]
     async fn tc_3417_markdown_paths_linkified_and_open_viewer() {

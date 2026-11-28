@@ -1027,8 +1027,13 @@ with sync_playwright() as p:
     no_decision = page.evaluate(
         """async (p) => !(await (await fetch('/api/board/' + encodeURIComponent(p.id))).json()).decision""",
         {{"id": item_id}})
-    notice = page.evaluate(
-        "() => (document.body.innerText || '').includes('Plan changed')")
+    try:
+        page.wait_for_function(
+            "() => (document.body.innerText || '').includes('Plan changed')",
+            timeout=10000)
+        notice = True
+    except Exception:
+        notice = False
     browser.close()
     print(json.dumps({{
         "no_decision": no_decision,
@@ -1048,10 +1053,11 @@ with sync_playwright() as p:
             result["no_decision"].as_bool().unwrap_or(false),
             "stale approve must not record decision: {result}"
         );
-        // TODO(#369): make this a hard assert once fixed
-        if !result["plan_changed_ui"].as_bool().unwrap_or(false) {
-            println!("KNOWN-BUG #369: stale approve shows no 'Plan changed' notice");
-        }
+        // FR-3814 (#369)
+        assert!(
+            result["plan_changed_ui"].as_bool().unwrap_or(false),
+            "stale approve must show the 'Plan changed' notice: {result}"
+        );
         let shown = board_show(&env, id);
         assert_eq!(shown["lane"].as_str(), Some("needs_decision"));
         assert!(shown.get("decision").is_none() || shown["decision"].is_null());
@@ -1061,6 +1067,179 @@ with sync_playwright() as p:
             "stale approve must not run: {log}"
         );
     }
+}
+
+const BOARD_PLAN_JSON_TWO_TASKS: &str = r#"{"tasks":[{"id":"task-1","title":"first","done_check":"done","size":"small","depends_on":[]},{"id":"task-2","title":"second","done_check":"done","size":"small","depends_on":["task-1"]}],"steps":[{"id":"step-1","role":"implement","job":"edit one","runner":"cursor","depends_on":[],"task":"task-1"},{"id":"step-2","role":"implement","job":"edit two","runner":"cursor","depends_on":["step-1"],"sensitive":true,"task":"task-2"}]}"#;
+
+// TC-3812 (SPEC-board-web-fixes FR-3812, #359)
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3812_board_save_plan_keeps_task_and_sensitive() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let item = board_add(&env, "Save keeps fields", "Edit me", "needs_decision");
+    let id = item["id"].as_str().expect("id");
+    board_plan_edit(&env, id, "ship it", BOARD_PLAN_JSON_TWO_TASKS);
+    let (_guard, url) = start_web(&env, &[]);
+
+    // Board events re-render the open modal, which would discard the edits
+    // typed below, so the event stream is blocked for this test.
+    let script = format!(
+        r##"{OPEN_BOARD}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    page.route("**/api/board/events**", lambda route: route.abort())
+    open_board(page)
+    open_item(page)
+    page.wait_for_function(
+        "() => document.querySelectorAll('#board-plan-steps tbody tr').length === 2",
+        timeout=20000)
+    page.fill('#board-plan-steps tr[data-step-index="0"] textarea[data-field="job"]',
+              'edit one more')
+    page.locator('#board-add-step').click(force=True)
+    last = '#board-plan-steps tbody tr:last-child '
+    page.fill(last + 'input[data-field="id"]', 'step-3')
+    page.fill(last + 'input[data-field="role"]', 'implement')
+    page.fill(last + 'input[data-field="runner"]', 'cursor')
+    page.fill(last + 'input[data-field="depends_on"]', 'step-1')
+    page.fill(last + 'textarea[data-field="job"]', 'extra step')
+    with page.expect_response(
+        lambda r: r.url.split('?')[0].endswith('/plan') and r.request.method == 'POST',
+        timeout=20000) as resp_info:
+        page.locator('#board-save-plan').click(force=True)
+    status = resp_info.value.status
+    errors = page.evaluate(
+        "() => (document.getElementById('board-plan-errors') || {{}}).textContent || ''")
+    browser.close()
+    print(json.dumps({{"status": status, "errors": errors}}))
+"##
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, id]);
+    assert_eq!(result["status"].as_u64(), Some(200), "{result}");
+    let shown = board_show(&env, id);
+    let plan = &shown["plan"];
+    assert_eq!(plan["revision"].as_u64(), Some(2), "{shown}");
+    let steps = plan["steps"].as_array().expect("plan steps");
+    assert_eq!(steps.len(), 3, "{shown}");
+    assert_eq!(steps[0]["id"].as_str(), Some("step-1"));
+    assert_eq!(steps[0]["job"].as_str(), Some("edit one more"));
+    assert_eq!(steps[0]["task"].as_str(), Some("task-1"));
+    assert_eq!(steps[1]["id"].as_str(), Some("step-2"));
+    assert_eq!(steps[1]["task"].as_str(), Some("task-2"));
+    assert_eq!(steps[1]["sensitive"].as_bool(), Some(true));
+    assert_eq!(steps[2]["id"].as_str(), Some("step-3"));
+    assert_eq!(steps[2]["task"].as_str(), Some("task-1"));
+    assert!(steps[2].get("sensitive").is_none(), "{shown}");
+}
+
+// TC-3814 (SPEC-board-web-fixes FR-3814, #369)
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3814_stale_approve_shows_notice() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let _ = fs::remove_file(&env.argv_log);
+    let item = board_add(&env, "Stale in modal", "Plan changes", "needs_decision");
+    let id = item["id"].as_str().expect("id");
+    board_plan_edit(&env, id, "ship it", BOARD_PLAN_JSON);
+    let (_guard, url) = start_web(&env, &[]);
+
+    // The board event stream is blocked so the page keeps the plan hash it had
+    // when the modal opened; the test drives list refreshes itself.
+    let script = format!(
+        r##"{OPEN_BOARD}
+PLAN_V2 = json.loads({plan_body:?})
+
+NOTICE = "() => {{ const n = document.querySelector('#board-drawer .board-plan-notice'); return !!n && (n.textContent || '').includes('Plan changed'); }}"
+
+def approve_in_page():
+    page.evaluate("""(id) => {{
+      document.querySelector(
+        '.board-decision-card[data-item-id="' + id + '"] [data-board-action="approve"]').click();
+    }}""", item_id)
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    page.route("**/api/board/events**", lambda route: route.abort())
+    open_board(page)
+    open_item(page)
+    old_meta = page.inner_text('#board-drawer .board-plan-meta')
+    ok = page.evaluate("""async (p) => {{
+      const r = await fetch('/api/board/' + encodeURIComponent(p.id) + '/plan', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json', 'X-Dmuxai-Client': '1'}},
+        body: JSON.stringify(p.body),
+      }});
+      return r.ok;
+    }}""", {{"id": item_id, "body": PLAN_V2}})
+    assert ok, 'plan revision via API failed'
+    with page.expect_response(
+        lambda r: '/decision' in r.url and r.request.method == 'POST',
+        timeout=20000) as resp_info:
+        approve_in_page()
+    status = resp_info.value.status
+    page.wait_for_function(NOTICE, timeout=10000)
+    page.wait_for_function(
+        "(old) => {{ const m = document.querySelector('#board-drawer .board-plan-meta'); return !!m && m.textContent !== old; }}",
+        arg=old_meta, timeout=10000)
+    # A later list refresh re-fetches the open item; the notice must survive it.
+    with page.expect_response(
+        lambda r: r.url.split('?')[0].endswith('/api/board/' + item_id)
+            and r.request.method == 'GET',
+        timeout=10000):
+        page.evaluate("() => boardRefreshList()")
+    page.wait_for_timeout(500)
+    after_refresh = page.evaluate(NOTICE)
+    no_decision = page.evaluate(
+        """async (p) => !(await (await fetch('/api/board/' + encodeURIComponent(p.id))).json()).decision""",
+        {{"id": item_id}})
+    page.locator('#board-modal-close').click(force=True)
+    page.wait_for_function(
+        "() => !document.getElementById('board-drawer-wrap').classList.contains('open')",
+        timeout=5000)
+    open_item(page)
+    page.wait_for_selector('#board-drawer .board-plan-meta', timeout=10000)
+    page.wait_for_timeout(500)
+    after_reopen = page.evaluate(NOTICE)
+    browser.close()
+    print(json.dumps({{
+        "status": status,
+        "after_refresh": after_refresh,
+        "after_reopen": after_reopen,
+        "no_decision": no_decision,
+    }}))
+"##,
+        plan_body = BOARD_PLAN_JSON_V2,
+    );
+
+    let result = run_probe(&python, &chrome, &script, &[&url, id]);
+    assert_eq!(result["status"].as_u64(), Some(409), "{result}");
+    assert!(
+        result["after_refresh"].as_bool().unwrap_or(false),
+        "notice must stay after a list refresh: {result}"
+    );
+    assert!(
+        !result["after_reopen"].as_bool().unwrap_or(true),
+        "closing the modal clears the notice: {result}"
+    );
+    assert!(result["no_decision"].as_bool().unwrap_or(false), "{result}");
+    let shown = board_show(&env, id);
+    assert_eq!(shown["lane"].as_str(), Some("needs_decision"));
+    assert!(shown.get("decision").is_none() || shown["decision"].is_null());
+    let log = argv_log_text(&env);
+    assert!(
+        !log.contains("--graph"),
+        "stale approve must not run: {log}"
+    );
 }
 
 // TC-3606

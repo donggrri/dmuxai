@@ -515,9 +515,12 @@ Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 | POST | `/api/board/{id}/run` | `{plan_hash?}` | `202` item (`--web` only) | 400, 401, 403, 404, 409 |
 
 Dashboard writes act as `owner`. Owner writes (`POST /decision`, `POST /check`,
-`POST /lane`) require `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode`, and
-`X-Dmuxai-Human: 1` (else `403`). Invalid item ids return `400` before any
-store access.
+`POST /lane`, `PUT /rules`) require `Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode`, and
+`X-Dmuxai-Human: 1` (else `403`). On the WSL interface listener only, a request
+from the trusted Windows host with no `Sec-Fetch-*` headers is accepted when it
+carries `X-Dmuxai-Human: 1` and `Origin: http://<Host>` (browsers send no fetch
+metadata to a plain-HTTP non-loopback origin). Invalid item ids return `400`
+before any store access.
 
 Dashboard HTTP (user-level, same Bearer token; `serve` and `--web`):
 

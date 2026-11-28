@@ -28,7 +28,7 @@ var boardUiOpen = false;
 var boardShowClosed = false;
 var boardWorkspaceFilter = '';
 var boardRulesOpen = false;
-var boardPlanConflict = false;
+var boardPlanConflictId = null;
 var boardLaunchAllowed = false;
 var boardAskPending = {};
 var BOARD_ASK_POLL_MS = 3000;
@@ -608,6 +608,7 @@ function boardCloseDrawer() {
   boardNeedsFocus = false;
   boardSelectedId = null;
   boardSelectedItem = null;
+  boardPlanConflictId = null;
   if (focusTarget && focusTarget.isConnected && typeof focusTarget.focus === 'function') {
     try { focusTarget.focus(); } catch (err) { /* ignore */ }
   } else if (fallbackId) {
@@ -760,7 +761,7 @@ function boardRenderDrawer(item) {
     }
     drawer.appendChild(boardEl('p', 'board-plan-meta',
       (item.plan.hash || '—') + ' · revision ' + item.plan.revision));
-    if (boardPlanConflict) {
+    if (boardPlanConflictId === item.id) {
       drawer.appendChild(boardEl('p', 'board-plan-notice', 'Plan changed — reload'));
     }
     var planScroll = boardEl('div', 'board-plan-table-wrap');
@@ -807,7 +808,7 @@ function boardRenderDrawer(item) {
     savePlan.id = 'board-save-plan';
     planActions.appendChild(savePlan);
     drawer.appendChild(planActions);
-    savePlan.addEventListener('click', function () { boardSavePlan(item.id); });
+    savePlan.addEventListener('click', function () { boardSavePlan(item.id, item.plan); });
     addStep.addEventListener('click', function () { boardAddPlanStep(); });
     var errBox = boardEl('div', 'board-plan-errors');
     errBox.id = 'board-plan-errors';
@@ -1066,14 +1067,28 @@ function boardRunItem(item) {
     });
 }
 
-function boardCollectSteps() {
+/* Rows keep every field of their original plan step that the table does not
+   edit (task, sensitive, ...); new rows join the first task (FR-3812). */
+function boardCollectSteps(plan) {
   var tbody = document.querySelector('#board-plan-steps tbody');
   if (!tbody) { return []; }
+  var original = plan && Array.isArray(plan.steps) ? plan.steps : [];
+  var tasks = plan && Array.isArray(plan.tasks) ? plan.tasks : [];
+  var firstTaskId = tasks.length && tasks[0] && tasks[0].id ? tasks[0].id : null;
   var steps = [];
   var rows = tbody.querySelectorAll('tr');
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i];
-    var step = { id: '', role: '', runner: '', model: null, depends_on: [], job: '', task: null };
+    var index = row.getAttribute('data-step-index');
+    var base = index !== null ? original[parseInt(index, 10)] : null;
+    var step = { id: '', role: '', runner: '', depends_on: [], job: '' };
+    if (base) {
+      for (var key in base) {
+        if (Object.prototype.hasOwnProperty.call(base, key)) { step[key] = base[key]; }
+      }
+    } else if (firstTaskId) {
+      step.task = firstTaskId;
+    }
     var inputs = row.querySelectorAll('input, textarea');
     for (var j = 0; j < inputs.length; j++) {
       var field = inputs[j].getAttribute('data-field');
@@ -1091,13 +1106,15 @@ function boardCollectSteps() {
   return steps;
 }
 
-function boardSavePlan(id) {
-  var steps = boardCollectSteps();
+function boardSavePlan(id, plan) {
+  if (!plan && boardSelectedItem && boardSelectedItem.id === id) {
+    plan = boardSelectedItem.plan;
+  }
+  var steps = boardCollectSteps(plan);
   var errBox = document.getElementById('board-plan-errors');
   if (errBox) { errBox.textContent = ''; }
   boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/plan', { steps: steps })
     .then(function () {
-      boardPlanConflict = false;
       boardOpenDrawer(id, true);
       boardRefreshList();
     })
@@ -1159,6 +1176,9 @@ function boardOpenDrawer(id, skipPush) {
     boardLastFocusItemId = id;
     boardNeedsFocus = true;
   }
+  if (boardPlanConflictId !== id) {
+    boardPlanConflictId = null;
+  }
   boardSelectedId = id;
   if (wrap) {
     wrap.hidden = false;
@@ -1175,7 +1195,6 @@ function boardOpenDrawer(id, skipPush) {
   boardFetchJson('GET', '/api/board/' + encodeURIComponent(id)).then(function (item) {
     if (boardSelectedId !== id) { return; }
     boardSelectedItem = item;
-    boardPlanConflict = false;
     boardRenderDrawer(item);
   }).catch(function () {
     if (boardSelectedId === id) {
@@ -1227,7 +1246,9 @@ function boardDecide(id, verdict, extra) {
   }
   return boardFetchJson('POST', '/api/board/' + encodeURIComponent(id) + '/decision', body, true)
     .then(function (data) {
-      boardPlanConflict = false;
+      if (boardPlanConflictId === id) {
+        boardPlanConflictId = null;
+      }
       if (verdict === 'approve') {
         boardShowDecisionNotice(data && data.auto_run);
       }
@@ -1235,10 +1256,11 @@ function boardDecide(id, verdict, extra) {
     })
     .catch(function (err) {
       if (err.status === 409) {
-        boardPlanConflict = true;
-        if (boardSelectedId === id) {
-          boardOpenDrawer(id, true);
-        }
+        /* FR-3814: reload the item in the modal and keep the notice until a
+           new decision, closing the modal, or opening another item. */
+        boardPlanConflictId = id;
+        boardOpenDrawer(id, boardSelectedId === id);
+        boardRefreshList();
       }
     });
 }

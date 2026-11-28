@@ -1099,15 +1099,9 @@ struct SpecReviewPanel {
     notice: Option<String>,
 }
 
-/// FR-2545: persisted plan document for `--approve-plan-id`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct HeadlessPendingPlan {
-    prompt: String,
-    tasks: Vec<PlanTask>,
-    steps: Vec<PlanStep>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    dynamic_cap: Option<usize>,
-}
+/// FR-2545: persisted plan document for `--approve-plan-id`; the board reads and
+/// hashes the same type (FR-3813).
+type HeadlessPendingPlan = dmuxai::board::PendingPlanFile;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadlessPlan {
@@ -15635,17 +15629,13 @@ impl App {
             steps,
             dynamic_cap,
         };
-        let json = match serde_json::to_string(&pending) {
-            Ok(json) => json,
+        let (json, hash) = match pending.json_and_hash() {
+            Ok(pair) => pair,
             Err(error) => {
                 self.push_system(format!("Could not save the pending plan: {error}"));
                 return None;
             }
         };
-        let hash: String = dmuxai::docs::sha256_hex(json.as_bytes())
-            .chars()
-            .take(16)
-            .collect();
         let dir = match dmuxai::state_path::state_base() {
             Ok(base) => base.join("graph-pending"),
             Err(error) => {

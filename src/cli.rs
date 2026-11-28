@@ -3739,7 +3739,7 @@ fn execute_board_with_caller(
         AddItemRequest, DecideRequest, Grade, Kind, Lane, SayRequest, UpdateItemRequest, Verdict,
         WaitFilter, WaitFor, WaitOutcome, resolve_actor, wait_ready_json,
     };
-    use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json};
+    use dmuxai::board::{RulesStore, compile_rules_from_set_text, edit_plan_from_json_keep_cap};
 
     let json_out = command.json;
     let state_root = match dmuxai::state_path::state_base() {
@@ -3962,17 +3962,22 @@ fn execute_board_with_caller(
                             .as_deref()
                             .map(PathBuf::from)
                             .unwrap_or_else(|| workspace_root.to_path_buf());
-                        let stored_prompt = if let Some(prompt_path) = prompt {
-                            dmuxai::board::read_path_or_stdin(&prompt_path)
-                                .map_err(ApiError::from)?
-                        } else {
-                            dmuxai::board::unmasked_prompt_from_item_plan(
-                                &state_root,
-                                store.base(),
-                                item.plan.as_ref(),
+                        let stored = dmuxai::board::unmasked_pending_from_item_plan(
+                            &state_root,
+                            store.base(),
+                            item.plan.as_ref(),
+                        );
+                        let (stored_prompt, dynamic_cap) = if let Some(prompt_path) = prompt {
+                            (
+                                dmuxai::board::read_path_or_stdin(&prompt_path)
+                                    .map_err(ApiError::from)?,
+                                stored.ok().flatten().and_then(|p| p.dynamic_cap),
                             )
-                            .map_err(ApiError::from)?
-                            .unwrap_or_default()
+                        } else {
+                            match stored.map_err(ApiError::from)? {
+                                Some(pending) => (pending.prompt, pending.dynamic_cap),
+                                None => (String::new(), None),
+                            }
                         };
                         if stored_prompt.trim().is_empty() {
                             return Err(ApiError::new(
@@ -3982,9 +3987,15 @@ fn execute_board_with_caller(
                             ));
                         }
                         let inherit = item.plan.as_ref().map(|p| p.tasks.clone());
-                        let (_pending, hash) =
-                            edit_plan_from_json(&ws, &state_root, &stored_prompt, &text, inherit)
-                                .map_err(ApiError::from)?;
+                        let (_pending, hash) = edit_plan_from_json_keep_cap(
+                            &ws,
+                            &state_root,
+                            &stored_prompt,
+                            &text,
+                            inherit,
+                            dynamic_cap,
+                        )
+                        .map_err(ApiError::from)?;
                         store
                             .edit_plan(&id, &hash, &ws, &state_root, &by)
                             .map_err(ApiError::from)?
