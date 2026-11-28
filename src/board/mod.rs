@@ -10,9 +10,9 @@ mod store;
 pub use mcp::invoke as mcp_invoke;
 
 pub use plan::{
-    PendingPlanFile, board_plan_copy_path, edit_plan_from_json, ensure_pending_plan_from_copy,
-    pending_plan_path, prune_old_plan_copies, read_pending_plan, unmasked_prompt_from_item_plan,
-    write_board_plan_copy,
+    PendingPlanFile, board_plan_copy_path, edit_plan_from_json, edit_plan_from_json_keep_cap,
+    ensure_pending_plan_from_copy, pending_plan_path, prune_old_plan_copies, read_pending_plan,
+    unmasked_pending_from_item_plan, unmasked_prompt_from_item_plan, write_board_plan_copy,
 };
 pub use rules::{BoardRules, RulesStore, compile_rules_from_set_text, default_rules};
 pub use store::{
@@ -767,6 +767,7 @@ mod tests {
             prompt: unmasked_prompt.clone(),
             tasks: vec![],
             steps: vec![],
+            dynamic_cap: None,
         };
         let hash = write_pending_plan(&state, &pending).unwrap();
         let created = store

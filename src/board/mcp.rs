@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use super::edit_plan_from_json;
+use super::edit_plan_from_json_keep_cap;
 use super::{
     AddItemRequest, BoardCaller, Grade, Kind, Lane, ListFilter, SayRequest, TEXT_MAX,
     UpdateItemRequest, WaitFilter, WaitFor, WaitOutcome, resolve_actor, validate_item_id_early,
@@ -331,16 +331,21 @@ fn board_plan(workspace_root: &std::path::Path, args: &Value) -> Result<Value, A
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| workspace_root.to_path_buf());
-        let prompt = if let Some(prompt) = str_arg(args, "prompt") {
-            super::read_path_or_stdin(prompt).map_err(ApiError::from)?
-        } else {
-            super::plan::unmasked_prompt_from_item_plan(
-                &state_root,
-                store.base(),
-                item.plan.as_ref(),
+        let stored = super::plan::unmasked_pending_from_item_plan(
+            &state_root,
+            store.base(),
+            item.plan.as_ref(),
+        );
+        let (prompt, dynamic_cap) = if let Some(prompt) = str_arg(args, "prompt") {
+            (
+                super::read_path_or_stdin(prompt).map_err(ApiError::from)?,
+                stored.ok().flatten().and_then(|p| p.dynamic_cap),
             )
-            .map_err(ApiError::from)?
-            .unwrap_or_default()
+        } else {
+            match stored.map_err(ApiError::from)? {
+                Some(pending) => (pending.prompt, pending.dynamic_cap),
+                None => (String::new(), None),
+            }
         };
         if prompt.trim().is_empty() {
             return Err(ApiError::new(
@@ -354,13 +359,14 @@ fn board_plan(workspace_root: &std::path::Path, args: &Value) -> Result<Value, A
             doc["tasks"] = tasks.clone();
         }
         let by = resolve_actor(str_arg(args, "by"), BoardCaller::Mcp).map_err(ApiError::from)?;
-        let (_pending, hash) = edit_plan_from_json(
+        let (_pending, hash) = edit_plan_from_json_keep_cap(
             &ws,
             &state_root,
             &prompt,
             &serde_json::to_string(&doc)
                 .map_err(|e| ApiError::new(exit::INTERNAL, e.to_string()))?,
             inherit_tasks,
+            dynamic_cap,
         )
         .map_err(ApiError::from)?;
         store

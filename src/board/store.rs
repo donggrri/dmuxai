@@ -1660,6 +1660,7 @@ mod tests {
                 task: Some("task-1".to_owned()),
                 ..Default::default()
             }],
+            dynamic_cap: None,
         };
         let hash = write_pending_plan(&state, &plan).unwrap();
         let item = store

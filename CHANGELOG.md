@@ -40,6 +40,7 @@ All notable changes to dmuxai are listed here. Versions follow
 - `run --read-only` without `--agent` no longer stops at the sensitive gate (exit 7), so board Ask planner works without `[board] planner` (#353).
 - Board item chat: Send now asks the planner and posts its answer ("Note only" keeps the old store-only message).
 - Board: live updates and planner answers now work on tokenless dashboards; Ask no longer sticks on "Asking planner…" (#357).
+- Board (SPEC-board-web-fixes): a Windows browser using the WSL dashboard address can approve, check, move and edit rules again instead of getting 403 (#358); Save plan keeps each step's `task` and `sensitive` and puts new steps in the first task (#359); plans with `[graph] dynamic_nodes` attach and edit with the planner's hash and keep their `dynamic_cap` (#360); a stale Approve now shows "Plan changed — reload" in the item popup (#369).
 
 ## [0.4.1] - 2026-11-27
 

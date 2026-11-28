@@ -3,15 +3,16 @@
 use std::convert::Infallible;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -20,13 +21,15 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::board::BoardStore;
 use crate::board::{
     BoardCaller, BoardError, BoardItem, BoardRules, DecideRequest, Lane, ListFilter, RulesStore,
-    SayRequest, Verdict, default_actor_by, default_rules, edit_plan_from_json, resolve_actor,
-    unmasked_prompt_from_item_plan, valid_item_id,
+    SayRequest, Verdict, default_actor_by, default_rules, edit_plan_from_json_keep_cap,
+    resolve_actor, unmasked_pending_from_item_plan, valid_item_id,
 };
 use crate::graph::spec_review::{
     DecideRequest as SpecDecideRequest, ReviewError, SpecReviewStore, Verdict as SpecVerdict,
 };
 use crate::graph::{PlanStep, PlanTask};
+use crate::web::access::{ListenerKind, WebAccess};
+use crate::web::peer_connect::PeerConnectInfo;
 use crate::web::server::{error_json, json_ok};
 
 #[derive(Clone)]
@@ -34,7 +37,11 @@ pub struct BoardApiState {
     pub board_base: PathBuf,
     pub state_root: PathBuf,
     pub launch_allowed: bool,
+    /// Trusted Windows host peer, set only for the WSL interface listener (FR-3810).
+    pub wsl_host_peer: Option<IpAddr>,
 }
+
+pub(crate) type PeerInfo = Option<Extension<ConnectInfo<PeerConnectInfo>>>;
 
 pub fn state_root_from_services(services: &crate::web::server::DashboardServices) -> PathBuf {
     if let Some(env) = &services.trust_env
@@ -52,7 +59,12 @@ pub fn board_base_from_services(services: &crate::web::server::DashboardServices
         .unwrap_or_else(|| state_root_from_services(services).join("board"))
 }
 
-pub fn router<S>(board_base: PathBuf, state_root: PathBuf, launch_allowed: bool) -> Router<S>
+pub fn router<S>(
+    board_base: PathBuf,
+    state_root: PathBuf,
+    launch_allowed: bool,
+    access: &WebAccess,
+) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -60,6 +72,7 @@ where
         board_base,
         state_root,
         launch_allowed,
+        wsl_host_peer: wsl_trusted_host_peer(access),
     };
     Router::new()
         .route("/api/board", get(board_list))
@@ -82,23 +95,61 @@ where
         .with_state(state)
 }
 
+/// The Windows host peer trusted for the WSL Origin fallback; `None` on every
+/// other listener, which keeps the strict rule (FR-3810, FR-3811).
+pub(crate) fn wsl_trusted_host_peer(access: &WebAccess) -> Option<IpAddr> {
+    if access.listener == ListenerKind::WslInterface {
+        access.wsl_host_peer
+    } else {
+        None
+    }
+}
+
+fn human_browser_rejection(
+    state: &BoardApiState,
+    headers: &axum::http::HeaderMap,
+    peer: &PeerInfo,
+) -> Option<Response> {
+    human_rejection(state.wsl_host_peer, headers, peer)
+}
+
 /// Shared human-only rule (SPEC-decision-board FR-3138, SPEC-dashboard-feature-coverage
-/// FR-3762): browser fetch metadata plus `X-Dmuxai-Human: 1`.
-pub(crate) fn human_browser_rejection(headers: &axum::http::HeaderMap) -> Option<Response> {
-    let sec_site = headers
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim);
-    let sec_mode = headers
-        .get("sec-fetch-mode")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let human = headers
-        .get("x-dmuxai-human")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim);
-    if sec_site == Some("same-origin") && sec_mode.is_some() && human == Some("1") {
+/// FR-3762): browser fetch metadata plus `X-Dmuxai-Human: 1`. Browsers send no
+/// `Sec-Fetch-*` to a plain-HTTP non-loopback origin, so on the WSL interface
+/// listener the trusted Windows host peer may instead prove same-origin with
+/// `Origin` (FR-3810, FR-3811).
+pub(crate) fn human_rejection(
+    wsl_host_peer: Option<IpAddr>,
+    headers: &axum::http::HeaderMap,
+    peer: &PeerInfo,
+) -> Option<Response> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+    };
+    let sec_site = header("sec-fetch-site");
+    let sec_mode = header("sec-fetch-mode").filter(|s| !s.is_empty());
+    let human = header("x-dmuxai-human") == Some("1");
+    let strict_ok = sec_site == Some("same-origin") && sec_mode.is_some();
+    let wsl_fallback_ok = || {
+        if sec_site.is_some() || header("sec-fetch-mode").is_some() {
+            return false;
+        }
+        let Some(trusted) = wsl_host_peer else {
+            return false;
+        };
+        let from_trusted = peer
+            .as_ref()
+            .is_some_and(|Extension(ConnectInfo(info))| info.addr.ip() == trusted);
+        let same_origin = match (header("origin"), header("host")) {
+            (Some(origin), Some(host)) => origin == format!("http://{host}"),
+            _ => false,
+        };
+        from_trusted && same_origin
+    };
+    if human && (strict_ok || wsl_fallback_ok()) {
         None
     } else {
         Some(error_json(
@@ -250,11 +301,12 @@ struct DecisionBody {
 
 async fn board_decision(
     State(state): State<BoardApiState>,
+    peer: PeerInfo,
     headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     axum::Json(body): axum::Json<DecisionBody>,
 ) -> Response {
-    if let Some(resp) = human_browser_rejection(&headers) {
+    if let Some(resp) = human_browser_rejection(&state, &headers, &peer) {
         return resp;
     }
     if !valid_item_id(&id) {
@@ -346,11 +398,12 @@ fn spec_review_error_response(error: ReviewError) -> Response {
 /// (SPEC-spec-review-gate FR-3707, FR-3708, FR-3713).
 async fn board_spec_review(
     State(state): State<BoardApiState>,
+    peer: PeerInfo,
     headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     axum::Json(body): axum::Json<SpecReviewBody>,
 ) -> Response {
-    if let Some(resp) = human_browser_rejection(&headers) {
+    if let Some(resp) = human_browser_rejection(&state, &headers, &peer) {
         return resp;
     }
     if !valid_item_id(&id) {
@@ -420,11 +473,12 @@ struct CheckBody {
 
 async fn board_check(
     State(state): State<BoardApiState>,
+    peer: PeerInfo,
     headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     body: Option<axum::Json<CheckBody>>,
 ) -> Response {
-    if let Some(resp) = human_browser_rejection(&headers) {
+    if let Some(resp) = human_browser_rejection(&state, &headers, &peer) {
         return resp;
     }
     if !valid_item_id(&id) {
@@ -497,15 +551,13 @@ async fn board_plan(
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            let stored_prompt = match unmasked_prompt_from_item_plan(
-                &state_root,
-                &board_base,
-                item.plan.as_ref(),
-            ) {
-                Ok(Some(prompt)) => prompt,
-                Ok(None) => String::new(),
-                Err(error) => return board_error_response(error),
-            };
+            let (stored_prompt, dynamic_cap) =
+                match unmasked_pending_from_item_plan(&state_root, &board_base, item.plan.as_ref())
+                {
+                    Ok(Some(pending)) => (pending.prompt, pending.dynamic_cap),
+                    Ok(None) => (String::new(), None),
+                    Err(error) => return board_error_response(error),
+                };
             if stored_prompt.trim().is_empty() {
                 return board_error_response(BoardError::Usage(
                     "plan edit requires an existing plan or prompt".to_owned(),
@@ -522,8 +574,14 @@ async fn board_plan(
                     return board_error_response(BoardError::Internal(error.to_string()));
                 }
             };
-            let edit =
-                edit_plan_from_json(&workspace, &state_root, &stored_prompt, &json_text, inherit);
+            let edit = edit_plan_from_json_keep_cap(
+                &workspace,
+                &state_root,
+                &stored_prompt,
+                &json_text,
+                inherit,
+                dynamic_cap,
+            );
             match edit {
                 Ok((_pending, hash)) => {
                     let edit_id = id.clone();
@@ -551,11 +609,12 @@ struct LaneBody {
 
 async fn board_lane(
     State(state): State<BoardApiState>,
+    peer: PeerInfo,
     headers: axum::http::HeaderMap,
     AxumPath(id): AxumPath<String>,
     axum::Json(body): axum::Json<LaneBody>,
 ) -> Response {
-    if let Some(resp) = human_browser_rejection(&headers) {
+    if let Some(resp) = human_browser_rejection(&state, &headers, &peer) {
         return resp;
     }
     if !valid_item_id(&id) {
@@ -698,10 +757,11 @@ async fn board_rules_get(State(state): State<BoardApiState>) -> Response {
 
 async fn board_rules_put(
     State(state): State<BoardApiState>,
+    peer: PeerInfo,
     headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<BoardRules>,
 ) -> Response {
-    if let Some(resp) = human_browser_rejection(&headers) {
+    if let Some(resp) = human_browser_rejection(&state, &headers, &peer) {
         return resp;
     }
     if let Err(error) = body.validate() {
@@ -873,6 +933,7 @@ mod tests {
     use super::*;
     use crate::board::AddItemRequest;
     use crate::board::Kind;
+    use crate::board::edit_plan_from_json;
     use crate::web::hub::DashboardHub;
     use crate::web::server::{DashboardServices, build_router_with};
     use crate::web::snapshot::SnapshotSource;
@@ -898,6 +959,55 @@ mod tests {
             ]),
             services,
         )
+    }
+
+    fn services_for(board_base: PathBuf, state_root: PathBuf) -> DashboardServices {
+        DashboardServices {
+            board_base: Some(board_base),
+            trust_env: Some(crate::runtime_env::RuntimeEnv {
+                dmuxai_state_dir: Some(state_root),
+                ..crate::runtime_env::RuntimeEnv::from_process()
+            }),
+            ..DashboardServices::default()
+        }
+    }
+
+    fn router_with_access(
+        board_base: PathBuf,
+        state_root: PathBuf,
+        access: crate::web::access::WebAccess,
+    ) -> axum::Router {
+        let hub = DashboardHub::new(SnapshotSource::Tui, "/workspace".to_string());
+        let workspaces = std::sync::Arc::new(crate::web::directory::WorkspaceDirectory::single(
+            hub,
+            services_for(board_base, state_root),
+        ));
+        crate::web::server::build_router_with_directory_access(workspaces, access)
+    }
+
+    /// Owner-write request as a browser on a plain-HTTP origin sends it:
+    /// `Origin` and `X-Dmuxai-Human`, no `Sec-Fetch-*`.
+    fn owner_decision_request(
+        id: &str,
+        host: &str,
+        peer: Option<std::net::SocketAddr>,
+        edit: impl FnOnce(&mut axum::http::HeaderMap),
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{id}/decision"))
+            .header("Host", host)
+            .header("Content-Type", "application/json")
+            .header("Origin", format!("http://{host}"))
+            .header("X-Dmuxai-Human", "1")
+            .body(axum::body::Body::from(r#"{"verdict":"approve"}"#))
+            .unwrap();
+        edit(req.headers_mut());
+        if let Some(addr) = peer {
+            req.extensions_mut()
+                .insert(ConnectInfo(PeerConnectInfo::new(addr)));
+        }
+        req
     }
 
     async fn body_string(resp: axum::response::Response) -> String {
@@ -2497,5 +2607,163 @@ mod tests {
         let stored_hash = item["plan"]["hash"].as_str().unwrap();
         let pending = crate::board::read_pending_plan(&state, stored_hash).unwrap();
         assert_eq!(pending.steps.len(), 3);
+    }
+
+    // TC-3810 / FR-3810: on the WSL interface listener the trusted Windows host
+    // peer may prove a human same-origin write with Origin + X-Dmuxai-Human when
+    // the browser sends no Sec-Fetch-* headers; every other variant stays 403.
+    #[tokio::test]
+    async fn tc_3810_wsl_listener_human_headers_fallback() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let store = BoardStore::open(board.clone()).unwrap();
+        let token = "boardtesttoken";
+        let wsl_ip = IpAddr::V4(Ipv4Addr::new(172, 24, 64, 5));
+        let host_peer = IpAddr::V4(Ipv4Addr::new(172, 24, 48, 1));
+        let access = crate::web::access::WebAccess::wsl_interface(
+            token.to_owned(),
+            false,
+            wsl_ip,
+            7420,
+            Some(host_peer),
+            crate::web::local_peer::shared_peer_source(),
+        );
+        let router = router_with_access(board, state.clone(), access);
+        let host = "172.24.64.5:7420";
+        let trusted = Some(SocketAddr::new(host_peer, 50123));
+        let other = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 24, 48, 9)),
+            50124,
+        ));
+        let accepted_id = seed_item(&store, &state);
+        let resp = router
+            .clone()
+            .oneshot(owner_decision_request(&accepted_id, host, trusted, |_| {}))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{}", body_string(resp).await);
+        assert!(store.get(&accepted_id).unwrap().decision.is_some());
+
+        type Edit = fn(&mut axum::http::HeaderMap);
+        let with_token: Edit = |h| {
+            h.insert("authorization", "Bearer boardtesttoken".parse().unwrap());
+        };
+        let variants: Vec<(&str, Option<SocketAddr>, Edit)> = vec![
+            ("missing human header", trusted, |h| {
+                h.remove("x-dmuxai-human");
+            }),
+            ("wrong human header", trusted, |h| {
+                h.insert("x-dmuxai-human", "0".parse().unwrap());
+            }),
+            ("missing origin", trusted, |h| {
+                h.remove("origin");
+            }),
+            ("wrong origin", trusted, |h| {
+                h.insert("origin", "http://evil.test:7420".parse().unwrap());
+            }),
+            ("cross-site fetch metadata", trusted, |h| {
+                h.insert("sec-fetch-site", "cross-site".parse().unwrap());
+            }),
+            ("fetch mode without site", trusted, |h| {
+                h.insert("sec-fetch-mode", "cors".parse().unwrap());
+            }),
+            ("other peer with token", other, with_token),
+            ("no peer info with token", None, with_token),
+        ];
+        let refused_id = seed_item(&store, &state);
+        for (label, peer, edit) in variants {
+            let resp = router
+                .clone()
+                .oneshot(owner_decision_request(&refused_id, host, peer, edit))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{label}");
+        }
+        assert!(store.get(&refused_id).unwrap().decision.is_none());
+    }
+
+    // TC-3811 / FR-3811, NFR-3810: loopback and remote listeners keep the strict
+    // rule (both Sec-Fetch-* headers), and non-owner-write routes are untouched.
+    #[tokio::test]
+    async fn tc_3811_loopback_keeps_strict_human_rule() {
+        use std::net::SocketAddr;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let store = BoardStore::open(board.clone()).unwrap();
+        let id = seed_item(&store, &state);
+        let token = "boardtesttoken";
+        let loopback_peer: SocketAddr = "127.0.0.1:50200".parse().unwrap();
+
+        let with_token = |h: &mut axum::http::HeaderMap| {
+            h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        };
+
+        let loopback = test_router(board.clone(), state.clone(), token);
+        let resp = loopback
+            .clone()
+            .oneshot(owner_decision_request(
+                &id,
+                "localhost:7420",
+                Some(loopback_peer),
+                with_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "loopback");
+
+        let remote = router_with_access(
+            board.clone(),
+            state.clone(),
+            crate::web::access::WebAccess::remote(
+                token.to_owned(),
+                crate::web::local_peer::shared_peer_source(),
+            ),
+        );
+        let resp = remote
+            .clone()
+            .oneshot(owner_decision_request(
+                &id,
+                "203.0.113.7:7420",
+                Some("203.0.113.9:50300".parse().unwrap()),
+                with_token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "remote");
+        assert!(store.get(&id).unwrap().decision.is_none());
+
+        // The strict rule still accepts a same-origin browser write on loopback.
+        let resp = loopback
+            .clone()
+            .oneshot(owner_decision_request(
+                &id,
+                "localhost:7420",
+                Some(loopback_peer),
+                |h| {
+                    with_token(h);
+                    h.insert("sec-fetch-site", "same-origin".parse().unwrap());
+                    h.insert("sec-fetch-mode", "cors".parse().unwrap());
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "strict same-origin");
+
+        // NFR-3810: a non-owner write (side chat) needs no human headers.
+        let say = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/board/{id}/messages"))
+            .header("Host", "localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"text":"hi"}"#))
+            .unwrap();
+        assert_eq!(
+            loopback.oneshot(say).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 }
