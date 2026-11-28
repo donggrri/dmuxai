@@ -554,6 +554,79 @@ body.board-modal-open {
   color: var(--error-text);
 }
 
+.board-work-session-title {
+  margin: 0 0 0.35rem;
+  font-size: 0.9rem;
+}
+
+.board-work-session-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.board-session {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.55rem;
+  background: var(--bg-panel);
+}
+
+.board-session-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.board-session-kind {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.board-session-agent,
+.board-session-age {
+  color: var(--muted);
+}
+
+.board-session-status-failed {
+  color: var(--error-text);
+}
+
+.board-session-status-awaiting_approval,
+.board-session-status-running {
+  color: var(--warn);
+}
+
+.board-session-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.6rem;
+  margin-top: 0.3rem;
+}
+
+.board-session-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  font: inherit;
+  font-size: 0.8rem;
+  color: var(--accent);
+  text-decoration: underline;
+  cursor: pointer;
+  word-break: break-all;
+  text-align: left;
+}
+
+.board-work-session-error {
+  font-size: 0.8rem;
+  color: var(--error-text);
+}
+
 .board-chat-actions {
   display: flex;
   flex-wrap: wrap;

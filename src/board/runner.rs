@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use super::{
-    BoardError, BoardItem, BoardStore, Lane, ListFilter, SayRequest, TEXT_MAX, Verdict,
-    ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies,
+    BoardError, BoardItem, BoardStore, Lane, ListFilter, SayRequest, SessionKind, TEXT_MAX,
+    Verdict, ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies, session,
     validate_item_id_early, validate_message,
 };
 use crate::graph::spec_review::{ReviewStatus, SpecReviewRecord};
@@ -246,6 +246,7 @@ pub struct ChildOutcome {
     pub plan_hash: Option<String>,
     pub text: Option<String>,
     pub summary: Option<String>,
+    pub links: super::session::ChildLinks,
 }
 
 fn resolve_child_bin() -> Result<PathBuf, BoardError> {
@@ -295,13 +296,7 @@ fn parse_child_json(
     if trimmed.is_empty() {
         return (None, None, None, None);
     }
-    let parsed = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
-        trimmed
-            .lines()
-            .rev()
-            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-    });
-    let Some(val) = parsed.filter(Value::is_object) else {
+    let Some(val) = child_json_object(trimmed) else {
         return (
             None,
             None,
@@ -346,6 +341,34 @@ fn parse_child_json(
         })
         .map(str::to_owned);
     (run_id, plan_hash, text, summary)
+}
+
+fn child_json_object(trimmed: &str) -> Option<Value> {
+    let parsed = serde_json::from_str::<Value>(trimmed).ok().or_else(|| {
+        trimmed
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+    });
+    parsed.filter(Value::is_object)
+}
+
+fn parse_child_links(stdout: &str) -> super::session::ChildLinks {
+    let field = |val: &Value, key: &str| {
+        val.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    match child_json_object(stdout.trim()) {
+        Some(val) => super::session::ChildLinks {
+            conversation_id: field(&val, "conversation_id"),
+            graph_id: field(&val, "graph_id"),
+            agent: field(&val, "agent"),
+        },
+        None => super::session::ChildLinks::default(),
+    }
 }
 
 fn kill_child_process_group(child: &mut std::process::Child) {
@@ -510,6 +533,7 @@ pub fn spawn_child_dmuxai_for_item(
         plan_hash,
         text,
         summary,
+        links: parse_child_links(&stdout),
     })
 }
 
@@ -728,6 +752,7 @@ pub fn ask_item_execute(
     } = prepared;
     let ws_str = workspace.to_string_lossy().into_owned();
     let timeout = child_timeout();
+    let started_ms = session::now_ms();
 
     if !params.revise {
         let board_cfg = BoardSettings::load_user_only();
@@ -738,6 +763,15 @@ pub fn ask_item_execute(
 
         let prompt = build_ask_prompt(&item, &params.text);
         let outcome = spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
+        append_ask_link(
+            store,
+            &params.id,
+            &workspace,
+            started_ms,
+            &outcome,
+            agent.as_deref(),
+            model.as_deref(),
+        );
         let raw_answer = if outcome.exit_code == 0 {
             outcome
                 .text
@@ -785,6 +819,15 @@ pub fn ask_item_execute(
         "-".to_owned(),
     ];
     let outcome = spawn_child_dmuxai(&workspace, &args, &prompt, timeout, &params.state_root)?;
+    append_ask_link(
+        store,
+        &params.id,
+        &workspace,
+        started_ms,
+        &outcome,
+        params.agent.as_deref(),
+        params.model.as_deref(),
+    );
     if outcome.exit_code == 7
         && let Some(new_hash) = outcome.plan_hash
     {
@@ -822,6 +865,30 @@ pub fn ask_item_execute(
             from: "planner".to_owned(),
         },
     )
+}
+
+/// Record a finished `board ask` as an `ask` session link (SPEC-board-work-session
+/// FR-3822). Best-effort: a store error never hides the planner answer.
+fn append_ask_link(
+    store: &BoardStore,
+    id: &str,
+    workspace: &Path,
+    started_ms: u64,
+    outcome: &ChildOutcome,
+    agent: Option<&str>,
+    model: Option<&str>,
+) {
+    let mut link = session::running_link(SessionKind::Ask, workspace, started_ms);
+    link.agent = agent.map(str::to_owned);
+    link.model = model.map(str::to_owned);
+    let link = session::finished_link(
+        link,
+        outcome.run_id.as_deref(),
+        outcome.exit_code,
+        &outcome.links,
+        Vec::new(),
+    );
+    let _ = store.append_session(id, link, "planner");
 }
 
 pub fn ask_item(store: &BoardStore, params: AskParams) -> Result<BoardItem, BoardError> {
@@ -988,6 +1055,12 @@ pub fn run_item_execute(
     ];
     // FR-3850: a failed event write must not stop the run.
     let _ = store.record_run_started(&item.id, &by);
+    // SPEC-board-work-session FR-3820, FR-3821: session writes are best-effort
+    // and never block recording the run result.
+    let started_ms = session::now_ms();
+    let running = session::running_link(SessionKind::Run, &workspace, started_ms);
+    let _ = store.append_session(&item.id, running.clone(), &by);
+    let before = session::md_snapshot(&workspace);
     let outcome = match spawn_child_dmuxai_for_item(
         &workspace,
         &args,
@@ -998,11 +1071,23 @@ pub fn run_item_execute(
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
+            let failed = session::finished_link(running, None, 1, &Default::default(), Vec::new());
+            let _ = store.finish_session(&item.id, started_ms, failed, &by);
             let _ =
                 store.record_run_result(&item.id, None, 1, Some(&err.to_string()), &by, &plan_hash);
             return Err(err);
         }
     };
+    let md_paths =
+        session::changed_md_paths(before.as_ref(), session::md_snapshot(&workspace).as_ref());
+    let finished = session::finished_link(
+        running,
+        outcome.run_id.as_deref(),
+        outcome.exit_code,
+        &outcome.links,
+        md_paths,
+    );
+    let _ = store.finish_session(&item.id, started_ms, finished, &by);
     store.record_run_result(
         &item.id,
         outcome.run_id.as_deref(),
@@ -3186,5 +3271,227 @@ exit 0
         assert!(wait_for(Duration::from_secs(3), || {
             !BoardLockGuard::is_active(&h.board, "runs", &item.id)
         }));
+    }
+
+    fn with_board_env<T>(child: &Path, data: &Path, work: impl FnOnce() -> T) -> T {
+        unsafe {
+            std::env::set_var("DMUXAI_BOARD_CHILD_BIN", child);
+            std::env::set_var("DMUXAI_DATA_DIR", data);
+        }
+        let out = work();
+        unsafe {
+            std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
+            std::env::remove_var("DMUXAI_DATA_DIR");
+        }
+        out
+    }
+
+    fn item_workspace(item: &BoardItem) -> String {
+        item.workspace.path.clone().unwrap()
+    }
+
+    // TC-3820 / FR-3820: a board run appends a `running` link (and logs a
+    // `session` event) before the child finishes; links are capped at 50 with
+    // the oldest dropped; legacy items without `sessions` still load.
+    #[test]
+    fn tc_3820_run_appends_running_session_link() {
+        use crate::board::{SESSIONS_MAX, SessionKind, SessionStatus};
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let item = hardening_item(&h, Lane::Auto);
+        let item_file = h.board.join("items").join(format!("{}.json", item.id));
+        let during = h.dir.path().join("during.json");
+        let child = write_fake_runner(
+            h.dir.path(),
+            "fake-snapshot.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\ncp \"{}\" \"{}\"\nprintf '{{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\"}}\\n'\nexit 0\n",
+                item_file.display(),
+                during.display()
+            ),
+        );
+        let data = h.dir.path().join("data");
+        let done = with_board_env(&child, &data, || {
+            run_item_execute(&h.store, prepare(&h, &item))
+        })
+        .unwrap();
+
+        let seen: BoardItem = serde_json::from_slice(&fs::read(&during).unwrap()).unwrap();
+        assert_eq!(seen.sessions.len(), 1);
+        let running = &seen.sessions[0];
+        assert_eq!(running.kind, SessionKind::Run);
+        assert_eq!(running.status, SessionStatus::Running);
+        assert_eq!(running.workspace_path, item_workspace(&item));
+        assert!(running.ended_ms.is_none() && running.exit_code.is_none());
+        let events = h.store.list_events(0).unwrap();
+        let session_event = events
+            .iter()
+            .find(|e| e.item_id == item.id && e.kind == "session")
+            .expect("session event");
+        assert_eq!(session_event.by, "bot:coordinator");
+        assert_eq!(done.lane, Lane::Done);
+        assert_eq!(
+            done.sessions.len(),
+            1,
+            "the running link is filled in place"
+        );
+        assert_eq!(done.sessions[0].status, SessionStatus::Completed);
+        assert_eq!(done.sessions[0].started_ms, running.started_ms);
+
+        // Boundary: at most SESSIONS_MAX links, the oldest dropped first.
+        for n in 0..(SESSIONS_MAX as u64 + 5) {
+            let link = crate::board::session::running_link(SessionKind::Ask, &h.ws, 10_000 + n);
+            h.store.append_session(&item.id, link, "planner").unwrap();
+        }
+        let capped = h.store.get(&item.id).unwrap();
+        assert_eq!(capped.sessions.len(), SESSIONS_MAX);
+        assert_eq!(capped.sessions[0].started_ms, 10_005);
+
+        // Legacy item JSON without `sessions` loads with an empty list.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&item_file).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("sessions");
+        fs::write(&item_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+        assert!(h.store.get(&item.id).unwrap().sessions.is_empty());
+    }
+
+    // TC-3821 / FR-3821: the finished run fills the link from the child's
+    // `--json` output and run manifest, with the `.md` files it changed in a git
+    // workspace; a crashed child leaves a `failed` link with its exit code; a
+    // non-git workspace has no md_paths; no provider session id is stored.
+    #[test]
+    fn tc_3821_run_result_fills_session_link() {
+        use crate::board::SessionStatus;
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let git = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&h.ws)
+            .status()
+            .unwrap();
+        assert!(git.success());
+        fs::write(h.ws.join("README.md"), "# untouched\n").unwrap();
+        let data = h.dir.path().join("data");
+        let item = hardening_item(&h, Lane::Auto);
+        let ws = item_workspace(&item);
+        crate::board::session::test_support::write_manifest(
+            &data,
+            &ws,
+            "0123456789abcdef",
+            "completed",
+            Some("conv-1"),
+            Some("graph-1"),
+        );
+        let writer = write_fake_runner(
+            h.dir.path(),
+            "fake-writer.sh",
+            "#!/bin/sh\ncat > /dev/null\nmkdir -p docs/specs .dmuxai src\n\
+             printf '# x\\n' > docs/specs/SPEC-x.md\nprintf 'x' > src/a.rs\nprintf 'x' > .dmuxai/n.md\n\
+             printf '{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\",\"conversation_id\":\"conv-1\",\"graph_id\":\"graph-1\",\"agent\":\"cursor\",\"provider_session_id\":\"psid-SECRET\"}\\n'\nexit 0\n",
+        );
+        let done = with_board_env(&writer, &data, || {
+            run_item_execute(&h.store, prepare(&h, &item))
+        })
+        .unwrap();
+        let link = done.sessions.last().unwrap();
+        assert_eq!(link.status, SessionStatus::Completed);
+        assert_eq!(link.exit_code, Some(0));
+        assert_eq!(link.run_id.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-1"));
+        assert_eq!(link.graph_id.as_deref(), Some("graph-1"));
+        assert_eq!(link.agent.as_deref(), Some("cursor-agent"));
+        assert_eq!(link.model.as_deref(), Some("gpt-5"));
+        assert!(link.ended_ms.is_some());
+        assert_eq!(link.md_paths, vec!["docs/specs/SPEC-x.md".to_owned()]);
+        assert!(files_containing(&h.board, "psid-SECRET").is_empty());
+
+        // Failure: a crashing child (no JSON, exit 3) leaves a failed link.
+        let crashed = hardening_item(&h, Lane::Auto);
+        let crash = write_fake_runner(
+            h.dir.path(),
+            "fake-crash.sh",
+            "#!/bin/sh\ncat > /dev/null\nexit 3\n",
+        );
+        let after = with_board_env(&crash, &data, || {
+            run_item_execute(&h.store, prepare(&h, &crashed))
+        })
+        .unwrap();
+        assert_eq!(after.lane, Lane::Unknown);
+        let failed = after.sessions.last().unwrap();
+        assert_eq!(failed.status, SessionStatus::Failed);
+        assert_eq!(failed.exit_code, Some(3));
+        assert!(failed.run_id.is_none() && failed.md_paths.is_empty());
+
+        // Boundary: outside git, md_paths stay empty.
+        let plain = hardening();
+        let plain_item = hardening_item(&plain, Lane::Auto);
+        let done = with_board_env(&writer, &data, || {
+            run_item_execute(&plain.store, prepare(&plain, &plain_item))
+        })
+        .unwrap();
+        assert!(done.sessions.last().unwrap().md_paths.is_empty());
+    }
+
+    // TC-3822 / FR-3822: `board ask` (with and without --revise) appends an
+    // `ask` link with run id, conversation id and status.
+    #[test]
+    fn tc_3822_ask_appends_session_link() {
+        use crate::board::{SessionKind, SessionStatus};
+        let _env = crate::state_path::test_env_lock();
+        let h = hardening();
+        let data = h.dir.path().join("data");
+        let item = hardening_item(&h, Lane::NeedsDecision);
+        let (_, hash2) = edit_plan_from_json(
+            &h.ws,
+            &h.state,
+            "ship",
+            &sample_plan_json().replace("\"edit\"", "\"edit-v2\""),
+            None,
+        )
+        .unwrap();
+        let child = write_fake_runner(
+            h.dir.path(),
+            "fake-ask.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\ncase \"$*\" in\n  *--read-only*)\n    printf '{{\"ok\":true,\"exit_code\":0,\"text\":\"answer\",\"run_id\":\"1111111111111111\",\"conversation_id\":\"conv-ask\",\"agent\":\"agy\"}}\\n'\n    exit 0 ;;\n  *--graph*)\n    printf '{{\"ok\":false,\"exit_code\":7,\"plan_hash\":\"{hash2}\",\"run_id\":\"2222222222222222\",\"conversation_id\":\"conv-rev\",\"graph_id\":\"g-rev\"}}\\n'\n    exit 7 ;;\nesac\nexit 1\n"
+            ),
+        );
+        let ask = |revise: bool| AskParams {
+            id: item.id.clone(),
+            text: "why?".to_owned(),
+            revise,
+            agent: None,
+            model: None,
+            by: "bot:coord".to_owned(),
+            state_root: h.state.clone(),
+        };
+        let answered = with_board_env(&child, &data, || ask_item(&h.store, ask(false))).unwrap();
+        let link = answered.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.status, SessionStatus::Completed);
+        assert_eq!(link.run_id.as_deref(), Some("1111111111111111"));
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-ask"));
+        assert_eq!(link.agent.as_deref(), Some("agy"));
+
+        let revised = with_board_env(&child, &data, || ask_item(&h.store, ask(true))).unwrap();
+        assert_eq!(revised.plan.as_ref().unwrap().hash, hash2);
+        let link = revised.sessions.last().unwrap();
+        assert_eq!(link.kind, SessionKind::Ask);
+        assert_eq!(link.status, SessionStatus::AwaitingApproval);
+        assert_eq!(link.run_id.as_deref(), Some("2222222222222222"));
+        assert_eq!(link.conversation_id.as_deref(), Some("conv-rev"));
+        assert_eq!(link.graph_id.as_deref(), Some("g-rev"));
+        assert_eq!(revised.sessions.len(), 2);
+
+        // Failure: a failing planner child leaves a failed ask link.
+        let failing = write_fake_runner(
+            h.dir.path(),
+            "fake-ask-fail.sh",
+            "#!/bin/sh\ncat > /dev/null\nexit 1\n",
+        );
+        let failed = with_board_env(&failing, &data, || ask_item(&h.store, ask(false))).unwrap();
+        let link = failed.sessions.last().unwrap();
+        assert_eq!(link.status, SessionStatus::Failed);
+        assert_eq!(link.exit_code, Some(1));
     }
 }

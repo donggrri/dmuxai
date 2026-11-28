@@ -217,6 +217,13 @@ pub enum BoardOp {
         id: String,
         text: Option<String>,
     },
+    Session {
+        id: String,
+    },
+    Link {
+        id: String,
+        run_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +366,8 @@ Subcommands:
   run        Execute an approved or auto item's graph plan
   pending    List items waiting for human action
   check      Mark a done or unknown item as checked (owner only)
+  session    Show an item's work session (read-only)
+  link       Link an existing run to an item (--run-id R)
 
 Run `dmuxai board <subcommand> --help` for details.
 ";
@@ -430,6 +439,14 @@ Usage: dmuxai board pending [--workspace DIR] [--json]
 
 pub const BOARD_CHECK_USAGE: &str = "\
 Usage: dmuxai board check <id> [--text T] [--json]
+";
+
+pub const BOARD_SESSION_USAGE: &str = "\
+Usage: dmuxai board session <id> [--json]
+";
+
+pub const BOARD_LINK_USAGE: &str = "\
+Usage: dmuxai board link <id> --run-id R [--json]
 ";
 
 pub const RUN_USAGE: &str = "\
@@ -1155,6 +1172,8 @@ pub fn board_subcommand_usage(subcommand: &str) -> &'static str {
         "run" => BOARD_RUN_USAGE,
         "pending" => BOARD_PENDING_USAGE,
         "check" => BOARD_CHECK_USAGE,
+        "session" => BOARD_SESSION_USAGE,
+        "link" => BOARD_LINK_USAGE,
         _ => BOARD_USAGE,
     }
 }
@@ -2702,6 +2721,47 @@ fn parse_board(args: &[String]) -> Result<BoardCommand, String> {
                 },
             })
         }
+        "session" => {
+            let parsed = parse_flags(rest, BOARD_JSON_FLAG, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board session needs an id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Session { id },
+            })
+        }
+        "link" => {
+            const FLAGS: &[FlagSpec] = &[
+                FlagSpec {
+                    names: &["--run-id"],
+                    takes_value: true,
+                    hidden: false,
+                },
+                FlagSpec {
+                    names: &["--json"],
+                    takes_value: false,
+                    hidden: false,
+                },
+            ];
+            let parsed = parse_flags(rest, FLAGS, true)?;
+            let id = parsed
+                .positionals
+                .first()
+                .cloned()
+                .ok_or_else(|| "board link needs an id".to_owned())?;
+            let run_id = parsed
+                .flags
+                .get("--run-id")
+                .and_then(|v| v.clone())
+                .ok_or_else(|| "board link needs --run-id".to_owned())?;
+            Ok(BoardCommand {
+                json: parsed.flags.contains_key("--json"),
+                op: BoardOp::Link { id, run_id },
+            })
+        }
         other => Err(format!("unknown board subcommand '{other}'")),
     }
 }
@@ -3664,6 +3724,13 @@ fn prevalidate_board_command(command: &BoardCommand) -> Result<(), ApiError> {
                 validate_text_limit("text", t, TEXT_MAX).map_err(ApiError::from)?;
             }
         }
+        BoardOp::Session { id } => check_id(id)?,
+        BoardOp::Link { id, run_id } => {
+            check_id(id)?;
+            if !dmuxai::run_journal::valid_run_id(run_id) {
+                return Err(usage("--run-id must be 16 lowercase hex characters"));
+            }
+        }
     }
     Ok(())
 }
@@ -4402,6 +4469,58 @@ fn execute_board_with_caller(
                 let item = store.check(&id, text, &by).map_err(ApiError::from)?;
                 if json_out {
                     print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                }
+                Ok(())
+            }
+            BoardOp::Session { id } => {
+                let view = dmuxai::board::session::session_view(&store, &id, &state_root)
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&view).unwrap_or(Value::Null));
+                    return Ok(());
+                }
+                match &view.work_session {
+                    Some(link) => println!(
+                        "work session: conversation {} (run {}, {})",
+                        link.conversation_id.as_deref().unwrap_or("-"),
+                        link.run_id.as_deref().unwrap_or("-"),
+                        serde_json::to_value(link.status)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_owned))
+                            .unwrap_or_default()
+                    ),
+                    None => println!("work session: none"),
+                }
+                for binding in &view.bindings {
+                    let status = serde_json::to_value(binding.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    println!("binding\t{}\t{status}", binding.agent);
+                }
+                for link in view.sessions.iter().rev() {
+                    let value = serde_json::to_value(link).unwrap_or(Value::Null);
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        value["kind"].as_str().unwrap_or("-"),
+                        value["status"].as_str().unwrap_or("-"),
+                        link.agent.as_deref().unwrap_or("-"),
+                        link.run_id.as_deref().unwrap_or("-")
+                    );
+                }
+                if let Some(warning) = &view.warning {
+                    eprintln!("warning: {warning}");
+                }
+                Ok(())
+            }
+            BoardOp::Link { id, run_id } => {
+                let by = resolve_actor(None, caller).map_err(ApiError::from)?;
+                let item = dmuxai::board::session::link_run(&store, &id, &run_id, &by)
+                    .map_err(ApiError::from)?;
+                if json_out {
+                    print_json(&serde_json::to_value(&item).unwrap_or(Value::Null));
+                } else {
+                    println!("{}\tlinked run {run_id}", item.id);
                 }
                 Ok(())
             }
@@ -8040,12 +8159,151 @@ mod tests {
         }
     }
 
+    // TC-3826 / FR-3826, FR-3823: `board link <id> --run-id R` appends a run
+    // link read from the run manifest in the item's workspace (unknown run ->
+    // exit 3, invalid ids -> exit 2); `board session` answers for known items
+    // and exits 3 for unknown ones.
+    #[test]
+    fn tc_3826_board_link_run_id() {
+        let _guard = dmuxai::state_path::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let data = dir.path().join("data");
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        // SAFETY: test-only mutation of the process environment.
+        unsafe {
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+            std::env::set_var("DMUXAI_DATA_DIR", &data);
+        }
+        let store = agent_api::open_board_store().unwrap();
+        let item = store
+            .add(dmuxai::board::AddItemRequest {
+                title: "link me".to_owned(),
+                summary: String::new(),
+                kind: dmuxai::board::Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let ws_path = item.workspace.path.clone().unwrap();
+        let run_id = "abcdef0123456789";
+        let run_dir = data
+            .join("repos")
+            .join(dmuxai::state_path::repo_key_for_canonical(&ws_path))
+            .join("runs")
+            .join(run_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "run_id": run_id,
+                "origin": "cli",
+                "status": "completed",
+                "created_at_ms": 1_000,
+                "completed_at_ms": 2_000,
+                "requested_runner": "cursor-agent",
+                "resolved_model": "gpt-5",
+                "dmuxai_exit_code": 0,
+                "links": { "conversation_id": "conv-cli", "graph_id": "graph-cli" },
+                "diagnostics": { "stderr_bytes": 0 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let parsed = parse(&args(&[
+            "board", "link", &item.id, "--run-id", run_id, "--json",
+        ]));
+        assert_eq!(
+            parsed.unwrap(),
+            AgentCommand::Board(BoardCommand {
+                op: BoardOp::Link {
+                    id: item.id.clone(),
+                    run_id: run_id.to_owned(),
+                },
+                json: true,
+            })
+        );
+        let link = |id: &str, run: &str| {
+            execute_board_with_caller(
+                &ws,
+                BoardCommand {
+                    op: BoardOp::Link {
+                        id: id.to_owned(),
+                        run_id: run.to_owned(),
+                    },
+                    json: true,
+                },
+                dmuxai::board::BoardCaller::CliNonTty,
+            )
+        };
+        assert_eq!(link(&item.id, run_id), exit::OK);
+        assert_eq!(link(&item.id, run_id), exit::OK, "relinking is a no-op");
+        let linked = store.get(&item.id).unwrap();
+        assert_eq!(linked.sessions.len(), 1);
+        let session = &linked.sessions[0];
+        assert_eq!(session.kind, dmuxai::board::SessionKind::Run);
+        assert_eq!(session.status, dmuxai::board::SessionStatus::Completed);
+        assert_eq!(session.run_id.as_deref(), Some(run_id));
+        assert_eq!(session.conversation_id.as_deref(), Some("conv-cli"));
+        assert_eq!(session.graph_id.as_deref(), Some("graph-cli"));
+        assert_eq!(session.model.as_deref(), Some("gpt-5"));
+        assert_eq!(session.started_ms, 1_000);
+
+        assert_eq!(link(&item.id, "0000000000000000"), exit::NOT_FOUND);
+        assert_eq!(link(&item.id, "../../x"), exit::USAGE);
+        assert_eq!(link("not-an-id", run_id), exit::USAGE);
+        assert_eq!(link("b000000000001", run_id), exit::NOT_FOUND);
+        assert_eq!(store.get(&item.id).unwrap().sessions.len(), 1);
+
+        let session_cmd = |id: &str| {
+            execute_board_with_caller(
+                &ws,
+                BoardCommand {
+                    op: BoardOp::Session { id: id.to_owned() },
+                    json: true,
+                },
+                dmuxai::board::BoardCaller::CliNonTty,
+            )
+        };
+        assert!(matches!(
+            parse(&args(&["board", "session", &item.id, "--json"])).unwrap(),
+            AgentCommand::Board(BoardCommand {
+                op: BoardOp::Session { .. },
+                json: true
+            })
+        ));
+        assert_eq!(session_cmd(&item.id), exit::OK);
+        assert_eq!(session_cmd("b000000000001"), exit::NOT_FOUND);
+        assert_eq!(session_cmd("nope"), exit::USAGE);
+        assert!(
+            !state.join("repos").exists(),
+            "board session must not create a conversation database"
+        );
+        unsafe {
+            std::env::remove_var("DMUXAI_STATE_DIR");
+            std::env::remove_var("DMUXAI_DATA_DIR");
+        }
+    }
+
     // TC-3114 / FR-3114: board help lists subcommands.
     #[test]
     fn tc_3114_board_help_lists_subcommands() {
         for sub in [
             "add", "list", "show", "update", "move", "plan", "decide", "say", "wait", "events",
-            "prompt", "rules", "ask", "run", "pending", "check",
+            "prompt", "rules", "ask", "run", "pending", "check", "session", "link",
         ] {
             assert!(BOARD_USAGE.contains(sub), "BOARD_USAGE missing {sub}");
         }

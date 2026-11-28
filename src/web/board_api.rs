@@ -83,6 +83,7 @@ where
             get(board_rules_get).put(board_rules_put),
         )
         .route("/api/board/{id}", get(board_get))
+        .route("/api/board/{id}/session", get(board_session))
         .route("/api/board/{id}/decision", post(board_decision))
         .route("/api/board/{id}/spec-review", post(board_spec_review))
         .route("/api/board/{id}/check", post(board_check))
@@ -284,6 +285,26 @@ async fn board_get(State(state): State<BoardApiState>, AxumPath(id): AxumPath<St
     }
     match with_store(state.board_base.clone(), move |store| store.get(&id)).await {
         Ok(item) => json_ok(StatusCode::OK, &item_response(item)),
+        Err(error) => board_error_response(error),
+    }
+}
+
+/// Read-only work session (SPEC-board-work-session FR-3823); served by both
+/// `serve` and `--web`.
+async fn board_session(
+    State(state): State<BoardApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if !valid_item_id(&id) {
+        return error_json(StatusCode::BAD_REQUEST, "invalid board item id");
+    }
+    let state_root = state.state_root.clone();
+    match with_store(state.board_base.clone(), move |store| {
+        crate::board::session::session_view(store, &id, &state_root)
+    })
+    .await
+    {
+        Ok(view) => json_ok(StatusCode::OK, &view),
         Err(error) => board_error_response(error),
     }
 }
@@ -2765,5 +2786,106 @@ mod tests {
             loopback.oneshot(say).await.unwrap().status(),
             StatusCode::OK
         );
+    }
+
+    // TC-3823 / FR-3823, FR-3824: `GET /api/board/{id}/session` is read-only on
+    // a view-only router, reports binding agents and statuses without provider
+    // session ids, 404s unknown items and warns when the database is missing;
+    // `GET /api/board/{id}` includes `sessions`.
+    #[tokio::test]
+    async fn tc_3823_board_session_reports_bindings() {
+        use crate::board::{SessionKind, SessionStatus, session};
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board = state.join("board");
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let store = BoardStore::open(board.clone()).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "session".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("coord".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(ws.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:coord".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let ws_path = item.workspace.path.clone().unwrap();
+        let mut link = session::running_link(SessionKind::Run, Path::new(&ws_path), 1);
+        link.status = SessionStatus::Completed;
+        link.conversation_id = Some("conv-http".to_owned());
+        store.append_session(&item.id, link, "bot:coord").unwrap();
+        let token = "boardtesttoken";
+        let router = test_router(board.clone(), state.clone(), token);
+        let get = |uri: String| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .header("Host", "localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{}/session", item.id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let missing: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(missing["bindings"], serde_json::json!([]));
+        assert!(missing["warning"].is_string());
+        assert_eq!(missing["work_session"]["conversation_id"], "conv-http");
+
+        session::test_support::seed_conversation_db(&state, &ws_path, "conv-http", 10);
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{}/session", item.id)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(!body.contains("SECRET"), "{body}");
+        let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["item_id"], item.id.as_str());
+        assert_eq!(
+            view["bindings"],
+            serde_json::json!([
+                {"agent": "agy", "status": "stale"},
+                {"agent": "cursor", "status": "active"}
+            ])
+        );
+        assert!(view.get("warning").is_none());
+
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/board/{}", item.id)))
+            .await
+            .unwrap();
+        let shown: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(shown["sessions"][0]["conversation_id"], "conv-http");
+
+        let resp = router
+            .clone()
+            .oneshot(get("/api/board/b000000000001/session".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = router
+            .clone()
+            .oneshot(get("/api/board/nope/session".to_owned()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
