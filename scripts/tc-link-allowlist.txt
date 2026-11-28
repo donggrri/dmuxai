@@ -67,13 +67,6 @@ TC-1210 manual
 TC-1213 manual
 TC-1220 manual
 TC-1226 manual
-TC-1230 legacy: no test reference yet
-TC-1231 legacy: no test reference yet
-TC-1232 legacy: no test reference yet
-TC-1233 legacy: no test reference yet
-TC-1234 legacy: no test reference yet
-TC-1235 legacy: no test reference yet
-TC-1236 e2e/browser (ignored)
 TC-1480 manual
 TC-1481 manual
 TC-1482 manual

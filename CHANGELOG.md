@@ -14,6 +14,10 @@ All notable changes to dmuxai are listed here. Versions follow
 
 - **Human spec review and plan review on the board (SPEC-spec-review-gate).** With spec-first on, a run pauses after the spec step until a person approves the spec (`awaiting_spec_review`); steps after it do not start. Decide on the board (`Spec review` badge, spec links in the Markdown viewer, Approve spec / Request changes / Reject spec), in the TUI panel (`a` / `c` / `x`), or with `dmuxai spec-review list|show|approve|request-changes|reject` from a terminal. Agents, MCP and `--approve-plan` cannot approve a spec review. Settings: `[workflow] spec_review`, `spec_review_timeout_secs`, `spec_review_max_rounds`; per run `--no-spec-review` (MCP `no_spec_review`). Board items waiting on a plan show a `Plan review` badge.
 
+### Changed
+
+- Dashboard: `POST /api/skills/approve` and `POST /api/memory/proposals/{id}/approve|reject` now require the same human browser headers as board decisions (`Sec-Fetch-Site: same-origin`, `Sec-Fetch-Mode`, `X-Dmuxai-Human: 1`); scripted calls get 403 (SPEC-dashboard-feature-coverage FR-3762).
+
 ### Fixed
 
 - Board: the plan the owner approves is now the plan that runs. `board plan --edit`, dashboard Save plan and `board add --plan-hash` store the spec-first expanded plan (spec-1 / test-1 marked `added by spec-first`), so the approved hash matches the executed graph (#374).

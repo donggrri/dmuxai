@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -381,4 +383,182 @@ print(json.dumps(out))
     assert_eq!(v["open_after_reload"], false, "{v}");
     assert_eq!(v["expanded_after_reload"], "false", "{v}");
     assert!(screenshot_file.exists(), "screenshot was not captured");
+}
+
+// TC-3759 (FR-3759): switching conversations in the sidebar keeps each
+// conversation's own messages and run rows; switching to a conversation that is
+// still streaming shows its live text growing and then the final reply.
+// Run rows come from graph turns (also covered with mocked turn bands by
+// `web_dashboard_fullwidth` TC-1218).
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3759_switch_conversations_keeps_history_and_live_stream() {
+    let Some((chrome, python)) = common::prepare() else {
+        return;
+    };
+    let env = common::setup_env();
+    env.write_chat_agents_config_with_graph("");
+    let (_guard, url) = common::start_web(&env, &[]);
+
+    let script = r##"
+import json, sys
+from playwright.sync_api import sync_playwright
+
+chrome, url = sys.argv[1], sys.argv[2]
+out = {}
+
+TRANSCRIPT = """() => {
+  const t = document.querySelector('.session-transcript');
+  return {
+    text: t ? t.innerText : '',
+    rows: t ? [...t.querySelectorAll(':scope > li.chat-aux-run')].map(li => li.getAttribute('data-run-id')) : [],
+    working: !!(t && t.querySelector('.msg-working, .chat-aux-live, .spinner')),
+  };
+}"""
+
+def send(page, text, expect):
+    page.fill('#session textarea.session-input', text)
+    page.press('#session textarea.session-input', 'Enter')
+    page.wait_for_function(
+        "(e) => (document.querySelector('.session-transcript')?.innerText || '').includes(e)",
+        arg=expect, timeout=20000)
+
+def open_row(page, title):
+    page.locator('#sessions-list .sessions-row', has_text=title).first.click()
+    page.wait_for_function(
+        "(t) => document.querySelector('#sessions-list .sessions-row-active .sessions-row-title')?.textContent.includes(t)",
+        arg=title, timeout=15000)
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    page.goto(url, wait_until='domcontentloaded', timeout=20000)
+    page.wait_for_selector('#session textarea.session-input', timeout=20000)
+    if not page.locator('#sessions-sidebar.open').count():
+        page.click('#more-toggle')
+        page.click('#sessions-toggle')
+        page.wait_for_selector('#sessions-sidebar.open', timeout=5000)
+        page.keyboard.press('Escape')
+
+    send(page, 'alpha question', 'reply to alpha question')
+    page.wait_for_function("() => !document.querySelector('.session-transcript .msg-working, .session-transcript .chat-aux-live')", timeout=20000)
+    out['a_first'] = page.evaluate(TRANSCRIPT)
+
+    page.click('#sessions-new')
+    page.wait_for_function(
+        "() => !(document.querySelector('.session-transcript')?.innerText || '').includes('alpha question')",
+        timeout=15000)
+    send(page, 'beta question', 'reply to beta question')
+    page.wait_for_function("() => !document.querySelector('.session-transcript .msg-working, .session-transcript .chat-aux-live')", timeout=20000)
+    out['b_first'] = page.evaluate(TRANSCRIPT)
+
+    open_row(page, 'alpha question')
+    page.wait_for_function(
+        "() => (document.querySelector('.session-transcript')?.innerText || '').includes('reply to alpha question')",
+        timeout=15000)
+    out['a_again'] = page.evaluate(TRANSCRIPT)
+    open_row(page, 'beta question')
+    page.wait_for_function(
+        "() => (document.querySelector('.session-transcript')?.innerText || '').includes('reply to beta question')",
+        timeout=15000)
+    out['b_again'] = page.evaluate(TRANSCRIPT)
+
+    # Streaming: start a slow turn in a new conversation C, leave it, come back.
+    page.click('#sessions-new')
+    page.wait_for_function(
+        "() => !(document.querySelector('.session-transcript')?.innerText || '').includes('beta question')",
+        timeout=15000)
+    page.fill('#session textarea.session-input', 'slow gamma')
+    page.press('#session textarea.session-input', 'Enter')
+    page.wait_for_function(
+        "() => (document.querySelector('.session-transcript')?.innerText || '').includes('part1 for slow gamma')",
+        timeout=20000)
+    out['live_first'] = page.evaluate(TRANSCRIPT)
+    open_row(page, 'alpha question')
+    page.wait_for_function(
+        "() => !(document.querySelector('.session-transcript')?.innerText || '').includes('slow gamma')",
+        timeout=15000)
+    out['during_other'] = page.evaluate(TRANSCRIPT)
+    open_row(page, 'slow gamma')
+    page.wait_for_function(
+        "() => (document.querySelector('.session-transcript')?.innerText || '').includes('part1 for slow gamma')",
+        timeout=15000)
+    out['live_back'] = page.evaluate(TRANSCRIPT)
+    page.wait_for_function(
+        "() => (document.querySelector('.session-transcript')?.innerText || '').includes('part2-final for slow gamma')",
+        timeout=20000)
+    page.wait_for_function("() => !document.querySelector('.session-transcript .msg-working, .session-transcript .chat-aux-live, .session-transcript .spinner')", timeout=20000)
+    out['live_done'] = page.evaluate(TRANSCRIPT)
+    browser.close()
+print(json.dumps(out))
+"##;
+    let result = common::run_probe(&python, &chrome, script, &[&url]);
+    let text = |key: &str| result[key]["text"].as_str().unwrap_or("").to_owned();
+    let rows = |key: &str| result[key]["rows"].clone();
+
+    // A -> B -> A: each conversation shows only its own messages and run rows.
+    for key in ["a_first", "a_again"] {
+        assert!(text(key).contains("alpha question"), "{key}: {result}");
+        assert!(
+            text(key).contains("reply to alpha question"),
+            "{key}: {result}"
+        );
+        assert!(!text(key).contains("beta question"), "{key}: {result}");
+    }
+    for key in ["b_first", "b_again"] {
+        assert!(
+            text(key).contains("reply to beta question"),
+            "{key}: {result}"
+        );
+        assert!(!text(key).contains("alpha question"), "{key}: {result}");
+    }
+    assert_eq!(
+        rows("a_first"),
+        rows("a_again"),
+        "A keeps its run rows: {result}"
+    );
+    assert_eq!(
+        rows("b_first"),
+        rows("b_again"),
+        "B keeps its run rows: {result}"
+    );
+    let (a_rows, b_rows) = (rows("a_again"), rows("b_again"));
+    for run in a_rows.as_array().unwrap() {
+        assert!(
+            !b_rows.as_array().unwrap().contains(run),
+            "run rows of A must not appear in B: {result}"
+        );
+    }
+    // Streaming conversation: live text first, other conversation untouched,
+    // then the final reply after switching back.
+    assert!(
+        text("live_first").contains("part1 for slow gamma"),
+        "{result}"
+    );
+    assert!(!text("live_first").contains("part2-final"), "{result}");
+    assert!(!text("during_other").contains("part1"), "{result}");
+    assert!(
+        text("live_back").contains("part1 for slow gamma"),
+        "{result}"
+    );
+    assert!(
+        !text("live_back").contains("part2-final"),
+        "the slow turn must still be running when switching back: {result}"
+    );
+    assert!(
+        text("live_done").contains("part2-final for slow gamma"),
+        "{result}"
+    );
+    assert_eq!(result["live_done"]["working"], false, "{result}");
+    assert_eq!(
+        a_rows.as_array().unwrap().len(),
+        1,
+        "A has its own run row: {result}"
+    );
+    assert_eq!(
+        b_rows.as_array().unwrap().len(),
+        1,
+        "B has its own run row: {result}"
+    );
 }

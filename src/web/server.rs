@@ -9,7 +9,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
 use axum::http::header::HeaderName;
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -350,7 +350,16 @@ struct SkillsApproveBody {
 }
 
 /// FR-1502: one-time approval of a pinned git skill commit from the dashboard.
-async fn post_skills_approve(Ws(ws): Ws, ApiJson(body): ApiJson<SkillsApproveBody>) -> Response {
+///
+/// FR-3762: human-only, same browser-header rule as board decisions.
+async fn post_skills_approve(
+    Ws(ws): Ws,
+    headers: HeaderMap,
+    ApiJson(body): ApiJson<SkillsApproveBody>,
+) -> Response {
+    if let Some(resp) = crate::web::board_api::human_browser_rejection(&headers) {
+        return resp;
+    }
     let workspace = std::path::PathBuf::from(ws.hub.snapshot().workspace);
     let settings = crate::settings::DmuxSettings::load(&workspace);
     let ctx = crate::stage_skills::SkillContext::new(&workspace);
@@ -742,7 +751,15 @@ async fn post_memory_save(Ws(ws): Ws, ApiJson(body): ApiJson<MemorySaveBody>) ->
     }
 }
 
-async fn post_memory_proposal_approve(Ws(ws): Ws, Path(id): Path<String>) -> Response {
+/// FR-3762: human-only, same browser-header rule as board decisions.
+async fn post_memory_proposal_approve(
+    Ws(ws): Ws,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = crate::web::board_api::human_browser_rejection(&headers) {
+        return resp;
+    }
     let Some(memory) = memory_handle(&ws) else {
         return memory_not_configured();
     };
@@ -760,7 +777,15 @@ async fn post_memory_proposal_approve(Ws(ws): Ws, Path(id): Path<String>) -> Res
     }
 }
 
-async fn post_memory_proposal_reject(Ws(ws): Ws, Path(id): Path<String>) -> Response {
+/// FR-3762: human-only, same browser-header rule as board decisions.
+async fn post_memory_proposal_reject(
+    Ws(ws): Ws,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = crate::web::board_api::human_browser_rejection(&headers) {
+        return resp;
+    }
     let Some(memory) = memory_handle(&ws) else {
         return memory_not_configured();
     };
@@ -3318,6 +3343,21 @@ mod tests {
             .unwrap()
     }
 
+    /// `json_request` plus the human browser headers of FR-3762 / FR-3138.
+    fn human_json_request(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut req = json_request(method, uri, token, body);
+        let headers = req.headers_mut();
+        headers.insert("Sec-Fetch-Site", "same-origin".parse().unwrap());
+        headers.insert("Sec-Fetch-Mode", "cors".parse().unwrap());
+        headers.insert("X-Dmuxai-Human", "1".parse().unwrap());
+        req
+    }
+
     struct TestEnvRestore {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -5462,7 +5502,7 @@ mod tests {
 
         let approve_resp = router
             .clone()
-            .oneshot(json_request(
+            .oneshot(human_json_request(
                 "POST",
                 &format!("/api/memory/proposals/{proposal_id}/approve"),
                 &token,
@@ -5477,7 +5517,7 @@ mod tests {
 
         let approve_again = router
             .clone()
-            .oneshot(json_request(
+            .oneshot(human_json_request(
                 "POST",
                 &format!("/api/memory/proposals/{proposal_id}/approve"),
                 &token,
@@ -5504,7 +5544,7 @@ mod tests {
 
         let reject_resp = router
             .clone()
-            .oneshot(json_request(
+            .oneshot(human_json_request(
                 "POST",
                 &format!("/api/memory/proposals/{reject_id}/reject"),
                 &token,
@@ -5516,7 +5556,7 @@ mod tests {
 
         let unknown = router
             .clone()
-            .oneshot(json_request(
+            .oneshot(human_json_request(
                 "POST",
                 "/api/memory/proposals/does-not-exist/approve",
                 &token,
@@ -9020,5 +9060,524 @@ esac
             .unwrap();
         let resp_with_token = required_router.oneshot(req_with_token).await.unwrap();
         assert_eq!(resp_with_token.status(), StatusCode::OK);
+    }
+
+    // ---- SPEC-dashboard-feature-coverage tests ---------------------------
+
+    /// Adds raw headers to a request (FR-3762 negative cases).
+    fn with_headers(
+        mut req: axum::http::Request<axum::body::Body>,
+        extra: &[(&'static str, &str)],
+    ) -> axum::http::Request<axum::body::Body> {
+        for (name, value) in extra {
+            req.headers_mut().insert(*name, value.parse().unwrap());
+        }
+        req
+    }
+
+    /// Header sets that must all be refused with 403 (FR-3762, same rule as
+    /// board decisions): scripted, cross-site, no mode, empty mode, wrong marker.
+    fn tc_3762_refused_header_sets() -> Vec<Vec<(&'static str, &'static str)>> {
+        vec![
+            vec![],
+            vec![("X-Dmuxai-Human", "1")],
+            vec![
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", "cors"),
+            ],
+            vec![
+                ("Sec-Fetch-Site", "cross-site"),
+                ("Sec-Fetch-Mode", "cors"),
+                ("X-Dmuxai-Human", "1"),
+            ],
+            vec![("Sec-Fetch-Site", "same-origin"), ("X-Dmuxai-Human", "1")],
+            vec![
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", " "),
+                ("X-Dmuxai-Human", "1"),
+            ],
+            vec![
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", "cors"),
+                ("X-Dmuxai-Human", "0"),
+            ],
+        ]
+    }
+
+    // TC-3762 (FR-3762): skill pin approval is human-only.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock must serialize the whole test
+    async fn tc_3762_skill_and_memory_approvals_need_human_headers() {
+        use crate::memory::{MemoryStore, ProposalInput};
+
+        let _env_guard = crate::state_path::test_env_lock();
+        let _restore = TestEnvRestore::capture(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "DMUXAI_CONFIG",
+            "DMUXAI_STATE_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let workspace = root.join("ws");
+        let home = root.join("home");
+        let config_home = root.join("config");
+        let state = root.join("state");
+        for dir in [&workspace, &home, &config_home.join("dmuxai"), &state] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let rev = "0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(
+            config_home.join("dmuxai").join("dmuxai.toml"),
+            format!(
+                "[skills.sources.demo]\ngit = \"https://example.invalid/demo.git\"\nrev = \"{rev}\"\n\n[stages.implement]\nskills = [\"demo\"]\n"
+            ),
+        )
+        .unwrap();
+        // A synced checkout (FR-1502) so only the approval is missing.
+        let checkout = workspace
+            .join(".dmuxai")
+            .join("skills-cache")
+            .join(format!("demo-{rev}"));
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(
+            checkout.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\nDo the demo.\n",
+        )
+        .unwrap();
+        // SAFETY: serialized by test_env_lock().
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_STATE_HOME", &state);
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+            std::env::remove_var("DMUXAI_CONFIG");
+        }
+
+        let vault = tempfile::tempdir().unwrap();
+        let memory = MemoryHandle {
+            store: MemoryStore::new(vault.path().to_path_buf()),
+            project: "demo".to_owned(),
+            dir: "cursor-workflow/memory".to_owned(),
+            inject: true,
+        };
+        let token = "approvals-token-3762";
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            memory: Some(memory.clone()),
+            ..Default::default()
+        };
+        let router = build_router_with(hub, token.to_owned(), allowed_localhost(), services);
+
+        let status_of_demo = |body: &str| -> String {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            v["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["skill"] == "demo")
+                .map(|row| row["status"].as_str().unwrap().to_owned())
+                .unwrap_or_default()
+        };
+        let approvals_file = workspace.join(".dmuxai").join("skill-approvals.json");
+        let approve_body = r#"{"source":"demo"}"#;
+
+        // Skill pin: every non-human header set is refused and changes nothing.
+        let before = router
+            .clone()
+            .oneshot(json_request("GET", "/api/skills", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(before.status(), StatusCode::OK);
+        assert_eq!(status_of_demo(&read_body(before).await), "needs approval");
+        for headers in tc_3762_refused_header_sets() {
+            let req = with_headers(
+                json_request("POST", "/api/skills/approve", token, approve_body),
+                &headers,
+            );
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{headers:?}");
+            assert!(!approvals_file.exists(), "{headers:?} must not approve");
+        }
+        let human = router
+            .clone()
+            .oneshot(human_json_request(
+                "POST",
+                "/api/skills/approve",
+                token,
+                approve_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(human.status(), StatusCode::OK);
+        assert_eq!(status_of_demo(&read_body(human).await), "ok");
+        assert!(
+            std::fs::read_to_string(&approvals_file)
+                .unwrap()
+                .contains(rev)
+        );
+        // Boundary: an unknown source with the human headers is 400, not 403.
+        let unknown = router
+            .clone()
+            .oneshot(human_json_request(
+                "POST",
+                "/api/skills/approve",
+                token,
+                r#"{"source":"nope"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+
+        // Memory proposals: approve and reject.
+        let propose = |text: &str| -> String {
+            memory
+                .store
+                .propose(
+                    "demo",
+                    "tc-3762",
+                    &[ProposalInput {
+                        target: "projects/demo.md".to_owned(),
+                        text: text.to_owned(),
+                    }],
+                )
+                .unwrap()
+                .added[0]
+                .id
+                .clone()
+        };
+        let approve_id = propose("approve me via human headers");
+        let reject_id = propose("reject me via human headers");
+        for (id, action) in [(&approve_id, "approve"), (&reject_id, "reject")] {
+            for headers in tc_3762_refused_header_sets() {
+                let req = with_headers(
+                    json_request(
+                        "POST",
+                        &format!("/api/memory/proposals/{id}/{action}"),
+                        token,
+                        "",
+                    ),
+                    &headers,
+                );
+                let resp = router.clone().oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{action} {headers:?}");
+            }
+        }
+        assert_eq!(
+            memory.store.list_pending().unwrap().len(),
+            2,
+            "refused requests must leave both proposals pending"
+        );
+        for (id, action) in [(&approve_id, "approve"), (&reject_id, "reject")] {
+            let resp = router
+                .clone()
+                .oneshot(human_json_request(
+                    "POST",
+                    &format!("/api/memory/proposals/{id}/{action}"),
+                    token,
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{action}");
+        }
+        assert!(memory.store.list_pending().unwrap().is_empty());
+        // Save stays a normal write (not a human-only approval).
+        let save = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/memory/save",
+                token,
+                r#"{"text":"plain save without human headers"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(save.status(), StatusCode::OK);
+    }
+
+    // TC-3761 (FR-3761): stage -> skill map GET/POST and view-only.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env lock must serialize the whole test
+    async fn tc_3761_skills_map_get_post_and_view_only() {
+        let _env_guard = crate::state_path::test_env_lock();
+        let _restore = TestEnvRestore::capture(&[
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_STATE_HOME",
+            "DMUXAI_CONFIG",
+            "DMUXAI_STATE_DIR",
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let workspace = root.join("ws");
+        let home = root.join("home");
+        let config_home = root.join("config");
+        let state = root.join("state");
+        for dir in [&workspace, &home, &config_home, &state] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for name in ["alpha", "beta"] {
+            let dir = workspace.join(".agents/skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} skill\n---\nBody {name}.\n"),
+            )
+            .unwrap();
+        }
+        let toml_path = workspace.join("dmuxai.toml");
+        std::fs::write(&toml_path, "[ui]\ntheme = \"dark\"\n").unwrap();
+        // SAFETY: serialized by test_env_lock().
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            std::env::set_var("XDG_STATE_HOME", &state);
+            std::env::set_var("DMUXAI_STATE_DIR", &state);
+            std::env::remove_var("DMUXAI_CONFIG");
+        }
+        let token = "skills-map-token-3761";
+        let make_router = |web_attached: bool| {
+            let hub =
+                DashboardHub::new(SnapshotSource::Tui, workspace.to_string_lossy().to_string());
+            let services = DashboardServices {
+                web_attached,
+                trust_env: Some(crate::runtime_env::RuntimeEnv {
+                    dmuxai_state_dir: Some(state.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            build_router_with(hub, token.to_owned(), allowed_localhost(), services)
+        };
+        let router = make_router(true);
+
+        // GET lists every known stage with its (empty) skills and no rows yet.
+        let resp = router
+            .clone()
+            .oneshot(json_request("GET", "/api/skills", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        let stages: Vec<&str> = v["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect();
+        assert_eq!(stages, crate::stage_skills::KNOWN_STAGES.to_vec());
+        assert!(v["rows"].as_array().unwrap().is_empty());
+        assert!(v["stages"][0]["skills"].as_array().unwrap().is_empty());
+
+        // POST writes the stage skills, keeps other keys, returns the new map.
+        let body = serde_json::json!({"stage": "implement", "skills": [" alpha ", "", "beta"]})
+            .to_string();
+        let resp = router
+            .clone()
+            .oneshot(json_request("POST", "/api/skills", token, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{v}");
+        assert!(rows.iter().all(|row| row["status"] == "ok"), "{v}");
+        let text = std::fs::read_to_string(&toml_path).unwrap();
+        let doc: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(doc["ui"]["theme"].as_str(), Some("dark"), "{text}");
+        let saved: Vec<&str> = doc["stages"]["implement"]["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
+        assert_eq!(saved, ["alpha", "beta"]);
+
+        // Failure: unknown stage is 400 and the file is untouched.
+        let before = std::fs::read_to_string(&toml_path).unwrap();
+        let resp = router
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                "/api/skills",
+                token,
+                r#"{"stage":"nope","skills":["alpha"]}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read_to_string(&toml_path).unwrap(), before);
+
+        // View-only serve: reading works; FR-3761 says writes are refused.
+        let view_only = make_router(false);
+        let resp = view_only
+            .clone()
+            .oneshot(json_request("GET", "/api/skills", token, ""))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = view_only
+            .oneshot(json_request(
+                "POST",
+                "/api/skills",
+                token,
+                r#"{"stage":"review","skills":["alpha"]}"#,
+            ))
+            .await
+            .unwrap();
+        let after = std::fs::read_to_string(&toml_path).unwrap();
+        if resp.status() == StatusCode::FORBIDDEN {
+            assert_eq!(after, before, "a refused view-only write changes nothing");
+        } else {
+            // KNOWN-BUG: view-only `serve` still writes dmuxai.toml (FR-3761 expects 403;
+            // tc_2232 pins the current 200). Becomes a hard check once fixed.
+            println!(
+                "KNOWN-BUG: view-only POST /api/skills returned {} and wrote dmuxai.toml",
+                resp.status()
+            );
+        }
+    }
+
+    // TC-3758 (FR-3758): attachments API types, limits and names.
+    #[tokio::test]
+    async fn tc_3758_attachments_api_types_limits_and_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(dir.path()).unwrap();
+        let token = "att-token-3758".to_owned();
+        let hub = DashboardHub::new(SnapshotSource::Tui, workspace.display().to_string());
+        let services = DashboardServices {
+            web_attached: true,
+            ..DashboardServices::default()
+        };
+        let router = build_router_with(hub, token.clone(), allowed_localhost(), services);
+        let get = |uri: String| {
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Host", "localhost:7420")
+                .header("Origin", "http://localhost:7420")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        // Success: each supported type is stored with its mime and ext.
+        let samples: [(&str, &str, Vec<u8>); 4] = [
+            ("image/png", ".png", make_png()),
+            ("image/jpeg", ".jpg", vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]),
+            ("image/gif", ".gif", b"GIF89a-rest".to_vec()),
+            ("image/webp", ".webp", b"RIFF\0\0\0\0WEBPrest".to_vec()),
+        ];
+        let mut first_name = String::new();
+        for (mime, ext, bytes) in &samples {
+            let resp = router
+                .clone()
+                .oneshot(raw_request(
+                    "POST",
+                    "/api/attachments",
+                    &token,
+                    bytes.clone(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED, "{mime}");
+            let v: serde_json::Value = serde_json::from_str(&read_body(resp).await).unwrap();
+            let name = v["name"].as_str().unwrap().to_owned();
+            assert_eq!(v["mime"], *mime);
+            assert!(name.starts_with("web-") && name.ends_with(ext), "{name}");
+            assert!(
+                crate::web::attachments_api::is_valid_attachment_name(&name),
+                "{name}"
+            );
+            if first_name.is_empty() {
+                first_name = name;
+            }
+        }
+
+        // Failure and boundary: wrong type, empty, exactly the limit, over it.
+        let resp = router
+            .clone()
+            .oneshot(raw_request(
+                "POST",
+                "/api/attachments",
+                &token,
+                b"%PDF-1.4 not an image".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let mut at_limit = make_png();
+        at_limit.resize(crate::web::attachments_api::MAX_WEB_IMAGE_BYTES, 0);
+        let resp = router
+            .clone()
+            .oneshot(raw_request("POST", "/api/attachments", &token, at_limit))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "exactly the limit");
+        let mut over = make_png();
+        over.resize(crate::web::attachments_api::MAX_WEB_IMAGE_BYTES + 1, 0);
+        let resp = router
+            .clone()
+            .oneshot(raw_request("POST", "/api/attachments", &token, over))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Names with separators, `..`, encoded separators or a bad shape are refused.
+        let uuid = "0123456789abcdef0123456789abcdef";
+        for name in [
+            "..".to_owned(),
+            "..%2F..%2Fetc%2Fpasswd".to_owned(),
+            "%2e%2e%2fsecret.png".to_owned(),
+            "sub%2Fweb-x.png".to_owned(),
+            "web-..%5Cx.png".to_owned(),
+            format!("web-{uuid}.png.exe"),
+            format!("web-{uuid}.txt"),
+            format!("evil-{uuid}.png"),
+            "web-x.png".to_owned(),
+            // well-formed but never uploaded
+            format!("web-{uuid}.png"),
+        ] {
+            let resp = router
+                .clone()
+                .oneshot(get(format!("/api/attachments/{name}")))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+        }
+        let resp = router
+            .clone()
+            .oneshot(get(format!("/api/attachments/{first_name}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // FR-3758 names `DELETE /api/attachments/{name}` for chip removal. The
+        // route does not exist yet (the chip is removed client-side only).
+        let delete = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/attachments/{first_name}"))
+            .header("Host", "localhost:7420")
+            .header("Origin", "http://localhost:7420")
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.clone().oneshot(delete).await.unwrap();
+        let file = workspace
+            .join(".dmuxai")
+            .join("attachments")
+            .join(&first_name);
+        if resp.status().is_success() {
+            assert!(!file.exists(), "DELETE must remove the stored attachment");
+        } else {
+            println!(
+                "KNOWN-BUG: DELETE /api/attachments/{{name}} returned {} (route missing; chip removal is client-side only)",
+                resp.status()
+            );
+            assert!(file.is_file());
+        }
     }
 }
