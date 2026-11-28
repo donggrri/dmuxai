@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::run_journal::{mask_sensitive_tokens, truncate_tail_utf8};
 use crate::settings::{SpecFirstMode, WorkflowSettings};
 
-use super::plan_doc::PLAN_PROMPT;
+use super::plan_doc::{PLAN_PROMPT, PlanStep};
 use super::replan::REPLAN_PROMPT;
 use super::types::{GraphEdge, GraphNode, GraphNodeStatus, GraphPlan, NodeRole};
 
@@ -273,6 +273,71 @@ pub fn apply_spec_first(plan: &mut GraphPlan, wf: &WorkflowSettings) -> Vec<Stri
     }
 
     inserted
+}
+
+/// Expands plan steps the way [`apply_spec_first`] expands their graph
+/// (FR-3503, FR-3715). `graph` must be the validated graph of `steps`.
+/// Returns the steps a run executes and the ids of the inserted steps;
+/// existing steps keep their fields and only gain the new dependencies.
+pub fn expand_plan_steps(
+    steps: &[PlanStep],
+    graph: &GraphPlan,
+    wf: &WorkflowSettings,
+) -> (Vec<PlanStep>, Vec<String>) {
+    let mut expanded = graph.clone();
+    let inserted = apply_spec_first(&mut expanded, wf);
+    if inserted.is_empty() {
+        return (steps.to_vec(), inserted);
+    }
+    let template_step = first_write_step(graph)
+        .and_then(|node| steps.iter().find(|step| step.id == node.id))
+        .cloned()
+        .unwrap_or_default();
+    let incoming = build_incoming(&expanded);
+    let out = expanded
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let deps = incoming.get(&node.id).cloned().unwrap_or_default();
+            if let Some(step) = steps.iter().find(|step| step.id == node.id) {
+                let mut step = step.clone();
+                for dep in deps {
+                    if !step.depends_on.contains(&dep) {
+                        step.depends_on.push(dep);
+                    }
+                }
+                Some(step)
+            } else if inserted.contains(&node.id) {
+                Some(PlanStep {
+                    id: node.id.clone(),
+                    role: node.role.to_string(),
+                    job: node.job.clone(),
+                    runner: template_step.runner.clone(),
+                    model: template_step.model.clone(),
+                    depends_on: deps,
+                    sensitive: None,
+                    task: template_step.task.clone(),
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    (out, inserted)
+}
+
+/// Whether a step carries the fixed job [`apply_spec_first`] gives the spec
+/// and test steps it inserts for `user_prompt` (FR-3715).
+pub fn is_spec_first_step(role: &str, job: &str, user_prompt: &str) -> bool {
+    match role {
+        "spec" => {
+            job.starts_with("Write or update the spec under ")
+                && job.ends_with(&format!(" for: {user_prompt}"))
+        }
+        "test" => job == format!("Run the tests for: {user_prompt}"),
+        _ => false,
+    }
 }
 
 /// Builds the spec → implement → test graph for simple runs (FR-3505).

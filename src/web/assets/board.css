@@ -259,6 +259,86 @@ body.board-modal-open {
   font-size: 0.85rem;
 }
 
+/* SPEC-spec-review-gate FR-3714, FR-3715 */
+.board-review-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-top: 0.25rem;
+}
+
+.board-review-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.board-review-badge-plan {
+  border-color: var(--accent);
+}
+
+.board-review-badge-spec {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.board-review-title {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--text);
+}
+
+.board-spec-review {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+}
+
+.board-spec-paths {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+
+.board-spec-feedback {
+  width: 100%;
+  box-sizing: border-box;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.board-spec-review-actions,
+.board-plan-review-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.board-spec-verdict {
+  margin: 0;
+  font-weight: 600;
+}
+
+.board-spec-notice[hidden] {
+  display: none;
+}
+
+.board-plan-step-note {
+  display: block;
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-style: italic;
+}
+
 .board-plan-meta {
   font-size: 0.8rem;
   color: var(--muted);

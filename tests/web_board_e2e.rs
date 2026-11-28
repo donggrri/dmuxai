@@ -458,6 +458,16 @@ fn run_probe(
     script_body: &str,
     args: &[&str],
 ) -> serde_json::Value {
+    run_probe_for(python, chrome, script_body, args, Duration::from_secs(55))
+}
+
+fn run_probe_for(
+    python: impl AsRef<OsStr>,
+    chrome: &Path,
+    script_body: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> serde_json::Value {
     let mut cmd = Command::new(python.as_ref());
     cmd.args(["-c", script_body]);
     cmd.arg(chrome);
@@ -473,7 +483,7 @@ fn run_probe(
         let _ = stdout.read_to_end(&mut out);
         let _ = tx.send(out);
     });
-    let out_bytes = match rx.recv_timeout(Duration::from_secs(55)) {
+    let out_bytes = match rx.recv_timeout(timeout) {
         Ok(b) => {
             let _ = child.wait();
             b
@@ -1463,4 +1473,505 @@ with sync_playwright() as p:
         log.trim().is_empty(),
         "view-only serve must not invoke planner/run child: {log}"
     );
+}
+
+// --- SPEC-spec-review-gate FR-3714, FR-3715 (real board child) ---
+
+/// Fake cursor-agent for real board runs: the spec step writes
+/// `docs/specs/SPEC-x.md` (round 2 after reviewer feedback), the implement
+/// step writes `impl.txt` (`impl-reject.txt` for a `reject-flow` job) and the
+/// test step reports a passing `DMUXAI_TESTS` marker.
+const SPEC_FLOW_CURSOR: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo "test-cursor"; exit 0 ;;
+  status) echo '{"isAuthenticated":true,"userInfo":{"email":"alice@example.com"}}'; exit 0 ;;
+  models) exit 1 ;;
+esac
+ws="$PWD"
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--workspace" ]; then ws="$a"; fi
+  prev="$a"
+done
+prompt=$(cat)
+text="done"
+case "$prompt" in
+  *"End your reply with one line: DMUXAI_TESTS"*)
+    text='Tests passed.\nDMUXAI_TESTS: {\"command\": \"true\", \"exit\": 0}' ;;
+  *"Follow the spec written by the earlier spec step"*)
+    case "$prompt" in
+      *"reject-flow"*) out="impl-reject.txt" ;;
+      *) out="impl.txt" ;;
+    esac
+    printf 'implemented\n' > "$ws/$out"
+    text="implemented" ;;
+  *"Write or update a spec under"*)
+    mkdir -p "$ws/docs/specs"
+    case "$prompt" in
+      *"Reviewer feedback"*) printf '# Spec X\n\nRound 2 adds error handling.\n' > "$ws/docs/specs/SPEC-x.md" ;;
+      *) printf '# Spec X\n\nRound 1 draft.\n' > "$ws/docs/specs/SPEC-x.md" ;;
+    esac
+    text="spec written" ;;
+esac
+if [ -n "${FAKE_RUNNER_LOG:-}" ]; then printf 'turn %s\n' "$text" >> "$FAKE_RUNNER_LOG"; fi
+SESS="sess-$$"
+printf '{"type":"assistant","session_id":"%s","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$SESS" "$text"
+printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"%s"}\n' "$text" "$SESS"
+exit 0
+"#;
+
+fn git(workspace: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-c", "user.email=e2e@example.com", "-c", "user.name=e2e"])
+        .args(args)
+        .current_dir(workspace)
+        .env("HOME", workspace)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The temp workspace becomes a git repo, cursor-agent is the spec-flow fake
+/// and the user config turns spec-first (and optionally the review) on.
+fn setup_spec_flow(env: &Env, spec_review: &str) -> PathBuf {
+    let cursor = env.fake_bin.join("spec-flow-cursor.sh");
+    write_executable(&cursor, SPEC_FLOW_CURSOR);
+    write_user_config(
+        env,
+        &format!(
+            "[cursor]\nprotocol = \"legacy\"\n\n[workflow]\nspec_first = \"full\"\nspec_review = \"{spec_review}\"\n"
+        ),
+    );
+    cursor
+}
+
+fn commit_workspace(env: &Env) {
+    git(&env.workspace, &["init", "-q"]);
+    git(&env.workspace, &["add", "-A"]);
+    git(&env.workspace, &["commit", "-q", "-m", "init"]);
+}
+
+/// `dmuxai --web` whose board runs spawn the real `dmuxai run` child.
+fn start_web_real_child(env: &Env, cursor: &Path) -> (ChildGuard, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dmuxai"));
+    cmd.args(["--web", "-C"])
+        .arg(&env.workspace)
+        .args(["--port", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    apply_web_env(&mut cmd, env, &[]);
+    cmd.env_remove("DMUXAI_BOARD_CHILD_BIN")
+        .env("DMUXAI_CURSOR_BIN", cursor)
+        .env("DMUXAI_SPEC_REVIEW_POLL_MS", "200");
+    let mut child = cmd.spawn().expect("spawn dmuxai --web");
+    let stdout = child.stdout.take().expect("stdout");
+    (
+        ChildGuard {
+            child: Some(child),
+            _serial: web_e2e_serial(),
+        },
+        read_dashboard_url(stdout),
+    )
+}
+
+/// Screenshots go to `DMUXAI_E2E_SHOTS` when it names a directory, else under
+/// the test's temp root.
+fn shots_dir(env: &Env) -> PathBuf {
+    if let Some(dir) = std::env::var_os("DMUXAI_E2E_SHOTS").map(PathBuf::from)
+        && dir.is_dir()
+    {
+        return dir;
+    }
+    let dir = env.state.parent().expect("temp root").join("shots");
+    fs::create_dir_all(&dir).expect("shots dir");
+    dir
+}
+
+/// Executed graph runs in the workspace, keyed by their user prompt.
+fn graph_run_for_prompt(env: &Env, prompt: &str) -> serde_json::Value {
+    let dir = env.workspace.join(".dmuxai").join("graphs");
+    for entry in fs::read_dir(&dir).expect("graphs dir").flatten() {
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(run) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if run["plan"]["user_prompt"].as_str() == Some(prompt) {
+            return run;
+        }
+    }
+    panic!("no graph run for prompt {prompt:?} in {}", dir.display());
+}
+
+fn executed_node_ids(run: &serde_json::Value) -> Vec<String> {
+    run["plan"]["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter(|n| n["role"].as_str() != Some("orchestrate"))
+        .map(|n| n["id"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+fn plan_step_ids(item: &serde_json::Value) -> Vec<String> {
+    item["plan"]["steps"]
+        .as_array()
+        .expect("plan steps")
+        .iter()
+        .map(|s| s["id"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// Python helpers: token masking for screenshots and API polling.
+const SPEC_FLOW_PY: &str = r#"
+import os
+import time
+from urllib.parse import urlparse, parse_qs
+
+def url_token(u):
+    parts = urlparse(u)
+    for blob in (parts.query, parts.fragment):
+        vals = parse_qs(blob).get('token')
+        if vals:
+            return vals[0]
+    return ''
+
+TOKEN = url_token(url)
+
+def shot(page, shots, name):
+    page.evaluate("""(tok) => {
+      if (!tok) return;
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let n;
+      while ((n = walker.nextNode())) {
+        if (n.nodeValue && n.nodeValue.includes(tok)) n.nodeValue = n.nodeValue.split(tok).join('****');
+      }
+      document.querySelectorAll('input, textarea').forEach((el) => {
+        if (el.value && el.value.includes(tok)) el.value = el.value.split(tok).join('****');
+      });
+      document.querySelectorAll('*').forEach((el) => {
+        for (const a of [...el.attributes]) {
+          if (a.value && a.value.includes(tok)) el.setAttribute(a.name, a.value.split(tok).join('****'));
+        }
+      });
+    }""", TOKEN)
+    if TOKEN:
+        assert TOKEN not in page.content(), 'token visible before screenshot'
+    page.screenshot(path=os.path.join(shots, name + '.png'), full_page=True)
+
+def item_json(page, id):
+    return page.evaluate("""async (id) => {
+      const r = await fetch('/api/board/' + encodeURIComponent(id), {cache: 'no-store'});
+      return await r.json();
+    }""", id)
+
+def wait_item(page, id, pred, timeout=60000):
+    deadline = time.time() + timeout / 1000.0
+    item = None
+    while time.time() < deadline:
+        item = item_json(page, id)
+        if pred(item):
+            return item
+        page.wait_for_timeout(250)
+    raise AssertionError('item %s never matched; last: %s' % (id, json.dumps(item)))
+
+def open_item_by_id(page, id):
+    page.evaluate("(id) => boardOpenDrawer(id)", id)
+    page.wait_for_selector('#board-drawer-wrap.open:not([hidden])', timeout=20000)
+    page.wait_for_function(
+        "(id) => boardSelectedItem && boardSelectedItem.id === id", arg=id, timeout=20000)
+"#;
+
+// TC-3714 / FR-3714, FR-3715: Plan review → run pauses → Spec review badge,
+// My decisions, spec link in the viewer → Request changes → round 2 →
+// Approve spec → Done; a second item's Reject spec writes no implement file.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3714_spec_review_in_board_ui_with_real_child() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let cursor = setup_spec_flow(&env, "on");
+    let reject_plan = BOARD_PLAN_JSON.replace("\"edit\"", "\"edit reject-flow\"");
+    let rejected = board_add(&env, "Spec reject item", "Reject at spec", "needs_decision");
+    let rejected_id = rejected["id"].as_str().expect("id").to_owned();
+    board_plan_edit(&env, &rejected_id, "reject flow prompt", &reject_plan);
+    let approved = board_add(
+        &env,
+        "Spec approve item",
+        "Approve at spec",
+        "needs_decision",
+    );
+    let approved_id = approved["id"].as_str().expect("id").to_owned();
+    board_plan_edit(&env, &approved_id, "approve flow prompt", BOARD_PLAN_JSON);
+    commit_workspace(&env);
+    let shots = shots_dir(&env);
+    let (_guard, url) = start_web_real_child(&env, &cursor);
+
+    let script = format!(
+        r##"{OPEN_BOARD}
+{SPEC_FLOW_PY}
+shots = sys.argv[4]
+reject_id = sys.argv[5]
+out = {{}}
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 900}})
+    page.on('dialog', lambda d: d.accept())
+    open_board(page)
+
+    # Reject flow: Plan review → approve → spec review → Reject spec.
+    out['plan_badge'] = page.locator(
+        '.board-card[data-item-id="' + reject_id + '"] .board-review-badge-plan').inner_text()
+    open_item_by_id(page, reject_id)
+    out['plan_title'] = page.inner_text('#board-plan-review-title')
+    out['plan_rows'] = page.locator('#board-plan-steps tbody tr').count()
+    out['added_notes'] = page.locator('.board-plan-step-note').count()
+    shot(page, shots, 'tc3714-plan-review')
+    page.click('#board-plan-approve')
+    wait_item(page, reject_id, lambda i: (i.get('spec_review') or {{}}).get('status') == 'pending')
+    page.wait_for_selector('#board-spec-review-title', timeout=20000)
+    out['reject_lane_paused'] = item_json(page, reject_id)['lane']
+    page.click('#board-spec-reject')
+    page.wait_for_function(
+        "() => (document.getElementById('board-spec-verdict')?.textContent || '').includes('Spec rejected')",
+        timeout=20000)
+    out['reject_buttons_gone'] = page.locator('#board-spec-approve').count() == 0
+    wait_item(page, reject_id, lambda i: i.get('lane') in ('unknown', 'done'), 60000)
+    out['reject_final_lane'] = item_json(page, reject_id)['lane']
+    page.keyboard.press('Escape')
+
+    # Approve flow with Request changes and round 2.
+    page.locator(
+        '.board-decision-card[data-item-id="' + item_id + '"]'
+        ' [data-board-action="approve"]').click(force=True)
+    wait_item(page, item_id, lambda i: (i.get('spec_review') or {{}}).get('status') == 'pending')
+    page.wait_for_selector(
+        '.board-card[data-item-id="' + item_id + '"] .board-review-badge-spec', timeout=20000)
+    out['spec_badge'] = page.locator(
+        '.board-card[data-item-id="' + item_id + '"] .board-review-badge-spec').inner_text()
+    out['in_my_decisions'] = page.locator(
+        '.board-decision-card[data-item-id="' + item_id + '"]').count() == 1
+    out['paused_lane'] = item_json(page, item_id)['lane']
+    open_item_by_id(page, item_id)
+    out['round1_title'] = page.inner_text('#board-spec-review-title')
+    shot(page, shots, 'tc3714-spec-review')
+    page.click('#board-spec-review a.md-path-link')
+    page.wait_for_function(
+        "() => (document.getElementById('md-viewer-body')?.innerText || '').includes('Round 1 draft')",
+        timeout=20000)
+    out['viewer_no_script'] = page.locator('#md-viewer-body script').count() == 0
+    shot(page, shots, 'tc3714-spec-viewer')
+    page.keyboard.press('Escape')
+    page.wait_for_function(
+        "() => document.getElementById('md-viewer-backdrop').hidden", timeout=5000)
+    out['modal_open_after_viewer'] = page.evaluate(
+        "() => document.getElementById('board-drawer-wrap').classList.contains('open')")
+
+    page.click('#board-spec-request-changes')
+    page.wait_for_function(
+        "() => (document.getElementById('board-spec-notice')?.textContent || '').includes('needs feedback')",
+        timeout=5000)
+    out['empty_feedback_pending'] = item_json(page, item_id)['spec_review']['status'] == 'pending'
+    page.fill('#board-spec-feedback', 'Add error handling')
+    page.click('#board-spec-request-changes')
+    wait_item(page, item_id,
+        lambda i: (i.get('spec_review') or {{}}).get('round') == 2 and i['spec_review'].get('status') == 'pending')
+    page.wait_for_function(
+        "() => (document.getElementById('board-spec-review-title')?.textContent || '') === 'Spec review (round 2)'",
+        timeout=20000)
+
+    # A stale digest is refused with a reload notice and decides nothing.
+    def stale_digest(route):
+        body = json.loads(route.request.post_data or '{{}}')
+        body['spec_digest'] = 'stale'
+        route.continue_(post_data=json.dumps(body))
+    page.route('**/spec-review', stale_digest)
+    page.click('#board-spec-approve')
+    page.wait_for_function(
+        "() => (document.getElementById('board-spec-notice')?.textContent || '').includes('reload')",
+        timeout=10000)
+    out['stale_notice'] = page.inner_text('#board-spec-notice')
+    out['stale_still_pending'] = item_json(page, item_id)['spec_review']['status'] == 'pending'
+    page.unroute('**/spec-review')
+    open_item_by_id(page, item_id)
+    page.wait_for_selector('#board-spec-approve', timeout=20000)
+    page.click('#board-spec-approve')
+    page.wait_for_function(
+        "() => (document.getElementById('board-spec-verdict')?.textContent || '').includes('Spec approved')",
+        timeout=20000)
+    out['approve_buttons_gone'] = page.locator('#board-spec-approve').count() == 0
+    wait_item(page, item_id, lambda i: i.get('lane') == 'done', 90000)
+    out['final_lane'] = item_json(page, item_id)['lane']
+    open_item_by_id(page, item_id)
+    shot(page, shots, 'tc3714-done')
+    out['token_hidden'] = (not TOKEN) or TOKEN not in page.content()
+    browser.close()
+    print(json.dumps(out))
+"##
+    );
+
+    let shots_arg = shots.to_string_lossy().into_owned();
+    let result = run_probe_for(
+        &python,
+        &chrome,
+        &script,
+        &[&url, &approved_id, &shots_arg, &rejected_id],
+        Duration::from_secs(240),
+    );
+    assert_eq!(result["plan_badge"], "Plan review", "{result}");
+    assert_eq!(result["plan_title"], "Plan review", "{result}");
+    assert_eq!(result["plan_rows"], 3, "{result}");
+    assert_eq!(result["added_notes"], 2, "{result}");
+    assert_eq!(result["reject_lane_paused"], "in_progress", "{result}");
+    assert_eq!(result["reject_buttons_gone"], true, "{result}");
+    assert_eq!(result["reject_final_lane"], "unknown", "{result}");
+    assert_eq!(result["spec_badge"], "Spec review", "{result}");
+    assert_eq!(result["in_my_decisions"], true, "{result}");
+    assert_eq!(result["paused_lane"], "in_progress", "{result}");
+    assert_eq!(result["round1_title"], "Spec review (round 1)", "{result}");
+    assert_eq!(result["viewer_no_script"], true, "{result}");
+    assert_eq!(result["modal_open_after_viewer"], true, "{result}");
+    assert_eq!(result["empty_feedback_pending"], true, "{result}");
+    assert!(
+        result["stale_notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("reload")),
+        "{result}"
+    );
+    assert_eq!(result["stale_still_pending"], true, "{result}");
+    assert_eq!(result["approve_buttons_gone"], true, "{result}");
+    assert_eq!(result["final_lane"], "done", "{result}");
+    assert_eq!(result["token_hidden"], true, "{result}");
+
+    assert!(
+        env.workspace.join("impl.txt").is_file(),
+        "approved run implements"
+    );
+    assert!(
+        !env.workspace.join("impl-reject.txt").exists(),
+        "a rejected spec must not run the implement step"
+    );
+    let spec = fs::read_to_string(env.workspace.join("docs/specs/SPEC-x.md")).unwrap();
+    assert!(spec.contains("Round 2"), "{spec}");
+
+    let rejected_item = board_show(&env, &rejected_id);
+    assert_eq!(rejected_item["spec_review"]["status"], "rejected");
+    let approved_item = board_show(&env, &approved_id);
+    assert_eq!(approved_item["spec_review"]["status"], "approved");
+    assert_eq!(approved_item["spec_review"]["round"], 2);
+    let thread: Vec<(String, String)> = approved_item["thread"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["from"].as_str().unwrap_or_default().to_owned(),
+                m["text"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        thread
+            .iter()
+            .any(|(from, text)| from == "planner"
+                && text.starts_with("Spec review requested (round 2)")),
+        "{thread:?}"
+    );
+    assert!(
+        thread
+            .iter()
+            .any(|(from, text)| from == "owner" && text.contains("Add error handling")),
+        "{thread:?}"
+    );
+    for entry in fs::read_dir(&shots).unwrap().flatten() {
+        assert!(entry.path().extension().is_some_and(|e| e == "png"));
+    }
+}
+
+// TC-3715 / FR-3715, FR-3503 (#374): the plan the owner approves is the plan
+// that runs — the modal shows the spec-first expanded steps before approval
+// and the approved hash equals the executed graph's plan hash.
+#[test]
+#[ignore = "needs Chrome and playwright; run with --ignored"]
+fn tc_3715_plan_review_runs_spec_first_expanded_plan() {
+    let Some((chrome, python)) = prepare() else {
+        return;
+    };
+    let env = setup_env();
+    let cursor = setup_spec_flow(&env, "off");
+    let item = board_add(&env, "Expanded plan", "Runs as approved", "needs_decision");
+    let id = item["id"].as_str().expect("id").to_owned();
+    let planned = board_plan_edit(&env, &id, "expanded plan prompt", BOARD_PLAN_JSON);
+    assert_eq!(plan_step_ids(&planned), ["spec-1", "step-1", "test-1"]);
+    let stored_hash = planned["plan"]["hash"].as_str().expect("hash").to_owned();
+    commit_workspace(&env);
+    let shots = shots_dir(&env);
+    let (_guard, url) = start_web_real_child(&env, &cursor);
+
+    let script = format!(
+        r##"{OPEN_BOARD}
+{SPEC_FLOW_PY}
+shots = sys.argv[4]
+out = {{}}
+with sync_playwright() as p:
+    browser = p.chromium.launch(
+        executable_path=chrome, headless=True, args=["--no-sandbox"])
+    page = browser.new_page(viewport={{"width": 1280, "height": 900}})
+    open_board(page)
+    open_item_by_id(page, item_id)
+    out['step_ids'] = page.evaluate("""() => [...document.querySelectorAll(
+        '#board-plan-steps tbody tr input[data-field="id"]')].map((el) => el.value)""")
+    out['added_rows'] = page.evaluate("""() => [...document.querySelectorAll(
+        '#board-plan-steps tbody tr.board-plan-step-added input[data-field="id"]')].map((el) => el.value)""")
+    out['note'] = page.locator('.board-plan-step-note').first.inner_text()
+    shot(page, shots, 'tc3715-plan-review')
+    page.click('#board-plan-approve')
+    wait_item(page, item_id, lambda i: i.get('lane') == 'done', 90000)
+    browser.close()
+    print(json.dumps(out))
+"##
+    );
+    let shots_arg = shots.to_string_lossy().into_owned();
+    let result = run_probe_for(
+        &python,
+        &chrome,
+        &script,
+        &[&url, &id, &shots_arg],
+        Duration::from_secs(150),
+    );
+    assert_eq!(
+        result["step_ids"],
+        serde_json::json!(["spec-1", "step-1", "test-1"]),
+        "{result}"
+    );
+    assert_eq!(
+        result["added_rows"],
+        serde_json::json!(["spec-1", "test-1"]),
+        "{result}"
+    );
+    assert_eq!(result["note"], "added by spec-first", "{result}");
+
+    let done = board_show(&env, &id);
+    assert_eq!(
+        done["decision"]["plan_hash"].as_str(),
+        Some(stored_hash.as_str())
+    );
+    let run = graph_run_for_prompt(&env, "expanded plan prompt");
+    assert_eq!(
+        run["plan_hash"].as_str(),
+        Some(stored_hash.as_str()),
+        "{run}"
+    );
+    assert_eq!(executed_node_ids(&run), ["spec-1", "step-1", "test-1"]);
+    assert!(env.workspace.join("impl.txt").is_file());
 }

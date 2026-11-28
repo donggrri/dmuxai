@@ -186,6 +186,21 @@ pub struct BoardPlan {
     /// Steps from the revision immediately before the current one (dashboard diff).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_steps: Option<Vec<crate::graph::PlanStep>>,
+    /// Ids of the steps the spec-first expansion added (FR-3715).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_first_added: Vec<String>,
+}
+
+/// The spec review of a board item's run (SPEC-spec-review-gate FR-3711).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardSpecReview {
+    pub review_id: String,
+    pub status: crate::graph::spec_review::ReviewStatus,
+    pub round: u32,
+    #[serde(default)]
+    pub spec_paths: Vec<String>,
+    #[serde(default)]
+    pub spec_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +289,8 @@ pub struct BoardItem {
     pub run_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_review: Option<BoardSpecReview>,
     pub created_ms: u64,
     pub updated_ms: u64,
     pub version: u32,
@@ -696,6 +713,7 @@ mod tests {
                 revision: 1,
                 history: vec![],
                 previous_steps: None,
+                spec_first_added: vec![],
             }),
             decision: Some(Decision {
                 verdict: Verdict::RequestChanges,
@@ -713,6 +731,7 @@ mod tests {
             }],
             run_ids: vec![],
             key: None,
+            spec_review: None,
             created_ms: 0,
             updated_ms: 0,
             version: 1,

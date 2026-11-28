@@ -124,8 +124,13 @@ pub struct WorkspaceSettings {
     pub browse_roots: Vec<String>,
 }
 
-pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] =
-    &["needs_decision", "decision", "message", "run_finished"];
+pub const VALID_BOARD_NOTIFY_EVENTS: &[&str] = &[
+    "needs_decision",
+    "decision",
+    "message",
+    "run_finished",
+    "spec_review",
+];
 
 /// Placeholder for unknown `[board]` TOML keys so `BoardSettings` keeps `Eq`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

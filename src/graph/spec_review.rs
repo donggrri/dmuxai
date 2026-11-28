@@ -683,6 +683,7 @@ pub struct SpecReviewGate {
     journal: Option<JournalSink>,
     polls: u64,
     summary: Option<SpecReviewSummary>,
+    last_record: Option<SpecReviewRecord>,
 }
 
 impl SpecReviewGate {
@@ -711,11 +712,42 @@ impl SpecReviewGate {
             journal: None,
             polls: 0,
             summary: None,
+            last_record: None,
         }
     }
 
     pub fn set_board_item_id(&mut self, id: Option<String>) {
-        self.board_item_id = id.filter(|id| crate::board::valid_item_id(id));
+        self.board_item_id = id.filter(|id| {
+            let valid = crate::board::valid_item_id(id);
+            if !valid {
+                eprintln!("warning: ignoring invalid DMUXAI_BOARD_ITEM_ID");
+            }
+            valid
+        });
+    }
+
+    /// Mirrors the review on the run's board item (FR-3711). A missing or
+    /// invalid item is a warning, never a run failure.
+    fn sync_board(&mut self, record: &SpecReviewRecord) {
+        self.last_record = Some(record.clone());
+        let Some(item_id) = self.board_item_id.as_deref() else {
+            return;
+        };
+        let Some(board_base) = self.store.dir().parent().map(|state| state.join("board")) else {
+            return;
+        };
+        if let Err(error) = crate::board::runner::sync_spec_review(&board_base, item_id, record) {
+            eprintln!("warning: board item {item_id}: spec review not recorded: {error}");
+        }
+    }
+
+    /// Board sync for a status change without a readable record.
+    fn sync_board_status(&mut self, status: ReviewStatus) {
+        if let Some(mut record) = self.last_record.clone() {
+            record.status = status;
+            record.feedback = None;
+            self.sync_board(&record);
+        }
     }
 
     pub fn set_journal(&mut self, sink: Option<JournalSink>) {
@@ -733,6 +765,11 @@ impl SpecReviewGate {
 
     pub fn review_id(&self) -> &str {
         &self.graph_id
+    }
+
+    /// The record store this gate polls (the TUI decides through it, FR-3716).
+    pub fn store(&self) -> &SpecReviewStore {
+        &self.store
     }
 
     pub fn round(&self) -> u32 {
@@ -851,6 +888,7 @@ impl SpecReviewGate {
         let hint = self.hint();
         session.begin_spec_review_wait(hint.clone());
         self.set_summary(session, ReviewStatus::Pending);
+        self.sync_board(&record);
         self.emit(serde_json::json!({
             "type": "spec_review_requested",
             "review_id": record.review_id,
@@ -900,6 +938,7 @@ impl SpecReviewGate {
         let record = match self.store.load(&self.graph_id) {
             Ok(record) => record,
             Err(ReviewError::NotFound(_) | ReviewError::Corrupt(_)) => {
+                self.sync_board_status(ReviewStatus::Cancelled);
                 return self.stop(
                     session,
                     Some(ReviewStatus::Cancelled),
@@ -913,9 +952,13 @@ impl SpecReviewGate {
         match record.status {
             ReviewStatus::Pending => {
                 if now.saturating_duration_since(since) >= self.cfg.timeout {
-                    let _ = self
+                    match self
                         .store
-                        .close_if_open(&self.graph_id, ReviewStatus::Expired);
+                        .close_if_open(&self.graph_id, ReviewStatus::Expired)
+                    {
+                        Ok(record) => self.sync_board(&record),
+                        Err(_) => self.sync_board_status(ReviewStatus::Expired),
+                    }
                     let secs = self.cfg.timeout.as_secs_f64().ceil() as u64;
                     return self.stop(
                         session,
@@ -937,6 +980,7 @@ impl SpecReviewGate {
             }
             ReviewStatus::Approved => {
                 self.emit_decided(&record);
+                self.sync_board(&record);
                 self.phase = GatePhase::Done;
                 self.set_summary(session, ReviewStatus::Approved);
                 let actions = session.release_spec_review();
@@ -948,6 +992,7 @@ impl SpecReviewGate {
             }
             ReviewStatus::ChangesRequested => {
                 self.emit_decided(&record);
+                self.sync_board(&record);
                 self.phase = GatePhase::Rerunning;
                 let feedback = record.feedback.clone().unwrap_or_default();
                 let block = render_feedback_block(record.round, &feedback, &self.spec_dir);
@@ -961,6 +1006,7 @@ impl SpecReviewGate {
             }
             ReviewStatus::Rejected => {
                 self.emit_decided(&record);
+                self.sync_board(&record);
                 self.stop(
                     session,
                     Some(ReviewStatus::Rejected),
@@ -968,21 +1014,27 @@ impl SpecReviewGate {
                     "spec rejected by reviewer".to_owned(),
                 )
             }
-            ReviewStatus::Expired => self.stop(
-                session,
-                Some(ReviewStatus::Expired),
-                StopReason::TimedOut,
-                format!(
-                    "spec review timed out after {}s",
-                    self.cfg.timeout.as_secs_f64().ceil() as u64
-                ),
-            ),
-            ReviewStatus::Cancelled => self.stop(
-                session,
-                Some(ReviewStatus::Cancelled),
-                StopReason::Cancelled,
-                "spec review cancelled".to_owned(),
-            ),
+            ReviewStatus::Expired => {
+                self.sync_board(&record);
+                self.stop(
+                    session,
+                    Some(ReviewStatus::Expired),
+                    StopReason::TimedOut,
+                    format!(
+                        "spec review timed out after {}s",
+                        self.cfg.timeout.as_secs_f64().ceil() as u64
+                    ),
+                )
+            }
+            ReviewStatus::Cancelled => {
+                self.sync_board(&record);
+                self.stop(
+                    session,
+                    Some(ReviewStatus::Cancelled),
+                    StopReason::Cancelled,
+                    "spec review cancelled".to_owned(),
+                )
+            }
         }
     }
 
@@ -1011,6 +1063,7 @@ impl SpecReviewGate {
         {
             let summary = record.summary();
             self.summary = Some(summary);
+            self.sync_board(&record);
         }
         self.summary.clone()
     }

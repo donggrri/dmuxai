@@ -2639,6 +2639,48 @@ mod tests {
         }
     }
 
+    // TC-3715 / FR-3715, FR-3714: `Plan review` badge and modal title only for
+    // a needs_decision item with a plan; `Spec review` badge, section, buttons,
+    // human headers and digest; inserted plan steps are marked.
+    #[test]
+    fn tc_3715_board_plan_and_spec_review_assets() {
+        let plan_gate = BOARD_JS
+            .split("function boardPlanReviewPending(item) {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("plan review predicate");
+        assert!(plan_gate.contains("item.lane === 'needs_decision'"));
+        assert!(plan_gate.contains("item.plan"));
+        assert!(BOARD_JS.contains("'Plan review'"));
+        assert!(BOARD_JS.contains("board-review-badge-plan"));
+        assert!(BOARD_JS.contains("board-plan-review-title"));
+        assert!(BOARD_JS.contains("if (planReview) {"));
+        assert!(BOARD_JS.contains("board-plan-approve"));
+        assert!(BOARD_JS.contains("board-plan-reject"));
+        assert!(BOARD_JS.contains("'added by spec-first'"));
+        assert!(BOARD_JS.contains("spec_first_added"));
+
+        let spec_gate = BOARD_JS
+            .split("function boardSpecReviewPending(item) {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("spec review predicate");
+        assert!(spec_gate.contains("item.spec_review.status === 'pending'"));
+        assert!(BOARD_JS.contains("'Spec review'"));
+        assert!(BOARD_JS.contains("'Spec review (round '"));
+        assert!(BOARD_JS.contains("'Approve spec'"));
+        assert!(BOARD_JS.contains("'Request changes'"));
+        assert!(BOARD_JS.contains("'Reject spec'"));
+        assert!(BOARD_JS.contains("'/spec-review', body, true)"));
+        assert!(BOARD_JS.contains("spec_digest: review.spec_digest"));
+        assert!(BOARD_JS.contains("md-path-link"));
+        assert!(BOARD_JS.contains("data-md-path"));
+        assert!(BOARD_JS.contains("reload to review the new version"));
+        assert!(BOARD_JS.contains("err.status === 403"));
+        assert!(BOARD_CSS.contains(".board-review-badge"));
+        assert!(BOARD_CSS.contains(".board-spec-review"));
+    }
+
     // TC-3134 / FR-3134: drawer Ask planner & Run controls, hidden in view-only serve.
     #[test]
     fn tc_3134_drawer_ask_and_run_controls_hidden_in_serve() {

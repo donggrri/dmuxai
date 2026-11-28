@@ -41,10 +41,10 @@ pub use replan::{
 };
 pub use spec_first::{
     SpecGateResult, TestGate, apply_spec_first, changed_spec_paths, check_marker_gate,
-    check_spec_gate, ensure_spec_dir, implement_after_spec_directive, lite_directive,
-    node_has_spec_ancestor, parse_tests_marker, plan_prompt_for, replan_prompt_for,
-    run_test_command, spec_node_directive, spec_snapshot, spec_snapshot_in, test_node_directive,
-    three_step_plan,
+    check_spec_gate, ensure_spec_dir, expand_plan_steps, implement_after_spec_directive,
+    is_spec_first_step, lite_directive, node_has_spec_ancestor, parse_tests_marker,
+    plan_prompt_for, replan_prompt_for, run_test_command, spec_node_directive, spec_snapshot,
+    spec_snapshot_in, test_node_directive, three_step_plan,
 };
 pub use store::{GraphRunListCache, GraphStore, load_run, save_run};
 pub use tasks::{

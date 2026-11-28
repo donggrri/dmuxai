@@ -620,6 +620,7 @@ mod tests {
             dynamic_cap: None,
             dynamic_added: None,
             spec_review: None,
+            plan_hash: None,
         }
     }
 

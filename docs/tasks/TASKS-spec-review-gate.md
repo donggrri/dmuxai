@@ -1,6 +1,6 @@
 # TASKS: spec-review-gate
 
-Status: part 1 complete; part 2 open
+Status: part 1 and part 2 complete
 Owner: DmuxAI
 Created: 2026-11-28
 Spec: [SPEC-spec-review-gate](../specs/SPEC-spec-review-gate.md)
@@ -31,9 +31,29 @@ Plan: [PLAN-spec-review-gate](../plans/PLAN-spec-review-gate.md)
 - [x] T8 — Gates. Verify: `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`.
 
-## Part 2 (not started)
+## Part 2 (board, dashboard, TUI, #374)
 
-- [ ] T9 — Board item `spec_review` field, notify events, board child timeout
-  (FR-3711, FR-3712). `src/board/runner.rs`.
-- [ ] T10 — Dashboard endpoints and human headers (FR-3708 dashboard part, FR-3713).
-- [ ] T11 — Board UI (FR-3714, FR-3715) and TUI panel (FR-3716).
+- [x] T9 — Board item `spec_review` field, thread messages, `spec_review`
+  notify event, `DMUXAI_BOARD_ITEM_ID` for the child, board child timeout
+  suspended while pending. Requirements: FR-3711, FR-3712. Verify:
+  `cargo test --lib tc_3711` and `cargo test --lib tc_3712`
+  (`src/board/runner.rs`).
+- [x] T10 — `POST /api/board/{id}/spec-review` with human headers and digest;
+  `spec_review` in item and pending payloads. Requirements: FR-3708 (dashboard
+  part), FR-3713. Verify: `cargo test --lib tc_3708` and
+  `cargo test --lib tc_3713` (`src/web/board_api.rs`).
+- [x] T11 — Board UI `Plan review` / `Spec review` badges, My decisions entry,
+  spec review section and plan review title (FR-3714, FR-3715); TUI spec review
+  panel with `a` / `c` / `x` / Esc (FR-3716). Verify:
+  `cargo test --lib tc_3715`, `cargo test --bin dmuxai tc_3716`,
+  `cargo test --test web_board_e2e -- --ignored tc_3714 tc_3715`.
+- [x] T12 — #374: `board plan --edit`, dashboard Save plan and
+  `board add --plan-hash` store the spec-first expanded plan (FR-3715 with
+  FR-3503); inserted steps marked `added by spec-first`; executed graph records
+  `plan_hash`. Verify: `cargo test --lib tc_3715`,
+  `cargo test --bin dmuxai tc_3715`,
+  `cargo test --test web_board_e2e -- --ignored tc_3715`.
+- [x] T13 — Gates and cleanup: `tests/spec_review_part2.rs` deleted;
+  `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-targets`, `bash scripts/check-spec.sh docs/specs/SPEC-spec-review-gate.md`,
+  `python3 scripts/check-spec.py --all`, `python3 scripts/check-tc-links.py`.

@@ -16,12 +16,15 @@ use super::{
     ensure_pending_plan_from_copy, normalize_plan_prompt, prune_old_plan_copies,
     validate_item_id_early, validate_message,
 };
+use crate::graph::spec_review::{ReviewStatus, SpecReviewRecord};
 use crate::process::{apply_child_cwd, apply_child_env_policy};
 use crate::run_journal::{mask_sensitive_tokens, valid_run_id};
 use crate::settings::BoardSettings;
 use crate::state_path::valid_pending_plan_hash;
 
 pub const BOARD_CHILD_TIMEOUT_SECS: u64 = 900;
+/// Board item id a board run passes to its child (SPEC-spec-review-gate FR-3711).
+pub const BOARD_ITEM_ID_ENV: &str = "DMUXAI_BOARD_ITEM_ID";
 const STALE_LOCK_SECS: u64 = 960;
 const THREAD_CONTEXT_LIMIT: usize = 20;
 
@@ -257,6 +260,33 @@ pub fn spawn_child_dmuxai(
     timeout: Duration,
     state_root: &Path,
 ) -> Result<ChildOutcome, BoardError> {
+    spawn_child_dmuxai_for_item(workspace, args, stdin_prompt, timeout, state_root, None)
+}
+
+/// How often a running board child's item is checked for a pending spec review.
+const SPEC_REVIEW_PAUSE_CHECK: Duration = Duration::from_millis(250);
+
+/// Whether the item's spec review is pending (SPEC-spec-review-gate FR-3712).
+fn item_spec_review_pending(board_base: &Path, item_id: &str) -> bool {
+    let path = board_base.join("items").join(format!("{item_id}.json"));
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BoardItem>(&bytes).ok())
+        .and_then(|item| item.spec_review)
+        .is_some_and(|review| review.status == ReviewStatus::Pending)
+}
+
+/// [`spawn_child_dmuxai`] for a board item's run: the child gets
+/// `DMUXAI_BOARD_ITEM_ID` and the timeout does not count while the item's
+/// spec review is pending (SPEC-spec-review-gate FR-3711, FR-3712).
+pub fn spawn_child_dmuxai_for_item(
+    workspace: &Path,
+    args: &[String],
+    stdin_prompt: &str,
+    timeout: Duration,
+    state_root: &Path,
+    board_item: Option<(&Path, &str)>,
+) -> Result<ChildOutcome, BoardError> {
     let bin = resolve_child_bin()?;
     let mut cmd = Command::new(&bin);
     cmd.args(args);
@@ -268,6 +298,9 @@ pub fn spawn_child_dmuxai(
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(crate::run_journal::generate_run_id);
     cmd.env(crate::term::policy::RUN_ID_ENV, run_id);
+    if let Some((_, item_id)) = board_item {
+        cmd.env(BOARD_ITEM_ID_ENV, item_id);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -308,12 +341,26 @@ pub fn spawn_child_dmuxai(
         let _ = stderr_tx.send(buf);
     });
 
-    let deadline = Instant::now() + timeout;
+    let mut counted = Duration::ZERO;
+    let mut last_tick = Instant::now();
+    let mut paused = false;
+    let mut next_pause_check = last_tick;
     let exit_code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(1),
             Ok(None) => {
-                if Instant::now() >= deadline {
+                let now = Instant::now();
+                if let Some((board_base, item_id)) = board_item
+                    && now >= next_pause_check
+                {
+                    paused = item_spec_review_pending(board_base, item_id);
+                    next_pause_check = now + SPEC_REVIEW_PAUSE_CHECK;
+                }
+                if !paused {
+                    counted += now.saturating_duration_since(last_tick);
+                }
+                last_tick = now;
+                if counted >= timeout {
                     kill_child_process_group(&mut child);
                     break 124;
                 }
@@ -344,6 +391,92 @@ pub fn spawn_child_dmuxai(
         text,
         summary,
     })
+}
+
+/// Records a spec review change of a board item's run on the item
+/// (SPEC-spec-review-gate FR-3711): a request stores the review, adds a
+/// `planner` thread message and notifies `spec_review`; a decision updates the
+/// status and adds an `owner` message with the verdict. Never changes the lane
+/// or the decision.
+pub fn sync_spec_review(
+    board_base: &Path,
+    item_id: &str,
+    record: &SpecReviewRecord,
+) -> Result<BoardItem, BoardError> {
+    sync_spec_review_with_settings(
+        board_base,
+        item_id,
+        record,
+        &BoardSettings::load_user_only(),
+    )
+}
+
+pub fn sync_spec_review_with_settings(
+    board_base: &Path,
+    item_id: &str,
+    record: &SpecReviewRecord,
+    settings: &BoardSettings,
+) -> Result<BoardItem, BoardError> {
+    validate_item_id_early(item_id)?;
+    if !board_base.join("items").is_dir() {
+        return Err(BoardError::NotFound(format!(
+            "board item '{item_id}' not found"
+        )));
+    }
+    let store = BoardStore::open(board_base.to_path_buf())?;
+    let review = super::BoardSpecReview {
+        review_id: record.review_id.clone(),
+        status: record.status,
+        round: record.round,
+        spec_paths: record.spec_paths.clone(),
+        spec_digest: record.spec_digest.clone(),
+    };
+    let round = record.round;
+    let feedback = record
+        .feedback
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let message = match record.status {
+        ReviewStatus::Pending => Some((
+            "planner",
+            format!(
+                "Spec review requested (round {round}): {}",
+                record.spec_paths.join(", ")
+            ),
+        )),
+        ReviewStatus::Approved => Some(("owner", format!("Spec approved (round {round})."))),
+        ReviewStatus::ChangesRequested => Some((
+            "owner",
+            format!(
+                "Spec changes requested (round {round}): {}",
+                feedback.unwrap_or_default()
+            ),
+        )),
+        ReviewStatus::Rejected => Some((
+            "owner",
+            match feedback {
+                Some(reason) => format!("Spec rejected (round {round}): {reason}"),
+                None => format!("Spec rejected (round {round})."),
+            },
+        )),
+        ReviewStatus::Expired | ReviewStatus::Cancelled => None,
+    };
+    let item = store.set_spec_review(
+        item_id,
+        review,
+        message.as_ref().map(|(from, text)| (*from, text.as_str())),
+    )?;
+    if record.status == ReviewStatus::Pending {
+        super::notify::dispatch_board_event_with_settings(
+            board_base,
+            &item,
+            "spec_review",
+            "planner",
+            settings,
+        );
+    }
+    Ok(item)
 }
 
 fn require_item_workspace(item: &BoardItem) -> Result<PathBuf, BoardError> {
@@ -731,12 +864,13 @@ pub fn run_item_execute(
         "--json".to_owned(),
         "-".to_owned(),
     ];
-    let outcome = match spawn_child_dmuxai(
+    let outcome = match spawn_child_dmuxai_for_item(
         &workspace,
         &args,
         &normalized_prompt,
         child_timeout(),
         &state_root,
+        Some((store.base(), &item.id)),
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -1496,6 +1630,316 @@ exit 0
             std::env::remove_var("DMUXAI_BOARD_CHILD_BIN");
             std::env::remove_var("DMUXAI_BOARD_SELF_BIN");
         }
+    }
+
+    fn spec_review_record(
+        status: ReviewStatus,
+        round: u32,
+        feedback: Option<&str>,
+    ) -> SpecReviewRecord {
+        SpecReviewRecord {
+            review_id: "graph-1".to_owned(),
+            graph_id: "graph-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            workspace: "/ws".to_owned(),
+            prompt_summary: "ship it".to_owned(),
+            spec_paths: vec!["docs/specs/SPEC-x.md".to_owned()],
+            spec_digest: format!("digest-{round}"),
+            round,
+            max_rounds: 5,
+            status,
+            created_ms: 1,
+            updated_ms: 1,
+            board_item_id: None,
+            verdict: None,
+            by: None,
+            feedback: feedback.map(str::to_owned),
+            decided_ms: None,
+        }
+    }
+
+    fn add_in_progress_item(store: &BoardStore, state: &Path, workspace: &Path) -> BoardItem {
+        store
+            .add(AddItemRequest {
+                title: "Spec review item".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::InProgress),
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.to_path_buf()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.to_path_buf(),
+            })
+            .unwrap()
+    }
+
+    // TC-3711 / FR-3711: the board run passes DMUXAI_BOARD_ITEM_ID; a review
+    // request stores `spec_review`, adds a `planner` message and notifies
+    // `spec_review`; decisions update the status with an `owner` message; the
+    // lane and decision never change; a bad item id is refused.
+    #[test]
+    fn tc_3711_board_item_mirrors_spec_review() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        ensure_dir(&board_base).unwrap();
+        let store = BoardStore::open(board_base.clone()).unwrap();
+
+        // The board run's child gets the item id.
+        let run_item = store
+            .add(AddItemRequest {
+                title: "Run with id".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: Some(Lane::NeedsDecision),
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: None,
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let (_, hash) =
+            edit_plan_from_json(&workspace, &state, "ship it", &sample_plan_json(), None).unwrap();
+        store
+            .attach_plan(&run_item.id, &hash, &state, "bot:test")
+            .unwrap();
+        store
+            .decide(
+                &run_item.id,
+                DecideRequest {
+                    verdict: Verdict::Approve,
+                    text: None,
+                    option: None,
+                    plan_hash: Some(hash.clone()),
+                    by: "owner".to_owned(),
+                },
+            )
+            .unwrap();
+        let env_out = dir.path().join("child-item-id.txt");
+        let fake_bin = write_fake_runner(
+            dir.path(),
+            "capture-item-id.sh",
+            &format!(
+                "#!/bin/sh\ncat > /dev/null\nprintf '%s' \"$DMUXAI_BOARD_ITEM_ID\" > \"{}\"\nprintf '{{\"ok\":true,\"exit_code\":0,\"run_id\":\"0123456789abcdef\"}}\\n'\nexit 0\n",
+                env_out.display()
+            ),
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &fake_bin) };
+        let prepared = run_item_prepare(
+            &store,
+            RunParams {
+                id: run_item.id.clone(),
+                expected_plan_hash: Some(hash),
+                by: "owner".to_owned(),
+                state_root: state.clone(),
+            },
+        )
+        .unwrap();
+        let ran = run_item_execute(&store, prepared);
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        assert_eq!(ran.unwrap().lane, Lane::Done);
+        assert_eq!(fs::read_to_string(&env_out).unwrap(), run_item.id);
+
+        // Review request and decisions on an in-progress item.
+        let notify_out = dir.path().join("notify.jsonl");
+        let hook = write_fake_runner(
+            dir.path(),
+            "notify-hook.sh",
+            &format!(
+                "#!/bin/sh\nbody=$(cat)\nprintf '%s\\n' \"$body\" >> \"{}\"\n",
+                notify_out.display()
+            ),
+        );
+        let settings = BoardSettings {
+            notify_command: Some(vec![hook.display().to_string()]),
+            ..BoardSettings::default()
+        };
+        let item = add_in_progress_item(&store, &state, &workspace);
+        let requested = sync_spec_review_with_settings(
+            &board_base,
+            &item.id,
+            &spec_review_record(ReviewStatus::Pending, 1, None),
+            &settings,
+        )
+        .unwrap();
+        let review = requested.spec_review.clone().unwrap();
+        assert_eq!(review.review_id, "graph-1");
+        assert_eq!(review.status, ReviewStatus::Pending);
+        assert_eq!(review.round, 1);
+        assert_eq!(review.spec_paths, ["docs/specs/SPEC-x.md"]);
+        assert_eq!(review.spec_digest, "digest-1");
+        assert_eq!(requested.lane, Lane::InProgress);
+        assert!(requested.decision.is_none());
+        let last = requested.thread.last().unwrap();
+        assert_eq!(last.from, "planner");
+        assert_eq!(
+            last.text,
+            "Spec review requested (round 1): docs/specs/SPEC-x.md"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let body = fs::read_to_string(&notify_out).unwrap_or_default();
+            if body.contains("\"event\":\"spec_review\"") {
+                assert!(body.contains(&item.id));
+                break;
+            }
+            assert!(Instant::now() < deadline, "no spec_review notification");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let changes = sync_spec_review_with_settings(
+            &board_base,
+            &item.id,
+            &spec_review_record(ReviewStatus::ChangesRequested, 1, Some("add errors")),
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(
+            changes.spec_review.as_ref().unwrap().status,
+            ReviewStatus::ChangesRequested
+        );
+        let last = changes.thread.last().unwrap();
+        assert_eq!(last.from, "owner");
+        assert_eq!(last.text, "Spec changes requested (round 1): add errors");
+
+        sync_spec_review_with_settings(
+            &board_base,
+            &item.id,
+            &spec_review_record(ReviewStatus::Pending, 2, None),
+            &settings,
+        )
+        .unwrap();
+        let approved = sync_spec_review_with_settings(
+            &board_base,
+            &item.id,
+            &spec_review_record(ReviewStatus::Approved, 2, None),
+            &settings,
+        )
+        .unwrap();
+        let review = approved.spec_review.as_ref().unwrap();
+        assert_eq!(review.status, ReviewStatus::Approved);
+        assert_eq!(review.round, 2);
+        assert_eq!(
+            approved.thread.last().unwrap().text,
+            "Spec approved (round 2)."
+        );
+        assert_eq!(approved.lane, Lane::InProgress);
+        assert!(approved.decision.is_none());
+        let froms: Vec<&str> = approved.thread.iter().map(|m| m.from.as_str()).collect();
+        assert_eq!(froms, ["planner", "owner", "planner", "owner"]);
+
+        // Invalid and unknown ids are refused without touching the board.
+        let record = spec_review_record(ReviewStatus::Pending, 1, None);
+        assert!(matches!(
+            sync_spec_review_with_settings(&board_base, "../x", &record, &settings),
+            Err(BoardError::Usage(_))
+        ));
+        assert!(matches!(
+            sync_spec_review_with_settings(
+                &board_base,
+                &crate::board::generate_item_id(),
+                &record,
+                &settings
+            ),
+            Err(BoardError::NotFound(_))
+        ));
+        let missing_board = dir.path().join("no-board");
+        assert!(
+            sync_spec_review_with_settings(&missing_board, &item.id, &record, &settings).is_err()
+        );
+        assert!(!missing_board.exists());
+    }
+
+    // TC-3712 / FR-3712: the board child timeout does not count while the
+    // item's spec review is pending and counts again afterwards.
+    #[test]
+    fn tc_3712_child_timeout_suspended_while_spec_review_pending() {
+        let _guard = crate::state_path::test_env_lock();
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let board_base = state.join("board");
+        let workspace = dir.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        ensure_dir(&board_base).unwrap();
+        let store = BoardStore::open(board_base.clone()).unwrap();
+        let item = add_in_progress_item(&store, &state, &workspace);
+        let review = |status| crate::board::BoardSpecReview {
+            review_id: "graph-1".to_owned(),
+            status,
+            round: 1,
+            spec_paths: vec!["docs/specs/SPEC-x.md".to_owned()],
+            spec_digest: "d".to_owned(),
+        };
+        store
+            .set_spec_review(&item.id, review(ReviewStatus::Pending), None)
+            .unwrap();
+
+        let pausing = write_fake_runner(
+            dir.path(),
+            "pause-4s.sh",
+            "#!/bin/sh\ncat > /dev/null\nsleep 4\nprintf '{\"ok\":true,\"exit_code\":0}\\n'\nexit 0\n",
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &pausing) };
+        let outcome = spawn_child_dmuxai_for_item(
+            &workspace,
+            &[],
+            "p",
+            Duration::from_secs(2),
+            &state,
+            Some((&board_base, &item.id)),
+        );
+        assert_eq!(outcome.unwrap().exit_code, 0, "killed while pending");
+
+        let long = write_fake_runner(
+            dir.path(),
+            "pause-30s.sh",
+            "#!/bin/sh\ncat > /dev/null\nsleep 30\nexit 0\n",
+        );
+        unsafe { std::env::set_var("DMUXAI_BOARD_CHILD_BIN", &long) };
+        let flip_store = BoardStore::open(board_base.clone()).unwrap();
+        let flip_id = item.id.clone();
+        let flipper = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(1));
+            flip_store
+                .set_spec_review(&flip_id, review(ReviewStatus::Approved), None)
+                .unwrap();
+        });
+        let started = Instant::now();
+        let outcome = spawn_child_dmuxai_for_item(
+            &workspace,
+            &[],
+            "p",
+            Duration::from_secs(2),
+            &state,
+            Some((&board_base, &item.id)),
+        );
+        let elapsed = started.elapsed();
+        unsafe { std::env::remove_var("DMUXAI_BOARD_CHILD_BIN") };
+        flipper.join().unwrap();
+        assert_eq!(
+            outcome.unwrap().exit_code,
+            124,
+            "timeout resumes after review"
+        );
+        assert!(elapsed >= Duration::from_millis(2900), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::{BoardError, BoardPlan, PLAN_HISTORY_MAX, mask_board_plan};
 use crate::docs::sha256_hex;
 use crate::graph::{
-    PlanContext, PlanDoc, PlanStep, PlanTask, parse_plan, validate_plan_with_limit,
+    GraphPlan, PlanContext, PlanDoc, PlanStep, PlanTask, expand_plan_steps, is_spec_first_step,
+    parse_plan, validate_plan_with_limit,
 };
 use crate::settings::DmuxSettings;
 use crate::state_path::valid_pending_plan_hash;
@@ -287,28 +288,94 @@ pub fn edit_plan_from_json(
         doc.require_tasks = !doc.tasks.is_empty();
     }
     let settings = DmuxSettings::load(workspace_root);
-    let holder = PlanValidationCtx::from_settings(&settings);
     let normalized_prompt = super::normalize_plan_prompt(stored_prompt);
+    let graph =
+        validate_doc_for(&settings, &normalized_prompt, &doc).map_err(BoardError::Failed)?;
+    if let Some(expanded) = expand_doc(&settings, &normalized_prompt, &doc, &graph) {
+        doc = expanded;
+    }
+    let plan = pending_from_doc(&normalized_prompt, &doc);
+    let hash = write_pending_plan(state_root, &plan)?;
+    Ok((plan, hash))
+}
+
+fn validate_doc_for(
+    settings: &DmuxSettings,
+    prompt: &str,
+    doc: &PlanDoc,
+) -> Result<GraphPlan, String> {
+    let holder = PlanValidationCtx::from_settings(settings);
     let cap = settings.graph_max_nodes.clamp(1, 8) as usize;
     let ctx = PlanContext {
-        user_prompt: &normalized_prompt,
+        user_prompt: prompt,
         available_runners: &holder.runners,
         runner_allowed: &|runner: &str| settings.graph_runner_allowed(runner),
         effective_model: &|runner: &str| holder.effective_model(runner),
         validate_model: &crate::model_policy::validate_model_for_runner,
     };
-    let _graph = validate_plan_with_limit(&doc, &ctx, cap).map_err(|errors| {
-        BoardError::Failed(
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    })?;
-    let plan = pending_from_doc(&normalized_prompt, &doc);
+    validate_plan_with_limit(doc, &ctx, cap).map_err(|errors| {
+        errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// The spec-first expansion headless runs apply (FR-3503), so the stored
+/// plan is the plan `--approve-plan-id` executes (FR-3715). `None` when
+/// nothing is inserted or the expanded plan would not validate (for example
+/// over the step cap); the run then expands the stored plan as before.
+fn expand_doc(
+    settings: &DmuxSettings,
+    prompt: &str,
+    doc: &PlanDoc,
+    graph: &GraphPlan,
+) -> Option<PlanDoc> {
+    let (steps, inserted) = expand_plan_steps(&doc.steps, graph, &settings.workflow);
+    if inserted.is_empty() {
+        return None;
+    }
+    let expanded = PlanDoc {
+        steps,
+        ..doc.clone()
+    };
+    validate_doc_for(settings, prompt, &expanded)
+        .ok()
+        .map(|_| expanded)
+}
+
+/// Spec-first expansion of an attached pending plan for `workspace_root`
+/// (FR-3715). Writes and returns the expanded plan and its hash, or `None`
+/// when the plan is stored as given.
+pub fn expand_pending_plan(
+    workspace_root: &Path,
+    state_root: &Path,
+    pending: &PendingPlanFile,
+) -> Result<Option<(PendingPlanFile, String)>, BoardError> {
+    if !workspace_root.is_dir() {
+        return Ok(None);
+    }
+    let settings = DmuxSettings::load(workspace_root);
+    let doc = PlanDoc {
+        steps: pending.steps.clone(),
+        tasks: pending.tasks.clone(),
+        require_tasks: !pending.tasks.is_empty(),
+        task_errors: Vec::new(),
+    };
+    let Ok(graph) = validate_doc_for(&settings, &pending.prompt, &doc) else {
+        return Ok(None);
+    };
+    let Some(expanded) = expand_doc(&settings, &pending.prompt, &doc, &graph) else {
+        return Ok(None);
+    };
+    let plan = PendingPlanFile {
+        prompt: pending.prompt.clone(),
+        tasks: expanded.tasks,
+        steps: expanded.steps,
+    };
     let hash = write_pending_plan(state_root, &plan)?;
-    Ok((plan, hash))
+    Ok(Some((plan, hash)))
 }
 
 pub fn pending_from_doc(prompt: &str, doc: &PlanDoc) -> PendingPlanFile {
@@ -337,6 +404,12 @@ pub fn board_plan_from_pending(
         history.drain(..drop);
     }
     let previous_steps = previous.map(|p| p.steps.clone());
+    let spec_first_added = pending
+        .steps
+        .iter()
+        .filter(|step| is_spec_first_step(&step.role, &step.job, &pending.prompt))
+        .map(|step| step.id.clone())
+        .collect();
     let mut plan = BoardPlan {
         hash,
         prompt: pending.prompt,
@@ -345,6 +418,7 @@ pub fn board_plan_from_pending(
         revision,
         history,
         previous_steps,
+        spec_first_added,
     };
     mask_board_plan(&mut plan);
     plan
@@ -426,7 +500,14 @@ mod tests {
         assert_eq!(edited.plan.as_ref().unwrap().revision, 2);
         assert_eq!(edited.plan.as_ref().unwrap().tasks.len(), 1);
         assert_eq!(edited.plan.as_ref().unwrap().tasks[0].id, "task-1");
-        assert_eq!(edited.plan.as_ref().unwrap().steps[0].job, "edit-more");
+        let edited_step = edited
+            .plan
+            .as_ref()
+            .unwrap()
+            .steps
+            .iter()
+            .find(|s| s.id == "step-1");
+        assert_eq!(edited_step.unwrap().job, "edit-more");
         assert_ne!(hash, hash2);
 
         // An approved item goes back to needs_decision and loses its decision.
@@ -470,6 +551,115 @@ mod tests {
         assert_eq!(revised.plan.as_ref().unwrap().revision, 3);
         assert_eq!(revised.lane, crate::board::Lane::NeedsDecision);
         assert!(revised.decision.is_none());
+    }
+
+    /// A user config with `[workflow] spec_first = "<mode>"`; hold the guard
+    /// while plans are validated.
+    fn spec_first_user_config(
+        dir: &Path,
+        mode: &str,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        Option<std::ffi::OsString>,
+    ) {
+        let guard = crate::state_path::test_env_lock();
+        let xdg = dir.join("xdg");
+        std::fs::create_dir_all(xdg.join("dmuxai")).unwrap();
+        std::fs::write(
+            xdg.join("dmuxai").join("dmuxai.toml"),
+            format!("[workflow]\nspec_first = \"{mode}\"\n"),
+        )
+        .unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        (guard, prev)
+    }
+
+    fn restore_xdg(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+    }
+
+    // TC-3715 / FR-3715, FR-3503 (#374): `board plan --edit`, Save plan and
+    // `board add --plan-hash` store the spec-first expanded plan, so the
+    // stored hash and steps are what `--approve-plan-id` executes; inserted
+    // steps are marked.
+    #[test]
+    fn tc_3715_plan_edit_and_attach_store_spec_first_expanded_plan() {
+        let dir = tempdir().unwrap();
+        let state = dir.path().join("state");
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        ensure_dir(&state.join("board")).unwrap();
+        let (guard, prev) = spec_first_user_config(dir.path(), "full");
+        let one_step = sample_plan_json();
+        let one_step = one_step.as_str();
+
+        let (pending, hash) =
+            edit_plan_from_json(&workspace, &state, "ship it", one_step, None).unwrap();
+        let ids: Vec<&str> = pending.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["spec-1", "step-1", "test-1"]);
+        assert_eq!(pending.steps[1].depends_on, ["spec-1"]);
+        assert_eq!(pending.steps[2].depends_on, ["step-1"]);
+        assert_eq!(pending.steps[0].role, "spec");
+        assert_eq!(pending.steps[2].role, "test");
+        assert_eq!(pending_hash_for_plan(&pending).unwrap(), hash);
+        assert_eq!(read_pending_plan(&state, &hash).unwrap(), pending);
+
+        // Re-saving the expanded plan (dashboard Save plan) is a no-op.
+        let resaved =
+            serde_json::json!({ "tasks": pending.tasks, "steps": pending.steps }).to_string();
+        let (_, hash_again) =
+            edit_plan_from_json(&workspace, &state, "ship it", &resaved, None).unwrap();
+        assert_eq!(hash_again, hash);
+
+        // `board add --plan-hash` with an unexpanded pending plan stores the
+        // expanded plan under its own hash.
+        let raw_doc = parse_plan(one_step).unwrap();
+        let raw = PendingPlanFile {
+            prompt: "ship it".to_owned(),
+            tasks: raw_doc.tasks,
+            steps: raw_doc.steps,
+        };
+        let raw_hash = write_pending_plan(&state, &raw).unwrap();
+        let store = BoardStore::open(state.join("board")).unwrap();
+        let item = store
+            .add(AddItemRequest {
+                title: "expanded".to_owned(),
+                summary: String::new(),
+                kind: Kind::Feature,
+                grade: None,
+                lane: None,
+                source_bot: Some("bot".to_owned()),
+                source_channel: None,
+                source_ref: None,
+                workspace: Some(workspace.clone()),
+                recommendation: None,
+                options: vec![],
+                plan_hash: Some(raw_hash.clone()),
+                key: None,
+                by: "bot:test".to_owned(),
+                state_root: state.clone(),
+            })
+            .unwrap();
+        let plan = item.plan.as_ref().unwrap();
+        assert_eq!(plan.hash, hash);
+        assert_ne!(plan.hash, raw_hash);
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.spec_first_added, ["spec-1", "test-1"]);
+        assert!(board_plan_copy_path(&state.join("board"), &hash).exists());
+
+        // With spec-first off nothing is inserted or marked.
+        restore_xdg(prev);
+        drop(guard);
+        let (guard, prev) = spec_first_user_config(dir.path(), "off");
+        let (off_pending, _) =
+            edit_plan_from_json(&workspace, &state, "ship it", one_step, None).unwrap();
+        assert_eq!(off_pending.steps.len(), 1);
+        restore_xdg(prev);
+        drop(guard);
     }
 
     #[test]

@@ -107,3 +107,7 @@ Graph run states added: `awaiting_spec_review` (between the last spec step's suc
 
 - Spec review and plan review need a human check and must appear on the board (t793u).
 - Implementation runner: Cursor Sonnet 5.5 via dmuxai (t793u).
+
+## 7. Amendments
+
+- 2026-11-28 (#374): the plan shown under `Plan review` (FR-3715) is the plan after spec-first expansion (SPEC-spec-first-workflow FR-3503); `board plan --edit`, dashboard Save plan and `board add --plan-hash` store that expanded plan, so the approved hash and the shown steps equal what the board child runs. Inserted steps carry the note `added by spec-first`. Tests: `src/board/plan.rs`, `src/web/board_api.rs`, `src/app.rs` and `tests/web_board_e2e.rs` `tc_3715_*`.
