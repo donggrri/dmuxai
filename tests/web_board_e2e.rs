@@ -458,7 +458,7 @@ fn run_probe(
     script_body: &str,
     args: &[&str],
 ) -> serde_json::Value {
-    run_probe_for(python, chrome, script_body, args, Duration::from_secs(55))
+    run_probe_for(python, chrome, script_body, args, Duration::from_secs(90))
 }
 
 fn run_probe_for(
@@ -991,6 +991,8 @@ with sync_playwright() as p:
         board_plan_edit(&env, id, "ship it", BOARD_PLAN_JSON);
         let (_guard, url) = start_web(&env, &[]);
 
+        // The board event stream is blocked so the card keeps the plan hash it
+        // was rendered with; otherwise a refresh could make the click fresh.
         let stale_script = format!(
             r##"{OPEN_BOARD}
 PLAN_V2 = json.loads({plan_body:?})
@@ -999,7 +1001,11 @@ with sync_playwright() as p:
     browser = p.chromium.launch(
         executable_path=chrome, headless=True, args=["--no-sandbox"])
     page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+    page.route("**/api/board/events**", lambda route: route.abort())
     open_board(page)
+    old_hash = page.evaluate(
+        """async (p) => (await (await fetch('/api/board/' + encodeURIComponent(p.id))).json()).plan.hash""",
+        {{"id": item_id}})
     resp = page.evaluate("""async (p) => {{
       const r = await fetch('/api/board/' + encodeURIComponent(p.id) + '/plan', {{
         method: 'POST',
@@ -1016,6 +1022,7 @@ with sync_playwright() as p:
             '.board-decision-card[data-item-id="' + item_id + '"]'
             ' [data-board-action="approve"]').click(force=True)
     decision_status = resp_info.value.status
+    sent_hash = (resp_info.value.request.post_data_json or {{}}).get('plan_hash')
     page.wait_for_function(
         """async (p) => {{
           const r = await fetch('/api/board/' + encodeURIComponent(p.id));
@@ -1039,11 +1046,16 @@ with sync_playwright() as p:
         "no_decision": no_decision,
         "plan_changed_ui": notice,
         "decision_status": decision_status,
+        "sent_old_hash": bool(old_hash) and sent_hash == old_hash,
     }}))
 "##,
             plan_body = BOARD_PLAN_JSON_V2,
         );
         let result = run_probe(&python, &chrome, &stale_script, &[&url, id]);
+        assert!(
+            result["sent_old_hash"].as_bool().unwrap_or(false),
+            "approve must send the plan hash the card was rendered with: {result}"
+        );
         assert_eq!(
             result["decision_status"].as_u64(),
             Some(409),
@@ -1578,63 +1590,81 @@ fn tc_3610_view_only_serve_hides_launch_controls() {
     board_plan_edit(&env, id, "ship it", BOARD_PLAN_JSON);
     let (_guard, url) = start_serve(&env, &[]);
 
+    // The probe prints its JSON even when a step fails so a load-induced
+    // timeout reports the failing stage instead of "no JSON from playwright".
     let script = format!(
         r##"{OPEN_BOARD}
+result = {{}}
+stage = 'launch'
 with sync_playwright() as p:
     browser = p.chromium.launch(
         executable_path=chrome, headless=True, args=["--no-sandbox"])
-    page = browser.new_page(viewport={{"width": 1280, "height": 800}})
-    open_board(page)
-    open_item(page)
-    ctrl = page.evaluate("""() => {{
-      const revise = document.getElementById('board-ask-revise');
-      const run = document.getElementById('board-run');
-      const note = document.getElementById('board-chat-note-only');
-      const busy = document.getElementById('board-ask-busy');
-      const ask_send = document.getElementById('board-chat-send');
-      return {{
-        revise_hidden: !revise || revise.hidden,
-        run_hidden: !run || run.hidden,
-        note_hidden: !note || note.closest('label')?.hidden,
-        busy_hidden: !busy || busy.hidden,
-        has_send: !!ask_send,
-      }};
-    }}""")
-    page.fill('#board-chat-input', 'store only in serve')
-    page.locator('#board-chat-send').click(force=True)
-    page.wait_for_function(
-        "() => [...document.querySelectorAll('#board-chat-thread .board-chat-msg-owner')].length >= 1",
-        timeout=20000)
-    page.wait_for_timeout(1500)
-    planners = page.locator('#board-chat-thread .board-chat-sender', has_text='planner').count()
-    page.locator('#board-modal-close').click(force=True)
-    page.wait_for_function(
-        "() => !document.getElementById('board-drawer-wrap').classList.contains('open')",
-        timeout=5000)
-    page.locator(
-        '.board-decision-card[data-item-id="' + item_id + '"]'
-        ' [data-board-action="approve"]').click(force=True)
-    page.wait_for_function(
-        """() => (document.body.innerText || '').includes('auto-run skipped: view-only dashboard')""",
-        timeout=20000)
-    open_item(page)
-    page.wait_for_function(
-        """() => {{
-          const t = document.getElementById('board-chat-thread')?.innerText || '';
-          return t.includes('auto-run skipped: view-only dashboard');
-        }}""",
-        timeout=20000)
-    skip_text = page.inner_text('#board-chat-thread')
-    browser.close()
-    print(json.dumps({{
-        **ctrl,
-        "no_planner": planners == 0,
-        "thread_skip": 'auto-run skipped: view-only dashboard' in skip_text,
-    }}))
+    try:
+        page = browser.new_page(viewport={{"width": 1280, "height": 800}})
+        stage = 'open_board'
+        open_board(page)
+        stage = 'open_item'
+        open_item(page)
+        stage = 'controls'
+        result.update(page.evaluate("""() => {{
+          const revise = document.getElementById('board-ask-revise');
+          const run = document.getElementById('board-run');
+          const note = document.getElementById('board-chat-note-only');
+          const busy = document.getElementById('board-ask-busy');
+          const ask_send = document.getElementById('board-chat-send');
+          return {{
+            revise_hidden: !revise || revise.hidden,
+            run_hidden: !run || run.hidden,
+            note_hidden: !note || note.closest('label')?.hidden,
+            busy_hidden: !busy || busy.hidden,
+            has_send: !!ask_send,
+          }};
+        }}"""))
+        stage = 'chat_send'
+        page.fill('#board-chat-input', 'store only in serve')
+        page.locator('#board-chat-send').click(force=True)
+        page.wait_for_function(
+            "() => [...document.querySelectorAll('#board-chat-thread .board-chat-msg-owner')].length >= 1",
+            timeout=30000)
+        page.wait_for_timeout(1500)
+        planners = page.locator('#board-chat-thread .board-chat-sender', has_text='planner').count()
+        result["no_planner"] = planners == 0
+        stage = 'close_modal'
+        page.locator('#board-modal-close').click(force=True)
+        page.wait_for_function(
+            "() => !document.getElementById('board-drawer-wrap').classList.contains('open')",
+            timeout=10000)
+        stage = 'approve'
+        page.locator(
+            '.board-decision-card[data-item-id="' + item_id + '"]'
+            ' [data-board-action="approve"]').click(force=True)
+        page.wait_for_function(
+            """() => (document.body.innerText || '').includes('auto-run skipped: view-only dashboard')""",
+            timeout=30000)
+        stage = 'reopen_item'
+        open_item(page)
+        page.wait_for_function(
+            """() => {{
+              const t = document.getElementById('board-chat-thread')?.innerText || '';
+              return t.includes('auto-run skipped: view-only dashboard');
+            }}""",
+            timeout=30000)
+        skip_text = page.inner_text('#board-chat-thread')
+        result["thread_skip"] = 'auto-run skipped: view-only dashboard' in skip_text
+        stage = 'done'
+    except Exception as e:
+        result["error"] = stage + ': ' + repr(e)
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+print(json.dumps(result))
 "##
     );
 
     let result = run_probe(&python, &chrome, &script, &[&url, id]);
+    assert!(result.get("error").is_none(), "probe failed: {result}");
     assert!(
         result["revise_hidden"].as_bool().unwrap_or(false),
         "{result}"
